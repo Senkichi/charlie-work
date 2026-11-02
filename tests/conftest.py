@@ -11,6 +11,17 @@ from unittest.mock import create_autospec
 
 import pytest
 
+# The autouse ``_default_healthy_preflight`` stub below patches these two
+# modules on every test. Imported here -- at conftest import (collection)
+# time -- rather than lazily at the stub's first patch: the two modules cost
+# ~1 s to import, and a lazy import inside the fixture charged that cost to
+# the first test that ran in the process. In small selected runs
+# ``tests/test_attempt_resume.py`` is often the alphabetically-first selected
+# file, so ``test_non_throttle_death_starts_clean[stalled]`` absorbed the
+# whole import in its setup phase -- a 2.3x ledger regression (issue #2864).
+# At collection time the cost is paid once per process and attributed to no
+# test.
+from charlie_work import fleet_dispatch, workflow
 from charlie_work.preflight import PreflightResult
 
 _UNSET = object()
@@ -74,6 +85,12 @@ def pytest_configure(config: pytest.Config) -> None:
     creates a repo. Under xdist each worker process runs this hook for
     itself, so the guard below watches the same enclosing config from every
     worker.
+
+    This is the module's ONLY ``pytest_configure``: a second same-named
+    definition would silently replace this one (pluggy registers the module's
+    final binding), disabling the containment with no error. The short-basetemp
+    override therefore lives in ``_shorten_windows_basetemp`` and is called
+    first, so the ceiling is derived from the basetemp the run will use.
     """
     from _git_leak_guard import (
         enclosing_repo_config_path,
@@ -81,6 +98,7 @@ def pytest_configure(config: pytest.Config) -> None:
     )
 
     global _GIT_ISOLATION_SCRATCH_DIR, _ENCLOSING_REPO_CONFIG_PATH
+    _shorten_windows_basetemp(config)
     basetemp = getattr(config.option, "basetemp", None)
     _GIT_ISOLATION_SCRATCH_DIR = install_session_git_isolation(
         basetemp=Path(basetemp) if basetemp else None
@@ -92,6 +110,59 @@ def pytest_sessionfinish(session: pytest.Session) -> None:
     """Remove the per-session git-isolation scratch dir (issue #2060)."""
     if _GIT_ISOLATION_SCRATCH_DIR is not None:
         shutil.rmtree(_GIT_ISOLATION_SCRATCH_DIR, ignore_errors=True)
+
+
+def patch_path_replace(
+    monkeypatch: pytest.MonkeyPatch,
+    fake: Callable[..., Path],
+    *,
+    scope: Path,
+) -> None:
+    """Install ``fake`` as ``Path.replace``, but only for calls inside ``scope``.
+
+    ``monkeypatch.setattr(Path, "replace", fake)`` patches the *class*, so the
+    patch is process-wide: a ``Path.replace`` fired by any other thread during
+    the window -- a leftover background writer from an earlier test on the same
+    xdist worker, the flake behind issues #2284/#2290 -- lands in ``fake`` too,
+    where it is miscounted, raised at, or deadlocked on a barrier it was never
+    meant to join.
+
+    The installed wrapper routes a call to ``fake`` only when the source path
+    resolves inside ``scope`` (resolved containment via
+    ``charlie_work.safe_path.contains``, so a junction/reparse point cannot
+    smuggle an outside path in); every other call delegates to the real
+    ``Path.replace`` untouched. Scope the patch to the directory under test
+    (usually ``tmp_path``) -- a foreign path then behaves exactly as if the
+    patch did not exist.
+
+    ``fake`` keeps the real signature ``(self, target) -> Path``. A fake that
+    delegates must call a ``real_replace`` captured *before* this helper runs;
+    calling ``Path.replace`` inside ``fake`` would re-enter the wrapper.
+    """
+    from charlie_work import safe_path
+
+    real_replace = Path.replace
+
+    def _scoped(self: Path, target: object, *args: Any, **kwargs: Any) -> Path:
+        if safe_path.contains(scope, self):
+            return fake(self, target, *args, **kwargs)
+        return real_replace(self, target, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "replace", _scoped)
+
+
+@pytest.fixture(name="patch_path_replace")
+def _patch_path_replace_fixture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Callable[..., None]:
+    """``patch_path_replace`` bound to the test's own ``monkeypatch``.
+
+    Call as ``patch_path_replace(fake, scope=tmp_path)``. A test that manages
+    a ``pytest.MonkeyPatch()`` instance by hand (e.g. to control undo timing
+    around joined threads) calls the unbound ``conftest.patch_path_replace``
+    directly.
+    """
+    return lambda fake, *, scope: patch_path_replace(monkeypatch, fake, scope=scope)
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -121,6 +192,26 @@ def pytest_sessionstart(session: pytest.Session) -> None:
     enforce_source_anchor(Path(__file__).resolve().parents[1])
 
 
+@pytest.hookimpl(tryfirst=True, optionalhook=True)
+def pytest_xdist_auto_num_workers(config: pytest.Config) -> int | None:
+    """HS-CW-1: run 1-3 explicit file/nodeid targets serially under ``-n auto``.
+
+    ``addopts`` carries ``-n auto``; xdist asks this hook (firstresult) how many
+    workers ``auto`` means. ``0`` makes xdist run the session in-process;
+    ``None`` falls through to xdist's default (``PYTEST_XDIST_AUTO_NUM_WORKERS``,
+    else the CPU count). ``optionalhook`` keeps ``-n0``/no-xdist runs from
+    rejecting an unknown hook. Policy and rationale: ``tests/_xdist_policy.py``.
+    """
+    from _xdist_policy import small_run_workers
+
+    return small_run_workers(
+        config.args,
+        config.invocation_params.dir,
+        config.invocation_params.args,
+        from_command_line=config.args_source == pytest.Config.ArgsSource.ARGS,
+    )
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _kill_on_close_job() -> None:
     """Issue #1851: on Windows, put this pytest process in a Job Object with
@@ -141,26 +232,39 @@ def _kill_on_close_job() -> None:
     enter_kill_on_close_job()
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _src_ast_mutation_guard() -> Iterator[None]:
+    """HS-CW-3: fail the session if a test mutated a shared ``_src_ast`` tree.
+
+    ``_src_ast.parsed`` hands every caller in this process the same
+    ``ast.Module``; one consumer editing it would poison every later scan.
+    Teardown re-digests every handed-out tree once per process and names each
+    file whose tree changed. Mutating callers use ``_src_ast.parsed_fresh``.
+    """
+    yield
+    from _src_ast import assert_no_mutations
+
+    assert_no_mutations()
+
+
 @pytest.fixture(autouse=True)
 def _no_leaked_child_processes() -> Iterator[None]:
     """Issue #1851: fail a test that leaves a live descendant behind.
 
-    Snapshots this process's descendants at setup; at teardown gives new
-    children a short grace to exit on their own, kills the survivors, and
-    fails the test naming each survivor's pid and command line. Measured
-    cost: two ``psutil`` child enumerations per test ≈ 7.5 ms — ~60 s over
-    the 7909-test suite (~7 % of the ~14.5 min CI Tests job). A cheaper
-    ``create_time``-vs-``time.time()`` cutoff was tried and rejected:
-    ``time.time()`` granularity/stepping on some Windows hosts can place a
-    pre-existing child above the cutoff (see ``descendant_snapshot``).
+    ``leak_guard`` reads the kill-on-close job's member list at setup and
+    teardown (one syscall each, HS-CW-2) and falls back to the psutil walk --
+    grace, kill, report naming each survivor's pid and command line -- only
+    when the job gained a member. Off Windows, when the job was refused, or
+    with ``CI_FLEET_FAST_GUARDS=off``, every test takes the psutil walk (two
+    child enumerations, ~7.5 ms). A cheaper ``create_time``-vs-``time.time()``
+    cutoff was tried and rejected: ``time.time()`` granularity/stepping on some
+    Windows hosts can place a pre-existing child above the cutoff (see
+    ``descendant_snapshot``).
     """
-    from _process_guard import descendant_snapshot, reap_leaked_descendants
+    from _process_guard import leak_guard
 
-    before = descendant_snapshot()
-    yield
-    report = reap_leaked_descendants(before)
-    if report:
-        pytest.fail("test left live child process(es) behind:\n  " + "\n  ".join(report))
+    with leak_guard():
+        yield
 
 
 @pytest.fixture(autouse=True)
@@ -248,6 +352,18 @@ def _isolate_fleet_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
 
 
 @pytest.fixture(autouse=True)
+def _isolate_host_io_manifest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point ci-fleet's host I/O manifest at a per-test path that does not exist.
+
+    On a host provisioned for fast I/O, the default manifest is real, and any
+    test that resolves the worktrees root (``paths.resolved_layout``) would put
+    worktrees on that host's volume. ``host_io_worker`` tests write their own
+    manifest at this path. Control: ``test_the_suite_never_reads_the_hosts_manifest``.
+    """
+    monkeypatch.setenv("CI_FLEET_HOST_IO_MANIFEST", str(tmp_path / "host-io" / "host-io.json"))
+
+
+@pytest.fixture(autouse=True)
 def _reset_markdown_guard_sink() -> Iterator[None]:
     """Unbind the ambient ``markdown_guard`` disagreement sink around every test.
 
@@ -299,11 +415,11 @@ def _isolate_git_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     ascending, and can never reach the enclosing checkout.
     """
     from _git_leak_guard import merge_ceiling_directories
+    from _git_templates import GIT_CONFIG_ENV
 
     monkeypatch.setenv("GIT_CEILING_DIRECTORIES", merge_ceiling_directories(tmp_path.parent))
-    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
-    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.longpaths")
-    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "true")
+    for key, value in GIT_CONFIG_ENV.items():
+        monkeypatch.setenv(key, value)
 
 
 @pytest.fixture(autouse=True)
@@ -403,6 +519,50 @@ def _no_real_pr_create_retry_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(pr_create_retry_module, "_default_sleep", lambda seconds: None)
 
 
+_SHORT_BASETEMP: Path | None = None
+
+
+def _shorten_windows_basetemp(config: pytest.Config) -> None:
+    """Keep pytest's temp root short on Windows so real ``git worktree add`` works.
+
+    Under a deep checkout (worker worktrees) pytest's default
+    ``pytest-of-<user>/pytest-N/<test-name>`` nesting pushes salvage-test paths
+    past what git accepts (``fatal: '$GIT_DIR' too big``). Only applies when no
+    ``--basetemp`` was given (xdist workers always get one).
+
+    Called from the module's single ``pytest_configure`` (top of file), before
+    the git-isolation install reads ``config.option.basetemp``.
+    """
+    global _SHORT_BASETEMP
+    if os.name != "nt" or config.option.basetemp is not None:
+        return
+    # Not ``tempfile.gettempdir()``: workers export TMPDIR inside the worktree.
+    root = Path(os.environ.get("LOCALAPPDATA", "")) / "Temp"
+    _SHORT_BASETEMP = Path(
+        _tempfile_module.mkdtemp(prefix="t", dir=root if root.is_dir() else None)
+    )
+    config.option.basetemp = str(_SHORT_BASETEMP)
+
+
+def pytest_unconfigure(config: pytest.Config) -> None:
+    if _SHORT_BASETEMP is not None:
+        shutil.rmtree(_SHORT_BASETEMP, ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_closing_link_recheck_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never let ``closing_reference.probe_closing_link`` really sleep (cw#1868).
+
+    Its re-probe pauses (~13s) only elapse on an unlinked reading, but every
+    pre-existing salvage test with a mismatched ``closingIssuesReferences``
+    would otherwise pay them. Patches the module-local ``_default_sleep``
+    (not the shared ``time.sleep``, see ``_no_real_pr_create_retry_sleep``).
+    """
+    import charlie_work.closing_reference as closing_reference_module
+
+    monkeypatch.setattr(closing_reference_module, "_default_sleep", lambda seconds: None)
+
+
 @pytest.fixture(autouse=True)
 def _no_real_host_load_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     """Never let a governor's host-load probe spawn a real process listing.
@@ -426,6 +586,44 @@ def _no_real_host_load_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     import charlie_work.host_load as host_load_module
 
     monkeypatch.setattr(host_load_module, "list_host_processes", lambda: ((), None))
+
+
+@pytest.fixture(autouse=True)
+def _no_real_github_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never let the GitHub transport open a real connection (ADR-0006).
+
+    ``HttpAdapter`` builds its sockets through the module-level
+    ``_new_connection`` when no ``connection_factory`` is injected, so
+    patching that one hook makes "a test forgot to inject a fake" fail loudly
+    instead of calling api.github.com. Tests inject ``connection_factory=``.
+    """
+    from charlie_work.github_transport import http_adapter
+
+    def _refuse(host: str, timeout: float) -> object:
+        raise AssertionError(f"real network in tests: {host}")
+
+    monkeypatch.setattr(http_adapter, "_new_connection", _refuse)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_opencode_go_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never let the OpenCode Go quota probe reach opencode.ai.
+
+    Any opencode ``quota_exhausted`` classification probes the Go API with the
+    operator's real credential (``opencode_limits.go_quota_reset``). By default
+    no credential is found -- the same on every host, so a classification test
+    sees the 24h fallback -- and any connection is refused. Probe tests inject
+    ``_go_api_key`` and ``_open``; the per-process probe cache is cleared so
+    one test's answer never leaks into another.
+    """
+    from charlie_work import opencode_limits
+
+    def _refuse(request: object, timeout: float) -> object:
+        raise AssertionError(f"real network in tests: {getattr(request, 'full_url', request)}")
+
+    monkeypatch.setattr(opencode_limits, "_go_api_key", lambda: None)
+    monkeypatch.setattr(opencode_limits, "_open", _refuse)
+    monkeypatch.setattr(opencode_limits, "_cache", None)
 
 
 def _healthy_preflight(*args: object, **kwargs: object) -> PreflightResult:
@@ -465,9 +663,85 @@ def _default_healthy_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
     that one test (`test_charlie_work.py`'s two dedicated wiring tests;
     `test_supervise_loop.py`'s tests script the subprocess boundary directly
     and never import either module).
+
+    Both modules are imported at conftest module level (see the import's
+    comment, issue #2864): a lazy import here would charge their ~1 s import
+    cost to the first test that ran in the process.
     """
-    monkeypatch.setattr("charlie_work.workflow.run_preflight", _healthy_preflight)
-    monkeypatch.setattr("charlie_work.fleet_dispatch.run_preflight", _healthy_preflight)
+    monkeypatch.setattr(workflow, "run_preflight", _healthy_preflight)
+    monkeypatch.setattr(fleet_dispatch, "run_preflight", _healthy_preflight)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_boot_sync_repair(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Issue #2312: default the boot-time pending-sync repair to a no-op.
+
+    ``run_fleet_supervise`` invokes ``heal_pending_sync_at_boot`` before config
+    load; the real implementation shells out to ``git``/``uv`` against the
+    checkout under test, and on a skewed or dev-extra-heavy venv would run a
+    real ``uv sync --locked`` -- mutating the very environment pytest is
+    running from (observed: it pruned the dev extras mid-suite and every
+    spawned pytest child then died on ``import pluggy``). Every caller of
+    ``run_fleet_supervise`` gets the stub, including CLI-level tests that never
+    import the fleet fixtures. Tests that target the repair itself call
+    ``pending_sync.heal_pending_sync_at_boot`` directly (unpatched); tests
+    that target the wiring re-monkeypatch this same attribute in their own
+    body, which cleanly overrides the default.
+    """
+    from charlie_work.pending_sync import BootSyncRepair
+
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch.heal_pending_sync_at_boot",
+        lambda *a, **k: BootSyncRepair(),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_live_self_deploy_history(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Issue #2103: the reviewer reap reads the orchestrator's own ``events.db``
+    for ``self_deploy_succeeded``. On a host with deploy history that would
+    reclassify every fixture reviewer (started in the past) as deploy-interrupted,
+    so tests see no deploy store unless they opt in by patching this seam."""
+    monkeypatch.setattr(
+        "charlie_work.orchestration.misc_review_verdicts.self_deploy_state_path",
+        lambda: None,
+    )
+
+
+@pytest.fixture
+def fake_host(monkeypatch: pytest.MonkeyPatch) -> Callable[..., Any]:
+    """Swap the active host ports for the test; restored by monkeypatch.
+
+    ``fake_host(clock=FakeClock(...))`` replaces the named ports on top of the
+    currently active ports (so repeated calls compose) and returns the resulting ``HostPorts``.  An app built without an
+    explicit ``host=`` and every non-app module see the same fake.
+    """
+    import dataclasses
+
+    from charlie_work import host as host_pkg
+
+    def _install(**overrides: Any) -> Any:
+        ports = dataclasses.replace(host_pkg.current(), **overrides)
+        monkeypatch.setattr(host_pkg, "_ACTIVE", ports)
+        return ports
+
+    return _install
+
+
+@pytest.fixture(autouse=True)
+def _no_real_ci_fleet(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never let a test wrap a suite in the venv's real ``ci-fleet`` executable.
+
+    The worker/rework prompts and the local merge gate wrap the runner in
+    ``ci-fleet test`` whenever the console script sits beside the interpreter,
+    which in this venv it always does -- and the locked ``ci-fleet`` may predate
+    the ``test`` subcommand. Every test therefore starts with no executable (today's
+    commands, and no git subprocess per prompt render); a test that wants the
+    wrapped form patches ``selection_wrapper.ci_fleet_executable`` itself.
+    """
+    import charlie_work.selection_wrapper as selection_wrapper
+
+    monkeypatch.setattr(selection_wrapper, "ci_fleet_executable", lambda: None)
 
 
 @pytest.fixture(autouse=True)

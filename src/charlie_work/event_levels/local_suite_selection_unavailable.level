@@ -1,0 +1,5 @@
+warning
+# The local merge gate ran its suite without ``ci-fleet test`` because the
+# wrapper could not be used (no executable beside the interpreter, an origin
+# that is not GitHub, or no gate head/base). The gate still runs the full
+# suite, so nothing merges untested; the warning says selection is off.

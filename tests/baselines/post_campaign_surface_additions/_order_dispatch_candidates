@@ -1,0 +1,5 @@
+TIS-CW-7: the one fresh-dispatch candidate order (``dispatch.order``, then the
+``priority:<level>`` re-rank), called by both the real and the dry-run dispatch
+pass instead of each repeating the ``dispatch.order`` branch. Installed from
+``orchestration/helpers_dispatch.py``. Net-new OrchestratorApp member added
+after the surface baseline was pinned.

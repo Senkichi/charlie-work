@@ -13,7 +13,13 @@ from typing import Any
 import pytest
 
 from _sessions_db_fixtures import make_sessions_db
-from _worktree_fixtures import _FakeGH, _clone_repo, _git, _init_repo
+from _worktree_fixtures import (
+    _FakeGH,
+    _clone_repo,
+    _git,
+    _init_repo,
+    _seed_staged_addition_bubble,
+)
 from charlie_work.config import (
     DevinConfig,
     OrchestratorConfig,
@@ -21,6 +27,7 @@ from charlie_work.config import (
     WatchdogConfig,
     WorkerRoleConfig,
 )
+from charlie_work.host.fakes import FakeProcessProbe
 from charlie_work.process_utils import get_process_start_time
 from charlie_work.subprocess_runner import RunResult
 from charlie_work import worktree as worktree_module
@@ -237,15 +244,24 @@ def test_remove_worktree_force_removes_real_venv_dir_but_not_junction_targets(
 ) -> None:
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
-    info = create_worktree(repo_root, "agent/issue-4-force", base_ref="HEAD")
-    real_venv = info.path / ".venv"
+    # Register the worktree with git directly rather than create_worktree:
+    # remove_worktree is the subject here, and a pristine fresh repo
+    # exercises none of create_worktree's leftover/reclaim checks (each of
+    # which costs a git subprocess — the dominant per-test cost on Windows,
+    # issue #2465).
+    branch = "agent/issue-4-force"
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    worktrees_dir.mkdir(parents=True, exist_ok=True)
+    wt_path = worktrees_dir / _slugify(branch)
+    _git(repo_root, "worktree", "add", "-b", branch, str(wt_path), "HEAD")
+    real_venv = wt_path / ".venv"
     real_venv.mkdir()
     (real_venv / "pyvenv.cfg").write_text("home = somewhere\n", encoding="utf-8")
 
-    removed = remove_worktree(repo_root, info.path, force=True)
+    removed = remove_worktree(repo_root, wt_path, force=True)
 
     assert removed is True
-    assert not info.path.exists()
+    assert not wt_path.exists()
 
 
 def test_remove_worktree_junction_removal_preserves_shared_venv_contents(
@@ -905,22 +921,7 @@ def test_modified_paths_overwritten_by_ref_excludes_staged_addition(
     """
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
-
-    (repo_root / "tracked.txt").write_text("ancestor v0\n", encoding="utf-8")
-    _git(repo_root, "add", "tracked.txt")
-    _git(repo_root, "commit", "-m", "add ancestor file")
-
-    _git(repo_root, "checkout", "-b", "feature")
-
-    _git(repo_root, "checkout", "main")
-    (repo_root / "tracked.txt").write_text("main committed v1\n", encoding="utf-8")
-    _git(repo_root, "add", "tracked.txt")
-    _git(repo_root, "commit", "-m", "base changes tracked file")
-    (repo_root / "new_file.txt").write_text("base version\n", encoding="utf-8")
-    _git(repo_root, "add", "new_file.txt")
-    _git(repo_root, "commit", "-m", "base adds new file")
-
-    _git(repo_root, "checkout", "feature")
+    _seed_staged_addition_bubble(repo_root)
     (repo_root / "tracked.txt").write_text("locally edited\n", encoding="utf-8")
     # A staged ADDITION: in the index, not in HEAD. Same path name as
     # something the base independently added, so an unfiltered diff would
@@ -1484,7 +1485,7 @@ def test_rework_reuse_refuses_non_ff_with_dirty_worktree(
     _git(remote_repo, "checkout", "main")
 
     _force_capture_failure(monkeypatch)
-    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
+    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted source work"):
         create_worktree(
             repo_root,
             branch_name,
@@ -1633,7 +1634,7 @@ def test_rework_reclaim_refuses_dirty_detached_worktree(
     (info1.path / "dirty.txt").write_text("uncommitted worker edit\n", encoding="utf-8")
 
     _force_capture_failure(monkeypatch)
-    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
+    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted source work"):
         create_worktree(repo_root, branch_name, rework=True)
 
     assert info1.path.exists()
@@ -2296,7 +2297,7 @@ def test_fresh_dispatch_dirty_worktree_refuses_to_reset(
 
     # Fresh dispatch must refuse to reset the dirty worktree.
     _force_capture_failure(monkeypatch)
-    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
+    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted source work"):
         create_worktree(repo_root, branch_name, base_ref="HEAD")
 
     # The original worktree and the dirty file must remain intact.
@@ -2355,7 +2356,7 @@ def test_fresh_dispatch_still_refuses_worker_authored_dirtiness(
     (info1.path / "worker-change.txt").write_text("worker work\n", encoding="utf-8")
 
     _force_capture_failure(monkeypatch)
-    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
+    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted source work"):
         create_worktree(repo_root, branch_name, base_ref="HEAD", config=config)
 
     assert info1.path.exists()
@@ -2565,7 +2566,7 @@ def test_fresh_dispatch_dirty_worktree_with_broken_remote_refuses_to_reset(
 
     # Fresh dispatch should refuse to reset the dirty worktree without trying to push.
     _force_capture_failure(monkeypatch)
-    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
+    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted source work"):
         create_worktree(repo_root, branch_name, base_ref="HEAD")
 
     # Verify the worktree still exists (not removed)
@@ -3537,8 +3538,16 @@ branch refs/heads/{branch_name}
         remove_worktree(repo_root, info1.path)
 
 
-def test_create_worktree_materialize_dirs_error_cleanup(tmp_path: Path) -> None:
-    """Materialization failure should clean up the worktree and branch."""
+@pytest.fixture
+def _materialize_fail_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Scaffold for ``test_create_worktree_materialize_dirs_error_cleanup``.
+
+    The one-commit repo, the untracked ``.devin`` directory, and the failing
+    ``_materialize_directory`` patch are acquisition, not the property under
+    test. Housing them here charges the git-template copy to the ``setup``
+    phase so the ledger's ``call`` phase holds only ``create_worktree``'s
+    error-cleanup path -- the same remedy as #2624/#2634/#2670 (issue #2746).
+    """
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
 
@@ -3547,41 +3556,39 @@ def test_create_worktree_materialize_dirs_error_cleanup(tmp_path: Path) -> None:
     untracked_dir.mkdir()
     (untracked_dir / "config.json").write_text("config\n", encoding="utf-8")
 
-    # Monkeypatch _materialize_directory to raise an error
-    import charlie_work.worktree
-
-    original_materialize = charlie_work.worktree._materialize_directory
-
     def mock_materialize(*args: object, **kwargs: object) -> None:
         raise OSError("Mock materialization failure")
 
-    charlie_work.worktree._materialize_directory = mock_materialize
+    monkeypatch.setattr(worktree_module, "_materialize_directory", mock_materialize)
+    return repo_root
 
-    try:
-        with pytest.raises(RuntimeError, match="Failed to materialize directory"):
-            create_worktree(
-                repo_root,
-                "agent/issue-2-materialize-fail",
-                base_ref="HEAD",
-                materialize_dirs=(".devin",),
-            )
 
-        # Verify the worktree was cleaned up
-        worktrees_dir = _default_worktrees_dir(repo_root)
-        worktree_path = worktrees_dir / "agent-issue-2-materialize-fail"
-        assert not worktree_path.exists()
+def test_create_worktree_materialize_dirs_error_cleanup(
+    _materialize_fail_repo: Path,
+) -> None:
+    """Materialization failure should clean up the worktree and branch."""
+    repo_root = _materialize_fail_repo
 
-        # Verify the branch was deleted
-        result = subprocess.run(
-            ["git", "branch", "--list", "agent/issue-2-materialize-fail"],
-            cwd=repo_root,
-            check=True,
-            capture_output=True,
-            text=True,
+    with pytest.raises(RuntimeError, match="Failed to materialize directory"):
+        create_worktree(
+            repo_root,
+            "agent/issue-2-materialize-fail",
+            base_ref="HEAD",
+            materialize_dirs=(".devin",),
         )
-        assert "agent/issue-2-materialize-fail" not in result.stdout
-    finally:
-        charlie_work.worktree._materialize_directory = original_materialize
+
+    # Verify the worktree was cleaned up
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    worktree_path = worktrees_dir / "agent-issue-2-materialize-fail"
+    assert not worktree_path.exists()
+
+    # Verify the branch was deleted. A branch ``git worktree add -b`` just
+    # created is a loose ref under the common gitdir's refs/heads; ``git
+    # branch -D`` removes that file, so its absence is the same verdict
+    # ``git branch --list`` reported -- without another git spawn in the
+    # measured call phase (issue #2746).
+    branch_ref = repo_root / ".git" / "refs" / "heads" / "agent" / "issue-2-materialize-fail"
+    assert not branch_ref.exists()
 
 
 def test_fresh_dispatch_with_explicit_base_ref_fetches(tmp_path: Path) -> None:
@@ -6408,14 +6415,21 @@ def test_clean_worktrees_skips_worktree_with_live_writer_marker(tmp_path: Path) 
     _init_repo(repo_root)
     (repo_root / "src" / "charlie_work").mkdir(parents=True)
     (repo_root / "src" / "charlie_work" / "__init__.py").write_text("", encoding="utf-8")
-    _git(repo_root, "add", "src/charlie_work/__init__.py")
-    _git(repo_root, "commit", "-m", "add charlie_work")
     _create_shared_venv(repo_root, pth_target=repo_root / "src")
 
-    info = create_worktree(repo_root, "agent/issue-4-marker", base_ref="HEAD")
-    head_sha = _git(info.path, "rev-parse", "HEAD").stdout.strip()
-    write_worktree_marker(info.path, os.getpid(), "session-live")
+    # Register the worktree with git directly rather than create_worktree:
+    # the cleanup lane is the subject here, and a pristine fresh repo
+    # exercises none of create_worktree's leftover/reclaim checks (each of
+    # which costs a git subprocess — the dominant per-test cost on Windows,
+    # issue #2363). ``src/`` likewise stays uncommitted: the shared-venv
+    # verifier reads the filesystem, not the index.
+    branch = "agent/issue-4-marker"
     worktrees_dir = _default_worktrees_dir(repo_root)
+    worktrees_dir.mkdir(parents=True, exist_ok=True)
+    wt_path = worktrees_dir / _slugify(branch)
+    _git(repo_root, "worktree", "add", "-b", branch, str(wt_path), "HEAD")
+    head_sha = _git(wt_path, "rev-parse", "HEAD").stdout.strip()
+    write_worktree_marker(wt_path, os.getpid(), "session-live")
     config = OrchestratorConfig(devin=DevinConfig(venv_source="shared-venv"))
     state = _make_state(issue_number=4, pr_number=104)
 
@@ -6430,7 +6444,7 @@ def test_clean_worktrees_skips_worktree_with_live_writer_marker(tmp_path: Path) 
     assert result.data["removed"] == []
     assert len(result.data["skipped"]) == 1
     assert "live writer marker" in result.data["skipped"][0]["reason"]
-    assert info.path.exists()
+    assert wt_path.exists()
 
 
 def test_clean_worktrees_skips_operator_claimed_worktree(tmp_path: Path) -> None:
@@ -7700,7 +7714,7 @@ def _seed_live_writer_worktree(
 
 
 def test_worktree_unsafe_defers_when_writer_marker_is_live(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_host
 ) -> None:
     """Issue #1141: a dirty worktree whose writer marker has a LIVE pid must
     defer (LiveWorkerRedispatchError), not escalate (WorktreeUnsafeError).
@@ -7733,10 +7747,7 @@ def test_worktree_unsafe_defers_when_writer_marker_is_live(
     }
 
     # Only the marker's pid is alive; the recovery record's pid is dead.
-    monkeypatch.setattr(
-        "charlie_work.worktree.is_pid_alive",
-        lambda pid, start: pid == marker_pid,
-    )
+    fake_host(probe=FakeProcessProbe({marker_pid: None}))
 
     with pytest.raises(LiveWorkerRedispatchError) as exc_info:
         create_worktree(
@@ -7762,7 +7773,7 @@ def test_worktree_unsafe_defers_when_writer_marker_is_live(
 
 
 def test_worktree_unsafe_still_escalates_when_writer_marker_is_dead(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_host
 ) -> None:
     """Issue #1141 inverse: a dirty worktree whose writer marker has a DEAD
     pid must still escalate (WorktreeUnsafeError) — death is established, so
@@ -7793,13 +7804,10 @@ def test_worktree_unsafe_still_escalates_when_writer_marker_is_dead(
     # Every pid is dead — the marker is stale, the recovery record's pid is
     # stale. The marker check at entry cleans the stale marker; the dirt check
     # then escalates normally.
-    monkeypatch.setattr(
-        "charlie_work.worktree.is_pid_alive",
-        lambda pid, start: False,
-    )
+    fake_host(probe=FakeProcessProbe())
     _force_capture_failure(monkeypatch)
 
-    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
+    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted source work"):
         create_worktree(
             repo,
             branch_name,
@@ -7979,7 +7987,7 @@ def test_rescue_capture_failure_still_raises_worktree_unsafe(
         ),
     )
 
-    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
+    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted source work"):
         create_worktree(repo, branch_name, base_ref="origin/main", issue_number=849)
 
     # No reset occurred — the dirty content survives untouched.

@@ -36,6 +36,7 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 from pathlib import Path
+from _src_ast import parsed_source
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TESTS_DIR = REPO_ROOT / "tests"
@@ -82,7 +83,7 @@ def find_workflow_logger_scope_violations(
     ``ast.walk`` descends into every nested scope, so a scope written inside
     a helper or fixture is caught the same as one in a test body.
     """
-    tree = ast.parse(source, filename=str(file_path))
+    tree = parsed_source(source, str(file_path))
     violations: list[WorkflowLoggerScopeViolation] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):

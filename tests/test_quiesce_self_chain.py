@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -109,7 +110,18 @@ def test_list_processes_populates_created_from_ppid_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The UTC-sourced creation stamps ride on the CIM rows: the overlay is
-    pid-keyed, and a pid the psutil map missed keeps ``created=None``."""
+    pid-keyed, and a pid the chain probe did not cover keeps ``created=None``.
+
+    Issue #2376: the probe is scoped to ``os.getpid()``'s own ancestor chain
+    (``win32_ancestor_rows``), not a host-wide ``process_iter`` pass --
+    ``created`` is only ever consulted on that one chain, and stamping all
+    ~450 host processes cost about a second per listing on this host.
+
+    The leaf name predates the #2376 re-scope and is kept verbatim: the
+    collect-only gate (issue #1538) fails a required check on any leaf-name
+    removal, rename included, absent the operator-applied
+    ``collect-gate-exempt`` label.
+    """
     _win32_listing_env(monkeypatch)
     sample = [
         {
@@ -126,14 +138,18 @@ def test_list_processes_populates_created_from_ppid_snapshot(
         },
     ]
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: _fake_completed(json.dumps(sample)))
-    monkeypatch.setattr(
-        "charlie_work.quiesce.win32_process_ppid_snapshot",
-        lambda: {111: ProcRow(1, created=1234.5)},
-    )
+    calls: list[int] = []
+
+    def _chain_rows(pid: int, **_kwargs: object) -> dict[int, ProcRow]:
+        calls.append(pid)
+        return {111: ProcRow(1, created=1234.5)}
+
+    monkeypatch.setattr("charlie_work.quiesce.win32_ancestor_rows", _chain_rows)
 
     processes, error = list_processes()
 
     assert error is None
+    assert calls == [os.getpid()]
     assert [p.created for p in processes] == [1234.5, None]
 
 
@@ -146,8 +162,8 @@ def test_list_processes_created_overlay_failure_degrades_with_warning(
     _win32_listing_env(monkeypatch)
     sample = [{"ProcessId": 111, "ParentProcessId": 1, "Name": "a.exe", "CommandLine": "a"}]
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: _fake_completed(json.dumps(sample)))
-    # An empty snapshot map is the snapshot helper's failure contract.
-    monkeypatch.setattr("charlie_work.quiesce.win32_process_ppid_snapshot", lambda: {})
+    # An empty row map is the chain probe's failure contract.
+    monkeypatch.setattr("charlie_work.quiesce.win32_ancestor_rows", lambda _pid, **_k: {})
 
     with caplog.at_level(logging.WARNING, logger="charlie_work.quiesce"):
         processes, error = list_processes()

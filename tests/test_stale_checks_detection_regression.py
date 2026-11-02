@@ -62,6 +62,7 @@ from charlie_work.paths import runtime_paths
 from charlie_work.workflow import OrchestratorApp
 
 from _fakes_github import FakeGitHub
+from _src_ast import parsed, source_files, source_text
 
 _SRC_ROOT = Path(__file__).resolve().parent.parent / "src" / "charlie_work"
 
@@ -188,7 +189,7 @@ def _guard_member_modules() -> tuple[ModuleType, ...]:
     modules: list[ModuleType] = []
     for member in (
         OrchestratorApp._attempt_stale_checks_retrigger,
-        OrchestratorApp._detect_ci_run_never_created,
+        OrchestratorApp._detect_ci_absence,
     ):
         module = inspect.getmodule(member)
         assert module is not None, f"could not locate module for {member!r}"
@@ -243,7 +244,7 @@ def test_stale_checks_grace_minutes_never_referenced_inside_the_detector() -> No
         "retrigger's module (the retrigger-wait logic) -- scan found none, "
         "which means this test isn't actually exercising the field"
     )
-    assert "_detect_ci_run_never_created" not in referencing_functions
+    assert "_detect_ci_absence" not in referencing_functions
     assert referencing_functions == {"_attempt_stale_checks_retrigger"}
 
 
@@ -293,9 +294,9 @@ def test_exactly_one_workflow_runs_for_head_call_site_and_it_is_inside_the_detec
                 enclosing = _enclosing_function_name(node, parents)
                 call_sites.append((Path(module_file).name, enclosing))
 
-    assert call_sites == [("reap_dispatch.py", "_detect_ci_run_never_created")], (
+    assert call_sites == [("reap_dispatch.py", "_detect_ci_absence")], (
         f"expected exactly one workflow_runs_for_head call site across the "
-        f"stale-checks guard modules, inside _detect_ci_run_never_created; "
+        f"stale-checks guard modules, inside _detect_ci_absence; "
         f"found {call_sites!r}"
     )
 
@@ -315,7 +316,10 @@ def test_workflow_runs_for_head_call_sites_are_the_registered_ones() -> None:
     a deferred infra-rerun follow-up probes the CONTAINING run's
     terminal status before re-calling ``gh run rerun`` -- a different
     question (per-run status, not run existence), deliberately registered
-    rather than smuggled in. Call-site SET, not a text-pattern match for
+    rather than smuggled in. Issue #1717 adds the same shape again:
+    ``probe_merged_main_ci`` (post_merge_attribution_scan.py) probes a
+    MERGED PR's commit for the outcome record; registered below with the
+    same reasoning. Call-site SET, not a text-pattern match for
     "grace" nearby -- a differently-phrased second window still shows up
     here as another ``ast.Call`` node. The stale-checks-internal half of
     the original fence (exactly one call site inside the detector) lives
@@ -327,10 +331,24 @@ def test_workflow_runs_for_head_call_sites_are_the_registered_ones() -> None:
     ``self.gh.workflow_runs_for_head(head_sha)`` inside
     ``_attempt_stale_checks_retrigger`` made this test fail (3 call sites,
     the third unregistered); removed after confirming the failure.
+
+    Issue #2598: per-file work is gated on a ``workflow_runs_for_head``
+    substring in the cached source text -- a parse + parent-map + walk for
+    every file under ``src/`` cost ~3s when only a handful of files can
+    contain a matching call site. The substring check rejects, never
+    accepts; the AST assertions below are unchanged.
     """
     call_sites: list[tuple[str, str | None]] = []
-    for py_file in sorted(_SRC_ROOT.rglob("*.py")):
-        tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+    for py_file in source_files(_SRC_ROOT):
+        # Necessary-condition rejection on the cached source text, NOT the
+        # assertion itself: an ``x.workflow_runs_for_head(...)`` Call requires
+        # the attribute's literal identifier in the file, so a file without it
+        # cannot contain a matching call site. The AST walk below still decides
+        # membership -- this only skips the parse + parent-map + walk for the
+        # overwhelming majority of src/ files that never mention the name.
+        if "workflow_runs_for_head" not in source_text(py_file):
+            continue
+        tree = parsed(py_file)
         parents = _build_parent_map(tree)
         for node in ast.walk(tree):
             if (
@@ -343,5 +361,10 @@ def test_workflow_runs_for_head_call_sites_are_the_registered_ones() -> None:
 
     assert call_sites == [
         ("misc_checks.py", "_drive_infra_rerun_or_escalate"),
-        ("reap_dispatch.py", "_detect_ci_run_never_created"),
+        ("reap_dispatch.py", "_detect_ci_absence"),
+        # #1717: the post-merge outcome scanner probes the merged PR's
+        # merge-commit SHA for Actions runs -- again a different question
+        # (recorded post-merge CI outcome, not CI retrigger candidacy),
+        # registered rather than smuggled in, like #1936's consumer above.
+        ("post_merge_attribution_scan.py", "probe_merged_main_ci"),
     ], f"unexpected workflow_runs_for_head call site(s); found {call_sites!r}"

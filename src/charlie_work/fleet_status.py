@@ -49,12 +49,14 @@ from typing import Any
 from . import layout
 from .config import ConfigError
 from .fleet_dispatch import compute_api_worker_fleet_report
+from .fleet_pause import fleet_pause_status
 from .fleet_registry import _load_registry
 from .github import GitHub, GitHubError
 from .global_config import load_layered_config
 from .local_issues import github_client_for
 from .paths import RepoNotFoundError, runtime_paths
-from .workflow import CommandResult, OrchestratorApp
+from .command_result import CommandResult
+from .workflow import OrchestratorApp
 
 # Issue #1941: per-repo budget for the ``fleet status`` fan-out. Sized to
 # leave headroom under the heartbeat's 120s subprocess cap
@@ -101,7 +103,7 @@ def run_fleet_status(args: argparse.Namespace) -> CommandResult:
     Note: This command does not include per-worker health fields yet. That will be added
     in a follow-up issue (#167) once the worker health abstraction lands.
     """
-    fleet_json_path = layout.fleet_registry_path()
+    fleet_json_path = layout.fleet_registry_path(override=args.fleet_dir)
     registry = _load_registry(fleet_json_path)
     per_repo: dict[str, Any] = {}
     errors: list[dict[str, str]] = []
@@ -184,10 +186,18 @@ def run_fleet_status(args: argparse.Namespace) -> CommandResult:
     # api-worker fleet report line (issue #483): read-only, never raises.
     api_worker_report = compute_api_worker_fleet_report(fleet_dir_override=args.fleet_dir)
 
+    # Issue #1776: a paused fleet must stay visible -- an unnoticed pause is an
+    # outage (it also freezes runner allocation).
+    pause = fleet_pause_status(args.fleet_dir)
+    paused_note = f" [PAUSED: {pause['consequence']}]" if pause else ""
     return CommandResult(
         ok=not errors,
-        message=f"fleet status: {len(per_repo)} repo(s), {len(errors)} error(s), {len(stale)} stale(s)",
+        message=(
+            f"fleet status: {len(per_repo)} repo(s), {len(errors)} error(s), "
+            f"{len(stale)} stale(s){paused_note}"
+        ),
         data={
+            "pause": pause,
             "repos": per_repo,
             "errors": errors,
             "stale": stale,

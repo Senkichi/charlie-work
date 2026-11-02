@@ -17,7 +17,7 @@ from charlie_work.fleet_dispatch import (
     _build_fleet_attention_digest,
     _extract_attention_events,
 )
-from charlie_work.workflow import CommandResult
+from charlie_work.command_result import CommandResult
 
 
 def test_build_fleet_attention_digest_maps_escalated_label_repair_error() -> None:

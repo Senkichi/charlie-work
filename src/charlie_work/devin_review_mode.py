@@ -18,6 +18,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from .atomic_write import write_text_atomic
+
 logger = logging.getLogger(__name__)
 
 # Review-mode template: omits ``--permission-mode dangerous`` entirely. The
@@ -130,8 +132,18 @@ def _write_review_permissions(checkout_path: Path) -> None:
 REVIEW_EXEC_SECTION_HEADING = "## Shell commands in this review session"
 
 
+def _review_exec_commands_text() -> str:
+    """The allow-list as a prose list, rendered from ``_REVIEW_EXEC_ALLOWLIST``.
+
+    The single renderer for every prompt that states the runnable set (the
+    launch prompt section below and the issue #2090 resume nudge), so neither
+    can grow a second hand-kept list.
+    """
+    return ", ".join(f"`{entry[len('Exec(') : -1]}`" for entry in _REVIEW_EXEC_ALLOWLIST)
+
+
 def _review_exec_prompt_section() -> str:
-    commands = ", ".join(f"`{entry[len('Exec(') : -1]}`" for entry in _REVIEW_EXEC_ALLOWLIST)
+    commands = _review_exec_commands_text()
     return (
         f"{REVIEW_EXEC_SECTION_HEADING}\n\n"
         "This session is headless and read-only. Commands that need approval are "
@@ -162,9 +174,7 @@ def _write_devin_review_prompt(prompt_path: Path) -> Path:
     derived = prompt_path.with_name(f"{prompt_path.stem}.devin{prompt_path.suffix}")
     try:
         text = prompt_path.read_text(encoding="utf-8")
-        tmp = derived.with_suffix(derived.suffix + ".tmp")
-        tmp.write_text(f"{text.rstrip()}\n\n{_review_exec_prompt_section()}", encoding="utf-8")
-        tmp.replace(derived)
+        write_text_atomic(derived, f"{text.rstrip()}\n\n{_review_exec_prompt_section()}")
     except OSError as exc:
         logger.warning(
             "could not write devin review prompt %s: %s (using %s without the exec section)",

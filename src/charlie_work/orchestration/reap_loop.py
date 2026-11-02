@@ -26,11 +26,13 @@ detector, unpatched) is the decoy sibling of the ``_wf.``-rebound
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import datetime
+from functools import partial
 from typing import Any
 
 import charlie_work.workflow as _wf
-from charlie_work.dead_worker_reap import _detect_stalled_sessions
+from charlie_work.command_result import CommandResult
+from charlie_work.dead_worker_sweep.effects_sessions import _detect_stalled_sessions
 from charlie_work.escalation import _stale_template_warning_suppressed
 from charlie_work.github import (
     GitHub,
@@ -39,12 +41,16 @@ from charlie_work.github import (
     is_transient_repo_resolution_failure,
 )
 from charlie_work.instrumentation import log_event
+from charlie_work.merge_path.queue_skip import merge_ready_unless_queued
+from charlie_work.mergequeue_stall import alarm_best_effort
 from charlie_work.notify import AttentionDigest, AttentionEntry
+from charlie_work.packet_currency import packet_body_current_for_skip
 from charlie_work.pass_deadline import (
     PassDeadline,
     PassDeadlineExceeded,
     run_deadline_guarded_maintenance,
 )
+from charlie_work.budget_gates import budget_gate_for
 from charlie_work.review_decision import review_decision
 
 
@@ -55,7 +61,7 @@ def _loop_body(
     merge: bool | None,
     now: datetime | None = None,
     deadline_exceeded: Callable[[], bool] | None = None,
-) -> _wf.CommandResult:
+) -> CommandResult:
     # Every pass must observe a fresh GitHub snapshot. The list cache
     # dedupes calls within one pass, but a long-running supervisor
     # (charlie fleet supervise) reuses this app -- and therefore one
@@ -82,7 +88,7 @@ def _loop_body(
     # raising PassDeadlineExceeded). The full wiring policy -- what is
     # guarded, what stays unconditional, and the deferred-marking rule --
     # lives in charlie_work.pass_deadline's module docstring.
-    deadline = PassDeadline(deadline_exceeded, _wf.CommandResult)
+    deadline = PassDeadline(deadline_exceeded, CommandResult, budget_gate=budget_gate_for(self))
     early = deadline.preflight("loop pass deferred: in-pass deadline already reached")
     if early is not None:
         return early
@@ -287,7 +293,7 @@ def _loop_body(
     # Issue #1948: the last fetch-gated boundary before the per-PR scan --
     # once the budget is spent the scan runs on an empty list rather than
     # starting a new review/merge round on the tail end of a dead budget.
-    prs = deadline.call(self.gh.pr_list, [])
+    prs = _wf.host_local_prs(self, deadline.call(self.gh.pr_list, []))
     # Snapshot for foreign-PR markers only: markers change at most once
     # per PR, so a single point-in-time read at loop start is sufficient.
     state_snapshot = _wf.load_state_locked(self.paths.state_file)
@@ -304,7 +310,7 @@ def _loop_body(
     branch_validator = self._make_branch_issue_validator()
     fir_confirm_passes = self.config.review.foreign_issue_ref_confirm_passes
     fir_reprobe_hours = self.config.review.foreign_issue_ref_reprobe_hours
-    loop_now = now or datetime.now(UTC)
+    loop_now = now or self.host.clock.now()
     # Issue #1766: collected here and recorded once, after this loop, via
     # `_record_unlinked_pr_skips` -- see that method's docstring for why a
     # per-PR call site at the point of `continue` below could abort every
@@ -315,6 +321,15 @@ def _loop_body(
     # so `_record_unlinked_pr_skips` can evict standing `unlinked_pr_notice`
     # markers whose PR is no longer issue-less (the falling edge).
     linked_prs: dict[int, int] = {}
+    # Merge-ready for one PR, skipping a queued PR whose hand-off still holds (#2440).
+    merge_queued_aware = partial(
+        merge_ready_unless_queued,
+        self,
+        merge=merge,
+        merge_train_head=merge_train_head,
+        errors=errors,
+        merges=merges,
+    )
     for pr in prs:
         # Issue #1948: stop the review/merge scan at the first PR after the
         # budget is spent -- the remaining PRs defer to the next pass
@@ -433,6 +448,7 @@ def _loop_body(
             # that's simply waiting on pending checks.
             state = _wf.load_state_locked(self.paths.state_file)
             pr_state = state["prs"].get(str(pr_number), {})
+            alarm_best_effort(self, pr, pr_state)  # #2441: never aborts the pass
             pr_dir_for_decision = self.paths.prs / f"pr-{pr_number}"
             live_head_sha = pr.get("headRefOid")
             # Issue #1362 Stage 1 (#1340 regression): the FILE is
@@ -465,10 +481,7 @@ def _loop_body(
                 # used to hand-roll.
                 head_matches = not resolved_decision.stale
                 if head_matches and is_merge_head:
-                    merge_result = self.merge_ready(
-                        pr_number, merge=merge, merge_train_head=merge_train_head
-                    )
-                    self._record_merge_or_error(merge_result, errors, merges)
+                    merge_queued_aware(pr, pr_state, issue_number)
                 elif not head_matches:
                     review = self.review(pr_number)
                     if self._record_review_or_error(review, errors, reviews):
@@ -481,10 +494,7 @@ def _loop_body(
                         and not post_review_decision.stale
                         and is_merge_head
                     ):
-                        merge_result = self.merge_ready(
-                            pr_number, merge=merge, merge_train_head=merge_train_head
-                        )
-                        self._record_merge_or_error(merge_result, errors, merges)
+                        merge_queued_aware(pr, pr_state, issue_number)
             else:
                 # Same-head packet skip: if we already have a review packet
                 # for this exact head SHA and no decision has been recorded
@@ -516,7 +526,11 @@ def _loop_body(
                 template_current = packet_template_sha is None or (
                     packet_template_sha == current_template_sha
                 )
-                if head_current and template_current:
+                # #1983 drifted request_changes / #2826 applied body: the packet needs the live body.
+                body_current = packet_body_current_for_skip(
+                    self, state, pr_number, pr, resolved_decision
+                )
+                if head_current and template_current and body_current:
                     # Packet is current — skip regenerating it. The
                     # already_approved branch above is evaluated earlier
                     # in this same pass and may not see a decision file an
@@ -533,10 +547,7 @@ def _loop_body(
                         and not packet_skip_decision.stale
                         and is_merge_head
                     ):
-                        merge_result = self.merge_ready(
-                            pr_number, merge=merge, merge_train_head=merge_train_head
-                        )
-                        self._record_merge_or_error(merge_result, errors, merges)
+                        merge_queued_aware(pr, pr_state, issue_number)
                 else:
                     issue_state = (
                         state.get("issues", {}).get(str(issue_number), {})
@@ -572,10 +583,7 @@ def _loop_body(
                         continue
                     decision = self._review_decision(pr_number)
                     if decision.get("decision") == "approved" and is_merge_head:
-                        merge_result = self.merge_ready(
-                            pr_number, merge=merge, merge_train_head=merge_train_head
-                        )
-                        self._record_merge_or_error(merge_result, errors, merges)
+                        merge_queued_aware(pr, pr_state, issue_number)
         except PassDeadlineExceeded:
             # Issue #1948: budget spent mid-item -- latch it and stop the
             # scan. A refusal is NOT a GitHub failure: no github_error
@@ -648,6 +656,7 @@ def _loop_body(
     # `linked_prs` complement (issue #1781) lets the same call evict stale
     # `unlinked_pr_notice` markers for PRs that resolved an issue this pass.
     self._record_unlinked_pr_skips(unlinked_pr_entries, now=loop_now, linked_prs=linked_prs)
+    self._flush_pass_tracker_writes()  # issue #2434: pass-end tracker flush (no-op off local backend)
     warnings: list[str] = []
     merge_alert_transitions: dict[int, dict[str, Any]] = {}
     for merge_entry in merges:
@@ -788,8 +797,4 @@ def _loop_body(
             deferred_payload,
             repo=self.repo_root.name,
         )
-    return _wf.CommandResult(
-        ok,
-        message,
-        data,
-    )
+    return CommandResult(ok, message, data)

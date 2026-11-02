@@ -157,11 +157,11 @@ def test_write_text_atomic_happy_path_leaves_no_tmp_sibling(tmp_path: Path) -> N
     _write_text_atomic(target, "hello world")
 
     assert target.read_text(encoding="utf-8") == "hello world"
-    assert not target.with_suffix(target.suffix + ".tmp").exists()
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_write_text_atomic_crash_before_rename_leaves_final_path_untouched(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, patch_path_replace
 ) -> None:
     """The core atomicity guarantee: if the process dies after the tmp file
     is written but before the rename, the live path must never observe a
@@ -173,7 +173,7 @@ def test_write_text_atomic_crash_before_rename_leaves_final_path_untouched(
     def _boom(self: Path, other: object) -> None:
         raise OSError("simulated crash before rename")
 
-    monkeypatch.setattr(Path, "replace", _boom)
+    patch_path_replace(_boom, scope=tmp_path)
 
     with pytest.raises(OSError, match="simulated crash"):
         _write_text_atomic(target, "new content that must never land")

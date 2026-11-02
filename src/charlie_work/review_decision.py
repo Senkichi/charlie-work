@@ -36,6 +36,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from .atomic_write import write_json_atomic
+
 
 @dataclass(frozen=True)
 class ReviewDecision:
@@ -160,22 +162,16 @@ def _round_history_entries(
 
 
 def _write_json_atomic(path: Path, value: Any) -> None:
-    """Atomic temp-file + ``replace()`` write, matching the repo's canonical
-    pattern (``OrchestratorApp._write_json`` in ``workflow.py``,
-    ``adapters._write_json``, ``devin_shell._write_json`` -- see CLAUDE.md's
-    "All JSON state writes are atomic" invariant).
+    """Atomic write via the shared ``atomic_write`` primitive (unique temp
+    file + rename -- CLAUDE.md's "All JSON state writes are atomic"
+    invariant).
 
-    Hoisted here (issue #1362 Stage 2) as the one atomic-write primitive
+    Hoisted here (issue #1362 Stage 2) as the one atomic-write entry point
     :func:`record_decision` uses for both the round-file and flat-file
     writes, rather than inventing a second shape or requiring an
     ``OrchestratorApp`` instance just to reach the static method.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(value, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    tmp_path.replace(path)
+    write_json_atomic(path, value)
 
 
 # Issue #1268 (W11): the field set that identifies a review round. Two writes
@@ -300,6 +296,41 @@ def record_decision(
     _write_json_atomic(flat_path, payload)
 
     return review_decision(pr_dir, pr_state=None, current_head_sha=head_sha)
+
+
+_TERMINAL_DECISIONS = ("approved", "request_changes", "blocked")
+
+
+def classify_verdict_void(
+    decision: Any, reviewed_head_sha: Any, live_head_sha: Any, *, force: bool = False
+) -> tuple[bool, bool]:
+    """Return ``(voided_stale_verdict, force_voided_verdict)`` for a re-packet.
+
+    Only a real terminal decision can be voided. It is voided when it is pinned
+    to a stale (or no) head, or when ``force`` (issue #2081,
+    ``why-charlie-hate --force-rereview``) asks for it. ``force_voided`` is the
+    subset that ``force`` alone voided (verdict pinned to the live head).
+    """
+    is_terminal = decision in _TERMINAL_DECISIONS
+    stale_head = reviewed_head_sha is None or reviewed_head_sha != live_head_sha
+    return is_terminal and (force or stale_head), (force and is_terminal and not stale_head)
+
+
+def force_voided_event_payload(
+    live_decision: Mapping[str, Any],
+    pr_number: Any,
+    issue_number: Any,
+    head_sha: Any,
+) -> dict[str, Any]:
+    """Payload of the ``verdict_force_voided`` event (issue #2081)."""
+    return {
+        "pr_number": pr_number,
+        "issue_number": issue_number,
+        "voided_decision": live_decision.get("decision"),
+        "voided_reviewed_head_sha": live_decision.get("reviewed_head_sha"),
+        "verdict_provenance": live_decision.get("verdict_provenance"),
+        "head_sha": head_sha,
+    }
 
 
 def resolve_decision_payload(pr_dir: Path) -> dict[str, Any]:

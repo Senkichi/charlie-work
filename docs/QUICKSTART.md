@@ -31,7 +31,9 @@ uv run --project ..\charlie-work --directory ..\your-repo charlie --repo ..\your
 Most consumers wrap this in a one-line script so daily use is just
 `charlie <command>`. The console script is `charlie` (with a `charlie-work`
 alias), defined by `[project.scripts]` in this repo's `pyproject.toml`
-(`charlie = "charlie_work.cli:main"`). The `uv run charlie …` examples below are
+(`charlie = "charlie_work._entry:main"`, which checks the declared
+dependencies before importing `charlie_work.cli` — see `_entry`). The
+`uv run charlie …` examples below are
 shorthand for that wrapped invocation.
 
 ## 2. Add a config file
@@ -82,10 +84,12 @@ for the full dataclass list and defaults):
 | `runtime.prompts_dir` | Repo-local directory that overrides package prompt templates **by filename** — drop in your own `worker.md` and everything else keeps the package default. |
 | `runtime.config_retirement_quiet_days` | Days a deprecated config key must be absent from every config layer of every registered repo before the fleet retirement sweep marks its removal issue Ready (default `7`; `0` arms on the first clean pass). See [RUNBOOK.md](RUNBOOK.md#deprecated-config-key-retirement). |
 | `worker.harness` | How a worker is launched: `manual` (write a session manifest for a human to paste), `command` (blocking subprocess via `devin.dispatch_command`), `devin-shell` (non-blocking headless `devin --print`), or `claude-code` (non-blocking headless `claude -p` in an isolated worktree). See [ARCHITECTURE.md](ARCHITECTURE.md#adapter-boundary). |
+| `worker.fallbacks` / `reviewer.fallbacks` | Optional **role chain** (default empty = today's behavior). Up to 3 ordered `{harness, model}` entries (reviewer entries may also set `effort`), each validated like the primary; a duplicate `(harness, model)` pair, an unknown harness, a `manual`/`command` harness, or more than 3 entries is a `ConfigError`. At each launch the first entry not restricted in the fleet quota ledger is used. A same-family worker/reviewer pairing involving a fallback logs a warning. See [WORKFLOWS.md](WORKFLOWS.md#role-chain-model-waterfall). |
 | `watchdog.*` | Supervisor tripwires (stall, wall-clock, loop/no-progress, cost/token budget) and restart-intensity cap. WARN-first by default — see [RUNBOOK.md](RUNBOOK.md#supervisor-worker-health--escalation). |
 | `fleet.global_max_concurrent_sessions` | Cross-repo worker-count budget for `charlie fleet …` (default `0` = unlimited). |
+| `fleet.max_concurrent_sessions_by_harness` | Optional `{harness: N}` map capping live worker sessions fleet-wide **per harness** (e.g. `devin-shell: 3` for a shared provider quota), alongside the total above. A launch whose role-chain entry sits on a full harness falls through to the next entry with room, else defers (`clamped_by: harness_max`). Default empty = off. Keys must be registered harness names. |
 | `fleet.global_max_concurrent_reviews` | Cross-repo **reviewer**-count budget, the review-dispatch twin of the worker budget (default `0` = disabled; stacks on the per-repo `review_dispatch.max_concurrent_reviews`). |
-| `fleet_supervisor.*` | Knobs only `charlie fleet supervise` reads: pass deadline (`max_pass_runtime_seconds`), per-repo lane concurrency (`fleet_lane_concurrency`), out-of-band reap cadence (`reap_sweep_interval_seconds`), alarm thresholds, and the self-deploy sibling-pull/starvation knobs. **Host-wide only** — declare it in the global fleet layer (`<fleet_dir>/config.yaml`); a per-repo section is a `ConfigError`. Moved out of `supervisor.*` by issue #1978 — legacy `supervisor.<key>` spellings still parse but emit `config_key_deprecated_read`; removal tracked by #1979. |
+| `fleet_supervisor.*` | Knobs only `charlie fleet supervise` reads: pass deadline (`max_pass_runtime_seconds`), per-repo lane concurrency (`fleet_lane_concurrency`), out-of-band reap cadence (`reap_sweep_interval_seconds`), alarm thresholds, and the self-deploy sibling-pull/starvation knobs. **Host-wide only** — declare it in the global fleet layer (`<fleet_dir>/config.yaml`); a per-repo section is a `ConfigError`. Moved out of `supervisor.*` by issue #1978; the legacy `supervisor.<key>` spellings were removed by #1979 — they now fail like any other unknown key. |
 | `notify.*` | Opt-in needs-attention sink (webhook \| desktop \| shell \| file); `enabled: false` by default. See `examples/notify.config.yaml`. |
 | `local_issues.*` | Issue source for a repo with **no GitHub remote**: issues become markdown files under `local_issues.issues_dir` (default `docs/issues`) instead of GitHub issues. See [README.md#local-file-issue-source](../README.md#local-file-issue-source) and `examples/orchestrator.config.local.yaml`. |
 
@@ -160,7 +164,7 @@ uv run charlie bash-rats --limit 3
 Every command accepts `--json` (either before or after the subcommand — the
 CLI strips `--json` from `argv` before `argparse` sees it) for
 machine-readable output, and `--dry-run` to suppress **mutating** `gh` calls
-(the `_is_mutating` guard in `github.py`).
+(the guard transport's dry-run gate, `github_transport/guarded.py`).
 
 `--dry-run` additionally suppresses these local mutations, each of which used to
 run during a "preview":

@@ -1,0 +1,4 @@
+warning
+# Issue #2289: seeding a redispatch from a throttle-killed attempt failed
+# (conflict or git error). The dispatch proceeded from the clean base, so the
+# preserved work was not carried forward and an operator may want to look at it.

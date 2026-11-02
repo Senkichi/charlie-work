@@ -12,15 +12,19 @@ Namespace rule (#1627). Two kinds of name are reached through the
 
 - **Patched-on-workflow (Tier D).** Names some test patches on the
   ``charlie_work.workflow`` module object -- ``state_lock``, ``load_state_locked``,
-  ``utc_now``, ``transition``, ``is_pid_alive``, ``is_claim_stale``,
-  ``dispatch_sessions``, ``emit_digest``, ``linked_issue_number``,
-  ``_count_live_sessions``, ``_detect_and_handle_stalled_sessions``,
-  ``_worker_pid_alive``, ``_try_reap_blocked_foreign_writer`` -- must resolve
+  ``utc_now``, ``transition``, ``is_claim_stale``,
+  ``linked_issue_number``,
+  ``_detect_and_handle_stalled_sessions``,
+  ``_try_reap_blocked_foreign_writer`` -- must resolve
   through ``_wf.`` so ``patch("charlie_work.workflow.<name>")`` still bites.
-- **Defined in workflow.py.** ``CommandResult``, ``_MergedPRListOutcome``,
-  ``_build_attention_digest``, ``_build_failure_map``, ``_label_error_reason``,
-  ``_recent_dispatch_failed_attempts`` live in ``workflow`` itself; reaching them
-  via ``_wf.`` avoids an import cycle and keeps a single definition site.
+- **Reached through workflow.py.** ``_build_failure_map``,
+  ``_label_error_reason`` and ``_recent_dispatch_failed_attempts`` are defined
+  in ``workflow`` itself; ``_MergedPRListOutcome`` is a re-export
+  (``backlog_reachability.py`` owns the definition), and so are the
+  attention-digest emit tails ``_emit_stalled_session_digest`` /
+  ``_emit_attention_digest`` (``attention_digest.py`` owns those, issue #2600).
+  Reaching all of them via ``_wf.`` avoids an import cycle and keeps a single
+  name site.
 
 The three state primitives ``load_state`` / ``save_state`` / ``append_event`` are
 also routed via ``_wf.`` (matching ``state_maintenance.py``). ``load_state`` in
@@ -43,10 +47,10 @@ module below.
 from __future__ import annotations
 
 from dataclasses import asdict
-from datetime import UTC, datetime
 from typing import Any
 
 import charlie_work.workflow as _wf
+from charlie_work.command_result import CommandResult
 from charlie_work import worker_fate
 from charlie_work.worker_pid_stamp import stamp_worker_process
 from charlie_work.worker_launch_gate import (
@@ -73,10 +77,9 @@ from charlie_work.cross_repo_gate import (
     cross_repo_gate,
     cross_repo_scope_gate,
 )
-from charlie_work.dead_worker_reap import (
+from charlie_work.dead_worker_sweep.effects_pr import _dispatching_repo_name
+from charlie_work.dead_worker_sweep.effects_sessions import (
     _detect_stalled_sessions,
-    _dispatching_repo_name,
-    _issues_with_live_workers,
 )
 from charlie_work.dispatch_selection import (
     _MAX_DEFERRED_CONCURRENCY_EXAMPLES,
@@ -84,9 +87,12 @@ from charlie_work.dispatch_selection import (
     _windowed_blocked_environment_at,
     _windowed_foreign_writer_reaps,
 )
+from charlie_work.live_session_count import WORKER_LANE, _ghost_pid_alive
+import charlie_work.fleet_provider_throttle as fleet_provider_throttle
 from charlie_work.escalation import _escalate_issue, _escalation_edge
 from charlie_work.fleet_registry import managed_repo_names, managed_repo_roots
 from charlie_work.github import label_names
+from charlie_work.github_capabilities.cross_repo_blockers import blocker_refs
 from charlie_work.labels import TransitionOutcome
 from charlie_work.state import (
     arm_dispatch_stale_alert,
@@ -109,7 +115,7 @@ def _dispatch_impl(
     ready_issues: list[dict[str, Any]] | None = None,
     merged_prs: _wf._MergedPRListOutcome | None = None,
     launch_lock: FleetLaunchLock,
-) -> _wf.CommandResult:
+) -> CommandResult:
     # Issue #427: include closed ready-labeled issues so externally-merged PRs
     # (e.g. Aviator MergeQueue) can be finalized even after GitHub closes the issue.
     if ready_issues is None:
@@ -226,9 +232,28 @@ def _dispatch_impl(
             message = f"dispatch deferred: provider throttled until {permit.throttled_until}"
         else:
             message = f"dispatch deferred: {permit.reason}"
-        return _wf.CommandResult(permit.ok, message, data)
+        return CommandResult(permit.ok, message, data)
     gov = permit.governor
     dispatch_limit = permit.max_launches
+
+    # Issue #1993: the provider limit is per account, so consult the fleet-wide
+    # window (and staggered-resume probe) for this repo's worker adapter.
+    resume = fleet_provider_throttle.decide_for_app(self, selection=permit.role_selection)
+    if resume.deferred:
+        return resume.deferred_result(
+            "dispatch",
+            {
+                "selected_count": 0,
+                "attempted_count": 0,
+                "failed_count": 0,
+                "skipped_issue_numbers": [],
+                "label_errors": [],
+                "sessions": [],
+                "dispatch_results": [],
+                "merged_prs": merged_prs_for_tripwire,
+            },
+        )
+    dispatch_limit = resume.cap_limit(dispatch_limit)
 
     def _resolve_merged_prs(
         outcome: _wf._MergedPRListOutcome | None,
@@ -262,7 +287,7 @@ def _dispatch_impl(
         # Detect stalled sessions (read-only for dry-run)
         stalled_entries = _detect_stalled_sessions(sessions_dir, self.config)
         stalled_issues = {entry["issue"] for entry in stalled_entries}
-        live_worker_issues = _issues_with_live_workers(sessions_dir)
+        live_worker_issues = self.host.sessions.live_issue_numbers(sessions_dir)
         prs = self.gh.pr_list()
         # No ready issues means _merged_pr_referenced_issue_numbers() would
         # return empty sets regardless of what merged_pr_list() returns
@@ -322,7 +347,7 @@ def _dispatch_impl(
                     # A dead worker with an open PR is mid-review and must not be re-dispatched.
                     # Issue #207: also check state.json worker_pid for liveness when session files are orphaned
                     issue_number = int(number)
-                    worker_alive = _wf._worker_pid_alive(entry)
+                    worker_alive = _ghost_pid_alive(entry, WORKER_LANE)
                     if (
                         issue_number in live_worker_issues
                         or worker_alive
@@ -363,13 +388,8 @@ def _dispatch_impl(
             candidates
         )
 
-        # Sort candidates by dispatch order
-        # Default (oldest) uses dependency-aware ordering; explicit newest uses creation date
-        if self.config.dispatch.order == "newest":
-            candidates = self._sort_by_dispatch_order(candidates)
-        else:
-            # Default: use dependency-aware ordering (out-degree) with oldest-first tiebreaker
-            candidates = self._sort_by_dependency_depth(candidates)
+        # Dispatch order, then priority labels (TIS-CW-7) -- the same order as the real pass
+        candidates = self._order_dispatch_candidates(candidates)
 
         # Fill fresh candidates first; recovery retries only get leftover slots
         # and are capped at one per pass (issue #506).
@@ -454,12 +474,8 @@ def _dispatch_impl(
                 recovery_record = prev_entry
 
             session_requests.append(
-                SessionRequest(
-                    issue_number=issue_number,
-                    issue_title=str(full_issue.get("title") or ""),
-                    prompt_path=prompt_path,
-                    branch_name=branch_name,
-                    recovery=recovery_record,
+                SessionRequest.for_issue(
+                    full_issue, issue_number, prompt_path, branch_name, recovery=recovery_record
                 )
             )
 
@@ -485,14 +501,14 @@ def _dispatch_impl(
             "sessions": [asdict(request) for request in session_requests],
             "dispatch_results": [],
             "blocked": [
-                {"issue": issue_number, "blockers": blockers}
+                {"issue": issue_number, "blockers": blocker_refs(blockers)}
                 for issue_number, blockers in sorted(blocked_issues.items())
             ],
             "stalled": stalled_entries,
         }
         if gov.any_term_enabled:
             data.update(gov.report_fields())
-        return _wf.CommandResult(
+        return CommandResult(
             True,
             f"dry-run: would dispatch {len(session_requests)} issue(s)",
             data,
@@ -504,7 +520,7 @@ def _dispatch_impl(
     skipped_issue_numbers: list[int] = []
     # Use pre-computed stalled_entries from the stall detection above
     stalled_issues = {entry["issue"] for entry in stalled_entries}
-    live_worker_issues = _issues_with_live_workers(sessions_dir)
+    live_worker_issues = self.host.sessions.live_issue_numbers(sessions_dir)
     prs = self.gh.pr_list()
     # No ready issues means _merged_pr_referenced_issue_numbers() would
     # return empty sets regardless of what merged_pr_list() returns (it
@@ -581,7 +597,17 @@ def _dispatch_impl(
         # Best-effort label transition and issue close. A failure here is
         # non-fatal; the issue is still excluded from dispatch because the
         # merged PR reference exists, and the next pass will retry.
-        _wf.transition(self.gh, self.config.labels, issue_number, "merged")
+        _wf.transition(
+            self.gh,
+            self.config.labels,
+            issue_number,
+            "merged",
+            state_path=self.paths.state_file,
+            repo=self.repo_root.name,
+            pr_number=int(pr_by_issue[issue_number]["number"])
+            if issue_number in pr_by_issue
+            else None,
+        )
         if self.gh.close_issue(issue_number):
             closed_merged_pr_issues.add(issue_number)
 
@@ -650,19 +676,22 @@ def _dispatch_impl(
     # NOTHING_CHANGED is unreachable for this event today, but it is
     # handled here defensively since a retry would recompute the exact
     # same static edge and produce the same NOTHING_CHANGED outcome again.
-    mention_flag_outcomes: list[tuple[int, TransitionOutcome]] = [
+    mention_flag_results = [
         (
             issue_number,
             _wf.transition(
-                self.gh, self.config.labels, issue_number, "merged_pr_mention_flagged"
-            ).outcome,
+                self.gh,
+                self.config.labels,
+                issue_number,
+                "merged_pr_mention_flagged",
+                state_path=self.paths.state_file,
+                repo=self.repo_root.name,
+            ),
         )
         for issue_number in newly_flagged_mention_issues
     ]
     stamped_mention_issues = [
-        issue_number
-        for issue_number, outcome in mention_flag_outcomes
-        if outcome != TransitionOutcome.PARTIAL_FAILURE
+        issue_number for issue_number, result in mention_flag_results if result.ok
     ]
 
     # Issue #429/#433: closed-unmerged stripping is handled by
@@ -810,7 +839,7 @@ def _dispatch_impl(
         # from crashed workers before PR opens.
         live_dispatched = set()
         dispatch_blocked = set()
-        now = datetime.now(UTC)
+        now = self.host.clock.now()
         for number, entry in state.get("issues", {}).items():
             if not isinstance(entry, dict):
                 continue
@@ -825,7 +854,7 @@ def _dispatch_impl(
                 # A dead worker with an open PR is mid-review and must not be re-dispatched.
                 # Issue #207: also check state.json worker_pid for liveness when session files are orphaned
                 issue_number = int(number)
-                worker_alive = _wf._worker_pid_alive(entry)
+                worker_alive = _ghost_pid_alive(entry, WORKER_LANE)
                 if (
                     issue_number in live_worker_issues
                     or worker_alive
@@ -876,13 +905,8 @@ def _dispatch_impl(
     # Done outside the lock to avoid holding it during GitHub API calls
     candidates, blocked_issues, open_blockers_by_issue = self._filter_blocked_issues(candidates)
 
-    # Sort candidates by dispatch order
-    # Default (oldest) uses dependency-aware ordering; explicit newest uses creation date
-    if self.config.dispatch.order == "newest":
-        candidates = self._sort_by_dispatch_order(candidates)
-    else:
-        # Default: use dependency-aware ordering (out-degree) with oldest-first tiebreaker
-        candidates = self._sort_by_dependency_depth(candidates)
+    # Dispatch order, then priority labels: critical claims first (TIS-CW-7)
+    candidates = self._order_dispatch_candidates(candidates)
 
     # Re-enter lock to log events and claim issues
     with _wf.state_lock(self.paths.state_file):
@@ -895,7 +919,11 @@ def _dispatch_impl(
         # the (issue, blockers) content actually changed since the last
         # emission, tracked via a compact snapshot on the issue record.
         if blocked_issues:
-            for issue_number, blockers in blocked_issues.items():
+            for issue_number, raw_blockers in blocked_issues.items():
+                # Issue #2005: repo-qualified, JSON-stable refs -- a bare
+                # CrossRepoBlocker would round-trip through state.json to a
+                # local issue number and defeat this dedupe.
+                blockers = blocker_refs(raw_blockers)
                 issue_key = str(issue_number)
                 issue_entry = state["issues"].get(issue_key, {})
                 if not isinstance(issue_entry, dict):
@@ -926,6 +954,7 @@ def _dispatch_impl(
                     b for b in open_blockers if self._is_dead_blocker(b, state, pr_by_issue)
                 )
                 chain_dead = bool(open_blockers) and dead_blockers == sorted(open_blockers)
+                dead_blockers = blocker_refs(dead_blockers)
                 previously_alerted = issue_entry.get("chain_dead_alerted_blockers")
                 if chain_dead and previously_alerted != dead_blockers:
                     state["issues"][issue_key] = {
@@ -1085,17 +1114,14 @@ def _dispatch_impl(
             recovery_record = prev_entry
 
         session_requests.append(
-            SessionRequest(
-                issue_number=issue_number,
-                issue_title=str(full_issue.get("title") or ""),
-                prompt_path=prompt_path,
-                branch_name=branch_name,
-                recovery=recovery_record,
+            SessionRequest.for_issue(
+                full_issue, issue_number, prompt_path, branch_name, recovery=recovery_record
             )
         )
     manifest_path = self._layout.session_manifest
     results_path = self._layout.session_results
     dispatch_results = _launch_workers(self, permit, self._adapter_settings(), session_requests)
+    fleet_provider_throttle.note_probe_from_results(self, resume, dispatch_results)
     # Issue #2055: the sessions the fleet cap counts are on disk now -- the
     # governor -> claim -> launch window the lock exists to serialize is
     # closed. Release before the result bookkeeping below instead of holding
@@ -1121,7 +1147,7 @@ def _dispatch_impl(
         if (
             result.pid is not None
             and result.pid > 0
-            and _wf.is_pid_alive(result.pid, result.process_start_time)
+            and self.host.probe.is_alive(result.pid, result.process_start_time)
         ):
             live_worker_issue_numbers.add(result.issue_number)
         else:
@@ -1142,9 +1168,26 @@ def _dispatch_impl(
     manual = self.config.worker.harness == "manual"
     label_errors: list[int] = []
     label_error_failures: dict[int, str] = {}
-    # B6: fates the phantom-worker lane resolves while ``state_lock`` is held,
-    # reported (rule-1 stale evidence) once the lock is released below.
+    # B6: fates the phantom-worker lane resolves, reported (rule-1 stale
+    # evidence) once the lock below is released.
     phantom_fates: dict[int, list[worker_fate.WorkerFate]] = {}
+    # Issue #2262: the phantom lane's salvage probe (park a committed local
+    # branch for review / push + PR on a PR-capable backend) takes
+    # ``state_lock`` itself and does git + label I/O, so it must run BEFORE
+    # the lock below — the same pre-lock/two-phase pattern the dead-worker
+    # sweep uses. ``_precheck_phantom_live_worker`` also resolves each
+    # phantom sidecar's fate here (pure reads); the in-lock route consumes
+    # the verdicts.
+    phantom_prechecks: dict[int, Any] = {}
+    for request in session_requests:
+        if request.issue_number in phantom_live_worker_issue_numbers:
+            phantom_prechecks[request.issue_number] = self._precheck_phantom_live_worker(
+                request,
+                full_issues[request.issue_number],
+                sessions_dir,
+                previous_entries.get(request.issue_number, {}),
+                on_fate=lambda fate: worker_fate.collect_fate(phantom_fates, fate),
+            )
 
     with _wf.state_lock(self.paths.state_file):
         state = _wf.load_state(self.paths.state_file)
@@ -1221,7 +1264,7 @@ def _dispatch_impl(
                     request,
                     full_issue,
                     sessions_dir,
-                    on_fate=lambda fate: worker_fate.collect_fate(phantom_fates, fate),
+                    precheck=phantom_prechecks[request.issue_number],
                 )
                 # A phantom live worker is being routed as dead; do not
                 # preserve a stale worker_pid that would keep the slot
@@ -1239,7 +1282,7 @@ def _dispatch_impl(
             else:
                 # Issue #461: bound dispatch_failed retries with the same
                 # redispatch-window cap used for rework.
-                now = datetime.now(UTC)
+                now = self.host.clock.now()
                 failed_result = next(
                     (r for r in dispatch_results if r.issue_number == request.issue_number),
                     None,
@@ -1483,6 +1526,8 @@ def _dispatch_impl(
                     self.config.labels,
                     request.issue_number,
                     target,
+                    state_path=self.paths.state_file,
+                    repo=self.repo_root.name,
                 )
                 if result.outcome != TransitionOutcome.APPLIED:
                     label_error = {
@@ -1529,6 +1574,8 @@ def _dispatch_impl(
                     self.config.labels,
                     request.issue_number,
                     edge,
+                    state_path=self.paths.state_file,
+                    repo=self.repo_root.name,
                 )
                 if result.outcome != TransitionOutcome.APPLIED:
                     label_error = {
@@ -1603,6 +1650,8 @@ def _dispatch_impl(
                 self.config.labels,
                 issue_number,
                 edge,
+                state_path=self.paths.state_file,
+                repo=self.repo_root.name,
             )
             if result.outcome != TransitionOutcome.APPLIED:
                 label_error = {
@@ -1704,7 +1753,7 @@ def _dispatch_impl(
         # the durable baseline marker, the staleness check, and the alert
         # cadence marker all timestamp against the same instant, mirroring
         # the #828/#838 single-frozen-clock-per-pass invariant.
-        dispatch_cadence_now = datetime.now(UTC)
+        dispatch_cadence_now = self.host.clock.now()
         dispatch_cadence_now_iso = (
             dispatch_cadence_now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
         )
@@ -1862,7 +1911,7 @@ def _dispatch_impl(
         "live_worker_redispatch_averted": live_worker_redispatch_averted,
         "stalled": stalled_entries,
         "blocked": [
-            {"issue": issue_number, "blockers": blockers}
+            {"issue": issue_number, "blockers": blocker_refs(blockers)}
             for issue_number, blockers in sorted(blocked_issues.items())
         ],
         "operator_claimed_ready": sorted(operator_claimed_ready),
@@ -1872,39 +1921,14 @@ def _dispatch_impl(
 
     # Emit notification digest if there are health transitions (stalled sessions)
     # This will be enhanced by #165 to include RUNAWAY/DEAD/escalated transitions
-    if stalled_entries and self.config.notify.enabled:
-        health_transitions: dict[int, dict[str, Any]] = {}
-        for entry in stalled_entries:
-            health_transitions[entry["issue"]] = {
-                "adapter_kind": "unknown",  # Will be filled by #165's full supervisor
-                "health": entry.get("health", "STALLED"),
-                "last_log_line": None,
-                "pid": entry.get("pid"),
-                "terminal_tool": entry.get("terminal_tool"),
-                "terminal_reason": entry.get("terminal_reason"),
-            }
-        digest = _wf._build_attention_digest(
-            self.paths.state_file,
-            health_transitions,
-            repo=self.repo_root.name,
-        )
-        if digest:
-            _wf.emit_digest(self._layout.notify, digest)
+    _wf._emit_stalled_session_digest(self, stalled_entries)
 
     # Emit dispatch-alert digest for live-worker redispatch averted outcomes.
     # This surfaces the silent-stall class of dispatch failures in the same
     # attention pipeline used for stalled workers (issue #506 / #497).
-    if dispatch_alert_transitions and self.config.notify.enabled:
-        dispatch_digest = _wf._build_attention_digest(
-            self.paths.state_file,
-            dispatch_alert_transitions,
-            repo=self.repo_root.name,
-            state_field="dispatch_alert",
-        )
-        if dispatch_digest:
-            _wf.emit_digest(self._layout.notify, dispatch_digest)
+    _wf._emit_attention_digest(self, dispatch_alert_transitions, state_field="dispatch_alert")
 
-    return _wf.CommandResult(
+    return CommandResult(
         not failed_issue_numbers,
         message,
         data,

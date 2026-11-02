@@ -13,7 +13,6 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 import pytest
 from _fleet_dispatch_fixtures import (
-    _FakeClock,
     _active_fleet_result,
     _drained_fleet_result,
     _patch_ci_fleet_dirty_for_hermetic_tests as _patch_ci_fleet_dirty_for_hermetic_tests,
@@ -27,6 +26,7 @@ from charlie_work.fleet_dispatch import (
     run_fleet_supervise,
     run_fleet_supervise_loop,
 )
+from charlie_work.host.fakes import FakeClock
 from charlie_work.instrumentation import query_events
 from charlie_work.supervise import SelfDeployResult
 from charlie_work.supervise_loop import EXIT_RESTART_REQUESTED
@@ -54,8 +54,8 @@ def test_run_fleet_supervise_ensures_labels_on_first_pass_only(
     )
     mock_fleet_loop.return_value = _drained_fleet_result()
 
-    fc = _FakeClock(auto_advance=1.0)
-    run_fleet_supervise(max_passes=3, clock=fc.now, sleep=fc.sleep)
+    fc = FakeClock(auto_advance=1.0)
+    run_fleet_supervise(max_passes=3, clock=fc.monotonic, sleep=fc.sleep)
 
     assert mock_fleet_loop.call_count == 3
     ensure_flags = [call.kwargs.get("ensure_labels") for call in mock_fleet_loop.call_args_list]
@@ -92,8 +92,8 @@ def test_run_fleet_supervise_full_pass_interval_fallback_triggers_pass(
         lambda _before, _after: False,
     )
 
-    fc = _FakeClock(auto_advance=15.0)
-    result = run_fleet_supervise(max_passes=2, clock=fc.now, sleep=fc.sleep)
+    fc = FakeClock(auto_advance=15.0)
+    result = run_fleet_supervise(max_passes=2, clock=fc.monotonic, sleep=fc.sleep)
 
     assert result.ok is True
     assert result.data["passes"] == 2
@@ -121,8 +121,8 @@ def test_run_fleet_supervise_keyboard_interrupt_returns_ok(
     )
     mock_fleet_loop.side_effect = [_drained_fleet_result(), KeyboardInterrupt]
 
-    fc = _FakeClock(auto_advance=1.0)
-    result = run_fleet_supervise(max_passes=5, clock=fc.now, sleep=fc.sleep)
+    fc = FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=5, clock=fc.monotonic, sleep=fc.sleep)
 
     assert result.ok is True
     assert "fleet supervisor complete" in result.message
@@ -158,8 +158,8 @@ def test_run_fleet_supervise_local_delta_triggers_pass_before_fallback(
         MagicMock(side_effect=[False, True]),
     )
 
-    fc = _FakeClock(auto_advance=1.0)
-    result = run_fleet_supervise(max_passes=2, clock=fc.now, sleep=fc.sleep)
+    fc = FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=2, clock=fc.monotonic, sleep=fc.sleep)
 
     assert result.ok is True
     assert result.data["passes"] == 2
@@ -203,10 +203,10 @@ def test_run_fleet_supervise_logs_global_config_provenance(
         )
 
     # No global config on this fleet dir: reported as absent, at INFO.
-    fc = _FakeClock(auto_advance=1.0)
+    fc = FakeClock(auto_advance=1.0)
     with caplog.at_level(logging.INFO, logger="charlie_work.fleet_dispatch"):
         run_fleet_supervise(
-            max_passes=1, clock=fc.now, sleep=fc.sleep, fleet_dir_override=str(tmp_path)
+            max_passes=1, clock=fc.monotonic, sleep=fc.sleep, fleet_dir_override=str(tmp_path)
         )
     absent = provenance_lines()
     assert absent, "the supervisor logged no global-config provenance at all"
@@ -216,10 +216,10 @@ def test_run_fleet_supervise_logs_global_config_provenance(
     # Same call with the layer in place: distinguishable, with its size.
     caplog.clear()
     (tmp_path / "config.yaml").write_text("dispatch: {}\n", encoding="utf-8")
-    fc = _FakeClock(auto_advance=1.0)
+    fc = FakeClock(auto_advance=1.0)
     with caplog.at_level(logging.INFO, logger="charlie_work.fleet_dispatch"):
         run_fleet_supervise(
-            max_passes=1, clock=fc.now, sleep=fc.sleep, fleet_dir_override=str(tmp_path)
+            max_passes=1, clock=fc.monotonic, sleep=fc.sleep, fleet_dir_override=str(tmp_path)
         )
     present = provenance_lines()
     assert "present" in present, f"a present global layer was not reported: {present!r}"
@@ -333,8 +333,8 @@ def test_run_fleet_supervise_loops_until_max_passes(
     mock_load_config.return_value = cfg
     mock_fleet_loop.return_value = _drained_fleet_result()
 
-    fc = _FakeClock(auto_advance=1.0)
-    result = run_fleet_supervise(max_passes=3, clock=fc.now, sleep=fc.sleep)
+    fc = FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=3, clock=fc.monotonic, sleep=fc.sleep)
 
     assert result.ok is True
     assert result.data["passes"] == 3
@@ -375,11 +375,11 @@ def test_run_fleet_supervise_loud_on_absent_global_layer(
     """
     mock_fleet_loop.return_value = _drained_fleet_result()
 
-    fc = _FakeClock(auto_advance=1.0)
+    fc = FakeClock(auto_advance=1.0)
     with caplog.at_level(logging.WARNING, logger="charlie_work.fleet_dispatch"):
         result = run_fleet_supervise(
             max_passes=1,
-            clock=fc.now,
+            clock=fc.monotonic,
             sleep=fc.sleep,
             fleet_dir_override=str(tmp_path),
         )
@@ -450,9 +450,9 @@ def test_run_fleet_supervise_records_ci_fleet_provenance(
     )
     mock_fleet_loop.return_value = _drained_fleet_result()
 
-    fc = _FakeClock(auto_advance=1.0)
+    fc = FakeClock(auto_advance=1.0)
     run_fleet_supervise(
-        max_passes=1, clock=fc.now, sleep=fc.sleep, fleet_dir_override=str(tmp_path)
+        max_passes=1, clock=fc.monotonic, sleep=fc.sleep, fleet_dir_override=str(tmp_path)
     )
 
     # The event lands in the fleet-level events.db (sibling of the heartbeat).
@@ -518,8 +518,8 @@ def test_run_fleet_supervise_respects_max_runtime(
     mock_load_config.return_value = cfg
     mock_fleet_loop.return_value = _active_fleet_result()
 
-    fc = _FakeClock(auto_advance=70.0)
-    result = run_fleet_supervise(clock=fc.now, sleep=fc.sleep)
+    fc = FakeClock(auto_advance=70.0)
+    result = run_fleet_supervise(clock=fc.monotonic, sleep=fc.sleep)
 
     assert result.ok is True
     assert result.data["passes"] == 1
@@ -576,8 +576,8 @@ def test_run_fleet_supervise_throttles_idle_passes(
         lambda _before, _after: False,
     )
 
-    fc = _FakeClock(start=0.0, auto_advance=2.0)
-    result = run_fleet_supervise(clock=fc.now, sleep=fc.sleep)
+    fc = FakeClock(mono=0.0, auto_advance=2.0)
+    result = run_fleet_supervise(clock=fc.monotonic, sleep=fc.sleep)
 
     assert result.ok is True
     assert mock_fleet_loop.call_count == 1  # only the initial fallback pass
@@ -605,8 +605,8 @@ def test_run_fleet_supervise_uses_active_cooldown_after_activity(
     mock_load_config.return_value = cfg
     mock_fleet_loop.side_effect = [_active_fleet_result(), _drained_fleet_result()]
 
-    fc = _FakeClock(auto_advance=1.0)
-    result = run_fleet_supervise(max_passes=2, clock=fc.now, sleep=fc.sleep)
+    fc = FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=2, clock=fc.monotonic, sleep=fc.sleep)
 
     assert result.ok is True
     assert result.data["passes"] == 2
@@ -640,8 +640,8 @@ def test_a_mid_loop_crash_reports_aborted_and_does_not_relaunch(
     mock_load_config.return_value = cfg
     mock_fleet_loop.side_effect = RuntimeError("boom")
 
-    fc = _FakeClock(auto_advance=1.0)
-    result = run_fleet_supervise(max_passes=5, clock=fc.now, sleep=fc.sleep)
+    fc = FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=5, clock=fc.monotonic, sleep=fc.sleep)
 
     assert result.ok is False
     assert result.data["exit_reason"] == "aborted"
@@ -675,8 +675,8 @@ def test_an_operator_interrupt_never_asks_to_be_relaunched(
     mock_load_config.return_value = cfg
     mock_fleet_loop.side_effect = KeyboardInterrupt()
 
-    fc = _FakeClock(auto_advance=1.0)
-    result = run_fleet_supervise(max_passes=5, clock=fc.now, sleep=fc.sleep)
+    fc = FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=5, clock=fc.monotonic, sleep=fc.sleep)
 
     assert result.data["exit_reason"] == "interrupted"
     assert result.data["restart_requested"] is False
@@ -745,8 +745,8 @@ def test_zero_pass_bookkeeping_failure_cannot_cancel_a_self_deploy_restart(
 
     monkeypatch.setattr("charlie_work.fleet_dispatch.record_zero_pass_streak", _boom)
 
-    fc = _FakeClock(auto_advance=1.0)
-    result = run_fleet_supervise(max_passes=5, clock=fc.now, sleep=fc.sleep)
+    fc = FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=5, clock=fc.monotonic, sleep=fc.sleep)
 
     assert result.data["exit_reason"] == "self_deploy"
     assert result.data["restart_requested"] is True

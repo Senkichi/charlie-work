@@ -52,10 +52,7 @@ $section_config_parity
 5. Add or update regression tests unless genuinely not applicable (justify if so).
 
    $section_test_hygiene
-6. Run the tests impacted by your change from the worktree root: the test
-   file(s) you added or modified, plus `grep tests/` for every
-   module/function/symbol your production diff touched and run every
-   matching test file — not just the tests you wrote:
+6. $test_step_instruction
    ```bash
    $targeted_test_command
    ```

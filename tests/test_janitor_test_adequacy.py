@@ -517,3 +517,72 @@ index 123..456 100644
     assert verdict.facts.added_product_loc == 0
     assert verdict.facts.added_test_loc == 5
     assert verdict.facts.test_files_changed == 1
+
+
+_EXEMPT_DIFF = """diff --git a/src/feature.py b/src/feature.py
+index 123..456 100644
+--- a/src/feature.py
++++ b/src/feature.py
+@@ -1,3 +1,5 @@
+ def feature():
+     pass
++def new_feature():
++    pass
+"""
+
+
+def test_commit_trailer_exempts_when_body_has_no_marker() -> None:
+    """Issue #2220: a ``Test-exempt:`` commit trailer exempts and carries its reason."""
+    config = _test_adequacy_config(min_product_lines=1)
+    messages = ["docs: touch docstrings\n\nTest-exempt: docstring-only"]
+
+    verdict = check_test_adequacy(_EXEMPT_DIFF, _test_pr(body="Closes #1."), config, messages)
+
+    assert verdict.ok is True
+    assert verdict.facts.exempt is True
+    assert verdict.facts.exempt_reason == "docstring-only"
+
+
+def test_commit_trailer_marker_in_body_prose_does_not_exempt() -> None:
+    """A marker quoted mid-body (not in the last paragraph) or in the subject is not a trailer."""
+    config = _test_adequacy_config(min_product_lines=1)
+    messages = [
+        "fix: x\n\nTest-exempt: quoted in prose\n\nSigned-off-by: someone",
+        "Test-exempt: subject line only",
+    ]
+
+    verdict = check_test_adequacy(_EXEMPT_DIFF, _test_pr(body="Closes #1."), config, messages)
+
+    assert verdict.ok is False
+    assert verdict.facts.exempt is False
+
+
+def test_body_marker_still_wins_over_commit_trailer() -> None:
+    config = _test_adequacy_config(min_product_lines=1)
+    verdict = check_test_adequacy(
+        _EXEMPT_DIFF,
+        _test_pr(body="Test-exempt: from body"),
+        config,
+        ["x\n\nTest-exempt: from trailer"],
+    )
+
+    assert verdict.facts.exempt_reason == "from body"
+
+
+def test_failure_text_and_summary_name_trailer_route_with_configured_marker() -> None:
+    """Prompt text and reader share one ``exempt_marker`` config value."""
+    from charlie_work.workflow import render_test_adequacy_summary
+
+    config = _test_adequacy_config(min_product_lines=1, exempt_marker="Skip-tests:")
+    verdict = check_test_adequacy(_EXEMPT_DIFF, _test_pr(body="Closes #1."), config)
+    summary = render_test_adequacy_summary(verdict, config.exempt_marker)
+
+    assert "'Skip-tests: <reason>' trailer" in verdict.failures[0]
+    assert "'Skip-tests: <reason>' trailer" in summary
+    assert "Test-exempt:" not in summary
+
+    # The reader honours the same configured marker.
+    ok = check_test_adequacy(
+        _EXEMPT_DIFF, _test_pr(body="Closes #1."), config, ["x\n\nSkip-tests: why"]
+    )
+    assert ok.facts.exempt_reason == "why"

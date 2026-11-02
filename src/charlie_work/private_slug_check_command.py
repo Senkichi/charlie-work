@@ -61,7 +61,7 @@ from .ratchet_baseline import (
     write_count_baseline,
     write_set_baseline,
 )
-from .workflow import CommandResult
+from .command_result import CommandResult
 
 PRIVATE_SLUG_BASELINE_DIRNAME = ".private-slug-baseline"
 _SLUGS_DIRNAME = "slugs"

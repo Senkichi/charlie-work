@@ -1,0 +1,4 @@
+info
+# Issue #2837: a moved-head re-review could not build the archive-based
+# PR-relative interdiff and fell back to the three-dot gh.compare_diff.
+# Measurement/bookkeeping, not a failure: info.

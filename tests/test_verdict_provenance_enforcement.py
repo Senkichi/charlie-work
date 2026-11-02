@@ -66,10 +66,12 @@ import inspect
 import json
 from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import pytest
+from _src_ast import parsed, source_files
 
+from charlie_work.command_result import CommandResult
 from charlie_work.config import OrchestratorConfig
 from charlie_work.instrumentation import query_events
 from charlie_work.paths import runtime_paths
@@ -383,7 +385,7 @@ def test_merge_authorize_write_never_gains_verdict_provenance_key(tmp_path: Path
 
 def test_derived_from_prose_absent_from_verdict_provenance_surface() -> None:
     assert "derived_from_prose" not in VERDICT_PROVENANCE_VALUES
-    for path in sorted(_SRC_ROOT.rglob("*.py")):
+    for path in source_files(_SRC_ROOT):
         text = path.read_text(encoding="utf-8")
         assert "derived_from_prose" not in text, (
             f"{path.name} contains the literal string 'derived_from_prose' -- "
@@ -601,8 +603,8 @@ def test_every_record_review_call_site_and_review_decision_writer_supplies_prove
     scanned_write_sites: list[str] = []
     exempted_write_sites: list[str] = []
 
-    for path in sorted(_SRC_ROOT.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for path in source_files(_SRC_ROOT):
+        tree = parsed(path)
 
         for call in _record_review_call_sites(tree):
             scanned_call_sites.append(f"{path.name}:{call.lineno}")
@@ -793,21 +795,23 @@ def test_review_decision_write_sites_collects_bare_name_form() -> None:
 # are 2 (one ``record_review`` call + one ``record_local_review`` call).
 _EXPECTED_RECORD_REVIEW_PROVENANCE_BY_SITE: dict[tuple[str, str], Counter[str]] = {
     ("workflow.py", "review"): Counter({"ci_gate_auto_reject": 2, "test_adequacy_auto_reject": 1}),
-    ("misc_review_verdicts.py", "_reap_review_verdicts"): Counter({"fresh_llm_review": 2}),
+    ("misc_review_verdicts.py", "_reap_dead_reviewer"): Counter({"fresh_llm_review": 2}),
     ("instrumentation_ops.py", "_reconcile_stranded_verdicts"): Counter(
         {"stranded_reconciliation": 2}
     ),
     ("state_rescue.py", "_process_rescue_review"): Counter({"rescue_review": 1}),
     ("cli.py", "run_command"): Counter({"operator_manual": 1}),
     ("local_lanes.py", "_local_build_packet"): Counter({"test_adequacy_auto_reject": 1}),
+    # issue #1681: the workflow_no_jobs rework route, extracted from review().
+    ("reap_dispatch.py", "_route_workflow_no_jobs"): Counter({"ci_gate_auto_reject": 1}),
 }
 
 
 def test_record_review_call_sites_map_to_expected_provenance_literal() -> None:
     actual: dict[tuple[str, str], Counter[str]] = {}
 
-    for path in sorted(_SRC_ROOT.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for path in source_files(_SRC_ROOT):
+        tree = parsed(path)
         parents = _build_parent_map(tree)
         for call in _record_review_call_sites(tree):
             func = _enclosing_function(call, parents)
@@ -840,14 +844,14 @@ def test_record_review_call_sites_map_to_expected_provenance_literal() -> None:
     # Positive control: the table itself must cover all known call sites --
     # an accidentally-empty expected table would make the equality assertion
     # above vacuously true if `actual` were also empty (e.g. a scanner
-    # regression that stopped matching anything). 7 ``record_review`` sites
+    # regression that stopped matching anything). 8 ``record_review`` sites
     # plus 3 ``record_local_review`` sites (issue #1844's local lane:
     # _reap_review_verdicts, _reconcile_stranded_verdicts, and
     # _local_build_packet's test-adequacy auto-reject).
     total_sites = sum(
         sum(counter.values()) for counter in _EXPECTED_RECORD_REVIEW_PROVENANCE_BY_SITE.values()
     )
-    assert total_sites == 10, _EXPECTED_RECORD_REVIEW_PROVENANCE_BY_SITE
+    assert total_sites == 11, _EXPECTED_RECORD_REVIEW_PROVENANCE_BY_SITE
 
 
 # ---------------------------------------------------------------------------
@@ -876,7 +880,7 @@ def test_record_review_verdict_provenance_has_no_default_in_the_ast() -> None:
     # member wherever future batches relocate it.
     host_module = inspect.getmodule(OrchestratorApp.record_review)
     host_path = Path(host_module.__file__)
-    tree = ast.parse(host_path.read_text(encoding="utf-8"), filename=host_path.name)
+    tree = parsed(host_path)
     func = _find_function_def(tree, "record_review")
 
     positional_names = [a.arg for a in func.args.posonlyargs + func.args.args]
@@ -922,11 +926,96 @@ def test_record_review_missing_verdict_provenance_raises_typeerror_at_call_bound
 # every row/write carries the field as designed. This is a fixture, not the
 # live database, per the task's own framing (a fresh clone's events.db has
 # no populated rows and is off-limits regardless).
+#
+# Issue #2568 (ledger-regress: the test slowed 2.6x on the shared CI host):
+# the *drive* lives in the ``_driven_verdict_provenance`` fixture so the
+# measured ``call`` phase pays only for the assertions. What the drive
+# spends is shared-infra acquisition, not the property under test: eight
+# OrchestratorApp constructions each re-run the prompt-template drift
+# scan's full prompt-section file walk, each case provisions a fresh
+# events.db (schema executescript + WAL pragma), and review()'s
+# fresh-packet path spawns a subprocess -- all per-file/per-process host
+# I/O whose cost is set by the runner, not by this repo's code. The ledger
+# deliberately charges that shape of cost to setup (it stays visible under
+# ``ci-fleet ledger report --section slow-fixtures``), the same charging
+# #2515 applied to the a11y node boot. Every assertion below is unchanged
+# and still reads back the real writes.
 # ---------------------------------------------------------------------------
 
 
+class _DrivenRecordReviewCase(NamedTuple):
+    value: str
+    result: CommandResult
+    decision_path: Path
+    state_file: Path
+
+
+class _DrivenVerdictProvenance(NamedTuple):
+    record_review_cases: tuple[_DrivenRecordReviewCase, ...]
+    carried_forward_applied: bool
+    carried_forward_decision_path: Path
+    carried_forward_state_file: Path
+    pending_reset_decision_path: Path
+
+
+@pytest.fixture
+def _driven_verdict_provenance(tmp_path: Path) -> _DrivenVerdictProvenance:
+    cases: list[_DrivenRecordReviewCase] = []
+    for index, value in enumerate(sorted(VERDICT_PROVENANCE_VALUES - {"carried_forward"})):
+        case_root = tmp_path / f"case-{index}"
+        config = OrchestratorConfig()
+        paths = runtime_paths(case_root, config.runtime.state_dir)
+        app = OrchestratorApp(case_root, paths, config, FakeGitHub())
+
+        result = app.record_review(456, "approved", summary="lgtm", verdict_provenance=value)
+        cases.append(
+            _DrivenRecordReviewCase(
+                value=value,
+                result=result,
+                decision_path=paths.prs / "pr-456" / "review-decision.json",
+                state_file=paths.state_file,
+            )
+        )
+
+    # "carried_forward": _update_approval_head bypasses record_review
+    # entirely (issue #638's carry-forward mechanism).
+    cf_app, cf_paths = _carry_forward_app(tmp_path / "case-carried-forward")
+    decision_dir = cf_paths.prs / "pr-456"
+    decision_dir.mkdir(parents=True)
+    decision = {
+        "decision": "approved",
+        "reviewed_head_sha": "old-sha",
+        "verdict_provenance": "fresh_llm_review",
+    }
+    carried_forward_decision_path = decision_dir / "review-decision.json"
+    carried_forward_decision_path.write_text(json.dumps(decision), encoding="utf-8")
+
+    applied = cf_app._update_approval_head(
+        456,
+        decision,
+        "new-sha",
+        old_head="old-sha",
+        issue_number=123,
+        tier="verified-sync",
+    )
+
+    # The pending-reset None sentinel, driven through review()'s real
+    # fresh-packet path (same mechanism as the AC4 tests above).
+    none_app = _cross_family_app(tmp_path / "case-none-sentinel")
+    none_decision_path = none_app.paths.prs / "pr-456" / "review-decision.json"
+    none_app.review(456)
+
+    return _DrivenVerdictProvenance(
+        record_review_cases=tuple(cases),
+        carried_forward_applied=applied,
+        carried_forward_decision_path=carried_forward_decision_path,
+        carried_forward_state_file=cf_paths.state_file,
+        pending_reset_decision_path=none_decision_path,
+    )
+
+
 def test_verdict_provenance_fixture_drives_every_enum_value_and_null_sentinel(
-    tmp_path: Path,
+    _driven_verdict_provenance: _DrivenVerdictProvenance,
 ) -> None:
     # 6 of the 7 enum values are ever passed to record_review() as a fresh
     # decision; "carried_forward" is stamped only by _update_approval_head,
@@ -942,57 +1031,30 @@ def test_verdict_provenance_fixture_drives_every_enum_value_and_null_sentinel(
         "test_adequacy_auto_reject",
     ], record_review_values
 
-    for index, value in enumerate(record_review_values):
-        case_root = tmp_path / f"case-{index}"
-        config = OrchestratorConfig()
-        paths = runtime_paths(case_root, config.runtime.state_dir)
-        app = OrchestratorApp(case_root, paths, config, FakeGitHub())
+    driven = _driven_verdict_provenance
+    assert [case.value for case in driven.record_review_cases] == record_review_values
 
-        result = app.record_review(456, "approved", summary="lgtm", verdict_provenance=value)
-        assert result.ok is True, (value, result.message)
+    for value, case in zip(record_review_values, driven.record_review_cases):
+        assert case.result.ok is True, (value, case.result.message)
 
-        decision_path = paths.prs / "pr-456" / "review-decision.json"
-        on_disk = json.loads(decision_path.read_text(encoding="utf-8"))
+        on_disk = json.loads(case.decision_path.read_text(encoding="utf-8"))
         assert on_disk["verdict_provenance"] == value
 
-        rows = query_events(paths.state_file, kind="record_review")
+        rows = query_events(case.state_file, kind="record_review")
         assert len(rows) == 1, (value, rows)
         assert rows[0]["payload"]["verdict_provenance"] == value
 
-    # "carried_forward": _update_approval_head bypasses record_review
-    # entirely (issue #638's carry-forward mechanism).
-    app, paths = _carry_forward_app(tmp_path / "case-carried-forward")
-    decision_dir = paths.prs / "pr-456"
-    decision_dir.mkdir(parents=True)
-    decision = {
-        "decision": "approved",
-        "reviewed_head_sha": "old-sha",
-        "verdict_provenance": "fresh_llm_review",
-    }
-    (decision_dir / "review-decision.json").write_text(json.dumps(decision), encoding="utf-8")
+    assert driven.carried_forward_applied is True
 
-    applied = app._update_approval_head(
-        456,
-        decision,
-        "new-sha",
-        old_head="old-sha",
-        issue_number=123,
-        tier="verified-sync",
-    )
-    assert applied is True
-
-    on_disk = json.loads((decision_dir / "review-decision.json").read_text(encoding="utf-8"))
+    on_disk = json.loads(driven.carried_forward_decision_path.read_text(encoding="utf-8"))
     assert on_disk["verdict_provenance"] == "carried_forward"
-    rows = query_events(paths.state_file, kind="verdict_carried_forward_verified_sync")
+    rows = query_events(
+        driven.carried_forward_state_file, kind="verdict_carried_forward_verified_sync"
+    )
     assert len(rows) == 1
     assert rows[0]["payload"]["verdict_provenance"] == "carried_forward"
 
-    # The pending-reset None sentinel, driven through review()'s real
-    # fresh-packet path (same mechanism as the AC4 tests above).
-    none_app = _cross_family_app(tmp_path / "case-none-sentinel")
-    none_decision_path = none_app.paths.prs / "pr-456" / "review-decision.json"
-    none_app.review(456)
-    none_on_disk = json.loads(none_decision_path.read_text(encoding="utf-8"))
+    none_on_disk = json.loads(driven.pending_reset_decision_path.read_text(encoding="utf-8"))
     assert none_on_disk["decision"] == "pending"
     assert "verdict_provenance" in none_on_disk
     assert none_on_disk["verdict_provenance"] is None

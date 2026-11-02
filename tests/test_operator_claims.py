@@ -9,8 +9,9 @@ from typing import Any, cast
 
 import pytest
 
-from charlie_work.config import OrchestratorConfig
+from charlie_work.config import OrchestratorConfig, PostMortemConfig
 from charlie_work.github import GitHubLike
+from charlie_work.host.fakes import FakeProcessProbe
 from charlie_work.paths import runtime_paths
 from charlie_work.state import (
     empty_state,
@@ -34,6 +35,19 @@ from charlie_work.worktree import (
     write_worktree_marker,
 )
 from charlie_work.workflow import OrchestratorApp
+
+
+def _alive_probe(monkeypatch: pytest.MonkeyPatch, *pids: int) -> None:
+    """Install a fake host probe reporting ``pids`` as live; all others dead."""
+    import dataclasses
+
+    from charlie_work import host as host_pkg
+
+    monkeypatch.setattr(
+        host_pkg,
+        "_ACTIVE",
+        dataclasses.replace(host_pkg.current(), probe=FakeProcessProbe(dict.fromkeys(pids))),
+    )
 
 
 def _init_repo(repo_root: Path) -> None:
@@ -100,7 +114,7 @@ def test_check_worktree_marker_stale_removed(
     sessions_dir.mkdir()
     write_worktree_marker(worktree_path, 1234, "session-abc")
 
-    monkeypatch.setattr("charlie_work.worktree.is_pid_alive", lambda pid, start: False)
+    _alive_probe(monkeypatch)
     _check_worktree_writer_marker(worktree_path, sessions_dir)
     assert read_worktree_marker(worktree_path) is None
 
@@ -114,7 +128,7 @@ def test_check_worktree_marker_foreign_live_raises(
     sessions_dir.mkdir()
     write_worktree_marker(worktree_path, 1234, "foreign-session")
 
-    monkeypatch.setattr("charlie_work.worktree.is_pid_alive", lambda pid, start: True)
+    _alive_probe(monkeypatch, 1234)
     with pytest.raises(WorktreeForeignWriterError) as exc_info:
         _check_worktree_writer_marker(worktree_path, sessions_dir)
 
@@ -186,12 +200,19 @@ def test_foreign_writer_live_pid_stale_mtime_reaped(
     _write_marker_with_started_at(worktree_path, 1234, "foreign-session", old_started)
 
     # Monkeypatch process kills so the test doesn't actually kill anything.
-    monkeypatch.setattr("charlie_work.worktree.is_pid_alive", lambda pid, start: True)
+    _alive_probe(monkeypatch, 1234)
     monkeypatch.setattr("charlie_work.worktree.kill_process_tree", lambda pid, st: [pid])
     monkeypatch.setattr("charlie_work.worktree.sweep_orphan_processes", lambda wt: [])
     monkeypatch.setattr("charlie_work.worktree.kill_orphan_pid", lambda pid: None)
 
-    config = OrchestratorConfig()
+    # Keep the reap path's sessions.db probe off the real host store
+    # (%APPDATA%\devin\cli\sessions.db — 7.9 GB on the fleet host): a db_path
+    # that cannot exist degrades real_activity_for_worker to its fast "not
+    # found" branch. Same convention as test_charlie_work_stall_reap.py
+    # (issue #2604).
+    config = OrchestratorConfig(
+        post_mortem=PostMortemConfig(db_path=str(tmp_path / "no-such-sessions.db"))
+    )
     state_file = tmp_path / "state.json"
     state_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -229,12 +250,15 @@ def test_foreign_writer_live_pid_fresh_mtime_blocked(
     os.utime(fresh_file, (recent_mtime, recent_mtime))
 
     # Monkeypatch process kills so the test doesn't actually kill anything.
-    monkeypatch.setattr("charlie_work.worktree.is_pid_alive", lambda pid, start: True)
+    _alive_probe(monkeypatch, 1234)
     monkeypatch.setattr("charlie_work.worktree.kill_process_tree", lambda pid, st: [pid])
     monkeypatch.setattr("charlie_work.worktree.sweep_orphan_processes", lambda wt: [])
     monkeypatch.setattr("charlie_work.worktree.kill_orphan_pid", lambda pid: None)
 
-    config = OrchestratorConfig()
+    # Off the real host store — see test_foreign_writer_live_pid_stale_mtime_reaped.
+    config = OrchestratorConfig(
+        post_mortem=PostMortemConfig(db_path=str(tmp_path / "no-such-sessions.db"))
+    )
     state_file = tmp_path / "state.json"
 
     # Should raise — the writer is active, so dispatch is blocked.
@@ -267,12 +291,15 @@ def test_foreign_writer_reaped_event_logged(
     old_started = (datetime.now(UTC) - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
     _write_marker_with_started_at(worktree_path, 1234, "foreign-session", old_started)
 
-    monkeypatch.setattr("charlie_work.worktree.is_pid_alive", lambda pid, start: True)
+    _alive_probe(monkeypatch, 1234)
     monkeypatch.setattr("charlie_work.worktree.kill_process_tree", lambda pid, st: [pid])
     monkeypatch.setattr("charlie_work.worktree.sweep_orphan_processes", lambda wt: [])
     monkeypatch.setattr("charlie_work.worktree.kill_orphan_pid", lambda pid: None)
 
-    config = OrchestratorConfig()
+    # Off the real host store — see test_foreign_writer_live_pid_stale_mtime_reaped.
+    config = OrchestratorConfig(
+        post_mortem=PostMortemConfig(db_path=str(tmp_path / "no-such-sessions.db"))
+    )
     state_file = tmp_path / "state.json"
     save_state(state_file, empty_state())
 
@@ -317,12 +344,15 @@ def test_foreign_writer_reap_passes_process_start_time_to_kill(
         kill_calls.append((pid, start))
         return [pid]
 
-    monkeypatch.setattr("charlie_work.worktree.is_pid_alive", lambda pid, start: True)
+    _alive_probe(monkeypatch, 1234)
     monkeypatch.setattr("charlie_work.worktree.kill_process_tree", _fake_kill)
     monkeypatch.setattr("charlie_work.worktree.sweep_orphan_processes", lambda wt: [])
     monkeypatch.setattr("charlie_work.worktree.kill_orphan_pid", lambda pid: None)
 
-    config = OrchestratorConfig()
+    # Off the real host store — see test_foreign_writer_live_pid_stale_mtime_reaped.
+    config = OrchestratorConfig(
+        post_mortem=PostMortemConfig(db_path=str(tmp_path / "no-such-sessions.db"))
+    )
     state_file = tmp_path / "state.json"
 
     _check_worktree_writer_marker(
@@ -356,7 +386,7 @@ def test_foreign_writer_legacy_marker_without_start_time_not_reaped(
     )
 
     kill_calls: list[tuple[int, float | None]] = []
-    monkeypatch.setattr("charlie_work.worktree.is_pid_alive", lambda pid, start: True)
+    _alive_probe(monkeypatch, 1234)
     monkeypatch.setattr(
         "charlie_work.worktree.kill_process_tree",
         lambda pid, st: kill_calls.append((pid, st)) or [pid],
@@ -397,7 +427,7 @@ def test_check_worktree_marker_owned_session_allowed(
         encoding="utf-8",
     )
 
-    monkeypatch.setattr("charlie_work.worktree.is_pid_alive", lambda pid, start: True)
+    _alive_probe(monkeypatch, 1234)
     _check_worktree_writer_marker(worktree_path, sessions_dir)
     # Marker should not be removed when the session is owned and live.
     assert read_worktree_marker(worktree_path) is not None
@@ -432,7 +462,7 @@ def test_reap_idle_foreign_writer_own_session_not_reaped(
     )
 
     kill_calls: list[tuple[int, float | None]] = []
-    monkeypatch.setattr("charlie_work.worktree.is_pid_alive", lambda pid, start: True)
+    _alive_probe(monkeypatch, 1234)
     monkeypatch.setattr(
         "charlie_work.worktree.kill_process_tree",
         lambda pid, st: kill_calls.append((pid, st)) or [pid],
@@ -506,11 +536,14 @@ def test_reap_idle_foreign_writer_kill_noop_keeps_marker(
     monkeypatch.setattr("charlie_work.worktree.kill_process_tree", lambda pid, st: [])
     # ...and the pid is still alive with the fingerprint, so the writer is
     # genuinely still there.
-    monkeypatch.setattr("charlie_work.worktree.is_pid_alive", lambda pid, start: True)
+    _alive_probe(monkeypatch, 1234)
     monkeypatch.setattr("charlie_work.worktree.sweep_orphan_processes", lambda wt: [])
     monkeypatch.setattr("charlie_work.worktree.kill_orphan_pid", lambda pid: None)
 
-    config = OrchestratorConfig()
+    # Off the real host store — see test_foreign_writer_live_pid_stale_mtime_reaped.
+    config = OrchestratorConfig(
+        post_mortem=PostMortemConfig(db_path=str(tmp_path / "no-such-sessions.db"))
+    )
     marker = read_worktree_marker(worktree_path)
     assert marker is not None
 
@@ -541,7 +574,7 @@ def test_try_reap_blocked_foreign_writer_derives_pid_from_marker(
     _write_marker_with_started_at(worktree_path, 9999, "foreign-session", old_started)
 
     kill_calls: list[tuple[int, float | None]] = []
-    monkeypatch.setattr("charlie_work.worktree.is_pid_alive", lambda pid, start: True)
+    _alive_probe(monkeypatch, 9999)
     monkeypatch.setattr(
         "charlie_work.worktree.kill_process_tree",
         lambda pid, st: kill_calls.append((pid, st)) or [pid],
@@ -549,7 +582,10 @@ def test_try_reap_blocked_foreign_writer_derives_pid_from_marker(
     monkeypatch.setattr("charlie_work.worktree.sweep_orphan_processes", lambda wt: [])
     monkeypatch.setattr("charlie_work.worktree.kill_orphan_pid", lambda pid: None)
 
-    config = OrchestratorConfig()
+    # Off the real host store — see test_foreign_writer_live_pid_stale_mtime_reaped.
+    config = OrchestratorConfig(
+        post_mortem=PostMortemConfig(db_path=str(tmp_path / "no-such-sessions.db"))
+    )
     state_file = tmp_path / "state.json"
     state_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -664,7 +700,7 @@ def test_claim_marker_liveness_derived_from_state(
 
     # Even though the sentinel pid is "not alive", the marker is live because
     # state.json shows an active operator claim for issue 42.
-    monkeypatch.setattr("charlie_work.worktree.is_pid_alive", lambda pid, start: False)
+    _alive_probe(monkeypatch)
     with pytest.raises(WorktreeForeignWriterError) as exc_info:
         _check_worktree_writer_marker(worktree_path, sessions_dir, 42, state_file)
 
@@ -687,7 +723,7 @@ def test_claim_marker_removed_when_claim_released(
 
     write_worktree_marker(worktree_path, 0, OPERATOR_MARKER_SESSION_ID, kind=OPERATOR_MARKER_KIND)
 
-    monkeypatch.setattr("charlie_work.worktree.is_pid_alive", lambda pid, start: False)
+    _alive_probe(monkeypatch)
     _check_worktree_writer_marker(worktree_path, sessions_dir, 42, state_file)
     assert read_worktree_marker(worktree_path) is None
 

@@ -227,7 +227,7 @@ def http_etag_cache_path(state_root: Path) -> Path:
     """Return the pooled HTTP transport's ETag cache path under ``state_root``.
 
     Issue #1834: stores ``ETag``/response pairs for REST GET requests made by
-    ``github_capabilities/http_transport.py`` so a repeated call can send
+    ``github_transport/http_adapter.py`` (via ``http_cache``) so a repeated call can send
     ``If-None-Match`` and treat a ``304 Not Modified`` as a cache hit instead
     of re-transferring an unchanged body. Sibling of
     :func:`queue_sync_coverage_cache_path` -- same directory, same
@@ -361,9 +361,12 @@ def worker_tmp_dir(target_path: Path) -> Path:
 GLOBAL_CONFIG_FILENAME = "config.yaml"
 FLEET_REGISTRY_FILENAME = "fleet.json"
 FLEET_LOCK_FILENAME = "fleet.lock"
+GITHUB_BUDGET_FILENAME = "github-budget.json"
 FLEET_LOCK_HOLDER_FILENAME = "fleet.lock.holder"
 FLEET_SUPERVISOR_LOCK_FILENAME = "fleet-supervisor.lock"
 FLEET_STOP_REQUEST_FILENAME = "fleet-stop-request.json"
+FLEET_PAUSE_FILENAME = "fleet-pause.json"
+DASHBOARD_DB_FILENAME = "dashboard.db"
 NOTIFY_HEALTH_STATE_FILENAME = "notify_health_state.json"
 CAPACITY_STARVATION_STATE_FILENAME = "capacity_starvation_state.json"
 CONFIG_RETIREMENT_STATE_FILENAME = "config_retirement_state.json"
@@ -421,6 +424,12 @@ def fleet_registry_path(override: str | None = None) -> Path:
     return fleet_dir(override=override) / FLEET_REGISTRY_FILENAME
 
 
+def github_budget_path(override: str | None = None) -> Path:
+    """The observed-GitHub-budget snapshot every client and process on this
+    host shares (issue #2442): a per-token rate-limit window, not per-repo state."""
+    return fleet_dir(override=override) / GITHUB_BUDGET_FILENAME
+
+
 def fleet_lock_path(override: str | None = None) -> Path:
     """Return the fleet-wide dispatch lock path in the fleet dir."""
     return fleet_dir(override=override) / FLEET_LOCK_FILENAME
@@ -454,6 +463,28 @@ def fleet_stop_request_path(override: str | None = None) -> Path:
     writer and both readers agree on the name (issue #1716).
     """
     return fleet_dir(override=override) / FLEET_STOP_REQUEST_FILENAME
+
+
+def fleet_pause_path(override: str | None = None) -> Path:
+    """Return the persistent fleet pause flag path in the fleet dir.
+
+    ``charlie fleet pause`` writes this file and ``charlie fleet resume``
+    removes it. Unlike the one-shot stop marker it is never consumed by the
+    supervisor: the supervisor reads it between passes and
+    ``scripts/fleet-pass.ps1`` refuses to launch while it exists (issue #1776).
+    The launcher hardcodes the filename (no Python has run yet); the test
+    suite pins the two together.
+    """
+    return fleet_dir(override=override) / FLEET_PAUSE_FILENAME
+
+
+def dashboard_db_path(override: str | None = None) -> Path:
+    """Return the dashboard's derived SQLite cache path in the fleet dir (ADR-0008).
+
+    ``charlie dashboard`` is the only writer. The file is a rebuildable cache of
+    read-only fleet sources, so deleting it loses nothing.
+    """
+    return fleet_dir(override=override) / DASHBOARD_DB_FILENAME
 
 
 def notify_health_state_path(override: str | None = None) -> Path:

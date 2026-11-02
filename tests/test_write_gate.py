@@ -257,8 +257,8 @@ def test_transition_dry_run_false_passes_through(monkeypatch: pytest.MonkeyPatch
     calls = []
     expected = TransitionResult(TransitionOutcome.APPLIED, [], [])
 
-    def fake_transition(gh, labels, issue_number, event):
-        calls.append((gh, labels, issue_number, event))
+    def fake_transition(gh, labels, issue_number, event, **kwargs):
+        calls.append((gh, labels, issue_number, event, kwargs))
         return expected
 
     monkeypatch.setattr(write_gate, "transition", fake_transition)
@@ -266,7 +266,15 @@ def test_transition_dry_run_false_passes_through(monkeypatch: pytest.MonkeyPatch
     gh_sentinel = object()
     labels_sentinel = object()
     result = gate.transition(gh_sentinel, labels_sentinel, 123, "escalated")
-    assert calls == [(gh_sentinel, labels_sentinel, 123, "escalated")]
+    assert calls == [
+        (
+            gh_sentinel,
+            labels_sentinel,
+            123,
+            "escalated",
+            {"state_path": STATE_PATH, "repo": REPO, "pr_number": None, "cause": None},
+        )
+    ]
     assert result is expected
 
 

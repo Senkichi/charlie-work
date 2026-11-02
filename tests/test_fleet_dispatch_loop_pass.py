@@ -27,7 +27,7 @@ from charlie_work.fleet_dispatch import fleet_loop
 from charlie_work.instrumentation import query_events
 from ci_fleet.runner_allocation import AllocationPlan
 from ci_fleet.runner_allocation_pass import AllocationPassResult
-from charlie_work.workflow import CommandResult
+from charlie_work.command_result import CommandResult
 
 
 @patch("charlie_work.fleet_dispatch.emit_digest")

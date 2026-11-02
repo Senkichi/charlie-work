@@ -16,7 +16,7 @@ from charlie_work import cli, layout
 from charlie_work.config import NotifyConfig
 from charlie_work.notify import NotifyResult
 from charlie_work.supervise import SelfDeployResult, supervisor_runtime_paths
-from charlie_work.workflow import CommandResult
+from charlie_work.command_result import CommandResult
 
 
 def test_run_fleet_bash_rats_self_deploys_before_pass(

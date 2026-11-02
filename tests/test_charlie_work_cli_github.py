@@ -7,14 +7,25 @@ Track-1 wave 7/8).
 from __future__ import annotations
 
 import json
-import subprocess
 from pathlib import Path
 
 import pytest
 import yaml
 
+from _fake_transport import (
+    FakeAdapter,
+    graphql_ok,
+    graphql_variables,
+    make_github,
+    merge_adapter,
+    rest_sent,
+    ok,
+    sent,
+)
 from _fakes_github import FakeGitHub
 from charlie_work import cli, github as github_module
+from charlie_work.config_validation import ConfigError
+from charlie_work.github_transport import GraphQLError, GraphQLRequest, Response, RestRequest
 from charlie_work.state import load_state
 from charlie_work.workflow import OrchestratorApp
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
@@ -195,200 +206,143 @@ def test_cli_build_app_registers_repo(tmp_path: Path, monkeypatch: pytest.Monkey
     assert entry["name_with_owner"] == "owner/repo"
 
 
-def test_github_run_parses_allow_failure_json_stdout(monkeypatch, tmp_path: Path) -> None:
-    def fake_run(*args, **kwargs):
-        return subprocess.CompletedProcess(
-            args=args,
-            returncode=1,
-            stdout='[{"name": "Tests passed", "state": "FAILURE"}]',
-            stderr="checks failed",
-        )
+def test_github_run_parses_allow_failure_json_stdout(tmp_path: Path) -> None:
+    # A GraphQL reply that carries both data and errors is a failure whose body
+    # still reaches the caller (#1933): allow_failure returns it parsed.
+    partial = Response(
+        200,
+        (),
+        '{"data": {"checks": [{"name": "Tests passed", "state": "FAILURE"}]}}',
+        "http",
+        graphql_errors=(GraphQLError("checks failed", "FORBIDDEN"),),
+    )
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [partial]))
 
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    result = github_module.GitHub(tmp_path).run(
-        ["pr", "checks", "123"], json_output=True, allow_failure=True
+    result = gh.run(
+        ["api", "graphql", "-f", "query=query { viewer { login } }"],
+        json_output=True,
+        allow_failure=True,
     )
 
     # allow_failure=True now returns a structured result with an ok flag.
     assert isinstance(result, github_module.GitHubRunResult)
     assert result.ok is False
-    assert result.value == [{"name": "Tests passed", "state": "FAILURE"}]
+    assert result.value == {"data": {"checks": [{"name": "Tests passed", "state": "FAILURE"}]}}
+    (request,) = http.api_requests
+    assert isinstance(request, GraphQLRequest)
+    assert "viewer" in request.document
 
 
-def test_github_run_allow_failure_returns_result_for_success(monkeypatch, tmp_path: Path) -> None:
-    def fake_run(*args, **kwargs):
-        return subprocess.CompletedProcess(
-            args=args,
-            returncode=0,
-            stdout='{"number": 123}',
-            stderr="",
-        )
+def test_github_run_allow_failure_returns_result_for_success(tmp_path: Path) -> None:
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok({"number": 123})]))
 
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    result = github_module.GitHub(tmp_path).run(
-        ["pr", "view", "123"], json_output=True, allow_failure=True
+    result = gh.run(
+        ["api", "repos/{owner}/{repo}/pulls/123"], json_output=True, allow_failure=True
     )
 
     assert isinstance(result, github_module.GitHubRunResult)
     assert result.ok is True
     assert result.value == {"number": 123}
+    assert sent(http) == [("GET", "repos/{owner}/{repo}/pulls/123", None)]
 
 
-def test_github_run_allow_failure_text_value_on_success(monkeypatch, tmp_path: Path) -> None:
-    def fake_run(*args, **kwargs):
-        return subprocess.CompletedProcess(
-            args=args,
-            returncode=0,
-            stdout="diff text",
-            stderr="",
-        )
+def test_github_run_allow_failure_text_value_on_success(tmp_path: Path) -> None:
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok("diff text")]))
 
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    result = github_module.GitHub(tmp_path).run(["pr", "diff", "123"], allow_failure=True)
+    result = gh.run(
+        ["api", "-H", "Accept: application/vnd.github.v3.diff", "repos/{owner}/{repo}/pulls/123"],
+        allow_failure=True,
+    )
 
     assert isinstance(result, github_module.GitHubRunResult)
     assert result.ok is True
     assert result.value == "diff text"
+    assert http.api_requests[0].accept == "application/vnd.github.v3.diff"  # type: ignore[union-attr]
 
 
-def test_github_merge_pr_argv_with_merge_flags(monkeypatch, tmp_path: Path) -> None:
-    """Test that merge_flags are correctly passed to gh pr merge."""
-    captured_args = []
+def _auto_merge_transport() -> FakeAdapter:
+    """Answers the node-id read, then the auto-merge mutation."""
 
-    def fake_run(cmd, *args, **kwargs):
-        captured_args.append(cmd)
-        return subprocess.CompletedProcess(
-            args=cmd,
-            returncode=0,
-            stdout="",
-            stderr="",
-        )
+    def handler(request):
+        if request.document.lstrip().startswith("query"):
+            return graphql_ok({"repository": {"pullRequest": {"id": "PR_node_123"}}})
+        return graphql_ok({"enablePullRequestAutoMerge": {"pullRequest": {"number": 123}}})
 
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    gh = github_module.GitHub(tmp_path)
-    gh.merge_pr(123, "squash", admin=False, merge_flags=("--auto", "--subject"))
-
-    assert len(captured_args) == 1
-    args = captured_args[0]
-    # Expected: ["gh", "pr", "merge", "123", "--auto", "--subject", "--squash"]
-    assert args[0] == "gh"
-    assert args[1:4] == ["pr", "merge", "123"]
-    assert "--auto" in args
-    assert "--subject" in args
-    assert "--squash" in args
-    # Verify merge_flags come before strategy flag
-    auto_idx = args.index("--auto")
-    subject_idx = args.index("--subject")
-    squash_idx = args.index("--squash")
-    assert auto_idx < squash_idx
-    assert subject_idx < squash_idx
+    return FakeAdapter("http", handler=handler)
 
 
-def test_github_merge_pr_argv_with_admin_flag(monkeypatch, tmp_path: Path) -> None:
-    """Test that legacy admin flag is passed when merge_flags is empty."""
-    captured_args = []
+def test_github_merge_pr_argv_with_merge_flags(tmp_path: Path) -> None:
+    """``--auto`` becomes the enable-auto-merge mutation (an id read, then the
+    mutation carrying the merge method); a flag outside the closed set is a
+    config error (B8)."""
+    gh, http, _ = make_github(tmp_path, http=_auto_merge_transport())
 
-    def fake_run(cmd, *args, **kwargs):
-        captured_args.append(cmd)
-        return subprocess.CompletedProcess(
-            args=cmd,
-            returncode=0,
-            stdout="",
-            stderr="",
-        )
+    assert gh.merge_pr(123, "squash", admin=False, merge_flags=("--auto",)) == "merged #123"
 
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+    read, mutation = http.api_requests
+    assert isinstance(read, GraphQLRequest) and isinstance(mutation, GraphQLRequest)
+    assert graphql_variables(read)["number"] == 123
+    assert "enablePullRequestAutoMerge" in mutation.document
+    assert graphql_variables(mutation) == {"id": "PR_node_123", "method": "SQUASH"}
 
-    gh = github_module.GitHub(tmp_path)
+    with pytest.raises(ConfigError, match="--subject"):
+        gh.merge_pr(123, "squash", admin=False, merge_flags=("--auto", "--subject"))
+    assert len(http.api_requests) == 2  # rejected before anything was sent
+
+
+def test_github_merge_pr_argv_with_admin_flag(tmp_path: Path) -> None:
+    """The legacy admin flag selects the direct REST merge (no ``--admin`` argv)."""
+    gh, http, _ = make_github(tmp_path, http=merge_adapter(ok({"message": "merged"}), "BLOCKED"))
     gh.merge_pr(123, "squash", admin=True, merge_flags=())
 
-    assert len(captured_args) == 1
-    args = captured_args[0]
-    # Expected: ["gh", "pr", "merge", "123", "--admin", "--squash"]
-    assert args[0] == "gh"
-    assert args[1:4] == ["pr", "merge", "123"]
-    assert "--admin" in args
-    assert "--squash" in args
+    assert rest_sent(http) == [
+        ("PUT", "repos/{owner}/{repo}/pulls/123/merge", {"merge_method": "squash"})
+    ]
 
 
-def test_github_merge_pr_argv_merge_flags_precedence(monkeypatch, tmp_path: Path) -> None:
+def test_github_merge_pr_argv_merge_flags_precedence(tmp_path: Path) -> None:
     """Test that merge_flags takes precedence over admin flag.
 
     Uses a legal non-managed flag (--auto) with admin=True to ensure the
-    precedence logic is observable (the argv differs depending on which wins).
+    precedence logic is observable (the requests differ depending on which wins:
+    ``--auto`` is the GraphQL mutation, ``--admin`` the direct REST merge).
     """
-    captured_args = []
+    gh, http, _ = make_github(tmp_path, http=_auto_merge_transport())
 
-    def fake_run(cmd, *args, **kwargs):
-        captured_args.append(cmd)
-        return subprocess.CompletedProcess(
-            args=cmd,
-            returncode=0,
-            stdout="",
-            stderr="",
-        )
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    gh = github_module.GitHub(tmp_path)
     # Both admin=True and merge_flags set; merge_flags should win
     gh.merge_pr(123, "squash", admin=True, merge_flags=("--auto",))
 
-    assert len(captured_args) == 1
-    args = captured_args[0]
-    # Expected: ["gh", "pr", "merge", "123", "--auto", "--squash"]
-    # merge_flags wins, so --auto is present and --admin is NOT present
-    assert "--auto" in args
-    assert "--admin" not in args
-    assert "--squash" in args
-    # Verify exact order: merge_flags before strategy flag
-    auto_idx = args.index("--auto")
-    squash_idx = args.index("--squash")
-    assert auto_idx < squash_idx
+    assert not [r for r in http.api_requests if isinstance(r, RestRequest)]  # no REST PUT
+    assert all(isinstance(r, GraphQLRequest) for r in http.api_requests)
+    assert "enablePullRequestAutoMerge" in http.api_requests[-1].document  # type: ignore[union-attr]
+    assert graphql_variables(http.api_requests[-1])["method"] == "SQUASH"
 
 
 def test_github_merge_pr_flags_are_orchestrator_managed(monkeypatch, tmp_path: Path) -> None:
-    """Invariant: every flag merge_pr appends is in ORCHESTRATOR_MANAGED_MERGE_FLAGS.
+    """Invariant: every flag merge_pr maps is in ORCHESTRATOR_MANAGED_MERGE_FLAGS.
 
     This gate ensures that removing a flag from the constant derivation fails tests
-    on BOTH the validation side (config.py) and the argv side (merge_pr), preventing
+    on BOTH the validation side (config.py) and the request side (merge_pr), preventing
     the drift issue #107 where merge_pr could add flags without config validation
-    rejecting them.
+    rejecting them. The REST merge carries the strategy as ``merge_method``; the
+    strategy flag it stands for must stay in the managed set.
     """
-    captured_args = []
+    strategies = {"merge": "--merge", "squash": "--squash", "rebase": "--rebase"}
 
-    def fake_run(cmd, *args, **kwargs):
-        captured_args.append(cmd)
-        return subprocess.CompletedProcess(
-            args=cmd,
-            returncode=0,
-            stdout="",
-            stderr="",
-        )
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    gh = github_module.GitHub(tmp_path)
-    strategies = ["merge", "squash", "rebase"]
-
-    for strategy in strategies:
+    for strategy, strategy_flag in strategies.items():
         for admin in (False, True):
-            captured_args.clear()
+            gh, http, _ = make_github(tmp_path, http=merge_adapter(ok({"message": "merged"})))
             gh.merge_pr(123, strategy, admin=admin, merge_flags=())
 
-            assert len(captured_args) == 1
-            args = captured_args[0]
-
-            # Extract flags (skip "gh", "pr", "merge", and the PR number)
-            flags = [arg for arg in args if arg.startswith("--")]
-
-            # Every flag merge_pr appends must be in ORCHESTRATOR_MANAGED_MERGE_FLAGS
-            for flag in flags:
+            (call,) = rest_sent(http)
+            assert call == (
+                "PUT",
+                "repos/{owner}/{repo}/pulls/123/merge",
+                {"merge_method": strategy},
+            )
+            # Every flag merge_pr stands for must be in ORCHESTRATOR_MANAGED_MERGE_FLAGS
+            for flag in (strategy_flag, *(["--admin"] if admin else [])):
                 assert flag in github_module.ORCHESTRATOR_MANAGED_MERGE_FLAGS, (
-                    f"Flag {flag} appended by merge_pr(strategy={strategy}, admin={admin}) "
+                    f"Flag {flag} used by merge_pr(strategy={strategy}, admin={admin}) "
                     f"is not in ORCHESTRATOR_MANAGED_MERGE_FLAGS"
                 )

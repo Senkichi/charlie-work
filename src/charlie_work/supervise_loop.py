@@ -81,6 +81,16 @@ EXIT_RESTART_REQUESTED = 3
 # self-deploy boundary exactly as documented above.
 PREFLIGHT_REFUSAL_EXIT_CODE = 4
 
+# The supervisor's exit code meaning "an operator pause flag
+# (``fleet-pause.json``) was honored between passes; do not relaunch me"
+# (issue #1776). Distinct from 0 (other clean stops), 1 (crash), 3
+# (EXIT_RESTART_REQUESTED) and 4 (preflight refusal). Like those it is a
+# cross-version wire contract: the heartbeat's ``exit_code`` and the launcher
+# log carry it, and a stale wrapper must read it as "do not relaunch" (any value
+# other than EXIT_RESTART_REQUESTED does). NEVER renumber it, and never reuse
+# another constant's value.
+EXIT_FLEET_PAUSED = 5
+
 # Chosen to be generous relative to the real event (a self-deploy chain is
 # normally one restart) while still bounding a pathological loop to well under
 # the 5-minute tick it must not starve.

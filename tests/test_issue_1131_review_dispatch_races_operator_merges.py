@@ -34,7 +34,8 @@ from typing import Any
 from charlie_work.config import OrchestratorConfig, ReviewDispatchConfig
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state, state_lock
-from charlie_work.workflow import CommandResult, OrchestratorApp
+from charlie_work.command_result import CommandResult
+from charlie_work.workflow import OrchestratorApp
 
 from _fakes_github import FakeGitHub
 

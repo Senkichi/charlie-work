@@ -1,0 +1,3 @@
+warning
+# Issue #2124: a wide suite gave up waiting for a host test slot (exit 75).
+# Warning: starvation means the slot budget is too small or a holder is wedged.

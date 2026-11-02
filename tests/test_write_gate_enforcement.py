@@ -246,6 +246,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from _src_ast import parsed, source_files, source_text
 
 from charlie_work.ratchet_baseline import BaselineFormatError, load_count_baseline
 
@@ -272,6 +273,7 @@ _GATED_PRIMITIVE_NAMES = {
     "record_event",
     "log_event",
     "transition",
+    "apply_issue_labels",
     "kill_orphan_pid",
     "kill_process",
 }
@@ -657,15 +659,27 @@ def _scan_gated_mutator_layer(root: Path) -> list[_RawPrimitiveSite]:
     """Walk every `.py` module under `root` (dynamically discovered, no
     hardcoded module list); return every raw (un-gated) call to a gated
     primitive outside write_gate.py and the primitives' own defining
-    modules."""
+    modules.
+
+    `parsed()` is gated on a `source_text()` pre-filter -- the same
+    convention as the #2422/#2431/#2498/#2500 sibling scans. Every site the
+    walk can report resolves to a gated-primitive name either directly (a
+    `Name`/`Attribute` carrying the literal name) or through an issue-#1374
+    alias whose definition (`emit=log_event`, `_LOG = log_event`) spells
+    the primitive name literally in the same file's text. Either way the
+    name must appear in the source, so a file containing none of the
+    `_GATED_PRIMITIVE_NAMES` can yield no site and its parse is skipped.
+    Files that only mention a name in prose still pass the filter and are
+    still walked -- the filter can only drop files, never sites."""
     sites: list[_RawPrimitiveSite] = []
-    for path in sorted(root.rglob("*.py")):
+    for path in source_files(root):
         rel_path = path.relative_to(root).as_posix()
         if _is_exempt_module(rel_path):
             continue
-        text = path.read_text(encoding="utf-8")
+        if not any(name in source_text(path) for name in _GATED_PRIMITIVE_NAMES):
+            continue
         try:
-            tree = ast.parse(text, filename=str(path))
+            tree = parsed(path)
         except SyntaxError:
             continue
         sites.extend(_scan_module_for_raw_primitive_calls(tree, rel_path))
@@ -810,9 +824,9 @@ def _scan_exemption_markers(
     -> marker}}, [error message, ...])`."""
     markers: dict[str, dict[int, _ExemptionMarker]] = {}
     errors: list[str] = []
-    for path in sorted(root.rglob("*.py")):
+    for path in source_files(root):
         rel_path = path.relative_to(root).as_posix()
-        text = path.read_text(encoding="utf-8")
+        text = source_text(path)
         module_markers, module_errors = _scan_text_for_markers(text, path=rel_path)
         errors.extend(module_errors)
         if module_markers:
@@ -1523,7 +1537,41 @@ def test_scanner_assigns_distinct_occurrences_to_identical_alias_calls() -> None
     assert len({s.key for s in sites}) == 2
 
 
-def test_real_pr2_pr3_converted_sites_are_not_flagged() -> None:
+@pytest.fixture(scope="module")
+def _whole_tree_scan() -> tuple[
+    list[_RawPrimitiveSite], dict[str, dict[int, _ExemptionMarker]], list[str]
+]:
+    """Own the tree-wide write-gate scan so the measured call stays the assertion.
+
+    The three real-tree tests below (`test_real_pr2_pr3_converted_sites_are_not_flagged`,
+    `test_write_gate_allowlist_entries_are_not_stale`, and the R9 keystone) each used to
+    re-run the whole-tree marker scan and/or the gated-mutator-layer scan in their own
+    call phase. The layer scan pays the per-process cold `ast.parse` of every gate-carrying
+    file under `src/charlie_work` (493 files; ~2.7 s measured on the CI runner hardware,
+    issue #2863) plus the pure-Python walk -- and whenever an impact-selected CI run
+    reaches this module before any other `_src_ast` consumer in its pytest worker, that
+    whole cost lands on the first scan consumer's call. That is what the ledger flagged
+    2.2x on `test_write_gate_allowlist_entries_are_not_stale` (issue #2881: recent median
+    3.348 s / n=10 vs baseline 1.552 s / n=283).
+
+    One module-scoped fixture computes the scan ONCE per pytest process and hands the
+    same `(sites, markers, marker_errors)` triple to every consumer: the assertions stay
+    in the tests, verbatim, while the shared scaffold charges to fixture setup where
+    `ci-fleet ledger report --section slow-fixtures` owns it (the accepted #2662/#2867/
+    #2875 remedy family). Sharing also removes the two redundant whole-tree walks a
+    module run used to pay after the first consumer warmed the parse cache.
+
+    The result is shared, read-only scan output: consumers must not mutate the lists,
+    dicts, or the `_RawPrimitiveSite`/`_ExemptionMarker` records (the same discipline as
+    `_src_ast`'s shared trees; the session-end mutation guard has no say here, so treat
+    mutation as undefined behavior).
+    """
+    markers, marker_errors = _scan_exemption_markers(_SRC_ROOT)
+    sites = _scan_gated_mutator_layer(_SRC_ROOT)
+    return sites, markers, marker_errors
+
+
+def test_real_pr2_pr3_converted_sites_are_not_flagged(_whole_tree_scan) -> None:
     """Real-code confirmation that bucket (a) fires against actual repo
     formatting, not just the synthetic fixtures above. W6 PR2 (merged as
     #1323) converted every write path in stalled_review_reap.py except
@@ -1536,7 +1584,7 @@ def test_real_pr2_pr3_converted_sites_are_not_flagged() -> None:
     if R5's completion had left a residual raw call, this module's
     unaccounted count would be nonzero."""
     module_path = _SRC_ROOT / "stalled_review_reap.py"
-    tree = ast.parse(module_path.read_text(encoding="utf-8"), filename=str(module_path))
+    tree = parsed(module_path)
     sites = _scan_module_for_raw_primitive_calls(tree, "stalled_review_reap.py")
 
     scopes_found = {s.scope for s in sites}
@@ -1544,7 +1592,7 @@ def test_real_pr2_pr3_converted_sites_are_not_flagged() -> None:
         f"unexpected raw call site outside the R4-marked scope "
         f"(R5 completion should have closed _append_sweep_events): {sites}"
     )
-    markers, marker_errors = _scan_exemption_markers(_SRC_ROOT)
+    _, markers, marker_errors = _whole_tree_scan
     assert not marker_errors, "malformed write-gate-exempt marker(s):\n" + "\n".join(marker_errors)
     exempted_keys, _ = _resolve_exemptions(sites, markers)
     non_exempted = [s for s in sites if s.key not in exempted_keys]
@@ -1554,7 +1602,7 @@ def test_real_pr2_pr3_converted_sites_are_not_flagged() -> None:
     )
 
 
-def test_write_gate_allowlist_entries_are_not_stale() -> None:
+def test_write_gate_allowlist_entries_are_not_stale(_whole_tree_scan) -> None:
     """Symmetric direction of the main enforcement check, mirroring
     test_instrumentation.py's `test_event_kind_registry_exhaustive` 'stale'
     assertion. Name kept from the pre-#1837 `_ALLOWED_RAW_PRIMITIVE_SITES`-tuple
@@ -1564,10 +1612,9 @@ def test_write_gate_allowlist_entries_are_not_stale() -> None:
     raw-primitive-call site on the line directly below it. A marker that
     matches nothing is a silent hole -- the code it was written to justify
     moved or changed, and the marker is now lying about what it covers."""
-    markers, marker_errors = _scan_exemption_markers(_SRC_ROOT)
+    sites, markers, marker_errors = _whole_tree_scan
     assert not marker_errors, "malformed write-gate-exempt marker(s):\n" + "\n".join(marker_errors)
 
-    sites = _scan_gated_mutator_layer(_SRC_ROOT)
     _, matched = _resolve_exemptions(sites, markers)
     stale = _stale_markers(markers, matched)
     assert not stale, (
@@ -1754,11 +1801,10 @@ def test_ratchet_treats_a_brand_new_module_as_baseline_zero() -> None:
 #   2. Every OUT-OF-PREDICATE module's raw-call count must not exceed its
 #      recorded tests/baselines/write_gate/ entry -- shrink or hold only.
 # ---------------------------------------------------------------------------
-def test_write_gate_no_unaccounted_raw_primitive_calls() -> None:
+def test_write_gate_no_unaccounted_raw_primitive_calls(_whole_tree_scan) -> None:
     """The PR4 keystone. Fails loudly, naming every offending site or
     module, otherwise."""
-    sites = _scan_gated_mutator_layer(_SRC_ROOT)
-    markers, marker_errors = _scan_exemption_markers(_SRC_ROOT)
+    sites, markers, marker_errors = _whole_tree_scan
     assert not marker_errors, "malformed write-gate-exempt marker(s):\n" + "\n".join(marker_errors)
     exempted_keys, _ = _resolve_exemptions(sites, markers)
 

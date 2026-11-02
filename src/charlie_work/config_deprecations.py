@@ -15,13 +15,9 @@ lazily inside ``emit_deprecated_key_reads`` for exactly that reason.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
-
-# ``fleet_supervisor_config`` is a leaf module (stdlib-only at import time),
-# so importing it here cannot cycle back through ``config.py``.
-from .fleet_supervisor_config import FLEET_SUPERVISOR_SECTION, FleetSupervisorConfig
 
 
 @dataclass(frozen=True)
@@ -29,9 +25,7 @@ class DeprecatedConfigKey:
     """One deprecated config key and the issue that retires it.
 
     ``replacement`` is ``section.key`` form (e.g. ``"dispatch.max_limit"``),
-    or ``None`` when the knob was retired without a successor -- the
-    ``dispatch.require_worker_github_token`` case, where the gate was
-    removed outright (issue #1853).
+    or ``None`` when the knob was retired without a successor.
     """
 
     section: str
@@ -45,32 +39,12 @@ class DeprecatedConfigKey:
 
 
 #: THE registry. Membership is what makes a key "deprecated"; tests and the
-#: retirement sweep read this and nothing else.
-DEPRECATED_CONFIG_KEYS: tuple[DeprecatedConfigKey, ...] = (
-    # Issue #1853 made this a no-op kept only so existing config files parse;
-    # issue #1977 removes it once the quiet window proves it is set nowhere.
-    DeprecatedConfigKey(
-        section="dispatch",
-        key="require_worker_github_token",
-        replacement=None,
-        removal_issue=1977,
-    ),
-    # Issue #1978: every ``FleetSupervisorConfig`` field is a knob relocated
-    # out of ``supervisor:`` -- deriving the entries from the dataclass keeps
-    # the registry in sync with the new section by construction instead of
-    # restating the same key list a second time. Issue #1979 removes the
-    # legacy ``supervisor.<key>`` locations once the quiet window proves the
-    # sweep sees them set nowhere.
-    *(
-        DeprecatedConfigKey(
-            section="supervisor",
-            key=f.name,
-            replacement=f"{FLEET_SUPERVISOR_SECTION}.{f.name}",
-            removal_issue=1979,
-        )
-        for f in fields(FleetSupervisorConfig)
-    ),
-)
+#: retirement sweep read this and nothing else. Empty is the resting state:
+#: issue #1979 removed the ``supervisor.<key>`` -> ``fleet_supervisor.<key>``
+#: entries (the #1978 relocation's legacy spellings) once the sweep proved
+#: them absent from every config layer of every registered repo, the same
+#: way #1977 removed ``dispatch.require_worker_github_token`` before them.
+DEPRECATED_CONFIG_KEYS: tuple[DeprecatedConfigKey, ...] = ()
 
 
 def deprecated_keys_in(data: Mapping[str, Any]) -> list[DeprecatedConfigKey]:

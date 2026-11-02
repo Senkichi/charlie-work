@@ -7,10 +7,9 @@ the ``workflow_delegation`` installer re-attaches each ``def`` onto the class.
 
 from __future__ import annotations
 
+from charlie_work.command_result import CommandResult
 from charlie_work.github import GitHubError
 from charlie_work.local_work_park import publishes_pull_requests
-
-import charlie_work.workflow as _wf
 
 
 def _label_color(self, label: str) -> str:
@@ -50,7 +49,7 @@ def _label_descriptions(self) -> dict[str, str]:
     }
 
 
-def _ensure_labels_core(self) -> _wf.CommandResult:
+def _ensure_labels_core(self) -> CommandResult:
     """Idempotent ensure of every LabelConfig-derived label on the repo.
 
     Creates/updates each label in ``self.config.labels.all`` via
@@ -78,7 +77,7 @@ def _ensure_labels_core(self) -> _wf.CommandResult:
     # probe doctor (#1706) and the PR-capability loop lanes (#1810) use,
     # not on isinstance or the ``local/`` name prefix.
     if not publishes_pull_requests(self.gh):
-        return _wf.CommandResult(
+        return CommandResult(
             True,
             "no remote label registry on this backend — nothing to ensure",
             {"labels": desired, "missing": []},
@@ -100,19 +99,19 @@ def _ensure_labels_core(self) -> _wf.CommandResult:
         }
         missing = [name for name in desired if name not in live]
     except GitHubError as exc:
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             f"labels created but verification failed: {exc}",
             {"labels": desired, "missing": None},
         )
     if missing:
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             f"bootstrap incomplete — {len(missing)} label(s) still missing: {missing}",
             {"labels": desired, "missing": missing},
         )
-    return _wf.CommandResult(True, "labels ensured", {"labels": desired, "missing": []})
+    return CommandResult(True, "labels ensured", {"labels": desired, "missing": []})
 
 
-def bootstrap_labels(self) -> _wf.CommandResult:
+def bootstrap_labels(self) -> CommandResult:
     return self._ensure_labels_core()

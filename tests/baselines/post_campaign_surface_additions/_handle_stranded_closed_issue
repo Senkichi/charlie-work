@@ -1,0 +1,8 @@
+issue #2226: converges a stranded ``request_changes`` repair whose linked
+issue is CLOSED on GitHub -- records the ``stranded_skip_closed`` marker,
+normalizes status to ``closed``, and strips active labels via the WriteGate.
+Installed from ``orchestration/state_rework_review.py``. Net-new
+OrchestratorApp member (the lane was inlined inside
+``_reroute_stranded_request_changes`` in ``state_rework_routing.py`` and was
+extracted for the #2226 file-size ratchet) added after the surface baseline
+was pinned.

@@ -39,9 +39,13 @@ from typing import Any, Sequence
 
 import charlie_work.superseded_worker_reap as superseded_worker_reap
 import charlie_work.workflow as _wf
+from charlie_work import review_interdiff as _review_interdiff
+from charlie_work.command_result import CommandResult
 from charlie_work.worker_pid_stamp import stamp_worker_process
 from charlie_work.adapters import SessionRequest
 from charlie_work.claude_code import resolve_review_effort
+import charlie_work.fleet_provider_throttle as fleet_provider_throttle
+from charlie_work import role_selection
 from charlie_work.fleet_registry import try_acquire_fleet_lock
 from charlie_work.worker_launch_gate import (
     REASON_CONCURRENCY_CAP,
@@ -50,13 +54,14 @@ from charlie_work.worker_launch_gate import (
     _launch_workers,
     issue_worker_launch_permit,
 )
-from charlie_work.github import GitHubError
+from charlie_work.github import GitHubError, label_names
 from charlie_work.review_fleet_gate import (
     fleet_review_lock,
     fleet_review_lock_deferral,
     read_fleet_review_cap,
 )
 from charlie_work.janitor import check_operator_containment, check_test_adequacy
+from charlie_work.local_approval_carry import approval_survives_head_move
 from charlie_work.labels import TransitionOutcome
 from charlie_work.local_lane import (
     LOCAL_PENDING_STATUS,
@@ -102,7 +107,7 @@ _REVIEW_STALE_CLAIM_TIMEOUT_MINUTES = 5
 # ``local_lane_stall_alarm.py`` (#1968).
 
 
-def _local_lane(self, *, now: Any = None, limit: int | None = None) -> _wf.CommandResult:
+def _local_lane(self, *, now: Any = None, limit: int | None = None) -> CommandResult:
     """One pass of the local review/merge/rework lane.
 
     Runs inside ``loop()`` after ``dispatch_reviews``. Read-only no-op on a
@@ -123,13 +128,13 @@ def _local_lane(self, *, now: Any = None, limit: int | None = None) -> _wf.Comma
     pre-drain behavior -- it only claims verdict-driven candidates.
     """
     if publishes_pull_requests(self.gh):
-        return _wf.CommandResult(
+        return CommandResult(
             True,
             "backend publishes pull requests; local lane not applicable",
             {"local": False},
         )
     if self.dry_run:
-        return _wf.CommandResult(
+        return CommandResult(
             True,
             "dry run",
             {"local": True, "dry_run": True},
@@ -149,7 +154,7 @@ def _local_lane(self, *, now: Any = None, limit: int | None = None) -> _wf.Comma
         if launches_suspended
         else self._local_dispatch_rework()
     )
-    return _wf.CommandResult(
+    return CommandResult(
         True,
         "local lane pass complete",
         {
@@ -360,6 +365,24 @@ def _local_review_packets(self) -> dict[str, Any]:
         issue_live = issue_status == "dispatch_pending" or (
             issue_status in _LIVE_DISPATCH_STATUSES and issue_number in live_sidecar_issues
         )
+        base_ref = str(record.get("baseRefName") or base_branch or "HEAD")
+        # Issue #2739: the already-landed / closed-issue terminal decisions
+        # live in ``orchestration/local_landed_finalize.py`` -- an empty
+        # three-dot diff retires the record through the gate's terminal
+        # bookkeeping instead of rebuilding a packet and re-entering the
+        # review cycle.
+        skipped = self._local_landed_or_closed_skip(
+            pr_key=pr_key,
+            record=record,
+            issue_number=issue_number,
+            issue_live=issue_live,
+            branch=branch,
+            base_ref=base_ref,
+            head=head,
+        )
+        if skipped is not None:
+            results["skipped"].append(skipped)
+            continue
         needs_build = (
             status == LOCAL_PENDING_STATUS
             or packet_head != head
@@ -382,17 +405,11 @@ def _local_review_packets(self) -> dict[str, Any]:
             # invariant the remote lane records on every verdict -- keeps the
             # approval valid across the sync merge while still re-reviewing
             # any genuinely new content (different patch-id -> rebuild).
-            decision = self._review_decision(pr_number)
-            reviewed_patch = decision.get("reviewed_patch_id")
-            live_diff = branch_diff(
+            if approval_survives_head_move(
                 self.repo_root,
                 str(record.get("baseRefName") or base_branch or "HEAD"),
                 branch,
-            )
-            if (
-                reviewed_patch
-                and live_diff is not None
-                and _wf._calculate_patch_id(live_diff) == reviewed_patch
+                self._review_decision(pr_number),
             ):
                 needs_build = False
         if not needs_build or issue_live:
@@ -501,8 +518,16 @@ def _local_build_packet(
         )
     attachment_budget_section = self._build_attachment_budget_section(diff, pr_number)
     existing_decision = self._review_decision(pr_number)
-    prior_review_section = self._build_prior_review_section(pr_dir, existing_decision, head)
-
+    # Same round-2 gate as the remote builder (workflow.py ``review()``): a
+    # never-reviewed packet has no prior review to render or measure.
+    prior_review_section = (
+        self._build_prior_review_section(pr_dir, existing_decision, head)
+        if _review_interdiff.is_round2_review(existing_decision)
+        else ""
+    )
+    round_facts = _review_interdiff.packet_round_facts(
+        pr_dir, existing_decision, head, cfg=self.config.review_dispatch
+    )
     prompt = self._render(
         "review_local.md",
         {
@@ -523,6 +548,7 @@ def _local_build_packet(
             "over_cap_section": over_cap_section,
             "attachment_budget_section": attachment_budget_section,
             "prior_review_section": prior_review_section,
+            "incremental_review_procedure": round_facts.procedure,
         },
     )
     prompt_path.write_text(prompt, encoding="utf-8")
@@ -643,6 +669,7 @@ def _local_build_packet(
             ),
             "review_dispatch_attempt_last_head": head,
             "review_log_unreadable_streak": 0,
+            "review_api_error_streak": 0,  # issue #1808
             "review_turn_limit_miss_streak": (
                 0
                 if _fresh_dispatch_cycle
@@ -650,6 +677,8 @@ def _local_build_packet(
             ),
             "no_op_rework_attempts": 0,
             "no_op_rework_attempts_last_head": None,
+            # Issue #2837: round kind + interdiff size stamp (remote mirror).
+            **round_facts.stamp,
             "conflict_rework_attempts": 0,
             "conflict_rework_attempts_last_head": None,
         }
@@ -672,6 +701,8 @@ def _local_build_packet(
                     "review_turn_cap_structure_multiplier"
                 ],
                 "review_turn_cap_max_touched_lines": pr_json["review_turn_cap_max_touched_lines"],
+                # Issue #2837: per-packet audit mirror (as the remote lane's event).
+                **round_facts.stamp,
             },
         )
         self.write_gate.save_state(state)
@@ -682,7 +713,7 @@ def _local_build_packet(
     return {"issue": issue_number, "ok": True, "head": head, "branch": branch}
 
 
-@fleet_review_lock(lambda data: _wf.CommandResult(True, "local review dispatch pass", data))
+@fleet_review_lock(lambda data: CommandResult(True, "local review dispatch pass", data))
 def _local_dispatch_reviewers(self, *, now: Any = None, launch_lock: Any = None) -> dict[str, Any]:
     """Claim and launch reviewers for lane records whose head is packetized.
 
@@ -787,6 +818,21 @@ def _local_dispatch_reviewers(self, *, now: Any = None, launch_lock: Any = None)
 
     if not selected:
         return result
+    # Issue #2086: the reviewer role chain, resolved against the fleet ledger.
+    role_sel = role_selection.select_for_launch(self.config.reviewer.chain)
+    if role_sel.exhausted:
+        # ``result["skipped"]`` is a list of PR numbers; the chain's
+        # SkippedEntry payloads go under ``chain_skipped`` so neither clobbers
+        # the other, and the unlaunched PRs are folded in like the lock deferral.
+        chain_fields = role_sel.report_fields()
+        chain_fields["chain_skipped"] = chain_fields.pop("skipped")
+        return {
+            **result,
+            "deferred_reason": "reviewer_chain_exhausted",
+            **chain_fields,
+            "skipped": [*result["skipped"], *selected],
+        }
+    role_cfg = role_selection.reviewer_config_for(self.config, role_sel)
 
     # Issue #2084: realize the fleet lock now -- after the lock-free scan,
     # before the fleet reviewer count is read -- and hold it through
@@ -812,11 +858,12 @@ def _local_dispatch_reviewers(self, *, now: Any = None, launch_lock: Any = None)
             record = state["prs"].get(str(pr_number), {})
             attempt_count = int(record.get("review_dispatch_attempt_count", 0))
             review_effort_used, review_effort_arm = resolve_review_effort(
-                pr_number, self.config.reviewer, self.config.claude_code
+                pr_number, role_cfg.reviewer, self.config.claude_code
             )
             resolved_efforts[pr_number] = review_effort_used
+            # Issue #2837: smaller base budget for an incremental round.
             resolved_cap = _wf.resolve_review_turn_cap(
-                cfg.review_max_turns,
+                _review_interdiff.base_turn_cap(record, cfg),
                 self._read_packet_turn_cap_multiplier(pr_number),
                 int(record.get("review_turn_limit_miss_streak", 0)),
                 cfg,
@@ -845,13 +892,14 @@ def _local_dispatch_reviewers(self, *, now: Any = None, launch_lock: Any = None)
                 "pr_numbers": selected,
                 "count": len(selected),
                 "local": True,
+                # Issue #2837: round kinds for the incrementality measurement.
+                "review_round_kinds": _review_interdiff.round_kinds_for(state["prs"], selected),
             },
         )
         self.write_gate.save_state(state)
 
-    reviewer_harness = self.config.reviewer.harness
+    reviewer_harness = role_cfg.reviewer.harness
     reviewer_adapter_settings = self._adapter_settings(adapter=reviewer_harness)
-    reviewer_launcher = _wf._REVIEW_LAUNCHERS.get(reviewer_harness)
     launched: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
     quota_hit = False
@@ -874,16 +922,9 @@ def _local_dispatch_reviewers(self, *, now: Any = None, launch_lock: Any = None)
             if not head_sha:
                 failed.append({"pr": pr_number, "error": "packet head missing"})
                 continue
-            if reviewer_launcher is None:
-                failed.append(
-                    {
-                        "pr": pr_number,
-                        "error": f"unsupported reviewer harness: {reviewer_harness!r}",
-                    }
-                )
-                continue
             prompt_text = prompt_path.read_text(encoding="utf-8")
-            launch_record = reviewer_launcher(
+            launch_record = self.host.launch.launch(
+                reviewer_harness,
                 pr_number=pr_number,
                 branch=branch,
                 prompt_path=prompt_path,
@@ -891,12 +932,12 @@ def _local_dispatch_reviewers(self, *, now: Any = None, launch_lock: Any = None)
                 head_sha=head_sha,
                 repo_root=self.repo_root,
                 reviews_dir=reviews_dir,
-                config=self.config,
+                config=role_cfg,
                 worker_env=reviewer_adapter_settings.worker_env,
                 materialize_dirs=self.config.dispatch.materialize_dirs,
                 resolved_review_effort=resolved_efforts.get(pr_number),
                 max_turns_override=resolved_turn_caps.get(pr_number),
-                model_override=self.config.reviewer.model or None,
+                model_override=role_cfg.reviewer.model or None,
                 api_worker_config=reviewer_adapter_settings.api_worker_config,
             )
             if launch_record.error or launch_record.pid is None:
@@ -912,6 +953,9 @@ def _local_dispatch_reviewers(self, *, now: Any = None, launch_lock: Any = None)
                     )
                 ):
                     quota_hit = True
+                    role_selection.record_error_quota_hit(
+                        role_sel, launch_record.error, self.config, source="local_launch_quota_hit"
+                    )
                     break
                 failed.append({"pr": pr_number, "error": error_text})
             else:
@@ -925,6 +969,9 @@ def _local_dispatch_reviewers(self, *, now: Any = None, launch_lock: Any = None)
                 )
         except (OSError, GitHubError, ValueError) as exc:
             failed.append({"pr": pr_number, "error": f"{type(exc).__name__}: {exc}"})
+    role_selection.after_review_launch(
+        reviews_dir, self.write_gate, role_sel, [x["pr"] for x in launched]
+    )
 
     with _wf.state_lock(self.paths.state_file):
         state = _wf.load_state(self.paths.state_file)
@@ -999,7 +1046,7 @@ def record_local_review(
     verdict_provenance: str,
     allow_stale_head: bool = False,
     verdict_source: str | None = None,
-) -> _wf.CommandResult:
+) -> CommandResult:
     """Record a review verdict for a local-lane record (no ``pr_view``).
 
     Local mirror of ``record_review``: same decision file (``prs/pr-<n>/
@@ -1011,19 +1058,25 @@ def record_local_review(
     issue via ``issue_comment`` instead of ``pr_comment``.
     """
     if decision not in ("approved", "request_changes", "blocked"):
-        return _wf.CommandResult(False, f"invalid decision: {decision}", {})
+        return CommandResult(
+            False, f"invalid decision: {decision}", {"reason": "invalid_decision"}
+        )
     if verdict_provenance not in _wf.VERDICT_PROVENANCE_VALUES:
-        return _wf.CommandResult(False, f"invalid verdict provenance: {verdict_provenance}", {})
+        return CommandResult(
+            False,
+            f"invalid verdict provenance: {verdict_provenance}",
+            {"reason": "invalid_verdict_provenance"},
+        )
     summary_text = summary_file.read_text(encoding="utf-8") if summary_file else summary
     # Same rule as record_review: empty summary rejects, empty
     # required_changes never does -- it derives from the summary (or marks
     # the channel "vacuous") so a malformed verdict can never wedge the lane
     # in a silent re-review loop.
     if decision in {"request_changes", "blocked"} and not summary_text.strip():
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             f"--summary or --summary-file is required for decision '{decision}'",
-            {},
+            {"reason": "missing_summary"},
         )
     effective_required_changes = (
         [str(item) for item in required_changes] if required_changes else []
@@ -1049,26 +1102,31 @@ def record_local_review(
     guard_state = _wf.load_state_locked(self.paths.state_file)
     pr_state = (guard_state.get("prs") or {}).get(str(pr_number), {})
     if not is_local_pr_record(pr_state):
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             f"prs[{pr_number}] is not a local-lane record",
-            {"pr": pr_number},
+            {"pr": pr_number, "reason": "not_local_record"},
         )
     issue_number = pr_state.get("issue_number")
     issue_number = int(issue_number) if issue_number is not None else pr_number
     guard_issue_state = (guard_state.get("issues") or {}).get(str(issue_number), {})
     if pr_state.get("status") in ("merged", "closed"):
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             f"local record {pr_number} is already {pr_state.get('status')}; verdict not recorded",
-            {"pr": pr_number, "issue": issue_number, "terminal": True},
+            {
+                "pr": pr_number,
+                "issue": issue_number,
+                "reason": "pr_terminal_state",
+                "terminal": True,
+            },
         )
     if pr_state.get("status") == "escalated" or guard_issue_state.get("status") == "escalated":
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             f"local record {pr_number} is escalated; verdict not recorded "
             "(unescalate the issue first)",
-            {"pr": pr_number, "issue": issue_number, "escalated": True},
+            {"pr": pr_number, "issue": issue_number, "reason": "pr_escalated", "escalated": True},
         )
 
     # Head pinning: same packet-vs-live rule as record_review. The "live"
@@ -1084,7 +1142,7 @@ def record_local_review(
                 and live_head_sha is not None
                 and packet_head_sha != live_head_sha
             ):
-                return _wf.CommandResult(
+                return CommandResult(
                     False,
                     f"reviewed head ({reviewed_head}) matches packet head "
                     f"({packet_head_sha}) but live branch head has moved to "
@@ -1109,23 +1167,23 @@ def record_local_review(
                 options.append(f"packet head {packet_head_sha}")
             if live_head_sha is not None:
                 options.append(f"live head {live_head_sha}")
-            return _wf.CommandResult(
+            return CommandResult(
                 False,
                 f"reviewed-head {reviewed_head} does not match "
                 f"{' or '.join(options) if options else 'any available head'}",
-                {},
+                {"reason": "reviewed_head_mismatch"},
             )
     elif (
         packet_head_sha is not None
         and live_head_sha is not None
         and packet_head_sha != live_head_sha
     ):
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             f"review packet head ({packet_head_sha}) differs from live branch "
             f"head ({live_head_sha}); pass reviewed_head to choose the head "
             "the verdict applies to",
-            {},
+            {"reason": "head_moved_during_build"},
         )
     elif packet_head_sha is not None:
         reviewed_head_sha = packet_head_sha
@@ -1134,14 +1192,23 @@ def record_local_review(
         reviewed_head_sha = live_head_sha
         reviewed_head_source = "live"
     else:
-        return _wf.CommandResult(False, "no packet or live branch head available", {})
+        return CommandResult(
+            False, "no packet or live branch head available", {"reason": "no_head_available"}
+        )
 
-    diff = self._read_packet_diff(pr_number)
-    if diff is None and branch:
+    # The patch-id must describe the head the verdict is pinned to (issue
+    # #2151). The packet's diff.patch is that head's diff only when the
+    # verdict is pinned to the packet; an operator ``charlie verdict
+    # --reviewed-head <live>`` over a stale packet would otherwise record the
+    # PACKET head's patch-id against a different head, and the gate's own
+    # base-sync merge later fails the patch-id carry-forward and voids the
+    # approval. Everything else derives the diff from ``reviewed_head_sha``.
+    diff = self._read_packet_diff(pr_number) if reviewed_head_source == "packet" else None
+    if diff is None:
         diff = branch_diff(
             self.repo_root,
             str(pr_state.get("baseRefName") or local_base_branch(self.repo_root) or "HEAD"),
-            branch,
+            reviewed_head_sha,
         )
     reviewed_patch_id = _wf._calculate_patch_id(diff) if diff else ""
     reviewed_signature = (
@@ -1228,6 +1295,9 @@ def record_local_review(
         round_number = _wf._next_round_number(rounds_dir, decision_payload)
         round_dir = rounds_dir / f"round-{round_number}"
         record_decision(pr_dir, decision_payload, None)
+        # Issue #2837: archive this round's diff.patch (the live packet diff is
+        # the one this verdict was recorded against; the next packet overwrites it).
+        _review_interdiff.archive_round_diff(pr_dir, round_dir)
         if decision == "request_changes" and not escalated:
             rework_path = str(
                 self._write_rework_prompt(
@@ -1265,6 +1335,7 @@ def record_local_review(
             "reviewer_process_start_time": None,
             "review_dispatch_attempt_count": 0,
             "review_log_unreadable_streak": 0,
+            "review_api_error_streak": 0,  # issue #1808
             "review_turn_limit_miss_streak": 0,
             "review_session_metrics": (
                 session_metrics
@@ -1467,7 +1538,7 @@ def record_local_review(
         )
     if label_error:
         message += f" (label update failed: {label_error.get('outcome', label_error)})"
-    return _wf.CommandResult(
+    return CommandResult(
         True,
         message,
         {
@@ -1501,8 +1572,16 @@ def _local_dispatch_rework(self) -> dict[str, Any]:
     attachment, the base sync-merge, and the conflict notice are all
     origin-tolerant already.
     """
-    result: dict[str, Any] = {"dispatched": [], "failed": [], "skipped": []}
+    result: dict[str, Any] = {
+        "dispatched": [],
+        "failed": [],
+        "skipped": [],
+        "operator_claimed_skipped": [],
+    }
     state = _wf.load_state_locked(self.paths.state_file)
+    # Issue #400, as the remote lane applies it: ``charlie claim N`` hands the
+    # branch to the operator, so a rework worker must not launch onto it.
+    operator_claimed = _wf.operator_claimed_issues(state)
     candidates: list[int] = []
     for pr_key, record in sorted(local_pr_records(state).items(), key=lambda kv: int(kv[0])):
         issue_number = int(record.get("issue_number") or pr_key)
@@ -1515,6 +1594,9 @@ def _local_dispatch_rework(self) -> dict[str, Any]:
         # status ("dispatched"/"dispatch_pending"), so this filter alone
         # excludes it; a stale claim is recovered by the dead-worker reap.
         if issue_entry.get("status") != "rework_requested":
+            continue
+        if issue_number in operator_claimed:
+            result["operator_claimed_skipped"].append(issue_number)
             continue
         prompt_path = self.paths.prs / f"pr-{pr_key}" / "rework-prompt.md"
         if not prompt_path.exists():
@@ -1538,6 +1620,18 @@ def _local_dispatch_rework(self) -> dict[str, Any]:
             self, result, candidates, decision.reason, **decision.report_fields()
         )
     with decision as permit:
+        # Issue #1993: fleet-wide window + staggered resume for the selected
+        # worker adapter, same gate the remote dispatch/rework lanes apply.
+        resume = fleet_provider_throttle.decide_for_app(self, selection=permit.role_selection)
+        if resume.deferred:
+            return _defer_local_rework(
+                self,
+                result,
+                candidates,
+                str(resume.deferred_reason),
+                throttled_until=resume.deferral_data()["throttled_until"],
+            )
+        candidates = candidates[: resume.cap_limit(len(candidates))]
         if permit.max_launches < len(candidates):
             _defer_local_rework(
                 self,
@@ -1549,7 +1643,7 @@ def _local_dispatch_rework(self) -> dict[str, Any]:
             candidates = candidates[: permit.max_launches]
         if not candidates:
             return result
-        return _launch_local_rework(self, state, candidates, result, permit)
+        return _launch_local_rework(self, state, candidates, result, permit, resume)
 
 
 def _defer_local_rework(
@@ -1581,6 +1675,7 @@ def _launch_local_rework(
     candidates: list[int],
     result: dict[str, Any],
     permit: WorkerLaunchPermit,
+    resume: fleet_provider_throttle.ResumeDecision,
 ) -> dict[str, Any]:
     """Claim and launch the gated local rework candidates."""
     requests: list[SessionRequest] = []
@@ -1589,6 +1684,16 @@ def _launch_local_rework(
         record = (state.get("prs") or {}).get(str(pr_number), {})
         issue_number = int(record.get("issue_number") or pr_number)
         issue_entry = (state.get("issues") or {}).get(str(issue_number), {})
+        # TIS-CW-6: carry the issue's labels so a ``model:<tier>`` issue reworks
+        # on its tier, as the remote lane does. Live labels first (the local
+        # backend reads a file); the intake snapshot in state is the fallback.
+        try:
+            live_issue = self.gh.issue_view(issue_number)
+        except (GitHubError, ValueError):
+            live_issue = None
+        label_source = (
+            live_issue if isinstance(live_issue, dict) and "labels" in live_issue else issue_entry
+        )
         requests.append(
             SessionRequest(
                 issue_number=issue_number,
@@ -1596,6 +1701,7 @@ def _launch_local_rework(
                 prompt_path=self.paths.prs / f"pr-{pr_number}" / "rework-prompt.md",
                 branch_name=str(record.get("branch") or record.get("headRefName") or ""),
                 rework=True,
+                labels=tuple(sorted(label_names(label_source))),
             )
         )
         request_issues[pr_number] = issue_number
@@ -1644,6 +1750,7 @@ def _launch_local_rework(
         dispatch_results.extend(
             _launch_workers(self, permit, self._adapter_settings(), launch_requests)
         )
+        fleet_provider_throttle.note_probe_from_results(self, resume, dispatch_results)
     successful = {r.issue_number for r in dispatch_results if r.ok}
     failed_map = {
         r.issue_number: (r.error or "dispatch failed") for r in dispatch_results if not r.ok

@@ -1,0 +1,5 @@
+issue #2739: the packet phase's pre-build skip for the already-landed
+and closed-issue-with-unprovable-diff shapes -- the label-convergence
+half of the fix. Installed from
+``orchestration/local_landed_finalize.py``. Net-new OrchestratorApp
+member added after the Track 2 Phase B surface baseline was pinned.

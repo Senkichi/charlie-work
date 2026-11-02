@@ -26,6 +26,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from _dws_facts import run_reap
 
 from _local_park_fixtures import (
     _add_worktree_commit,
@@ -55,7 +56,6 @@ from charlie_work.local_work_park import (
     park_backstop_due_local_orphans,
     park_labelless_dead_local_session,
 )
-from charlie_work.orphaned_worker_sweep import maybe_reap_dead_dispatched_worker
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state
 from charlie_work.subprocess_runner import RunResult
@@ -103,7 +103,7 @@ def _worktree_gone_setup(tmp_path: Path, shallow_wts: Path, number: int, labels:
 
 
 def test_reclaim_lane_probe_failed_skips_reclaim_then_parks(
-    tmp_path: Path, shallow_wts: Path
+    tmp_path: Path, shallow_wts: Path, monkeypatch
 ) -> None:
     labels_cfg = LabelConfig()
     number = 1981
@@ -117,7 +117,13 @@ def test_reclaim_lane_probe_failed_skips_reclaim_then_parks(
 
     with _probe_error():
         _run_sweep(
-            sessions_dir, paths.state_file, config, gh, _wg(paths.state_file), tmp_path / "fleet"
+            sessions_dir,
+            paths.state_file,
+            config,
+            gh,
+            _wg(paths.state_file),
+            tmp_path / "fleet",
+            monkeypatch=monkeypatch,
         )
 
     current = _label_names(gh, number)
@@ -134,7 +140,13 @@ def test_reclaim_lane_probe_failed_skips_reclaim_then_parks(
 
     # Healthy next pass: the real diff is non-empty -> parked, counters gone.
     _run_sweep(
-        sessions_dir, paths.state_file, config, gh, _wg(paths.state_file), tmp_path / "fleet"
+        sessions_dir,
+        paths.state_file,
+        config,
+        gh,
+        _wg(paths.state_file),
+        tmp_path / "fleet",
+        monkeypatch=monkeypatch,
     )
     current = _label_names(gh, number)
     assert labels_cfg.review_ready in current
@@ -145,7 +157,7 @@ def test_reclaim_lane_probe_failed_skips_reclaim_then_parks(
 
 
 def test_reclaim_lane_probe_failure_budget_spent_reclaims_with_git_error(
-    tmp_path: Path, shallow_wts: Path
+    tmp_path: Path, shallow_wts: Path, monkeypatch
 ) -> None:
     """The cap: a deterministic probe failure cannot wedge the entry."""
     labels_cfg = LabelConfig()
@@ -165,13 +177,20 @@ def test_reclaim_lane_probe_failure_budget_spent_reclaims_with_git_error(
                 gh,
                 _wg(paths.state_file),
                 tmp_path / "fleet",
+                monkeypatch=monkeypatch,
             )
         assert labels_cfg.in_progress in _label_names(gh, number)
         assert _events(paths.state_file, "session_failed_relabeled", number) == []
 
     with _probe_error():
         _run_sweep(
-            sessions_dir, paths.state_file, config, gh, _wg(paths.state_file), tmp_path / "fleet"
+            sessions_dir,
+            paths.state_file,
+            config,
+            gh,
+            _wg(paths.state_file),
+            tmp_path / "fleet",
+            monkeypatch=monkeypatch,
         )
 
     current = _label_names(gh, number)
@@ -193,7 +212,7 @@ def test_reclaim_lane_probe_failure_budget_spent_reclaims_with_git_error(
 
 
 def test_backstop_deferral_is_bounded_and_escalation_carries_probe_error(
-    tmp_path: Path, shallow_wts: Path
+    tmp_path: Path, shallow_wts: Path, monkeypatch
 ) -> None:
     labels_cfg = LabelConfig()
     number = 1983
@@ -210,6 +229,7 @@ def test_backstop_deferral_is_bounded_and_escalation_carries_probe_error(
                 gh,
                 _wg(paths.state_file),
                 tmp_path / "fleet",
+                monkeypatch=monkeypatch,
             )
         entry = load_state(paths.state_file)["issues"][str(number)]
         assert entry["status"] == "dispatched"
@@ -220,7 +240,13 @@ def test_backstop_deferral_is_bounded_and_escalation_carries_probe_error(
 
     with _probe_error():
         _run_sweep(
-            sessions_dir, paths.state_file, config, gh, _wg(paths.state_file), tmp_path / "fleet"
+            sessions_dir,
+            paths.state_file,
+            config,
+            gh,
+            _wg(paths.state_file),
+            tmp_path / "fleet",
+            monkeypatch=monkeypatch,
         )
 
     entry = load_state(paths.state_file)["issues"][str(number)]
@@ -485,20 +511,17 @@ def test_reap_due_matches_documented_semantics(
         )
         is expected
     )
-    # The in-lock timer must agree (``max_throttle_rearms=0`` disables the
-    # bounded re-arm, which mutates the entry and is not part of the predicate).
-    _, reaped = maybe_reap_dead_dispatched_worker(
-        state=state,
-        entry=state["issues"]["42"],
-        issue_number=42,
-        sessions_dir=tmp_path,
-        pr_data=None,
-        dead_dispatched_reap_minutes=60,
+    # The sweep's decision must agree (``max_rearms=0`` disables the bounded
+    # re-arm, which mutates the entry and is not part of the predicate).
+    run = run_reap(
+        state["issues"]["42"],
+        issue=42,
+        reap_minutes=60,
+        max_rearms=0,
+        throttled_until=state.get("throttled_until"),
         now=_NOW,
-        sweep_events=[],
-        max_throttle_rearms=0,
     )
-    assert reaped is expected
+    assert run.reaped is expected
 
 
 # ---------------------------------------------------------------------------
@@ -574,7 +597,7 @@ def test_drain_rechecks_due_against_fresh_state(tmp_path: Path, shallow_wts: Pat
 
 
 def test_probe_failed_then_conclusive_verdict_clears_deferral(
-    tmp_path: Path, shallow_wts: Path
+    tmp_path: Path, shallow_wts: Path, monkeypatch
 ) -> None:
     """A conclusive verdict after a deferred probe clears the stamped budget.
 
@@ -601,6 +624,7 @@ def test_probe_failed_then_conclusive_verdict_clears_deferral(
             gh,
             _wg(paths.state_file),
             tmp_path / "fleet",
+            monkeypatch=monkeypatch,
         )
     entry = load_state(paths.state_file)["issues"][str(number)]
     assert entry["local_park_defer_count"] == 1
@@ -618,6 +642,7 @@ def test_probe_failed_then_conclusive_verdict_clears_deferral(
             gh,
             _wg(paths.state_file),
             tmp_path / "fleet",
+            monkeypatch=monkeypatch,
         )
 
     entry = load_state(paths.state_file)["issues"][str(number)]
@@ -639,4 +664,49 @@ def test_reap_due_throttle_exemption_is_not_vacuous() -> None:
     )
     assert dead_dispatched_reap_due(
         state={}, entry=entry, dead_dispatched_reap_minutes=60, now=_NOW
+    )
+
+
+@pytest.mark.parametrize(
+    ("issue_labels", "reaped"),
+    [
+        ((("ready",)), False),  # #2748: reclaim landed; queue wait is not a failure
+        ((("in-progress",)), True),  # active label present: reclaim never landed
+        ((), True),  # labels unavailable (the PR-linked arm): timer unchanged
+    ],
+)
+def test_reap_flow_skips_issue_already_reclaimed_to_ready(
+    tmp_path: Path, issue_labels: tuple[str], reaped: bool
+) -> None:
+    """Issue #2748: ``reap_flow`` itself skips a due entry whose issue's
+    labels already read ``ready`` with no active label (the reclaim-success
+    edge); with an active label present or labels unavailable the backstop
+    escalates exactly as before. The shared due predicate
+    (``dead_dispatched_reap_due``) keeps its semantics untouched -- the skip
+    is one enforcement point in ``reap_flow``."""
+    label_map = {"ready": LabelConfig().ready, "in-progress": LabelConfig().in_progress}
+    resolved_labels = [label_map[name] for name in issue_labels]
+    active = [name for name in resolved_labels if name != label_map["ready"]]
+    entry = {
+        "status": "dispatched",
+        "orphan_drift_at": _iso(_NOW - timedelta(minutes=120)),
+        "orphan_flagged_at": _iso(_NOW - timedelta(minutes=30)),
+    }
+    details = {
+        42: {"issue_labels": resolved_labels, "active_labels": active},
+    }
+    run = run_reap(entry, issue=42, reap_minutes=60, max_rearms=0, now=_NOW, issue_details=details)
+    assert run.reaped is reaped
+    if not reaped:
+        assert [kind for kind, _payload in run.events] == [], (
+            "the reclaimed-ready issue must reap nothing"
+        )
+    # The predicate itself (the park drain's due-check) still reports due for
+    # the same entry -- the disarm is reap_flow-local, not predicate-local.
+    state: dict[str, Any] = {"issues": {"42": dict(entry)}, "prs": {}}
+    assert dead_dispatched_reap_due(
+        state=state,
+        entry=state["issues"]["42"],
+        dead_dispatched_reap_minutes=60,
+        now=_NOW,
     )

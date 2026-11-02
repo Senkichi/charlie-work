@@ -68,12 +68,23 @@ from ..issue_linking import linked_issue_number
 # while none of its own members had moved yet -- mirroring ``repo_meta.py``'s
 # L05 promotion of the same import for the same reason.
 #
-# ``_LIST_LIMIT``/``_is_mutating`` also live in ``_base.py`` (Track 2, issue
+# ``_LIST_LIMIT`` also lives in ``_base.py`` (Track 2, issue
 # #1590; design doc Section 5, L06) -- see ``_base.py``'s own comment on each
 # for the full cross-cutting rationale (both are shared with ``GitHub``
 # methods that have not moved yet, so they belong in the shared base, not
 # here).
-from ._base import CapabilityCollaborator, GitHubRunResult, _is_mutating, _LIST_LIMIT
+from ..github_transport.json_read import JsonRead
+from ..github_transport.outcome import Response
+from ..github_transport.request import ACCEPT_DIFF, RestRequest
+from ._base import CapabilityCollaborator, GitHubRunResult, _LIST_LIMIT
+from ._pr_mutations import mark_ready
+from ._outcome import failure_text, is_success
+from ._send import read_json, read_result, send, send_json, send_result, send_text
+from .pr_diff_fallback import (
+    base_ref_from_rest_pr,
+    emit_unavailable_event,
+    local_pr_diff,
+)
 
 # Outbound secret guard (issue #1505): ``pr_create`` scans title+body before
 # any ``gh`` invocation -- a credential in a PR body survives deletion via
@@ -102,7 +113,16 @@ logger = logging.getLogger(__name__)
 # ``transport.py`` (Track 2, issue #1593; design doc Section 5, L09), which
 # imports them from here rather than re-deriving a second copy -- the same
 # re-export pattern already used for ``PR_CHECKS_FIELDS``/``LABEL_LIST_FIELDS``.
-PR_LIST_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,headRefOid,isCrossRepository,mergeStateStatus,mergeable,state"
+PR_LIST_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,headRefOid,isCrossRepository,mergeStateStatus,mergeable,state"
+# Issue #2443: ``PR_LIST_FIELDS`` no longer carries ``statusCheckRollup`` -- the
+# nested connection walk made the per-pass ``pr list`` the costliest GraphQL
+# read. Per-pass consumers read checks through ``pr_checks``/``pr_view``; the
+# one consumer that genuinely needs the whole open-PR rollup (the broadcast
+# ``update_open_prs`` required-check guard, which runs only after a merge) uses
+# ``pr_list_with_checks``.
+PR_LIST_WITH_CHECKS_FIELDS = PR_LIST_FIELDS.replace(
+    "reviewDecision,", "reviewDecision,statusCheckRollup,"
+)
 PR_VIEW_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,state,mergeable,additions,deletions,headRefOid,isCrossRepository,mergeStateStatus"
 
 # Moved from ``github_capabilities/_base.py`` alongside ``merged_prs_for_issue``
@@ -202,6 +222,20 @@ def _pr_number_from_url(output: str) -> int | None:
     return int(match.group(1)) if match is not None else None
 
 
+def _pr_number_from_response(outcome: Response) -> int | None:
+    """The created PR's number from the REST create response (B9).
+
+    Replaces URL parsing: the JSON body carries ``number`` directly. Never
+    raises; ``None`` when the body is not an object with an integer number.
+    """
+    try:
+        payload = outcome.json()
+    except ValueError:
+        return None
+    number = payload.get("number") if isinstance(payload, dict) else None
+    return number if isinstance(number, int) and not isinstance(number, bool) else None
+
+
 @runtime_checkable
 class PullRequestsLike(Protocol):
     """Structural interface for pull-request read/create operations."""
@@ -214,7 +248,9 @@ class PullRequestsLike(Protocol):
 
     def pr_list(self) -> list[dict[str, Any]]: ...
 
-    def pr_diff(self, number: int) -> str: ...
+    def pr_list_with_checks(self) -> list[dict[str, Any]]: ...
+
+    def pr_diff(self, number: int) -> str | None: ...
 
     def pr_commits(self, number: int) -> list[dict[str, Any]] | None: ...
 
@@ -251,10 +287,9 @@ class PullRequests(CapabilityCollaborator):
     and this module's own ``logger``; ``pr_diff``/``pr_commits``/``pr_ready``
     use ``GitHubRunResult`` (relocated to ``_base.py`` in L04 and imported
     from there, not re-derived from ``github.py``, to avoid a circular
-    import); ``pr_list``/``merged_pr_list`` use ``_LIST_LIMIT`` and
-    ``pr_ready`` uses ``_is_mutating`` (both relocated to ``_base.py`` in L06
-    because they are also used by ``GitHub`` methods that have not moved
-    yet -- see ``_base.py``'s own comments on each); ``merged_pr_list``
+    import); ``pr_list``/``merged_pr_list`` use ``_LIST_LIMIT`` (relocated to
+    ``_base.py`` in L06 because ``GitHub`` methods use it too -- see
+    ``_base.py``'s own comment); ``merged_pr_list``
     raises ``GitHubError`` (imported directly from ``ci_fleet.github``, the
     same external, identity-sensitive source ``github.py`` itself re-exports
     from -- see this module's import block); and ``merged_prs_for_issue``
@@ -318,41 +353,33 @@ class PullRequests(CapabilityCollaborator):
                 len(matches),
             )
             return None
-        result = self.run(
-            [
-                "pr",
-                "create",
-                "--head",
-                head,
-                "--base",
-                base,
-                "--title",
-                title,
-                "--body",
-                body,
-            ],
-            allow_failure=True,
+        outcome = send(
+            self,
+            RestRequest.of(
+                "POST",
+                "repos/{owner}/{repo}/pulls",
+                body={"head": head, "base": base, "title": title, "body": body},
+            ),
         )
-        if not result.ok:
+        if not is_success(outcome):
             # Logged here rather than left to the caller: the caller sees only
-            # ``None`` and cannot say whether gh was missing, unauthenticated,
-            # rejected by the API, or handed a bad flag -- the ambiguity that
-            # hid this bug.
+            # ``None`` and cannot say whether the token was missing, the API
+            # rejected the request, or the transport failed -- the ambiguity
+            # that hid the original ``--json`` bug.
             logger.warning(
-                "gh pr create failed (head=%s base=%s rc=%s): %s",
+                "pr create failed (head=%s base=%s): %s",
                 head,
                 base,
-                result.returncode,
-                (result.stderr or "").strip()[:500] or "(no stderr)",
+                failure_text(outcome).strip()[:500] or "(no detail)",
             )
             return None
-        number = _pr_number_from_url(str(result.value or ""))
+        assert isinstance(outcome, Response)
+        number = _pr_number_from_response(outcome)
         if number is None:
             logger.warning(
-                "gh pr create reported success for head=%s but no PR URL was found "
-                "in its output: %r",
+                "pr create reported success for head=%s but its response carried no PR number: %r",
                 head,
-                str(result.value or "")[:500],
+                outcome.body[:500],
             )
         return number
 
@@ -368,8 +395,9 @@ class PullRequests(CapabilityCollaborator):
         file must be readable; an unreadable file refuses rather than letting
         gh discover it. Guard skipped under ``dry_run`` -- nothing is
         written, so there is nothing to guard (``run`` itself short-circuits
-        the mutating ``gh pr edit`` under dry-run via ``_is_mutating``).
+        the mutating request under dry-run).
         """
+        body = ""  # dry-run: the transport suppresses the write, nothing reads it
         if not self.dry_run:
             try:
                 body = body_file.read_text(encoding="utf-8")
@@ -387,27 +415,44 @@ class PullRequests(CapabilityCollaborator):
                 raise GitHubError(f"pr_edit #{number}: {exc}") from exc
             if matches:
                 raise GitHubError(refusal_summary("pr_edit", matches))
-        self.run(["pr", "edit", str(number), "--body-file", str(body_file)])
+        send_text(
+            self,
+            RestRequest.of(
+                "PATCH", f"repos/{{owner}}/{{repo}}/pulls/{number}", body={"body": body}
+            ),
+        )
 
     def pr_list(self) -> list[dict[str, Any]]:
         cache_key = ("pr_list",)
         cached = self._list_cache.get(cache_key)
         if cached is not None:
             return cached
-        result = self._list_json(
-            [
-                "pr",
-                "list",
-                "--state",
-                "open",
-                "--limit",
-                str(_LIST_LIMIT),
-                "--json",
-                PR_LIST_FIELDS,
-            ],
-            limit=_LIST_LIMIT,
-            kind="open PRs",
+        read = JsonRead(
+            "pr", "list", PR_LIST_FIELDS, state="open", limit=_LIST_LIMIT, long_call=True
         )
+        result = self._list_json(read, kind="open PRs")
+        self._list_cache[cache_key] = result
+        return result
+
+    def pr_list_with_checks(self) -> list[dict[str, Any]]:
+        """Open PRs including ``statusCheckRollup`` (issue #2443).
+
+        Costlier than ``pr_list``; only for a consumer that must inspect every
+        open PR's checks at once. Cached per pass under its own key.
+        """
+        cache_key = ("pr_list_with_checks",)
+        cached = self._list_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        read = JsonRead(
+            "pr",
+            "list",
+            PR_LIST_WITH_CHECKS_FIELDS,
+            state="open",
+            limit=_LIST_LIMIT,
+            long_call=True,
+        )
+        result = self._list_json(read, kind="open PRs with checks")
         self._list_cache[cache_key] = result
         return result
 
@@ -426,16 +471,23 @@ class PullRequests(CapabilityCollaborator):
         merged: list[dict[str, Any]] = []
         max_pages = (_LIST_LIMIT // 100) + 1
         for page in range(1, max_pages + 1):
-            result = self.run(
-                [
-                    "api",
-                    f"repos/{{owner}}/{{repo}}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page={page}",
-                ],
-                json_output=True,
-                # issue #1833: up to _LIST_LIMIT (500) items across pages of
-                # 100, like _list_json's large-limit calls -- legitimately
-                # longer than the fail-fast default.
-                long_call=True,
+            result = send_json(
+                self,
+                RestRequest.of(
+                    "GET",
+                    "repos/{owner}/{repo}/pulls",
+                    query={
+                        "state": "closed",
+                        "sort": "updated",
+                        "direction": "desc",
+                        "per_page": 100,
+                        "page": page,
+                    },
+                    # issue #1833: up to _LIST_LIMIT (500) items across pages
+                    # of 100, like _list_json's large-limit calls --
+                    # legitimately longer than the fail-fast default.
+                    long_call=True,
+                ),
             )
             # run() returns None when gh exits 0 with empty stdout. A genuine
             # empty page comes back as the JSON array ``[]`` (a list), so a
@@ -476,23 +528,77 @@ class PullRequests(CapabilityCollaborator):
         list rather than filtering the wide result after the fact, so the gh
         invocation itself never requests a field it doesn't need.
         """
-        result = self.run(
-            [
-                "pr",
-                "view",
-                str(number),
-                "--json",
-                fields,
-            ],
-            json_output=True,
-        )
+        result = read_json(self, JsonRead("pr", "view", fields, number=number))
         return result if isinstance(result, dict) else {}
 
-    def pr_diff(self, number: int) -> str:
-        result = self.run(["pr", "diff", str(number)], allow_failure=True)
-        if isinstance(result, GitHubRunResult):
-            return result.value if result.ok else ""
-        return result if isinstance(result, str) else ""
+    def pr_diff(self, number: int) -> str | None:
+        """Fetch a PR's diff via the REST ``pulls/{number}`` endpoint with
+        the diff media type.
+
+        Three outcomes, deliberately distinct (issue #1807):
+
+        - a diff string, possibly ``""`` when the PR's merge-base diff is
+          *genuinely empty and was successfully fetched* -- the #1251
+          empty-diff gate relies on this exact shape to skip a zero-delta
+          PR's review dispatch;
+        - a diff string from the local-git fallback
+          (``pr_diff_fallback.local_pr_diff``): ``git fetch origin
+          pull/N/head`` + ``git diff --merge-base`` against the fetched
+          head, which survives GitHub's 300-file ``too_large`` diff cap
+          (observed on PR #2160, a 461-file mechanical ledger split) and
+          every other fetch failure;
+        - ``None`` when the remote refused or failed the fetch AND the
+          local fallback could not produce a diff either. ``None`` is NOT
+          an empty diff: a packet that treated it as one would read as a
+          zero-delta PR and skip review dispatch on every pass, forever.
+          Callers must not write a ``diff.patch`` / packet from ``None``;
+          the ``review_packet_diff_unavailable`` warning event fires here
+          (with the transport's error text) so the condition is observable.
+        """
+        result = send_result(
+            self,
+            RestRequest.of("GET", f"repos/{{owner}}/{{repo}}/pulls/{number}", accept=ACCEPT_DIFF),
+        )
+        if result.ok and isinstance(result.value, str):
+            return result.value
+        remote_error = (result.error or "").strip() or "diff fetch failed"
+        # Fallback step 1: no GraphQL -- read the baseRefName from the same
+        # REST endpoint without the diff media type, which happy-succeeds
+        # under the transport where a follow-up pr_view read raises on
+        # failure instead of returning a value.
+        base_read = send_result(
+            self,
+            RestRequest.of("GET", f"repos/{{owner}}/{{repo}}/pulls/{number}"),
+            json_output=True,
+        )
+        # Errors come back as values: ``value`` is only meaningful when the
+        # read succeeded (GitHubRunResult's own contract, issue #1807 rework).
+        base_ref = base_ref_from_rest_pr(base_read.value) if base_read.ok else None
+        if base_ref is not None:
+            local = local_pr_diff(self.repo_root, number, base_ref)
+            if local is not None:
+                logger.warning(
+                    "pr_diff #%d: remote diff failed (%s); serving the local "
+                    "git fallback vs origin/%s",
+                    number,
+                    remote_error,
+                    base_ref,
+                )
+                return local
+        fallback_note = " (local git fallback unavailable or failed)"
+        emit_unavailable_event(
+            self.repo_root,
+            getattr(self.runtime, "state_dir", None),
+            number,
+            remote_error,
+        )
+        logger.warning(
+            "pr_diff #%d unavailable: %s%s",
+            number,
+            remote_error,
+            fallback_note,
+        )
+        return None
 
     def pr_commits(self, number: int) -> list[dict[str, Any]] | None:
         """Fetch a PR's commits via the REST ``pulls/{number}/commits`` endpoint.
@@ -511,34 +617,27 @@ class PullRequests(CapabilityCollaborator):
         commits than that is outside this project's workflow. Returns
         ``None`` on failure — errors are returned as values, never raised.
         """
-        result = self.run(
-            ["api", f"repos/{{owner}}/{{repo}}/pulls/{number}/commits?per_page=100"],
+        result = send_result(
+            self,
+            RestRequest.of(
+                "GET", f"repos/{{owner}}/{{repo}}/pulls/{number}/commits", query={"per_page": 100}
+            ),
             json_output=True,
-            allow_failure=True,
         )
-        if isinstance(result, GitHubRunResult):
-            return result.value if result.ok and isinstance(result.value, list) else None
-        return result if isinstance(result, list) else None
+        return result.value if result.ok and isinstance(result.value, list) else None
 
     def pr_ready(self, number: int) -> GitHubRunResult:
-        """Mark a draft PR as ready for review via ``gh pr ready`` (issue #818).
+        """Mark a draft PR as ready for review (issue #818).
 
         Returns a structured result so callers can distinguish success from
         failure without inferring from output shape -- errors from external
         processes come back as values here, never exceptions. Dry-run mode
         returns a synthetic ok=True result (the operation would succeed if not
-        for dry-run); this mirrors ``_run_bool``'s explicit guard because
-        ``.run()`` itself returns a bare string under dry-run, not a
-        ``GitHubRunResult``.
+        for dry-run).
         """
-        args = ["pr", "ready", str(number)]
-        if self.dry_run and _is_mutating(args):
-            return GitHubRunResult(
-                ok=True, returncode=0, stdout="", stderr="", value=None, error=None
-            )
-        result = self.run(args, allow_failure=True)
-        assert isinstance(result, GitHubRunResult)
-        return result
+        # B10: a node-id read, then ``markPullRequestReadyForReview``. The guard
+        # answers the mutation with a synthetic success under dry-run.
+        return mark_ready(self, number)
 
     # Moved from ``GitHub`` verbatim (Track 2, issue #1613; design doc
     # Section 5, L06b). Its only sibling call is ``self.run(...)``; ``run`` is
@@ -563,34 +662,23 @@ class PullRequests(CapabilityCollaborator):
         The returned object's ``ok`` flag is False when the search call itself
         failed (e.g. rate limit), allowing callers to implement circuit breakers.
         """
-        query = f'"#{issue_number}"'
-        result = self.run(
-            [
-                "pr",
-                "list",
-                "--state",
-                "merged",
-                "--search",
-                query,
-                "--limit",
-                "20",
-                "--json",
-                MERGED_PR_LIST_FIELDS,
-            ],
-            json_output=True,
-            allow_failure=True,
+        read = JsonRead(
+            "pr",
+            "search",
+            MERGED_PR_LIST_FIELDS,
+            state="merged",
+            search=f'"#{issue_number}"',
+            limit=20,
         )
-        if isinstance(result, GitHubRunResult):
-            if not result.ok:
-                logger.warning(
-                    "Failed to search merged PRs for issue #%d: %s",
-                    issue_number,
-                    result.error,
-                )
-                return MergedPRSearchResult([], ok=False)
-            items = result.value if isinstance(result.value, list) else []
-        else:
-            items = result if isinstance(result, list) else []
+        result = read_result(self, read)
+        if not result.ok:
+            logger.warning(
+                "Failed to search merged PRs for issue #%d: %s",
+                issue_number,
+                result.error,
+            )
+            return MergedPRSearchResult([], ok=False)
+        items = result.value if isinstance(result.value, list) else []
 
         matched: list[dict[str, Any]] = []
         for pr in items:

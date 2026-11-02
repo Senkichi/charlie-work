@@ -29,10 +29,11 @@ owns the devin-adapter-specific cooldown policy around it.
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from . import role_quota_ledger
 from .config import OrchestratorConfig
 from .process_utils import terminal_record_proves_completion
 from .throttle_signatures import match_throttle_tail
@@ -55,6 +56,7 @@ def get_rate_limit_defer_until(
     now: datetime | None = None,
     throttle_error_markers: Sequence[str] | None = None,
     resume_margin_seconds: int = 0,
+    log_digest: Callable[[str], str] | None = None,
 ) -> str | None:
     """Return a defer-until ISO timestamp for a log tail containing a rate-limit signature.
 
@@ -91,6 +93,9 @@ def get_rate_limit_defer_until(
         log_text = log_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
+    if log_digest is not None:
+        # Same narrowing classify_failure applies (AdapterFateProfile.log_digest).
+        log_text = log_digest(log_text)
 
     tail = log_text[-2048:] if len(log_text) > 2048 else log_text
 
@@ -104,21 +109,23 @@ def get_rate_limit_defer_until(
         return None
 
     minutes = reset_minutes if reset_minutes is not None else _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES
+    cooldown = timedelta(minutes=minutes + slack_minutes, seconds=resume_margin_seconds)
+    if reset_minutes is None:
+        # No stated countdown: the default cooldown is a synthetic
+        # post-detection window, not a countdown that started at emission.
+        defer_until = now + cooldown
+    else:
+        # Issue #1997: same emission-time anchor as worker_fate.classify_for —
+        # the provider's countdown started when the log line was written, not
+        # now. max(now, ...) keeps a born-expired window a zero-length deferral
+        # rather than a negative one. Lazy import: the anchor helper now lives
+        # in worker_fate (design doc §7), and a top-level import here would
+        # cycle (worker_fate -> worker -> claude_code/devin_shell already
+        # imports this module's sibling functions).
+        from .failure_classifier import _throttle_emission_anchor
 
-    # Issue #1997: same emission-time anchor as worker_fate.classify_for —
-    # the provider's countdown started when the log line was written, not
-    # now. max(now, ...) keeps a born-expired window a zero-length deferral
-    # rather than a negative one. Lazy import: the anchor helper now lives
-    # in worker_fate (design doc §7), and a top-level import here would
-    # cycle (worker_fate -> worker -> claude_code/devin_shell already
-    # imports this module's sibling functions).
-    from .failure_classifier import _throttle_emission_anchor
-
-    emitted_at = _throttle_emission_anchor(log_path, tail, now=now, throttle_markers=markers)
-    defer_until = max(
-        now,
-        emitted_at + timedelta(minutes=minutes + slack_minutes, seconds=resume_margin_seconds),
-    )
+        emitted_at = _throttle_emission_anchor(log_path, tail, now=now, throttle_markers=markers)
+        defer_until = max(now, emitted_at + cooldown)
     return defer_until.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
@@ -231,4 +238,9 @@ def update_session_record_with_failure_classification(
 
     payload["failure_kind"] = resolved_kind
     devin_shell._write_json(sidecar_path, payload)
+    # Issue #2086: a quota/rate-limit death restricts the session's own
+    # stamped (harness, model) fleet-wide. Best-effort, never raises.
+    role_quota_ledger.record_classified_death(
+        payload, resolved_kind, throttled_until, source="devin_failure_classification"
+    )
     return resolved_kind, throttled_until

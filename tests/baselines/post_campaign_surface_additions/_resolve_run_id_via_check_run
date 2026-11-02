@@ -1,0 +1,7 @@
+issue #2540: the two-endpoint helper behind ``_enrich_checks_run_ids`` --
+``GET /repos/{owner}/{repo}/check-runs/{id}`` then
+``GET /repos/{owner}/{repo}/actions/runs?check_suite_id=<id>`` -- that
+resolves a check-run-linked check's workflow run id. Net-new
+OrchestratorApp member declared here so the member-surface conservation
+check in tests/test_workflow_delegation_l00.py subtracts it before
+comparing moved delegates against the pre-campaign total.

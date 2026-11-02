@@ -26,6 +26,7 @@ import pytest
 
 from charlie_work.adapters import SessionDispatchResult
 from charlie_work.config import DevinConfig, OrchestratorConfig, ReviewConfig, WorkerRoleConfig
+from charlie_work.host.fakes import FakeWorkerLauncher
 from charlie_work.paths import runtime_paths
 from charlie_work.state import (
     clear_escalation,
@@ -204,7 +205,7 @@ def _assert_issue_escalation_pairing(state: dict) -> None:
 
 
 def test_dispatch_non_terminal_failure_clears_stale_reason_class(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, fake_host
 ) -> None:
     """A non-terminal dispatch failure must clear both escalation fields, not
     leave a stale ``reason_class`` behind."""
@@ -224,10 +225,7 @@ def test_dispatch_non_terminal_failure_clears_stale_reason_class(
         }
         save_state(app.paths.state_file, state)
 
-    monkeypatch.setattr(
-        "charlie_work.workflow.dispatch_sessions",
-        _fake_dispatch_sessions_factory(None),
-    )
+    fake_host(worker_launch=FakeWorkerLauncher([_fake_dispatch_sessions_factory(None)]))
 
     result = app.dispatch(limit=1)
     assert result.ok is False

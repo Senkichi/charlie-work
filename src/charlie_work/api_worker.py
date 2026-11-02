@@ -20,6 +20,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from . import launch_events
 from .claude_code import ClaudeWorkerRecord, launch_claude_worker
 from .config import ApiWorkerConfig, OrchestratorConfig
 from .paths import runtime_paths
@@ -156,6 +157,11 @@ def launch_api_worker(
             directly (e.g. a test) still gets an error record rather than a
             ``KeyError``.
     """
+    # Issue #2246: shared context for the launch_failed event every error
+    # record below emits via _error_record (a pure path computation here --
+    # no event is written on the success path).
+    launch_state_path = launch_events.state_path_for(repo_root, config)
+    launch_role = "reviewer" if review else "worker"
     # Defensive re-check (config load already validates enabled+provider, but a
     # directly-constructed config or a stale registry must not raise here).
     if not api_worker_config.enabled:
@@ -164,6 +170,9 @@ def launch_api_worker(
             branch,
             sessions_dir,
             error="api_worker.enabled is false; cannot launch api worker",
+            state_path=launch_state_path,
+            role=launch_role,
+            error_class=launch_events.LAUNCH_ERR_CONFIG,
         )
     provider_name = api_worker_config.provider
     provider = api_worker_config.providers.get(provider_name)
@@ -180,6 +189,9 @@ def launch_api_worker(
             # failed; carry it so the sidecar/record identify which provider
             # was attempted (useful for triage without leaking key material).
             provider=provider_name,
+            state_path=launch_state_path,
+            role=launch_role,
+            error_class=launch_events.LAUNCH_ERR_CONFIG,
         )
 
     # Resolve the auth token from the named env var. The key VALUE never enters
@@ -197,6 +209,10 @@ def launch_api_worker(
                 f"api worker"
             ),
             provider=provider_name,
+            state_path=launch_state_path,
+            role=launch_role,
+            model=provider.model,
+            error_class=launch_events.LAUNCH_ERR_CREDENTIALS,
         )
 
     # Budget preflight (issue #1514): refuse the launch when the daily or
@@ -237,6 +253,10 @@ def launch_api_worker(
                 sessions_dir,
                 error=budget_error,
                 provider=provider_name,
+                state_path=launch_state_path,
+                role=launch_role,
+                model=provider.model,
+                error_class=launch_events.LAUNCH_ERR_BUDGET,
             )
 
     provider_env = _provider_env(provider.base_url, auth_token, provider.model)
@@ -292,6 +312,10 @@ def launch_api_worker(
             sessions_dir,
             error=f"api worker launch failed: {exc}",
             provider=provider_name,
+            state_path=launch_state_path,
+            role=launch_role,
+            model=provider.model,
+            error_class=launch_events.LAUNCH_ERR_INTERNAL,
         )
 
 
@@ -302,15 +326,21 @@ def _error_record(
     *,
     error: str,
     provider: str = "",
+    state_path: Path | None = None,
+    role: str = "worker",
+    model: str = "",
+    error_class: str = launch_events.LAUNCH_ERR_INTERNAL,
 ) -> ClaudeWorkerRecord:
     """Write an error sidecar (issue-<n>.api.json) and return the record.
 
-    Mirrors claude_code._error_record's never-raise + atomic-write contract.
-    The sidecar carries no key material: only the error string, which is
+    Mirrors claude_code._error_record's never-raise + atomic-write contract —
+    including the single ``launch_failed`` event it emits (issue #2246). The
+    sidecar carries no key material: only the error string, which is
     constructed from the env var NAME (never the value) and the provider name.
     ``provider`` is the configured provider name when known (carried through so
     the sidecar/record identify which provider was attempted); empty for the
-    disabled-config path where no provider was resolved.
+    disabled-config path where no provider was resolved. ``model`` is the
+    provider's pinned model — the role-chain entry actually tried.
     """
     from .claude_code import _error_record as _claude_error_record
 
@@ -324,6 +354,10 @@ def _error_record(
         error=error,
         adapter_kind="api",
         provider=provider,
+        state_path=state_path,
+        role=role,
+        model=model,
+        error_class=error_class,
     )
     # Write the sidecar atomically via the shared claude_code helper so the
     # error is durable even when the failure happened before launch_claude_worker

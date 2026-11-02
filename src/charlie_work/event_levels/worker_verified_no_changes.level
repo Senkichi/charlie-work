@@ -1,0 +1,3 @@
+info
+# cw#2185: a worker declared verified_no_changes (task complete, verified, no diff
+# expected); the sweep closed the issue. The sweep doing its job -- success, not anomaly.

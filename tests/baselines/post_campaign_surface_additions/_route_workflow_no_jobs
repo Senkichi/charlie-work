@@ -1,0 +1,1 @@
+issue #1681: routes a workflow_no_jobs head to rework via record_review, extracted from review() for the file-size ratchet; installed from orchestration/reap_dispatch.py. Net-new OrchestratorApp member declared here so the member-surface conservation check in tests/test_workflow_delegation_l00.py subtracts it before comparing moved delegates against the pre-campaign total (133).

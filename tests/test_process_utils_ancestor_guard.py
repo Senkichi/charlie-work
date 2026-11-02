@@ -227,15 +227,15 @@ def test_kill_process_tree_refuses_real_parent(monkeypatch: pytest.MonkeyPatch) 
 
 
 def test_self_ancestor_pids_walks_win32_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Fabricated snapshot rows: the walk must return self plus the whole chain,
-    including the final ancestor whose own ppid is absent from the snapshot —
+    """Fabricated chain rows: the walk must return self plus the whole chain,
+    including the final ancestor whose own ppid is absent from the rows —
     the same boundary ``quiesce.self_process_chain`` tests pin.
     """
     monkeypatch.setattr(_sweep.os, "name", "nt")
     monkeypatch.setattr(
         _sweep,
-        "_win32_process_ppid_snapshot",
-        lambda: {
+        "_win32_ancestor_rows",
+        lambda _pid, **_k: {
             300: _sweep._ProcRow(200),
             200: _sweep._ProcRow(100),
             100: _sweep._ProcRow(1),
@@ -245,6 +245,53 @@ def test_self_ancestor_pids_walks_win32_snapshot(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(_sweep.os, "getpid", lambda: 300)
 
     assert _sweep._self_ancestor_pids() == frozenset({300, 200, 100, 1})
+
+
+def test_self_ancestor_pids_never_enumerates_the_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #2332: the kill guard only ever consults rows on the caller's own
+    ancestor chain, so its row source must be chain-scoped. The host-wide
+    ``process_iter`` snapshot pays a ``ppid_map()`` enumeration plus a
+    handle open *per process* — seconds at a few hundred processes — on
+    every guarded kill call, while ``_win32_ancestor_rows`` pays one
+    ``ppid_map()`` enumeration per walk plus a handle open per ancestor hop
+    (issue #2362). The spy records instead of raising because
+    ``_self_ancestor_pids`` deliberately degrades on helper failure, which
+    would hide this regression."""
+    monkeypatch.setattr(_sweep.os, "name", "nt")
+    iter_calls: list[Any] = []
+
+    def spy_iter(attrs: Any = None) -> Any:
+        iter_calls.append(attrs)
+        return iter(())
+
+    monkeypatch.setattr(_pc.psutil, "process_iter", spy_iter)
+
+    result = _sweep._self_ancestor_pids()
+
+    assert os.getpid() in result
+    assert iter_calls == []
+
+
+def test_self_ancestor_pids_scopes_gather_to_own_pid_and_hop_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_self_ancestor_pids`` must hand ``_win32_ancestor_rows`` the caller's
+    own pid and the shared ``_MAX_ANCESTOR_CHAIN_HOPS`` cap — the two knobs
+    that keep the gather chain-scoped."""
+    monkeypatch.setattr(_sweep.os, "name", "nt")
+    calls: list[tuple[int, int]] = []
+
+    def spy(pid: int, *, max_hops: int) -> dict[int, _sweep._ProcRow]:
+        calls.append((pid, max_hops))
+        return {pid: _sweep._ProcRow(1)}
+
+    monkeypatch.setattr(_sweep, "_win32_ancestor_rows", spy)
+
+    _sweep._self_ancestor_pids()
+
+    assert calls == [(os.getpid(), _sweep._MAX_ANCESTOR_CHAIN_HOPS)]
 
 
 def test_self_ancestor_pids_rejects_recycled_parent_pid(
@@ -259,8 +306,8 @@ def test_self_ancestor_pids_rejects_recycled_parent_pid(
     monkeypatch.setattr(_sweep.os, "name", "nt")
     monkeypatch.setattr(
         _sweep,
-        "_win32_process_ppid_snapshot",
-        lambda: {
+        "_win32_ancestor_rows",
+        lambda _pid, **_k: {
             300: _sweep._ProcRow(200, created=5_000),
             200: _sweep._ProcRow(100, created=9_000),  # younger than its "child"
             100: _sweep._ProcRow(1, created=1_000),
@@ -279,8 +326,8 @@ def test_self_ancestor_pids_keeps_older_parent_with_stamps(
     monkeypatch.setattr(_sweep.os, "name", "nt")
     monkeypatch.setattr(
         _sweep,
-        "_win32_process_ppid_snapshot",
-        lambda: {
+        "_win32_ancestor_rows",
+        lambda _pid, **_k: {
             300: _sweep._ProcRow(200, created=5_000),
             200: _sweep._ProcRow(100, created=3_000),
             100: _sweep._ProcRow(1, created=1_000),
@@ -303,8 +350,8 @@ def test_kill_process_tree_kills_pid_that_only_recycled_an_ancestor_slot(
     monkeypatch.setattr(_sweep.os, "getpid", lambda: own_pid)
     monkeypatch.setattr(
         _sweep,
-        "_win32_process_ppid_snapshot",
-        lambda: {
+        "_win32_ancestor_rows",
+        lambda _pid, **_k: {
             own_pid: _sweep._ProcRow(recycled_pid, created=100),
             recycled_pid: _sweep._ProcRow(1, created=200),
         },
@@ -339,8 +386,8 @@ def test_kill_process_tree_refuses_older_ancestor_with_stamps(
     monkeypatch.setattr(_sweep.os, "getpid", lambda: own_pid)
     monkeypatch.setattr(
         _sweep,
-        "_win32_process_ppid_snapshot",
-        lambda: {
+        "_win32_ancestor_rows",
+        lambda _pid, **_k: {
             own_pid: _sweep._ProcRow(parent_pid, created=200.0),
             parent_pid: _sweep._ProcRow(grandparent_pid, created=100.0),
             grandparent_pid: _sweep._ProcRow(1, created=50.0),
@@ -370,8 +417,8 @@ def test_self_ancestor_pids_terminates_on_cycle(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(_sweep.os, "name", "nt")
     monkeypatch.setattr(
         _sweep,
-        "_win32_process_ppid_snapshot",
-        lambda: {5: _sweep._ProcRow(7), 7: _sweep._ProcRow(5)},
+        "_win32_ancestor_rows",
+        lambda _pid, **_k: {5: _sweep._ProcRow(7), 7: _sweep._ProcRow(5)},
     )
     monkeypatch.setattr(_sweep.os, "getpid", lambda: 5)
 
@@ -385,7 +432,7 @@ def test_self_ancestor_pids_degrades_to_self_when_snapshot_fails(
     than disabling reaping — or pretending to protect ancestors it cannot see.
     """
     monkeypatch.setattr(_sweep.os, "name", "nt")
-    monkeypatch.setattr(_sweep, "_win32_process_ppid_snapshot", lambda: {})
+    monkeypatch.setattr(_sweep, "_win32_ancestor_rows", lambda _pid, **_k: {})
     monkeypatch.setattr(_sweep.os, "getpid", lambda: 424242)
 
     assert _sweep._self_ancestor_pids() == frozenset({424242})
@@ -408,30 +455,20 @@ def test_posix_process_ppid_snapshot_parses_procfs(tmp_path: Path) -> None:
     }
 
 
-class _FakePsutilProc:
-    """Minimal ``psutil.Process`` stand-in exposing only ``.info``."""
-
-    def __init__(self, **info: Any) -> None:
-        self.info = info
-
-
 def test_win32_process_ppid_snapshot_normalizes_single_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Rows come from one ``psutil.process_iter`` pass: pid, ppid, and the
-    UTC-derived ``create_time`` (seconds, one unit for every row). An
-    unreadable creation time (``AccessDenied`` -> ``None``) yields ``created
-    is None`` so the link is kept, and a missing ppid maps to 0."""
+    """Rows come from the bulk ``cext.proc_times`` create-time map (UTC-derived
+    seconds, one unit for every row; #2372 — the ``process_iter``
+    ``create_time`` column pays a per-denied-process ``proc_info`` walk) plus
+    the bulk ppid map (#2353 — a per-row ``ppid`` column is O(n²) on Windows).
+    An unreadable creation time (``AccessDenied`` -> ``None``) yields
+    ``created is None`` so the link is kept, and a missing ppid maps to 0."""
+    monkeypatch.setattr(_pc, "_bulk_ppid_map", lambda: {7: 3, 8: 7})
     monkeypatch.setattr(
-        _pc.psutil,
-        "process_iter",
-        lambda attrs=None: iter(
-            [
-                _FakePsutilProc(pid=7, ppid=3, create_time=99.5),
-                _FakePsutilProc(pid=8, ppid=7, create_time=None),
-                _FakePsutilProc(pid=4, ppid=None, create_time=1.0),
-            ]
-        ),
+        _pc,
+        "_bulk_create_time_map",
+        lambda: {7: 99.5, 8: None, 4: 1.0},
     )
 
     assert _sweep._win32_process_ppid_snapshot() == {
@@ -447,10 +484,10 @@ def test_win32_process_ppid_snapshot_failure_returns_empty(
     """A psutil failure must yield ``{}`` so the ancestor guard degrades
     rather than raising."""
 
-    def boom(attrs: Any = None) -> Any:
+    def boom() -> Any:
         raise _pc.psutil.Error("substrate broken")
 
-    monkeypatch.setattr(_pc.psutil, "process_iter", boom)
+    monkeypatch.setattr(_pc, "_bulk_ppid_map", boom)
     assert _sweep._win32_process_ppid_snapshot() == {}
 
 
@@ -464,6 +501,7 @@ def test_win32_process_ppid_snapshot_real_rows_carry_creation_times() -> None:
     row = snapshot.get(os.getpid())
     assert row is not None, "own pid missing from the real snapshot"
     assert row.created is not None, "creation time unavailable: recycle guard is inert"
+    assert row.ppid == os.getppid(), "ppid table broken or zeroed: ancestor guard is unprotected"
     parent_row = snapshot.get(row.ppid)
     if parent_row is not None and parent_row.created is not None:
         assert parent_row.created <= row.created
@@ -572,17 +610,18 @@ def test_snapshot_spawn_oserror_degrades_without_raising(
     caplog: pytest.LogCaptureFixture,
     exc_type: type[OSError],
 ) -> None:
-    """A spawn-level ``OSError`` (e.g. ``PermissionError`` from a denied
-    ``CreateProcess``) is not a ``SubprocessError`` — the snapshot must
-    return ``{}``, ``_self_ancestor_pids`` must degrade to ``{os.getpid()}``
-    with a warning, and both kill primitives must return without raising.
+    """A substrate-level ``OSError`` (e.g. ``PermissionError`` from a denied
+    ``OpenProcess`` surfacing mid-enumeration) is not a ``SubprocessError``
+    — the snapshot must return ``{}``, ``_self_ancestor_pids`` must degrade
+    to ``{os.getpid()}`` with a warning, and both kill primitives must
+    return without raising.
     """
     monkeypatch.setattr(_sweep.os, "name", "nt")
 
     def boom(*args: Any, **kwargs: Any) -> Any:
         raise exc_type("denied")
 
-    monkeypatch.setattr(_pc.psutil, "process_iter", boom)
+    monkeypatch.setattr(_pc, "_bulk_ppid_map", boom)
 
     assert _sweep._win32_process_ppid_snapshot() == {}
 
@@ -632,15 +671,15 @@ def test_snapshot_spawn_oserror_degrades_without_raising(
 def test_self_ancestor_pids_degrades_when_snapshot_raises(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """If the snapshot helper itself raises (e.g. ``Path.cwd()`` on a deleted
+    """If the row-gather helper itself raises (e.g. ``Path.cwd()`` on a deleted
     cwd), ``_self_ancestor_pids`` degrades to ``{os.getpid()}`` with a warning
     instead of propagating into the kill path."""
     monkeypatch.setattr(_sweep.os, "name", "nt")
 
-    def boom() -> dict[int, int]:
+    def boom(_pid: int, **_k: Any) -> dict[int, int]:
         raise PermissionError("cwd gone")
 
-    monkeypatch.setattr(_sweep, "_win32_process_ppid_snapshot", boom)
+    monkeypatch.setattr(_sweep, "_win32_ancestor_rows", boom)
     monkeypatch.setattr(_sweep.os, "getpid", lambda: 555)
 
     with caplog.at_level(logging.WARNING, logger="charlie_work.orphan_sweep"):

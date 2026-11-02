@@ -1,0 +1,603 @@
+"""Decision table for ``decide_merge`` (merge-path stage 4), via its public interface."""
+
+from __future__ import annotations
+
+import itertools
+from typing import Any
+
+import _merge_path_facts as mf
+import pytest
+from charlie_work.merge_path import FactNotGathered, Hold, PlanKind, decide_merge
+
+BLOCKED_GATE = mf.gate(summary_ready=False)
+FAILED = mf.summary(passed=(), failed=("Lint & Format",))
+ALL_STATUSES = (
+    None,
+    "pr_open",
+    "escalated",
+    "blocked",
+    "dispatched",
+    "dispatch_pending",
+    "manifest_written",
+    "rework_requested",
+)
+CHECK_ROUTE_EXCLUDED = (
+    "escalated",
+    "blocked",
+    "dispatched",
+    "dispatch_pending",
+    "manifest_written",
+    "rework_requested",
+)
+DEBOUNCED = mf.persisted(failed_attempts=2)  # prior + 1 >= alarm (3)
+
+
+def _conflict(**over: Any) -> Any:
+    """Readiness for an approved PR with a merge conflict and a blocked gate."""
+    base: dict[str, Any] = {
+        "gate": BLOCKED_GATE,
+        "branch": mf.branch_gate(merge_conflict=True),
+        "summary": mf.summary(passed=(), missing=mf.REQUIRED),
+    }
+    return mf.readiness(**{**base, **over})
+
+
+def _checks_failed(**over: Any) -> Any:
+    base: dict[str, Any] = {"gate": BLOCKED_GATE, "summary": FAILED}
+    return mf.readiness(**{**base, **over})
+
+
+# --------------------------------------------------------------------------- #
+# Action matrix
+# --------------------------------------------------------------------------- #
+
+
+def test_self_merge_when_no_mergequeue_label_is_configured() -> None:
+    plan = decide_merge(mf.readiness(), mf.hold_facts())
+    assert plan.kind == PlanKind.MERGE
+    assert (plan.action_merge, plan.action_hand_off, plan.action_human_merge) == (
+        True,
+        False,
+        False,
+    )
+    assert plan.read_merge_hold is False
+    assert plan.holds == frozenset()
+
+
+def test_no_action_when_the_pass_is_not_a_merge_pass() -> None:
+    plan = decide_merge(mf.readiness(), mf.hold_facts(should_merge=False))
+    assert plan.kind == PlanKind.NONE
+    assert (plan.action_merge, plan.action_hand_off) == (False, False)
+
+
+@pytest.mark.parametrize(
+    ("hold", "unavailable", "kind", "holds"),
+    [
+        pytest.param(False, False, PlanKind.HAND_OFF, frozenset(), id="free-to-hand-off"),
+        pytest.param(True, False, PlanKind.HOLD, frozenset({Hold.MERGE_HOLD}), id="merge-hold"),
+        pytest.param(
+            False,
+            True,
+            PlanKind.HOLD,
+            frozenset({Hold.MERGE_HOLD_UNAVAILABLE}),
+            id="merge-hold-read-failed",
+        ),
+    ],
+)
+def test_mergequeue_hand_off_reads_the_merge_hold(
+    hold: bool, unavailable: bool, kind: PlanKind, holds: frozenset[Hold]
+) -> None:
+    facts = mf.hold_facts(
+        config=mf.cfg(mergequeue_label=mf.LABEL),
+        merge_hold=None if unavailable else hold,
+        merge_hold_unavailable=unavailable,
+    )
+    plan = decide_merge(mf.readiness(), facts)
+    assert plan.kind == kind
+    assert plan.read_merge_hold is True
+    assert plan.action_hand_off is (kind == PlanKind.HAND_OFF)
+    assert plan.action_merge is False
+    assert plan.holds == holds
+
+
+def test_hand_off_without_the_merge_hold_fact_fails_loudly() -> None:
+    facts = mf.hold_facts(config=mf.cfg(mergequeue_label=mf.LABEL), merge_hold=None)
+    with pytest.raises(FactNotGathered):
+        decide_merge(mf.readiness(), facts)
+
+
+def test_merge_hold_is_not_needed_when_no_hand_off_can_happen() -> None:
+    facts = mf.hold_facts(config=mf.cfg(mergequeue_label=mf.LABEL), should_merge=False)
+    plan = decide_merge(mf.readiness(), facts)
+    assert (plan.read_merge_hold, plan.kind) == (False, PlanKind.NONE)
+
+
+@pytest.mark.parametrize(
+    ("reverted", "reset"),
+    [
+        pytest.param(False, True, id="fresh-hand-off-resets-counter"),
+        pytest.param(True, False, id="reapply-while-reverted-keeps-counter"),
+    ],
+)
+def test_counter_reset_on_hand_off_respects_a_reverted_label(reverted: bool, reset: bool) -> None:
+    readiness = mf.readiness(
+        branch=mf.branch_gate(admission=mf.admission(mergequeue_label_reverted=reverted))
+    )
+    facts = mf.hold_facts(config=mf.cfg(mergequeue_label=mf.LABEL), merge_hold=False)
+    assert decide_merge(readiness, facts).reset_failed_attempts_on_hand_off is reset
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        pytest.param({"gate": mf.gate(summary_ready=False)}, id="checks-not-green"),
+        pytest.param({"gate": mf.gate(sync_failed=True)}, id="sync-failed"),
+        pytest.param({"gate": mf.gate(approved=False)}, id="unapproved"),
+    ],
+)
+def test_no_merge_action_without_can_merge(over: dict[str, Any]) -> None:
+    plan = decide_merge(mf.readiness(**over), mf.hold_facts())
+    assert (plan.action_merge, plan.action_hand_off, plan.action_human_merge) == (False,) * 3
+
+
+def test_unapproved_pr_may_merge_when_approval_is_not_required() -> None:
+    gate = mf.gate(approved=False, require_approved_review=False)
+    plan = decide_merge(mf.readiness(gate=gate), mf.hold_facts())
+    assert plan.kind == PlanKind.MERGE
+
+
+# --------------------------------------------------------------------------- #
+# Holds
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        pytest.param({"pr_escalated": True}, id="pr-escalated"),
+        pytest.param({"issue_escalated": True}, id="issue-escalated"),
+    ],
+)
+def test_escalated_hold_blocks_actions_but_leaves_can_merge_intact(over: dict[str, Any]) -> None:
+    readiness = mf.readiness()
+    plan = decide_merge(readiness, mf.hold_facts(**over))
+    assert plan.kind == PlanKind.HOLD
+    assert plan.escalated_merge_hold is True
+    assert plan.holds == frozenset({Hold.ESCALATED})
+    assert (plan.action_merge, plan.action_hand_off, plan.action_human_merge) == (False,) * 3
+    # #840 / #777b: the hold must not rewrite the gate the merge_ready event reports.
+    assert plan.readiness.gate.can_merge is True
+    assert plan.readiness.gate == readiness.gate
+
+
+def test_escalation_is_not_a_merge_hold_when_the_pr_could_not_merge_anyway() -> None:
+    plan = decide_merge(mf.readiness(gate=BLOCKED_GATE), mf.hold_facts(pr_escalated=True))
+    assert plan.escalated_merge_hold is False
+    assert plan.kind == PlanKind.NONE
+
+
+def test_human_merge_label_escalates_instead_of_merging() -> None:
+    plan = decide_merge(mf.readiness(human_merge_hold=True), mf.hold_facts())
+    assert plan.kind == PlanKind.ESCALATE
+    assert plan.action_human_merge is True
+    assert (plan.action_merge, plan.action_hand_off) == (False, False)
+    assert Hold.HUMAN_MERGE in plan.holds
+
+
+def test_human_merge_hand_off_is_suppressed_while_escalated() -> None:
+    plan = decide_merge(mf.readiness(human_merge_hold=True), mf.hold_facts(issue_escalated=True))
+    assert plan.action_human_merge is False
+    assert plan.kind == PlanKind.HOLD
+    assert plan.holds == frozenset({Hold.ESCALATED, Hold.HUMAN_MERGE})
+
+
+def test_human_merge_label_outside_a_merge_pass_only_holds() -> None:
+    plan = decide_merge(mf.readiness(human_merge_hold=True), mf.hold_facts(should_merge=False))
+    assert (plan.kind, plan.action_human_merge) == (PlanKind.HOLD, False)
+
+
+def test_human_merge_label_does_not_escalate_a_pr_that_cannot_merge() -> None:
+    plan = decide_merge(mf.readiness(human_merge_hold=True, gate=BLOCKED_GATE), mf.hold_facts())
+    assert (plan.kind, plan.action_human_merge) == (PlanKind.HOLD, False)
+
+
+def test_unreadable_human_merge_labels_block_every_action() -> None:
+    plan = decide_merge(
+        mf.readiness(human_merge_check_unavailable=True),
+        mf.hold_facts(config=mf.cfg(mergequeue_label=mf.LABEL)),
+    )
+    assert plan.kind == PlanKind.HOLD
+    assert plan.holds == frozenset({Hold.HUMAN_MERGE_UNAVAILABLE})
+    assert plan.read_merge_hold is False
+
+
+def test_undetermined_revert_and_unavailable_checks_surface_as_holds() -> None:
+    plan = decide_merge(
+        mf.readiness(
+            gate=mf.gate(sync_failed=True),
+            cross_pr_revert_undetermined=True,
+            checks_unavailable=True,
+        ),
+        mf.hold_facts(),
+    )
+    assert plan.kind == PlanKind.HOLD
+    assert plan.holds == frozenset({Hold.REVERT_UNDETERMINED, Hold.CHECKS_UNAVAILABLE})
+
+
+@pytest.mark.parametrize(
+    "kind", [PlanKind.REQUEST_REWORK, PlanKind.RERUN_OR_ESCALATE], ids=["stall", "infra"]
+)
+def test_a_stage_three_terminal_kind_is_carried_through(kind: PlanKind) -> None:
+    plan = decide_merge(mf.readiness(kind=kind, gate=BLOCKED_GATE), mf.hold_facts())
+    assert plan.kind == kind
+
+
+# --------------------------------------------------------------------------- #
+# Conflict-rework route (#776) and its debounce
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("prior", "alarm", "routed"),
+    [
+        pytest.param(0, 3, False, id="first-pass"),
+        pytest.param(1, 3, False, id="second-pass"),
+        pytest.param(2, 3, True, id="prior-plus-one-reaches-alarm"),
+        pytest.param(5, 3, True, id="beyond-alarm"),
+        pytest.param(0, 1, True, id="alarm-one-routes-immediately"),
+        pytest.param(9, 0, False, id="alarm-zero-never-routes"),
+    ],
+)
+def test_conflict_route_is_debounced_by_the_failed_attempt_alarm(
+    prior: int, alarm: int, routed: bool
+) -> None:
+    facts = mf.hold_facts(
+        config=mf.cfg(failed_attempt_alarm=alarm), persisted=mf.persisted(failed_attempts=prior)
+    )
+    plan = decide_merge(_conflict(), facts)
+    assert plan.conflict_rework is routed
+    assert plan.kind == (PlanKind.REQUEST_REWORK if routed else PlanKind.NONE)
+
+
+@pytest.mark.parametrize("status", ALL_STATUSES, ids=str)
+def test_conflict_route_status_exclusions(status: str | None) -> None:
+    plan = decide_merge(_conflict(), mf.hold_facts(persisted=DEBOUNCED, issue_status=status))
+    assert plan.conflict_rework is (status not in ("manifest_written", "blocked"))
+
+
+def test_conflict_route_still_fires_for_an_escalated_issue() -> None:
+    facts = mf.hold_facts(persisted=DEBOUNCED, issue_status="escalated", issue_escalated=True)
+    assert decide_merge(_conflict(), facts).conflict_rework is True
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        pytest.param({"issue_number": None}, id="no-issue"),
+        pytest.param({"gate": mf.gate(approved=False, summary_ready=False)}, id="unapproved"),
+        pytest.param({"pending_only": True}, id="pending-only"),
+        pytest.param({"branch": mf.branch_gate(merge_conflict=False)}, id="no-conflict"),
+    ],
+)
+def test_conflict_route_preconditions(over: dict[str, Any]) -> None:
+    plan = decide_merge(_conflict(**over), mf.hold_facts(persisted=DEBOUNCED))
+    assert plan.conflict_rework is False
+
+
+def test_conflict_route_with_no_persisted_entry_counts_from_zero() -> None:
+    plan = decide_merge(_conflict(), mf.hold_facts(persisted=None))
+    assert plan.conflict_rework is False
+
+
+# --------------------------------------------------------------------------- #
+# Check-failure route
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("status", ALL_STATUSES, ids=str)
+def test_check_failure_route_status_exclusions(status: str | None) -> None:
+    plan = decide_merge(_checks_failed(), mf.hold_facts(persisted=DEBOUNCED, issue_status=status))
+    assert plan.check_failure_rework is (status not in CHECK_ROUTE_EXCLUDED)
+
+
+@pytest.mark.parametrize(
+    ("prior", "alarm", "routed"),
+    [(0, 3, False), (2, 3, True), (9, 0, False)],
+    ids=["first-pass", "debounced", "alarm-zero"],
+)
+def test_check_failure_route_debounce(prior: int, alarm: int, routed: bool) -> None:
+    facts = mf.hold_facts(
+        config=mf.cfg(failed_attempt_alarm=alarm), persisted=mf.persisted(failed_attempts=prior)
+    )
+    plan = decide_merge(_checks_failed(), facts)
+    assert (plan.check_failure_rework, plan.kind == PlanKind.REQUEST_REWORK) == (routed, routed)
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        pytest.param({"issue_number": None}, id="no-issue"),
+        pytest.param({"summary": mf.summary(passed=(), pending=mf.REQUIRED)}, id="nothing-failed"),
+        pytest.param({"branch": mf.branch_gate(merge_conflict=True)}, id="conflict-owns-it"),
+        pytest.param({"cross_pr_revert_detected": True}, id="revert-owns-it"),
+        pytest.param({"gate": mf.gate(approved=False, summary_ready=False)}, id="unapproved"),
+    ],
+)
+def test_check_failure_route_preconditions(over: dict[str, Any]) -> None:
+    plan = decide_merge(_checks_failed(**over), mf.hold_facts(persisted=DEBOUNCED))
+    assert plan.check_failure_rework is False
+
+
+# --------------------------------------------------------------------------- #
+# Exclusivity invariant
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("summary_ready", "approved", "sync_failed", "conflict", "failed", "human", "should_merge"),
+    list(itertools.product([True, False], repeat=7)),
+)
+def test_rework_routes_exclude_merge_and_hand_off_actions(
+    summary_ready: bool,
+    approved: bool,
+    sync_failed: bool,
+    conflict: bool,
+    failed: bool,
+    human: bool,
+    should_merge: bool,
+) -> None:
+    readiness = mf.readiness(
+        gate=mf.gate(summary_ready=summary_ready, approved=approved, sync_failed=sync_failed),
+        branch=mf.branch_gate(merge_conflict=conflict),
+        summary=FAILED if failed else mf.summary(),
+        human_merge_hold=human,
+    )
+    for label in (None, mf.LABEL):
+        facts = mf.hold_facts(
+            config=mf.cfg(mergequeue_label=label),
+            persisted=DEBOUNCED,
+            should_merge=should_merge,
+            merge_hold=False,
+        )
+        plan = decide_merge(readiness, facts)  # must never trip the internal assertion
+        routed = plan.conflict_rework or plan.check_failure_rework
+        acted = plan.action_merge or plan.action_hand_off or plan.action_human_merge
+        assert not (routed and acted)
+        assert not (plan.action_merge and plan.action_hand_off)
+
+
+# --------------------------------------------------------------------------- #
+# mergequeue requeue cap (issue #2743)
+# --------------------------------------------------------------------------- #
+
+REQUEUE_CFG = mf.cfg(mergequeue_label=mf.LABEL)
+
+
+def _requeue_persisted(requeues: int, head: str | None = mf.HEAD) -> Any:
+    return mf.persisted(
+        status="mergequeue",
+        mergequeue_requeues=requeues,
+        mergequeue_requeues_head_sha=head,
+    )
+
+
+def _reverted_readiness(**over: Any) -> Any:
+    """Green approved readiness whose prior queue hand-off was reverted this pass."""
+    base: dict[str, Any] = {
+        "branch": mf.branch_gate(admission=mf.admission(mergequeue_label_reverted=True))
+    }
+    return mf.readiness(**{**base, **over})
+
+
+def test_requeue_cap_blocks_the_hand_off_and_routes_to_rework() -> None:
+    """The Nth same-head queue revert refuses the re-add and routes to rework."""
+    facts = mf.hold_facts(
+        config=REQUEUE_CFG,
+        persisted=_requeue_persisted(2),  # this pass's revert is the 3rd
+        merge_hold=False,
+        issue_status="pr_open",
+        live_head_sha=mf.HEAD,
+    )
+    plan = decide_merge(_reverted_readiness(), facts)
+    assert plan.mergequeue_requeue_capped is True
+    assert plan.requeue_rework is True
+    assert plan.action_hand_off is False
+    assert plan.kind == PlanKind.REQUEST_REWORK
+    assert Hold.REQUEUE_CAPPED in plan.holds
+    assert plan.mergequeue_requeues == 3
+
+
+@pytest.mark.parametrize(
+    ("persisted_requeues", "reverted", "self_revoked", "head", "live_head", "cap", "capped"),
+    [
+        pytest.param(1, True, False, mf.HEAD, mf.HEAD, 3, False, id="below-cap"),
+        pytest.param(2, True, False, mf.HEAD, mf.HEAD, 3, True, id="revert-reaches-cap"),
+        pytest.param(3, False, False, mf.HEAD, mf.HEAD, 3, True, id="persisted-at-cap"),
+        pytest.param(3, True, False, mf.HEAD, mf.HEAD, 3, True, id="past-cap-stays-capped"),
+        pytest.param(
+            3, True, False, mf.NEW_HEAD, mf.HEAD, 3, False, id="new-head-resets-the-count"
+        ),
+        pytest.param(3, True, False, mf.HEAD, None, 3, False, id="unknown-head-not-capped"),
+        pytest.param(
+            2, True, True, mf.HEAD, mf.HEAD, 3, False, id="self-revocation-does-not-count"
+        ),
+        pytest.param(2, True, False, mf.HEAD, mf.HEAD, 0, False, id="cap-zero-disables"),
+        pytest.param(0, True, False, mf.HEAD, mf.HEAD, 1, True, id="cap-one-first-revert"),
+        pytest.param(0, False, False, None, mf.HEAD, 3, False, id="never-queued"),
+    ],
+)
+def test_requeue_cap_gate(
+    persisted_requeues: int,
+    reverted: bool,
+    self_revoked: bool,
+    head: str | None,
+    live_head: str | None,
+    cap: int,
+    capped: bool,
+) -> None:
+    readiness = mf.readiness(
+        branch=mf.branch_gate(
+            admission=mf.admission(
+                mergequeue_label_reverted=reverted, self_revoked_stale_head=self_revoked
+            )
+        )
+    )
+    facts = mf.hold_facts(
+        config=mf.cfg(mergequeue_label=mf.LABEL, mergequeue_requeue_cap=cap),
+        persisted=_requeue_persisted(persisted_requeues, head),
+        merge_hold=False,
+        issue_status="pr_open",
+        live_head_sha=live_head,
+    )
+    plan = decide_merge(readiness, facts)
+    assert plan.mergequeue_requeue_capped is capped
+    assert plan.action_hand_off is not capped
+
+
+def test_requeue_cap_without_a_mergequeue_label_never_applies() -> None:
+    """With the queue label unset the fleet self-merges; the cap is inert."""
+    facts = mf.hold_facts(
+        config=mf.cfg(mergequeue_requeue_cap=1),
+        persisted=_requeue_persisted(9),
+        live_head_sha=mf.HEAD,
+    )
+    plan = decide_merge(mf.readiness(), facts)
+    assert plan.mergequeue_requeue_capped is False
+    assert plan.action_merge is True
+
+
+def test_requeue_cap_needs_can_merge_to_count_the_revert() -> None:
+    """A same-pass check failure owns the revert (issue #823 lane) -- not the cap."""
+    facts = mf.hold_facts(
+        config=REQUEUE_CFG,
+        persisted=_requeue_persisted(2),
+        merge_hold=False,
+        live_head_sha=mf.HEAD,
+    )
+    plan = decide_merge(_reverted_readiness(gate=BLOCKED_GATE), facts)
+    assert plan.mergequeue_requeue_capped is False
+    assert plan.mergequeue_requeues == 2
+
+
+@pytest.mark.parametrize("status", ALL_STATUSES, ids=str)
+def test_requeue_route_status_exclusions(status: str | None) -> None:
+    facts = mf.hold_facts(
+        config=REQUEUE_CFG,
+        persisted=_requeue_persisted(2),
+        merge_hold=False,
+        issue_status=status,
+        live_head_sha=mf.HEAD,
+    )
+    plan = decide_merge(_reverted_readiness(), facts)
+    assert plan.mergequeue_requeue_capped is True
+    assert plan.requeue_rework is (status not in CHECK_ROUTE_EXCLUDED)
+    expected = PlanKind.REQUEST_REWORK if status not in CHECK_ROUTE_EXCLUDED else PlanKind.HOLD
+    assert plan.kind == expected
+
+
+def test_requeue_route_needs_a_linked_issue() -> None:
+    readiness = _reverted_readiness(issue_number=None)
+    facts = mf.hold_facts(
+        config=REQUEUE_CFG,
+        persisted=_requeue_persisted(2),
+        merge_hold=False,
+        live_head_sha=mf.HEAD,
+    )
+    plan = decide_merge(readiness, facts)
+    assert (plan.mergequeue_requeue_capped, plan.requeue_rework) == (True, False)
+    assert plan.kind == PlanKind.HOLD
+
+
+def test_requeue_route_defers_to_a_human_merge_hand_off() -> None:
+    """A human-merge label escalates as policy; the rework route must not also fire.
+
+    Review round 1 (issue #2743): the hold also means no re-add was attempted,
+    so the ledger stays flat and the cap does not engage under it.
+    """
+    facts = mf.hold_facts(
+        config=REQUEUE_CFG,
+        persisted=_requeue_persisted(2),
+        merge_hold=False,
+        issue_status="pr_open",
+        live_head_sha=mf.HEAD,
+    )
+    plan = decide_merge(_reverted_readiness(human_merge_hold=True), facts)
+    assert plan.action_human_merge is True
+    assert plan.requeue_rework is False
+    assert plan.mergequeue_requeue_capped is False
+    assert Hold.REQUEUE_CAPPED not in plan.holds
+    assert plan.mergequeue_requeues == 2
+
+
+def _requeue_cap_facts(**over: Any) -> Any:
+    """Hold facts for a PR one counted revert under the cap of 3."""
+    base: dict[str, Any] = {
+        "config": REQUEUE_CFG,
+        "persisted": _requeue_persisted(2),
+        "merge_hold": False,
+        "issue_status": "pr_open",
+        "live_head_sha": mf.HEAD,
+    }
+    return mf.hold_facts(**{**base, **over})
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        pytest.param({"pr_escalated": True}, id="pr-escalated"),
+        pytest.param({"issue_escalated": True}, id="issue-escalated"),
+    ],
+)
+def test_requeue_rework_requires_a_non_escalated_merge_pass(over: dict[str, Any]) -> None:
+    """Review round 1 (issue #2743): an escalated hold leaves ``can_merge``
+    intact but must neither cap the pass nor route it to rework by the queue
+    cap -- and the counter stays flat, because no re-add was attempted."""
+    plan = decide_merge(_reverted_readiness(), _requeue_cap_facts(**over))
+    assert plan.requeue_rework is False
+    assert plan.mergequeue_requeue_capped is False
+    assert Hold.REQUEUE_CAPPED not in plan.holds
+    assert plan.mergequeue_requeues == 2
+    # The escalated hold itself still holds the pass as usual.
+    assert plan.escalated_merge_hold is True
+
+
+def test_requeue_rework_requires_should_merge() -> None:
+    """Review round 1 (issue #2743): a non-merge pass is never routed to
+    rework, never capped, and never counts the reverted label."""
+    plan = decide_merge(_reverted_readiness(), _requeue_cap_facts(should_merge=False))
+    assert (plan.requeue_rework, plan.mergequeue_requeue_capped) == (False, False)
+    assert plan.mergequeue_requeues == 2
+    assert plan.kind == PlanKind.NONE
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        pytest.param({"pr_escalated": True}, id="pr-escalated"),
+        pytest.param({"issue_escalated": True}, id="issue-escalated"),
+        pytest.param({"should_merge": False}, id="not-a-merge-pass"),
+    ],
+)
+def test_requeue_cap_gates_on_a_merge_pass_even_at_the_cap(over: dict[str, Any]) -> None:
+    """The counting gate keeps the ledger flat below the cap; the verdict gate
+    is what stops a held pass from capping when its persisted count already
+    reached the cap (review round 1, issue #2743)."""
+    plan = decide_merge(
+        _reverted_readiness(), _requeue_cap_facts(persisted=_requeue_persisted(3), **over)
+    )
+    assert plan.requeue_rework is False
+    assert plan.mergequeue_requeue_capped is False
+    assert Hold.REQUEUE_CAPPED not in plan.holds
+    assert plan.mergequeue_requeues == 3
+
+
+def test_requeue_cap_still_holds_under_a_merge_hold_at_the_cap() -> None:
+    """A merge hold blocks the re-add, but the cap verdict itself stays so the
+    pass still surfaces the stuck queue budget (unchanged behaviour)."""
+    plan = decide_merge(
+        _reverted_readiness(),
+        _requeue_cap_facts(persisted=_requeue_persisted(3), merge_hold=True),
+    )
+    assert plan.mergequeue_requeues == 3
+    assert plan.mergequeue_requeue_capped is True
+    assert Hold.REQUEUE_CAPPED in plan.holds

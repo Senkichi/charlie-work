@@ -211,7 +211,9 @@ def test_attempt_salvage_records_salvaged_event(
     config = OrchestratorConfig()
     active_labels, issue_labels = _salvage_labels(config)
     gh = _SalvageTestGitHub(repo_root=tmp_path)
-    monkeypatch.setattr("charlie_work.dead_worker_reap.push_branch", lambda *a, **k: (True, None))
+    monkeypatch.setattr(
+        "charlie_work.dead_worker_sweep.effects_pr.push_branch", lambda *a, **k: (True, None)
+    )
 
     salvaged, error = _attempt_salvage(
         gh=gh,
@@ -251,7 +253,9 @@ def test_attempt_salvage_records_label_write_failure(
     config = OrchestratorConfig()
     active_labels, issue_labels = _salvage_labels(config)
     gh = _SalvageTestGitHub(repo_root=tmp_path, add_ok=False)
-    monkeypatch.setattr("charlie_work.dead_worker_reap.push_branch", lambda *a, **k: (True, None))
+    monkeypatch.setattr(
+        "charlie_work.dead_worker_sweep.effects_pr.push_branch", lambda *a, **k: (True, None)
+    )
 
     salvaged, error = _attempt_salvage(
         gh=gh,
@@ -299,8 +303,8 @@ def test_attempt_salvage_dry_run_threads_to_push_branch(
         return (True, None)
 
     # Issue #1317: push_branch is called bare-name from inside _attempt_salvage,
-    # which moved (verbatim) to dead_worker_reap.py -- patch it there.
-    monkeypatch.setattr("charlie_work.dead_worker_reap.push_branch", fake_push_branch)
+    # which lives in dead_worker_sweep/effects_pr.py -- patch it there.
+    monkeypatch.setattr("charlie_work.dead_worker_sweep.effects_pr.push_branch", fake_push_branch)
 
     salvaged, error = _attempt_salvage(
         gh=gh,

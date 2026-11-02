@@ -135,6 +135,14 @@ EXECUTION_CONTRACT_MARKERS: tuple[str, ...] = (
     "Execution contract (self-detect from your diff)",
     "run the **FULL suite** locally at the final head before pushing",
 )
+# The same contract when the test command is ``ci-fleet test``: the selector widens
+# for contract changes and runs the full suite itself when the change needs it
+# (``prompt_test_command`` renders one wording or the other). A prompt must carry
+# one of the two marker sets in full.
+SELECTION_CONTRACT_MARKERS: tuple[str, ...] = (
+    "Execution contract (selection decides scope)",
+    "runs the **FULL suite** itself whenever the change needs it",
+)
 
 
 class MissingExecutionContractError(RuntimeError):
@@ -174,7 +182,7 @@ def assert_execution_contract(prompt: str, *, context: str = "worker prompt") ->
     """
 
     missing = tuple(m for m in EXECUTION_CONTRACT_MARKERS if m not in prompt)
-    if missing:
+    if missing and any(m not in prompt for m in SELECTION_CONTRACT_MARKERS):
         raise MissingExecutionContractError(context, missing)
 
 
@@ -528,3 +536,24 @@ def prompt_template_digest(template_name: str, search_dirs: Sequence[Path] = ())
         hasher.update(b"\x00")
         hasher.update(sections[key].encode("utf-8"))
     return hasher.hexdigest()
+
+
+class PromptOverrideDriftError(RuntimeError):
+    """One or more configured prompt templates reference placeholders their
+    writer does not supply (issue #713).
+
+    Raised at supervisor startup (and asserted in CI) by
+    :func:`check_prompt_template_drift` so a repo-local flat whole-file
+    override that drifted out of sync with the orchestrator's writer -- e.g.
+    a flat ``rework.md`` still referencing ``$review_summary`` after the
+    writer renamed it to ``$dispatch_note`` -- fails fast before any
+    dispatch, instead of staying live-armed until the next dispatch crashes
+    with an uncaught :class:`PromptTemplateError`.
+    """
+
+    def __init__(self, errors: Sequence["PromptTemplateError"]) -> None:
+        self.errors = tuple(errors)
+        details = "; ".join(str(error) for error in self.errors)
+        super().__init__(
+            f"prompt template drift detected (issue #713); refusing to start: {details}"
+        )

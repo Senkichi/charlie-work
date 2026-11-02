@@ -34,6 +34,7 @@ import types
 from pathlib import Path
 
 import pytest
+from _src_ast import parsed
 
 import charlie_work.orchestration as _orchestration
 import charlie_work.workflow_delegation as wd
@@ -70,7 +71,7 @@ def _defs_below_workflow_import(source_path: Path) -> frozenset[str]:
     line that suspends the submodule's own execution. Derived from the live
     source, never a hand-maintained module/name list (CLAUDE.md rule 9).
     """
-    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    tree = parsed(source_path)
     import_lines = [
         node.lineno
         for node in tree.body

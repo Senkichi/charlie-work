@@ -1,0 +1,2 @@
+warning
+# Issue #1681: a head whose workflow runs all completed with no jobs; required checks can never arrive.

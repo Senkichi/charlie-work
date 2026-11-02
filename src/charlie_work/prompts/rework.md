@@ -105,9 +105,7 @@ authenticated) applies any PR body update or comment you request through
 
 After your final commit:
 
-1. Run the tests impacted by your change before pushing: the file(s) you
-   touched, plus `grep tests/` for every module/function/symbol the diff
-   touched — not just the tests you wrote:
+1. $test_step_instruction
    ```bash
    $targeted_test_command
    ```

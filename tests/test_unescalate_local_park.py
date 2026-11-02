@@ -51,7 +51,8 @@ from charlie_work.state import (
     save_state,
     state_lock,
 )
-from charlie_work.workflow import CommandResult, OrchestratorApp
+from charlie_work.command_result import CommandResult
+from charlie_work.workflow import OrchestratorApp
 
 
 def _git(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:

@@ -5,8 +5,9 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import layout
+from . import host_io_worker, layout
 from .config import NotifyConfig, OrchestratorConfig
+from .host_io_worker import NO_WORKER_IO, WorkerIoStatus
 from .subprocess_runner import run_captured
 
 logger = logging.getLogger(__name__)
@@ -251,6 +252,69 @@ class ResolvedLayout:
     reviews_dir: Path
     worktrees: Path
     notify: NotifyConfig
+    #: The root worktrees lived under before the host I/O volume took over;
+    #: ``None`` when the volume is not in use. Swept until it is empty.
+    legacy_worktrees: Path | None = None
+    worker_io: WorkerIoStatus = NO_WORKER_IO
+
+    def sweep_roots(self) -> tuple[Path, ...]:
+        """Roots ``clean_worktrees`` must sweep: the active one, plus the legacy
+        one while it still has entries (worktrees created before the switch)."""
+        active, legacy = self.worktrees, self.legacy_worktrees
+        if legacy is None or legacy.is_relative_to(active) or active.is_relative_to(legacy):
+            # Nested roots would be swept twice (merge_clean_results assumes
+            # disjoint roots); the outer one already covers the inner.
+            return (active,)
+        try:
+            if not legacy.is_dir() or not any(legacy.iterdir()):
+                return (active,)
+        except OSError:
+            # Unlistable: skip it this pass rather than fail the whole sweep.
+            return (active,)
+        return (active, legacy)
+
+    def host_io_scope_paths(self) -> tuple[Path, ...]:
+        """The volume's worker root while it is in use, for host-load attribution.
+
+        Worktrees there carry no ``.var/charlie-work`` path marker, so without
+        this a sibling repo's suites on the volume would not be counted.
+        """
+        io = self.worker_io.io
+        return () if io is None else (io.worker_root,)
+
+
+@dataclass(frozen=True)
+class WorktreeRoots:
+    """Where worker worktrees go (``active``) and the root they are leaving."""
+
+    active: Path
+    legacy: Path | None
+    io: WorkerIoStatus
+
+
+def worktree_roots(config: OrchestratorConfig, repo_root: Path, state_root: Path) -> WorktreeRoots:
+    """The single resolution of the worktrees root.
+
+    Precedence: explicit ``claude_code.worktrees_dir`` > the host I/O manifest
+    (``host_io_worker``) > ``<state_root>/worktrees``. Used by
+    :func:`resolved_layout` and ``fleet_dispatch._repo_state_dirs``.
+    """
+    configured = layout.resolve_state_child(
+        config.claude_code.worktrees_dir or "",
+        repo_root=repo_root,
+        default=layout.worktrees_dir(state_root),
+    )
+    if config.claude_code.worktrees_dir:
+        return WorktreeRoots(
+            configured, None, WorkerIoStatus(None, "claude_code.worktrees_dir is set")
+        )
+    status = host_io_worker.resolve_worker_io(
+        enabled=config.claude_code.host_io_worktrees,
+        manifest=config.runner_allocation.host_io_manifest,
+    )
+    if status.io is None:
+        return WorktreeRoots(configured, None, status)
+    return WorktreeRoots(host_io_worker.worktrees_root(status.io, repo_root), configured, status)
 
 
 def resolved_layout(config: OrchestratorConfig, repo_root: Path) -> ResolvedLayout:
@@ -281,11 +345,7 @@ def resolved_layout(config: OrchestratorConfig, repo_root: Path) -> ResolvedLayo
         repo_root=repo_root,
         default=layout.reviews_dir_default(root),
     )
-    worktrees = layout.resolve_state_child(
-        config.claude_code.worktrees_dir or "",
-        repo_root=repo_root,
-        default=layout.worktrees_dir(root),
-    )
+    roots = worktree_roots(config, repo_root, root)
     notify_file_path = layout.resolve_state_child(
         config.notify.file_path,
         repo_root=repo_root,
@@ -296,8 +356,10 @@ def resolved_layout(config: OrchestratorConfig, repo_root: Path) -> ResolvedLayo
         session_manifest=session_manifest,
         session_results=session_results,
         reviews_dir=reviews_dir,
-        worktrees=worktrees,
+        worktrees=roots.active,
         notify=dataclasses.replace(config.notify, file_path=str(notify_file_path)),
+        legacy_worktrees=roots.legacy,
+        worker_io=roots.io,
     )
 
 

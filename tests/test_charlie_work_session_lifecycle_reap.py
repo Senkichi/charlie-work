@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 from _fakes_github import FakeGitHub
 from _rework_dispatch_fixtures import _wg
+from _host_fixtures import host_probe
 from charlie_work.config import (
     DevinConfig,
     OrchestratorConfig,
@@ -31,7 +32,7 @@ from charlie_work.state import (
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
 
 
-def test_dead_dispatched_worker_reaped_after_grace_period(tmp_path: Path) -> None:
+def test_dead_dispatched_worker_reaped_after_grace_period(tmp_path: Path, monkeypatch) -> None:
     """Issue #654: a dead dispatched worker whose drift was already surfaced on
     a prior pass (``orphan_drift_at`` set) but whose PR state did not qualify
     for auto-reset (clean exit with no push -- the #773 no-op branch) must be
@@ -41,7 +42,6 @@ def test_dead_dispatched_worker_reaped_after_grace_period(tmp_path: Path) -> Non
     pushing, and the dispatch label held for 1+ hour because the #773 branch
     surfaces drift but never resets status or clears the label.
     """
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -115,7 +115,7 @@ def test_dead_dispatched_worker_reaped_after_grace_period(tmp_path: Path) -> Non
         encoding="utf-8",
     )
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -157,14 +157,15 @@ def test_dead_dispatched_worker_reaped_after_grace_period(tmp_path: Path) -> Non
     assert payload["exit_code"] == 0
 
 
-def test_dead_dispatched_worker_not_reaped_within_grace_period(tmp_path: Path) -> None:
+def test_dead_dispatched_worker_not_reaped_within_grace_period(
+    tmp_path: Path, monkeypatch
+) -> None:
     """Issue #654: a dead dispatched worker whose drift was surfaced recently
     (within ``dead_dispatched_reap_minutes``) must NOT be time-escalated.  The
     existing drift-only behavior (fingerprint match short-circuits to
     ``continue``) is preserved so a freshly-dead worker is not prematurely
     escalated before its specific sub-branch has had a chance to act.
     """
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -251,7 +252,7 @@ def test_dead_dispatched_worker_not_reaped_within_grace_period(tmp_path: Path) -
         encoding="utf-8",
     )
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -275,13 +276,12 @@ def test_dead_dispatched_worker_not_reaped_within_grace_period(tmp_path: Path) -
     assert (207, config.labels.human_needed) not in fake_gh.labels_added
 
 
-def test_dead_dispatched_worker_reap_disabled_by_config(tmp_path: Path) -> None:
+def test_dead_dispatched_worker_reap_disabled_by_config(tmp_path: Path, monkeypatch) -> None:
     """Issue #654: ``dead_dispatched_reap_minutes=0`` disables the time-based
     escape, reverting to the pre-#654 hold-forever behavior.  A dead dispatched
     worker with old drift stays ``dispatched`` -- the operator explicitly opted
     out.
     """
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -341,7 +341,7 @@ def test_dead_dispatched_worker_reap_disabled_by_config(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -360,7 +360,7 @@ def test_dead_dispatched_worker_reap_disabled_by_config(tmp_path: Path) -> None:
     assert reaped_events == []
 
 
-def test_dead_dispatched_worker_provider_throttled_not_reaped(tmp_path: Path) -> None:
+def test_dead_dispatched_worker_provider_throttled_not_reaped(tmp_path: Path, monkeypatch) -> None:
     """Issue #1917: a dead dispatched worker whose death was classified as a
     provider throttle (``failure_kind="rate_limited"``) must NOT be escalated
     by the ``dead_dispatched_reap_minutes`` timed backstop, even after the
@@ -373,7 +373,6 @@ def test_dead_dispatched_worker_provider_throttled_not_reaped(tmp_path: Path) ->
     issue's labels back to the dispatchable pool, and the redispatch is held
     by the ``throttled_until`` governor deferral until the window passes.
     """
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -462,7 +461,7 @@ def test_dead_dispatched_worker_provider_throttled_not_reaped(tmp_path: Path) ->
         encoding="utf-8",
     )
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -495,10 +494,9 @@ def test_dead_dispatched_worker_provider_throttled_reclaimed_and_retried(
     dispatchable pool, and becomes eligible for dispatch again once
     ``throttled_until`` passes.
     """
-    from unittest.mock import patch
 
     from _worker_fixtures import _make_stalled_devin_session, _stale_devin_probe
-    from charlie_work import dead_worker_reap
+    from charlie_work.dead_worker_sweep import effects_sessions
     from charlie_work.state import is_throttled
 
     issue_number = 249
@@ -547,7 +545,7 @@ def test_dead_dispatched_worker_provider_throttled_reclaimed_and_retried(
         "charlie_work.write_gate.kill_process_tree",
         lambda pid, start_time=None: killed.append(pid) or [pid],
     )
-    monkeypatch.setattr(dead_worker_reap, "sweep_orphan_processes", lambda worktree_path: [])
+    monkeypatch.setattr(effects_sessions, "sweep_orphan_processes", lambda worktree_path: [])
     monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
     monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _stale_devin_probe)
 
@@ -578,7 +576,7 @@ def test_dead_dispatched_worker_provider_throttled_reclaimed_and_retried(
         }
     )
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -628,10 +626,9 @@ def test_dead_dispatched_worker_expired_throttle_window_still_reclaimed(
     minutes`` grace past the window's end for normal handling to reclaim
     the issue — and ``not is_throttled`` means it can redispatch at once.
     """
-    from unittest.mock import patch
 
     from _worker_fixtures import _make_stalled_devin_session, _stale_devin_probe
-    from charlie_work import dead_worker_reap
+    from charlie_work.dead_worker_sweep import effects_sessions
     from charlie_work.state import is_throttled
 
     issue_number = 249
@@ -675,7 +672,7 @@ def test_dead_dispatched_worker_expired_throttle_window_still_reclaimed(
         "charlie_work.write_gate.kill_process_tree",
         lambda pid, start_time=None: killed.append(pid) or [pid],
     )
-    monkeypatch.setattr(dead_worker_reap, "sweep_orphan_processes", lambda worktree_path: [])
+    monkeypatch.setattr(effects_sessions, "sweep_orphan_processes", lambda worktree_path: [])
     monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
     monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _stale_devin_probe)
 
@@ -715,7 +712,7 @@ def test_dead_dispatched_worker_expired_throttle_window_still_reclaimed(
         }
     )
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -740,12 +737,13 @@ def test_dead_dispatched_worker_expired_throttle_window_still_reclaimed(
     assert (issue_number, config.labels.ready) in fake_gh.labels_added
 
 
-def test_dead_dispatched_worker_non_throttle_kind_still_reaped(tmp_path: Path) -> None:
+def test_dead_dispatched_worker_non_throttle_kind_still_reaped(
+    tmp_path: Path, monkeypatch
+) -> None:
     """Issue #1917 control: a stamped non-throttle classification (e.g.
     ``"stalled"``) must NOT disable the timed reap -- the exemption is
     scoped to ``PROVIDER_THROTTLE_FAILURE_KINDS``, not to any stamp.
     """
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -808,7 +806,7 @@ def test_dead_dispatched_worker_non_throttle_kind_still_reaped(tmp_path: Path) -
         encoding="utf-8",
     )
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -835,7 +833,7 @@ def test_dead_dispatched_worker_non_throttle_kind_still_reaped(tmp_path: Path) -
     ids=["expired", "unset", "malformed"],
 )
 def test_dead_dispatched_worker_provider_throttled_reaped_once_window_inactive(
-    tmp_path: Path, throttled_until: str | None
+    tmp_path: Path, throttled_until: str | None, monkeypatch
 ) -> None:
     """Issue #1917: the provider-throttle exemption from the
     ``dead_dispatched_reap_minutes`` timed backstop is bounded — it must
@@ -849,7 +847,6 @@ def test_dead_dispatched_worker_provider_throttled_reaped_once_window_inactive(
     to reclaim it — or was never armed, or is unparseable, the backstop
     resumes and the issue must escalate after the reap minutes elapse.
     """
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -921,7 +918,7 @@ def test_dead_dispatched_worker_provider_throttled_reaped_once_window_inactive(
         encoding="utf-8",
     )
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -978,7 +975,7 @@ def test_launch_failure_lane_stamps_throttle_kind_and_arms_window(
     ``worker_fate.persist_failure``) and calls ``set_throttled_until``
     when the log-tail classification returns a throttle window."""
     import charlie_work.state as state_module
-    from charlie_work.dead_worker_reap import (
+    from charlie_work.workflow import (
         _classify_dead_sessions_and_update_throttle_state,
     )
 
@@ -1044,7 +1041,7 @@ def test_launch_failure_lane_stamps_kind_without_window_for_non_throttle(
     ``set_throttled_until`` — the window write is gated on the classifier
     actually returning a ``throttled_until``."""
     import charlie_work.state as state_module
-    from charlie_work.dead_worker_reap import (
+    from charlie_work.workflow import (
         _classify_dead_sessions_and_update_throttle_state,
     )
 
@@ -1098,6 +1095,7 @@ def test_launch_failure_lane_stamps_kind_without_window_for_non_throttle(
 
 def _run_no_pr_dead_worker_sweep(
     tmp_path: Path,
+    monkeypatch,
     *,
     failure_kind: str | None,
     seed_entry_fields: dict | None = None,
@@ -1109,7 +1107,6 @@ def _run_no_pr_dead_worker_sweep(
     list, and counted-dispatch identity each pass, so one pass is enough to
     observe which branch the #1917 gate took.
     """
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -1147,7 +1144,7 @@ def _run_no_pr_dead_worker_sweep(
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -1162,14 +1159,16 @@ def _run_no_pr_dead_worker_sweep(
     [("rate_limited", 0), ("stalled", 1), (None, 1)],
 )
 def test_orphan_redispatch_seed_first_observation_gated_by_failure_kind(
-    tmp_path: Path, failure_kind: str | None, expected_len: int
+    tmp_path: Path, failure_kind: str | None, expected_len: int, monkeypatch
 ) -> None:
     """Issue #1917: on the first observation of a dead dispatched worker
     (``orphan_redispatch_head_sha`` never seeded), a provider-throttle
     classification must seed ``orphan_redispatch_at`` as ``[]`` — the death
     does not consume a redispatch attempt — while a non-throttle (or
     unclassified) death seeds it with the pass timestamp."""
-    entry = _run_no_pr_dead_worker_sweep(tmp_path, failure_kind=failure_kind)
+    entry = _run_no_pr_dead_worker_sweep(
+        tmp_path, failure_kind=failure_kind, monkeypatch=monkeypatch
+    )
 
     assert len(entry["orphan_redispatch_at"]) == expected_len
     # With no repo/worktree, the fingerprint is "none:none" and the counted
@@ -1183,7 +1182,7 @@ def test_orphan_redispatch_seed_first_observation_gated_by_failure_kind(
     [("rate_limited", 0), ("stalled", 1), (None, 1)],
 )
 def test_orphan_redispatch_seed_head_changed_gated_by_failure_kind(
-    tmp_path: Path, failure_kind: str | None, expected_len: int
+    tmp_path: Path, failure_kind: str | None, expected_len: int, monkeypatch
 ) -> None:
     """Issue #1917: on a head change (the seeded fingerprint differs from
     the current ``none:none``), the timestamp list is re-seeded — ``[]``
@@ -1196,6 +1195,7 @@ def test_orphan_redispatch_seed_head_changed_gated_by_failure_kind(
             "orphan_redispatch_counted_dispatch": "old-identity",
             "orphan_redispatch_at": ["2024-06-01T00:00:00Z"],
         },
+        monkeypatch=monkeypatch,
     )
 
     assert len(entry["orphan_redispatch_at"]) == expected_len
@@ -1207,7 +1207,7 @@ def test_orphan_redispatch_seed_head_changed_gated_by_failure_kind(
     [("rate_limited", 1), ("stalled", 2), (None, 2)],
 )
 def test_orphan_redispatch_append_new_dispatch_gated_by_failure_kind(
-    tmp_path: Path, failure_kind: str | None, expected_len: int
+    tmp_path: Path, failure_kind: str | None, expected_len: int, monkeypatch
 ) -> None:
     """Issue #1917: the ``elif`` branch — same head fingerprint but a
     dispatch identity not yet counted — appends this pass's timestamp for a
@@ -1224,6 +1224,7 @@ def test_orphan_redispatch_append_new_dispatch_gated_by_failure_kind(
             "orphan_redispatch_counted_dispatch": "prior-dispatch-identity",
             "orphan_redispatch_at": [recent_ts],
         },
+        monkeypatch=monkeypatch,
     )
 
     assert len(entry["orphan_redispatch_at"]) == expected_len

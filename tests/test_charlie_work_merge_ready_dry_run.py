@@ -6,6 +6,7 @@ wave 4/8).
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from _fakes_github import FakeGitHub
 from _review_fixtures import (
@@ -181,3 +182,133 @@ def test_merge_ready_dry_run_unapproved_reports_can_merge_false(tmp_path: Path) 
     assert result.data["sync_failed"] is False
     # No state was written for this PR.
     assert "456" not in load_state(paths.state_file)["prs"]
+
+
+# --------------------------------------------------------------------------- #
+# Issue #2743 (review round 2): the dry-run preview's requeue projection.
+#
+# The preview projects what decide_merge's ``requeue_gate`` would see. These
+# pin the same contract the live lane's tests
+# (``tests/test_charlie_work_merge_ready_requeue.py``) pin, through the
+# ``--dry-run`` driver: the ledger only climbs when the pass would re-add.
+# --------------------------------------------------------------------------- #
+
+_PR = 456
+_ISSUE = 123
+
+
+def _mergequeue_dry_run_app(
+    tmp_path: Path, cap: int = 3
+) -> tuple[OrchestratorApp, FakeGitHub, object]:
+    """A dry-run app under mergequeue automerge with an inline cap override."""
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    if cap != config.auto_merge.mergequeue_requeue_cap:
+        config = replace(
+            config,
+            auto_merge=replace(config.auto_merge, mergequeue_requeue_cap=cap),
+        )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+    app.record_review(_PR, "approved", summary="ok", verdict_provenance="fresh_llm_review")
+    return app, fake_gh, paths
+
+
+def _seed_reverted_requeue(paths) -> None:
+    """A PR parked in the queue two counted reverts under the cap of 3."""
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["prs"][str(_PR)] = {
+            **state["prs"].get(str(_PR), {}),
+            "number": _PR,
+            "status": "mergequeue",
+            "consecutive_mergequeue_requeues": 2,
+            "mergequeue_requeues_head_sha": "sha-abc123",
+        }
+        save_state(paths.state_file, state)
+
+
+def _assert_dry_run_never_climbs(app_result, paths) -> None:
+    """The payload stays at the persisted count and disk state is untouched."""
+    assert app_result.data["dry_run"] is True
+    assert app_result.data["mergequeue_requeue_capped"] is False
+    assert app_result.data["consecutive_mergequeue_requeues"] == 2
+    assert "would hold and route to rework" not in app_result.message
+    persisted = load_state(paths.state_file)["prs"][str(_PR)]
+    assert persisted["consecutive_mergequeue_requeues"] == 2
+    assert persisted["status"] == "mergequeue"
+
+
+def test_merge_ready_dry_run_capped_requeue_reports_cap_and_rework_route(
+    tmp_path: Path,
+) -> None:
+    """A dry run over a PR whose same-head revert count reaches the cap must
+    report ``mergequeue_requeue_capped`` and the rework route instead of
+    "would hand off", with the projected count in the payload — and since the
+    preview runs no accounting, nothing may be written."""
+    app, fake_gh, paths = _mergequeue_dry_run_app(tmp_path)
+    _seed_reverted_requeue(paths)
+
+    result = app.merge_ready(_PR, merge=True)
+
+    assert result.data["dry_run"] is True
+    assert "capped (3/3)" in result.message
+    assert "would hold and route to rework" in result.message
+    assert "would hand off" not in result.message
+    assert result.data["mergequeue_requeue_capped"] is True
+    assert result.data["consecutive_mergequeue_requeues"] == 3
+    # Nothing was applied: no label POST and no state write (the preview
+    # never enters the accounting stage), so the projected count is not
+    # persisted and the cap event cannot have been recorded.
+    assert fake_gh.pr_labels_added == []
+    persisted = load_state(paths.state_file)["prs"][str(_PR)]
+    assert persisted["consecutive_mergequeue_requeues"] == 2
+    assert persisted["status"] == "mergequeue"
+
+
+def test_merge_ready_dry_run_merge_hold_keeps_requeues_flat(tmp_path: Path) -> None:
+    """A merge-hold PR parked in the queue observes the reverted label pass
+    after pass; the dry run must project only the persisted count (no re-add
+    is attempted) and never report the cap."""
+    app, fake_gh, paths = _mergequeue_dry_run_app(tmp_path)
+    _seed_reverted_requeue(paths)
+    fake_gh.prs[0]["labels"] = [{"name": "agent:merge-hold"}]
+
+    result = app.merge_ready(_PR, merge=True)
+
+    assert result.data["merge_hold"] is True
+    _assert_dry_run_never_climbs(result, paths)
+
+
+def test_merge_ready_dry_run_should_merge_false_keeps_requeues_flat(
+    tmp_path: Path,
+) -> None:
+    """A dry run with ``should_merge=False`` observes the reverted label but
+    attempts no re-add: the projection stays at the persisted count and the
+    cap never engages."""
+    app, fake_gh, paths = _mergequeue_dry_run_app(tmp_path)
+    _seed_reverted_requeue(paths)
+
+    result = app.merge_ready(_PR, merge=False)
+
+    assert result.data["auto_merge_enabled"] is True
+    _assert_dry_run_never_climbs(result, paths)
+
+
+def test_merge_ready_dry_run_escalated_hold_never_reports_capped(
+    tmp_path: Path,
+) -> None:
+    """An escalated linked issue holds the pass; the dry run must mirror the
+    live lane — flat projection, no cap verdict, the escalation message."""
+    app, fake_gh, paths = _mergequeue_dry_run_app(tmp_path)
+    _seed_reverted_requeue(paths)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"][str(_ISSUE)] = {"number": _ISSUE, "status": "escalated"}
+        save_state(paths.state_file, state)
+
+    result = app.merge_ready(_PR, merge=True)
+
+    assert result.data["escalated_merge_hold"] is True
+    assert "escalated" in result.message
+    _assert_dry_run_never_climbs(result, paths)

@@ -1,0 +1,3 @@
+info
+# Issue #1776: `charlie fleet pause` wrote the pause flag. Operator-initiated
+# and expected -- info, not warning.

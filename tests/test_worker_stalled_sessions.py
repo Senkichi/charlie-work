@@ -1,5 +1,5 @@
 """``_detect_and_handle_stalled_sessions`` tests for ``charlie_work.worker`` and
-``charlie_work.workflow``/``charlie_work.dead_worker_reap``.
+``charlie_work.workflow``/``charlie_work.dead_worker_sweep``.
 
 Split out of ``tests/test_worker.py`` (issue #1574, Track-1 shoulder): the
 stalled-session reaper's probe wiring (#301), inconclusive-probe
@@ -132,10 +132,10 @@ def test_detect_and_handle_stalled_sessions_not_killed_when_real_activity_probe_
     # Issue #1317: kill_process_tree / sweep_orphan_processes are called
     # bare-name from inside _sweep_orphan_processes_for_dead_sessions and
     # _classify_dead_sessions_and_update_throttle_state, both of which moved
-    # (verbatim) to dead_worker_reap.py -- patch them there, not on the
+    # (verbatim) to dead_worker_sweep/effects_sessions.py -- patch them there, not on the
     # (still-valid) workflow.py facade re-export of
     # _detect_and_handle_stalled_sessions itself.
-    from charlie_work import dead_worker_reap
+    from charlie_work.dead_worker_sweep import effects_sessions
 
     sessions_dir = tmp_path / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -176,7 +176,7 @@ def test_detect_and_handle_stalled_sessions_not_killed_when_real_activity_probe_
         "charlie_work.write_gate.kill_process_tree",
         lambda pid, start_time=None: killed.append(pid) or [pid],
     )
-    monkeypatch.setattr(dead_worker_reap, "sweep_orphan_processes", lambda worktree_path: [])
+    monkeypatch.setattr(effects_sessions, "sweep_orphan_processes", lambda worktree_path: [])
     monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
 
     config = OrchestratorConfig(
@@ -204,10 +204,10 @@ def test_detect_and_handle_stalled_sessions_tolerates_none_probe(
     # Issue #1317: kill_process_tree / sweep_orphan_processes are called
     # bare-name from inside _sweep_orphan_processes_for_dead_sessions and
     # _classify_dead_sessions_and_update_throttle_state, both of which moved
-    # (verbatim) to dead_worker_reap.py -- patch them there, not on the
+    # (verbatim) to dead_worker_sweep/effects_sessions.py -- patch them there, not on the
     # (still-valid) workflow.py facade re-export of
     # _detect_and_handle_stalled_sessions itself.
-    from charlie_work import dead_worker_reap
+    from charlie_work.dead_worker_sweep import effects_sessions
 
     issue_number = 329
     sessions_dir = tmp_path / "sessions"
@@ -243,7 +243,7 @@ def test_detect_and_handle_stalled_sessions_tolerates_none_probe(
         "charlie_work.write_gate.kill_process_tree",
         lambda pid, start_time=None: killed.append(pid) or [pid],
     )
-    monkeypatch.setattr(dead_worker_reap, "sweep_orphan_processes", lambda worktree_path: [])
+    monkeypatch.setattr(effects_sessions, "sweep_orphan_processes", lambda worktree_path: [])
     monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
     monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", lambda *args: None)
 
@@ -301,10 +301,10 @@ def test_detect_and_handle_stalled_sessions_inconclusive_probe_deferred_then_esc
     # Issue #1317: kill_process_tree / sweep_orphan_processes are called
     # bare-name from inside _sweep_orphan_processes_for_dead_sessions and
     # _classify_dead_sessions_and_update_throttle_state, both of which moved
-    # (verbatim) to dead_worker_reap.py -- patch them there, not on the
+    # (verbatim) to dead_worker_sweep/effects_sessions.py -- patch them there, not on the
     # (still-valid) workflow.py facade re-export of
     # _detect_and_handle_stalled_sessions itself.
-    from charlie_work import dead_worker_reap
+    from charlie_work.dead_worker_sweep import effects_sessions
 
     issue_number = 338
     log_text = "Working on task...\n"
@@ -315,7 +315,7 @@ def test_detect_and_handle_stalled_sessions_inconclusive_probe_deferred_then_esc
         "charlie_work.write_gate.kill_process_tree",
         lambda pid, start_time=None: killed.append(pid) or [pid],
     )
-    monkeypatch.setattr(dead_worker_reap, "sweep_orphan_processes", lambda worktree_path: [])
+    monkeypatch.setattr(effects_sessions, "sweep_orphan_processes", lambda worktree_path: [])
     monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
     monkeypatch.setattr(
         "charlie_work.worker.real_activity_probe_for", _inconclusive_probe_for_signal_1
@@ -399,7 +399,8 @@ def test_detect_and_handle_stalled_sessions_dry_run_suppresses_kills_and_writes(
         lambda pid, start_time=None: killed.append(pid) or [pid],
     )
     monkeypatch.setattr(
-        "charlie_work.dead_worker_reap.sweep_orphan_processes", lambda worktree_path: []
+        "charlie_work.dead_worker_sweep.effects_sessions.sweep_orphan_processes",
+        lambda worktree_path: [],
     )
     monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
     monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _stale_devin_probe)
@@ -483,7 +484,8 @@ def test_detect_and_handle_stalled_sessions_dry_run_suppresses_api_budget_exceed
         lambda pid, start_time=None: killed.append(pid) or [pid],
     )
     monkeypatch.setattr(
-        "charlie_work.dead_worker_reap.sweep_orphan_processes", lambda worktree_path: []
+        "charlie_work.dead_worker_sweep.effects_sessions.sweep_orphan_processes",
+        lambda worktree_path: [],
     )
     monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
     monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _stale_devin_probe)
@@ -556,7 +558,8 @@ def test_detect_and_handle_stalled_sessions_dry_run_suppresses_rate_limit_defer(
         lambda pid, start_time=None: killed.append(pid) or [pid],
     )
     monkeypatch.setattr(
-        "charlie_work.dead_worker_reap.sweep_orphan_processes", lambda worktree_path: []
+        "charlie_work.dead_worker_sweep.effects_sessions.sweep_orphan_processes",
+        lambda worktree_path: [],
     )
     monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
     monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _stale_devin_probe)
@@ -621,10 +624,10 @@ def test_detect_and_handle_stalled_sessions_emits_provider_suspended_event(
     # Issue #1317: kill_process_tree / sweep_orphan_processes are called
     # bare-name from inside _sweep_orphan_processes_for_dead_sessions and
     # _classify_dead_sessions_and_update_throttle_state, both of which moved
-    # (verbatim) to dead_worker_reap.py -- patch them there, not on the
+    # (verbatim) to dead_worker_sweep/effects_sessions.py -- patch them there, not on the
     # (still-valid) workflow.py facade re-export of
     # _detect_and_handle_stalled_sessions itself.
-    from charlie_work import dead_worker_reap
+    from charlie_work.dead_worker_sweep import effects_sessions
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     issue_number = 1342
@@ -662,7 +665,7 @@ def test_detect_and_handle_stalled_sessions_emits_provider_suspended_event(
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
     killed: list[int] = []
-    monkeypatch.setattr(dead_worker_reap, "sweep_orphan_processes", lambda worktree_path: [])
+    monkeypatch.setattr(effects_sessions, "sweep_orphan_processes", lambda worktree_path: [])
 
     # The stall lane sees a live worker (Signal 2.5 fires on the log tail);
     # after it kills the PID, the dead lane sees a dead worker. Use a mutable

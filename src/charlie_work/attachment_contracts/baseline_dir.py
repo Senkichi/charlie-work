@@ -163,10 +163,7 @@ def _write_entry_file(path: Path, payload: str) -> None:
                 return
         except (OSError, UnicodeDecodeError):
             pass  # unreadable or non-UTF-8 -- rewrite it below
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(payload, encoding="utf-8")
-    tmp.replace(path)
+    baseline._write_text_atomic(path, payload)
 
 
 def _prune_empty_dirs(directory: Path) -> None:

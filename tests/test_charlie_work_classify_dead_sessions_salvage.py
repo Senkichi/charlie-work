@@ -368,11 +368,11 @@ def test_classify_dead_sessions_salvage_proceeds_when_merged_pr_search_fails(
 def test_classify_dead_sessions_salvage_push_failure_fallback(tmp_path: Path) -> None:
     """Issue #252: a failed salvage push records failure and falls back to relabel."""
     # Issue #1317: push_branch is called bare-name from inside _attempt_salvage,
-    # which moved (verbatim) to dead_worker_reap.py -- so the bare-name lookup
-    # now resolves via dead_worker_reap.py's own globals, not workflow.py's.
+    # which lives in dead_worker_sweep/effects_pr.py -- so the bare-name lookup
+    # resolves via that module's own globals, not workflow.py's.
     # Patch it there, not on the (still-valid) workflow.py facade re-export of
     # _classify_dead_sessions_and_update_throttle_state itself.
-    from charlie_work import dead_worker_reap as workflow_module
+    from charlie_work.dead_worker_sweep import effects_pr as workflow_module
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     remote, repo_root = _init_bare_remote_and_clone(tmp_path)

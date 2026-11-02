@@ -33,7 +33,11 @@
 ' process exists. Wedge detection is handled in-process by the supervise-loop
 ' wrapper's WedgeWatchdog (issue #728), which monitors the supervisor
 ' heartbeat and terminates a wedged child so the next tick relaunches it.
+'
+' The child's exit code MUST reach WScript.Quit (issue #2753): Task
+' Scheduler's LastTaskResult is read from wscript.exe, so discarding it makes
+' every tick report success even when the supervisor cannot start.
 Set fso = CreateObject("Scripting.FileSystemObject")
 scriptDir = fso.GetParentFolderName(WScript.ScriptFullName)
 Set shell = CreateObject("WScript.Shell")
-shell.Run "powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -File """ & scriptDir & "\fleet-pass.ps1""", 0, True
+WScript.Quit shell.Run("powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -File """ & scriptDir & "\fleet-pass.ps1""", 0, True)

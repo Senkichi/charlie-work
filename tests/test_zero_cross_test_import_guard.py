@@ -36,6 +36,7 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 from pathlib import Path
+from _src_ast import parsed_source
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TESTS_DIR = REPO_ROOT / "tests"
@@ -78,7 +79,7 @@ def find_cross_test_import_violations(
     inside a test function -- not just at module top level -- is still
     caught.
     """
-    tree = ast.parse(source, filename=str(file_path))
+    tree = parsed_source(source, str(file_path))
     violations: list[CrossTestImportViolation] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):

@@ -1,0 +1,6 @@
+warning
+# TIS-CW-6: issues labelled `model:<tier>` launched on the normal chain because the
+# chain could not serve the tier: `no_entry` (no entry of that family is
+# configured), `restricted` (every such entry is quota-restricted) or
+# `conflicting_labels` (two tiers on one issue). The launch still happened;
+# the warning is the signal that a requested family is missing or exhausted.

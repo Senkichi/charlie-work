@@ -1,0 +1,3 @@
+info
+# Issue #2108: the orchestrator rewrote a PR-body-only closing-keyword gate finding and
+# re-ran the failed Lint run -- a routine repair, not a lane-ending condition.

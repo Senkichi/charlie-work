@@ -46,7 +46,7 @@ from charlie_work.fleet_dispatch import (
 )
 from charlie_work.instrumentation import query_events
 from charlie_work.supervise import try_acquire_supervisor_lock
-from charlie_work.workflow import CommandResult
+from charlie_work.command_result import CommandResult
 
 _LANE_GATE_TIMEOUT = 15.0
 

@@ -24,10 +24,13 @@ This module supplies the machinery ``tests/conftest.py`` wires in:
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import logging
 import os
 import sys
 import time
+from collections.abc import Iterator
 from typing import Any
 
 import psutil
@@ -167,6 +170,137 @@ def reap_leaked_descendants(before: dict[int, float], grace: float = LEAK_GRACE_
     for proc in leaked:
         _kill_tree(proc)
     return report
+
+
+FAST_GUARDS_ENV = "CI_FLEET_FAST_GUARDS"
+
+# Descendants alive before ``enter_kill_on_close_job`` assigned this process to
+# its job are not job members. The fast path folds them back into the
+# ``before`` snapshot so its psutil fallback never reports one as new.
+_pre_job_descendants: dict[int, float] = {}
+
+_JOB_OBJECT_BASIC_PROCESS_ID_LIST = 3  # JOBOBJECTINFOCLASS
+_ERROR_MORE_DATA = 234
+_PID_LIST_INITIAL_CAPACITY = 64
+_PID_LIST_MAX_ATTEMPTS = 8
+
+
+def fast_guards_enabled() -> bool:
+    """``CI_FLEET_FAST_GUARDS=off`` turns the job fast path off; read on every call."""
+    return os.environ.get(FAST_GUARDS_ENV, "").strip().lower() != "off"
+
+
+@functools.cache
+def _query_information_job_object() -> Any:
+    import ctypes
+    from ctypes import wintypes
+
+    # use_last_error: ctypes.get_last_error() then reports the error THIS call
+    # set, not one a later interpreter-internal call overwrote.
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    query = kernel32.QueryInformationJobObject
+    query.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    query.restype = wintypes.BOOL
+    return query
+
+
+@functools.cache
+def _pid_list_type(capacity: int) -> Any:
+    import ctypes
+    from ctypes import wintypes
+
+    class _JOBOBJECT_BASIC_PROCESS_ID_LIST(ctypes.Structure):  # noqa: N801
+        _fields_ = [
+            ("NumberOfAssignedProcesses", wintypes.DWORD),
+            ("NumberOfProcessIdsInList", wintypes.DWORD),
+            ("ProcessIdList", ctypes.c_size_t * capacity),  # ULONG_PTR[]
+        ]
+
+    return _JOBOBJECT_BASIC_PROCESS_ID_LIST
+
+
+def job_process_ids() -> frozenset[int] | None:
+    """Pids of every live member of this process's kill-on-close job.
+
+    One ``QueryInformationJobObject(JobObjectBasicProcessIdList)`` call
+    (microseconds) instead of a psutil walk of the system process table. The
+    buffer grows when the kernel reports ``ERROR_MORE_DATA`` or lists fewer ids
+    than are assigned. ``None`` off Windows, when no job was entered, or when
+    the query fails -- callers then take the psutil path.
+    """
+    if os.name != "nt" or _job_handle is None:
+        return None
+    import ctypes
+
+    query = _query_information_job_object()
+    capacity = _PID_LIST_INITIAL_CAPACITY
+    for _ in range(_PID_LIST_MAX_ATTEMPTS):
+        info = _pid_list_type(capacity)()
+        ok = query(
+            _job_handle,
+            _JOB_OBJECT_BASIC_PROCESS_ID_LIST,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+            None,
+        )
+        if ok:
+            listed = int(info.NumberOfProcessIdsInList)
+            if listed >= int(info.NumberOfAssignedProcesses):
+                return frozenset(int(pid) for pid in info.ProcessIdList[:listed])
+        else:
+            err = ctypes.get_last_error()
+            if err != _ERROR_MORE_DATA:
+                logger.warning(
+                    "QueryInformationJobObject failed (error %s); using the psutil leak walk",
+                    err,
+                )
+                return None
+        capacity = max(capacity * 2, int(info.NumberOfAssignedProcesses) + 16)
+    return None
+
+
+def job_member_snapshot() -> dict[int, float] | None:
+    """``{pid: create_time}`` for job members other than this process, or ``None``."""
+    pids = job_process_ids()
+    if pids is None:
+        return None
+    snapshot: dict[int, float] = {}
+    for pid in pids - {_THIS_PID}:
+        try:
+            snapshot[pid] = psutil.Process(pid).create_time()
+        except psutil.Error:
+            continue
+    return snapshot
+
+
+@contextlib.contextmanager
+def leak_guard(grace: float = LEAK_GRACE_S) -> Iterator[None]:
+    """Fail the enclosed block if it leaves a live descendant behind.
+
+    Fast path (Windows, job entered, ``CI_FLEET_FAST_GUARDS`` not ``off``):
+    the job's member list at entry and exit, one syscall each. When the exit
+    list holds nothing new, nothing leaked. When it gained a member -- or on
+    any other path -- today's ``reap_leaked_descendants`` runs unchanged:
+    same grace, same report, same kill. Its ``before`` is the entry job list
+    plus ``_pre_job_descendants``, so a child that predates the job is never
+    reported as new.
+    """
+    setup = job_member_snapshot() if fast_guards_enabled() else None
+    before = descendant_snapshot() if setup is None else {**_pre_job_descendants, **setup}
+    yield
+    if setup is not None:
+        after = job_member_snapshot()
+        if after is not None and after.items() <= setup.items():
+            return
+    report = reap_leaked_descendants(before, grace=grace)
+    if report:
+        pytest.fail("test left live child process(es) behind:\n  " + "\n  ".join(report))
 
 
 def wrap_launchers(
@@ -324,6 +458,9 @@ def enter_kill_on_close_job() -> bool:
         )
         return False
 
+    # Taken before assignment: anything alive now never becomes a job member,
+    # so the leak guard's fast path must remember it (``_pre_job_descendants``).
+    pre_job = descendant_snapshot()
     if not kernel32.AssignProcessToJobObject(job, kernel32.GetCurrentProcess()):
         err = ctypes.GetLastError()
         kernel32.CloseHandle(job)
@@ -335,6 +472,7 @@ def enter_kill_on_close_job() -> bool:
         )
         return False
 
-    global _job_handle
+    global _job_handle, _pre_job_descendants
     _job_handle = job
+    _pre_job_descendants = pre_job
     return True

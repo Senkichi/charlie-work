@@ -7,6 +7,7 @@ adapter-iteration loops in workflow.py into a single abstraction point.
 
 import json
 import logging
+import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from enum import Enum
@@ -16,8 +17,10 @@ from pathlib import Path
 from typing import Any
 
 from .claude_code import (
+    CLAUDE_RECORD_KINDS,
     ClaudeWorkerRecord,
     _sidecar_path as claude_sidecar_path,
+    last_tool_call_timestamp,
     read_worker_records,
 )
 from .config import WRITER_MARKER_FILENAME, OrchestratorConfig
@@ -31,7 +34,7 @@ from .post_mortem import (
     _events_path_from_log,
     real_activity_for_worker,
 )
-from .process_utils import is_pid_alive
+from . import host as _host
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +42,12 @@ logger = logging.getLogger(__name__)
 # Shim marker that indicates successful infra materialization (issue #221)
 # Workers that hang at this line are detected as launch_stalled
 _SHIM_MARKER = "[shim] .devin infra materialized"
+
+# Issue #2767: minutes an opencode log may sit silent after an unrecovered
+# provider stream error before the worker is killed early (a retry sleep that
+# is not coming back is otherwise indistinguishable from a live session until
+# stall_minutes).
+OPENCODE_STREAM_ERROR_QUIET_MINUTES = 5
 
 
 def _log_has_shim_marker(log_path: Path) -> bool:
@@ -346,15 +355,13 @@ class WorkerView:
         """
         if self.adapter_kind == "devin":
             sidecar_path = devin_sidecar_path(sessions_dir, self.issue_number)
-        elif self.adapter_kind == "claude-code":
-            sidecar_path = claude_sidecar_path(sessions_dir, self.issue_number)
-        elif self.adapter_kind == "api":
-            # api sidecars share the claude-code sidecar-path derivation,
-            # routed through the adapter_kind-aware _sidecar_path helper so the
-            # .api.json suffix is selected.
-            sidecar_path = claude_sidecar_path(sessions_dir, self.issue_number, "api")
+        elif self.adapter_kind in CLAUDE_RECORD_KINDS:
+            # api/opencode sidecars share the claude-code sidecar-path
+            # derivation; the adapter_kind-aware _sidecar_path helper selects
+            # the .api.json / .opencode.json suffix.
+            sidecar_path = claude_sidecar_path(sessions_dir, self.issue_number, self.adapter_kind)
             # Best-effort spend settlement before the sidecar is unlinked (issue #480).
-            if api_config is not None and state_dir is not None:
+            if self.adapter_kind == "api" and api_config is not None and state_dir is not None:
                 self._settle_api_budget(sidecar_path, api_config, state_dir)
         else:
             # Unknown adapter kind - nothing to reap
@@ -365,6 +372,11 @@ class WorkerView:
         except OSError:
             # Best-effort cleanup - don't fail if unlink fails
             pass
+        if self.adapter_kind == "opencode":
+            # The per-worker opencode data dir (db, transcripts) dies with it.
+            from .opencode_log import opencode_data_dir
+
+            shutil.rmtree(opencode_data_dir(sessions_dir, self.issue_number), ignore_errors=True)
 
         self._remove_writer_marker()
 
@@ -470,50 +482,6 @@ class WorkerView:
             return (now - started_at).total_seconds()
         except (ValueError, TypeError):
             return 0.0
-
-
-def _tail_last_tool_call_timestamp(events_path: Path) -> datetime | None:
-    """Extract the timestamp of the last tool_call event from an events.jsonl file.
-
-    Reads the events.jsonl file line by line and returns the timestamp of the most
-    recent event with type="tool_call". Returns None if the file doesn't exist,
-    can't be read, or contains no tool_call events.
-
-    Args:
-        events_path: Path to the events.jsonl file
-
-    Returns:
-        datetime of the last tool_call event, or None if not found
-    """
-    from datetime import UTC
-
-    if not events_path.exists():
-        return None
-
-    try:
-        last_tool_call_at: datetime | None = None
-        with events_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                    if isinstance(event, dict) and event.get("type") == "tool_call":
-                        timestamp_str = event.get("timestamp")
-                        if timestamp_str:
-                            try:
-                                timestamp = datetime.fromisoformat(timestamp_str)
-                                if timestamp.tzinfo is None:
-                                    timestamp = timestamp.replace(tzinfo=UTC)
-                                last_tool_call_at = timestamp
-                            except (ValueError, TypeError):
-                                continue
-                except (JSONDecodeError, TypeError):
-                    continue
-        return last_tool_call_at
-    except OSError:
-        return None
 
 
 def _parse_started_at(value: str) -> datetime | None:
@@ -729,16 +697,57 @@ def classify_worker_health(
         lines = log_text.splitlines()
         if lines:
             last_log_line = lines[-1].strip()
-            for pattern in terminal_error_markers:
-                if pattern in last_log_line:
-                    has_terminal_error = True
-                    break
+            # Issue #2814: with the stream-json tee (now the default for
+            # claude-code workers), the log's last line is routinely a JSON
+            # event. The markers are CLI-fatal signatures; a ``tool_result``
+            # (or an assistant turn) that *quotes* one is the worker
+            # observing an error, not the CLI dying — so a stream-json event
+            # line never trips this scan. A plain (non-JSON) last line —
+            # merged stderr, or a non-tee plain-text log — keeps the
+            # anchored substring scan unchanged. Cf.
+            # ``failure_classifier._stream_json_emission_anchor`` for the
+            # same shape rule in the post-exit classifier.
+            from .failure_classifier import _parse_event
+
+            if _parse_event(last_log_line) is None:
+                for pattern in terminal_error_markers:
+                    if pattern in last_log_line:
+                        has_terminal_error = True
+                        break
         if view.adapter_kind == "api":
             from .failure_classifier import _provider_suspension_in_tail
 
             tail = log_text[-2048:] if len(log_text) > 2048 else log_text
             if _provider_suspension_in_tail(tail):
                 has_provider_suspension = True
+        else:
+            # opencode: a usage-limited provider makes opencode sleep out
+            # retry-after (hours) behind one logged ERROR record. Kill on the
+            # first quota record so the dead reap classifies quota_exhausted and
+            # restricts the chain entry within one pass, instead of ~37 min of
+            # stall + rate-limit defer while every failover launches onto the
+            # same exhausted account. Only the profile's digest (opencode's own
+            # provider-error records since the last progress event) is matched,
+            # never tool output; transient 429s are left to opencode's retry.
+            from . import worker_fate
+            from .throttle_signatures import match_quota_tail
+
+            profile = worker_fate.profile_for(view.adapter_kind)
+            if profile is not None and profile.log_digest is not None:
+                digest = profile.log_digest(log_text)
+                if digest and (
+                    match_quota_tail(digest, config.runtime.quota_error_markers)
+                    # Issue #2767: a non-quota stream error with no subsequent
+                    # progress event leaves opencode hung silent -- kill once
+                    # the log has been quiet past the stream-error window,
+                    # instead of waiting for stall_minutes.
+                    or (
+                        (log_stat := view.log_stat()) is not None
+                        and now - datetime.fromtimestamp(log_stat.st_mtime, tz=UTC)
+                        >= timedelta(minutes=OPENCODE_STREAM_ERROR_QUIET_MINUTES)
+                    )
+                ):
+                    has_provider_suspension = True
     except OSError:
         pass
 
@@ -777,7 +786,7 @@ def classify_worker_health(
         # Check for events.jsonl file (sibling to log_path)
         events_path = _events_path_from_log(log_path)
         if events_path.exists():
-            last_tool_call_at = _tail_last_tool_call_timestamp(events_path)
+            last_tool_call_at = last_tool_call_timestamp(events_path)
             log_stat = view.log_stat()
             if log_stat is not None:
                 log_mtime = datetime.fromtimestamp(log_stat.st_mtime, tz=UTC)
@@ -973,6 +982,12 @@ def iter_workers(sessions_dir: Path, *, repo_key: str = "") -> list[WorkerView]:
     for record in read_worker_records(sessions_dir, adapter_kind="api"):
         workers.append(_from_claude_record(record, repo_key))
 
+    # Read opencode-worker sidecars (issue-<n>.opencode.json): same
+    # ClaudeWorkerRecord shape, written by launch_claude_worker for the
+    # opencode harness (opencode_worker.launch_opencode_worker).
+    for record in read_worker_records(sessions_dir, adapter_kind="opencode"):
+        workers.append(_from_claude_record(record, repo_key))
+
     return workers
 
 
@@ -984,7 +999,7 @@ def _alive_review_worker_issue_numbers(sessions_dir: Path) -> set[int]:
     fixers. A PR whose reviewer process has not exited is deferred until a
     later pass, so its isolated review checkout is not torn down mid-session.
     """
-    return {w.issue_number for w in iter_workers(sessions_dir) if w.is_alive()}
+    return _host.current().sessions.live_issue_numbers(sessions_dir)
 
 
 def _log_activity_advanced(
@@ -1049,10 +1064,8 @@ def update_worker_log_stat(
 
     if worker.adapter_kind == "devin":
         sidecar_path = devin_sidecar_path(sessions_dir, worker.issue_number)
-    elif worker.adapter_kind == "claude-code":
-        sidecar_path = claude_sidecar_path(sessions_dir, worker.issue_number)
-    elif worker.adapter_kind == "api":
-        sidecar_path = claude_sidecar_path(sessions_dir, worker.issue_number, "api")
+    elif worker.adapter_kind in CLAUDE_RECORD_KINDS:
+        sidecar_path = claude_sidecar_path(sessions_dir, worker.issue_number, worker.adapter_kind)
     else:
         # Unknown adapter kind - nothing to update
         return
@@ -1103,8 +1116,8 @@ def update_worker_log_stat(
         from .devin_shell import _write_json
 
         _write_json(sidecar_path, payload)
-    elif worker.adapter_kind in ("claude-code", "api"):
-        # api sidecars share the claude-code atomic-write helper (same on-disk
+    elif worker.adapter_kind in CLAUDE_RECORD_KINDS:
+        # api/opencode sidecars share the claude-code atomic-write helper (same on-disk
         # record shape, just a different filename suffix).
         from .claude_code import _write_json_atomic
 
@@ -1268,7 +1281,9 @@ def issue_worker_liveness(
     started_at_dt = _state_session_start_dt(issue_state)
     started_at_iso = started_at_dt.isoformat() if started_at_dt is not None else None
 
-    if not is_pid_alive(worker_pid, issue_state.get("worker_process_start_time")):
+    if not _host.current().probe.is_alive(
+        worker_pid, issue_state.get("worker_process_start_time")
+    ):
         return IssueWorkerLiveness(
             live=False,
             reason=f"state worker_pid={worker_pid} is not alive",

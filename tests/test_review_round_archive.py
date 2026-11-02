@@ -57,6 +57,7 @@ import charlie_work.workflow as workflow
 from charlie_work.workflow import OrchestratorApp, _existing_round_numbers
 
 from _review_fixtures import (
+    _PR_NUMBER,
     _pr_dir,
     _record,
     _round_archive_app,
@@ -118,6 +119,64 @@ def test_ac1_two_rounds_leave_distinct_archived_content_for_each_round(tmp_path:
     assert round1_note != round2_note
     assert round1_note != live_note
     assert round2_note == live_note
+
+
+# ---------------------------------------------------------------------------
+# Issue #2837: diff.patch archives. Each verdict round also archives the
+# packet's diff.patch (the GitHub PR diff the reviewer read) into
+# rounds/round-K/, so a later packet can build a PR-relative interdiff
+# between two full PR diffs -- each relative to its own merge-base.
+# ---------------------------------------------------------------------------
+
+
+def test_archived_round_carries_diff_patch(tmp_path: Path) -> None:
+    """Two rounds with distinct packet diffs: each round-K archive holds its
+    own diff.patch -- round-1's diff survives round-2's in-place overwrite."""
+    app, paths = _round_archive_app(tmp_path)
+    pr_dir = _pr_dir(paths)
+    pr_dir.mkdir(parents=True, exist_ok=True)
+
+    (pr_dir / "diff.patch").write_text("ROUND-ONE DIFF", encoding="utf-8")
+    _record(app, head="sha-r1", summary="round one summary", required_changes=["change one"])
+    (pr_dir / "diff.patch").write_text("ROUND-TWO DIFF", encoding="utf-8")
+    _record(app, head="sha-r2", summary="round two summary", required_changes=["change two"])
+
+    assert (_round_dir(paths, 1) / "diff.patch").read_text(encoding="utf-8") == "ROUND-ONE DIFF"
+    assert (_round_dir(paths, 2) / "diff.patch").read_text(encoding="utf-8") == "ROUND-TWO DIFF"
+    assert (pr_dir / "diff.patch").read_text(encoding="utf-8") == "ROUND-TWO DIFF"
+
+
+def test_archived_round_carries_diff_patch_for_approved_verdict(tmp_path: Path) -> None:
+    """An approved round archives its diff too -- a later re-review after an
+    operator correction needs the same archive shape."""
+    app, paths = _round_archive_app(tmp_path)
+    pr_dir = _pr_dir(paths)
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    (pr_dir / "diff.patch").write_text("APPROVED-ROUND DIFF", encoding="utf-8")
+
+    app.gh.pr_head_shas[_PR_NUMBER] = "sha-approved"
+    result = app.record_review(
+        _PR_NUMBER,
+        "approved",
+        summary="looks good",
+        verdict_provenance="fresh_llm_review",
+    )
+    assert result.ok is True
+
+    assert (_round_dir(paths, 1) / "diff.patch").read_text(
+        encoding="utf-8"
+    ) == "APPROVED-ROUND DIFF"
+    assert (_round_dir(paths, 1) / "review-decision.json").is_file()
+
+
+def test_archived_round_without_diff_patch_is_unchanged(tmp_path: Path) -> None:
+    """No packet diff on disk (e.g. a legacy round): archiving still succeeds
+    and simply writes no diff.patch -- never a torn or empty file."""
+    app, paths = _round_archive_app(tmp_path)
+    _record(app, head="sha-legacy", summary="legacy summary", required_changes=["legacy change"])
+
+    assert not (_round_dir(paths, 1) / "diff.patch").exists()
+    assert (_round_dir(paths, 1) / "review-decision.json").is_file()
 
 
 # ---------------------------------------------------------------------------

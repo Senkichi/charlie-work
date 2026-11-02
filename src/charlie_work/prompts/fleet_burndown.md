@@ -82,7 +82,7 @@ the list of human-needed / blocked issues with the reason for each.
   escalation cap.
 - **`test_adequacy` is on.** A no-tests PR is auto-reworked before you ever see a
   packet — expect extra cycles. Don't override the gate unless a change is
-  legitimately test-exempt (`Test-exempt: <reason>` line in the PR body).
+  legitimately test-exempt (`Test-exempt: <reason>` trailer on a commit, or line in the PR body).
 - **State lives in GitHub labels + state.json, never in your memory.** Re-derive
   with `charlie fleet status` / `charlie roll-call --json` at the start of every
   pass; a context compaction must not lose your place in the loop.

@@ -26,7 +26,7 @@ from .ast_equivalence_gate import (
     generate_pep562_shim_source,
     render_review_packet,
 )
-from .workflow import CommandResult
+from .command_result import CommandResult
 
 
 def register_ast_equivalence_check_subparser(

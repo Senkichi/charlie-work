@@ -9,6 +9,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from _fakes_github import FakeGitHub
+from _incremental_review_fixtures import (
+    BASE_NOISE_COMPARE_DIFF,
+    ROUND1_HEAD,
+    ROUND2_PR_DIFF,
+    plant_round1,
+)
 from charlie_work.config import OrchestratorConfig
 from charlie_work.paths import runtime_paths
 from charlie_work.verdict_parsing import REVIEW_SESSION_SUMMARY_HEADING
@@ -499,3 +505,99 @@ def test_review_prompt_uses_fenced_json_verdict(tmp_path: Path) -> None:
     assert '"required_changes"' in packet_text
     assert "$decision_command" not in packet_text
     assert "charlie verdict" not in packet_text
+
+
+# ---------------------------------------------------------------------------
+# Issue #2837: the round-2 interdiff is PR-relative (built from the archived
+# last-round diff), not GitHub's three-dot compare.
+# ---------------------------------------------------------------------------
+
+
+def _round2_app_with_archived_round1(tmp_path: Path) -> tuple[OrchestratorApp, FakeGitHub, Path]:
+    """Round 2 of PR 456: round 1 archived WITH its diff.patch, and the live
+    PR diff carrying one genuinely new file plus two shift-only ones.
+
+    The three-dot ``compare_diff`` a rework that merged the base would return
+    is planted with a ``base_noise.txt`` patch, so every "base_noise is absent"
+    assertion below can fail: were the packet built from ``compare_diff``
+    instead of the archived PR diffs, that file would surface.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()  # PR 456 headRefOid is "sha-abc123"
+    fake_gh.diffs[456] = ROUND2_PR_DIFF
+    fake_gh.compare_diff_overrides[(ROUND1_HEAD, "sha-abc123")] = BASE_NOISE_COMPARE_DIFF
+    decision_dir = paths.prs / "pr-456"
+    plant_round1(decision_dir)
+    return OrchestratorApp(tmp_path, paths, config, fake_gh), fake_gh, decision_dir
+
+
+def test_review_round2_incremental_interdiff_is_pr_relative(tmp_path: Path) -> None:
+    """Issue #2837: with the last round's diff.patch archived, the interdiff is
+    built per-file between the two PR diffs -- the genuinely changed file gets
+    its patch; shifted-line-number files are listed as unchanged; base-merge
+    files never appear anywhere, and ``gh.compare_diff`` is never consulted."""
+    app, fake_gh, decision_dir = _round2_app_with_archived_round1(tmp_path)
+    # Positive control: the planted three-dot compare DOES carry base_noise, so
+    # its absence below is the archive-based builder's doing, not an empty plant.
+    assert "base_noise.txt" in (fake_gh.compare_diff(ROUND1_HEAD, "sha-abc123") or "")
+
+    result = app.review(456)
+
+    assert result.ok is True
+    interdiff_text = (decision_dir / "interdiff.patch").read_text(encoding="utf-8")
+    # Only the genuinely changed PR file's patch is in the interdiff.
+    assert interdiff_text == (
+        "diff --git a/three.py b/three.py\n"
+        "--- /dev/null\n"
+        "+++ b/three.py\n"
+        "@@ -0,0 +1,1 @@\n"
+        "+hello\n"
+    )
+    packet = (decision_dir / "review-prompt.md").read_text(encoding="utf-8")
+    # The interdiff path itself is referenced in the packet, pointing at the
+    # changed file's patch; the unchanged files are named in the section.
+    assert "interdiff.patch" in packet
+    # The base-merge file appears in no list at all.
+    assert "base_noise" not in packet
+    assert "base_noise" not in interdiff_text
+
+
+def test_review_round2_requires_only_hunk_shifts_listed_unchanged(tmp_path: Path) -> None:
+    """A file whose only change is shifted @@ line numbers is listed as
+    unchanged since the prior round, per the #2837 normalisation rule."""
+    app, _fake_gh, decision_dir = _round2_app_with_archived_round1(tmp_path)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (decision_dir / "review-prompt.md").read_text(encoding="utf-8")
+    # Both shift-only files are unchanged; "Files unchanged since round 1"
+    # lists one.py and two.py. three.py (the genuinely changed file) must not
+    # appear here, and neither may the base-merge file.
+    unchanged_start = packet.index("Files unchanged since round 1")
+    unchanged_block = packet[unchanged_start : packet.index("## CI status")]
+    assert "`one.py`" in unchanged_block
+    assert "`two.py`" in unchanged_block
+    assert "three.py" not in unchanged_block
+    assert "base_noise" not in unchanged_block
+    # The full-diff-re-read instruction is gone: the unchanged files keep the
+    # earlier round's assessment.
+    assert "the full diff remains authoritative" not in packet
+    assert "keep the round-1 assessment" in packet
+
+
+def test_review_round2_incremental_procedure_renders(tmp_path: Path) -> None:
+    """A round-2 packet with an archive-built interdiff renders the
+    incremental procedure -- including the explicit per-finding status
+    instruction."""
+    app, _fake_gh, decision_dir = _round2_app_with_archived_round1(tmp_path)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (decision_dir / "review-prompt.md").read_text(encoding="utf-8")
+    assert "## Incremental review procedure" in packet
+    assert "resolved, still present, or regressed" in packet
+    assert "Do not re-review the unchanged files" in packet
+    assert "base_noise" not in packet

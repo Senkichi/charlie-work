@@ -15,6 +15,7 @@ from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
 import pytest
+from _src_ast import parsed_source
 
 import charlie_work
 from charlie_work.config import (
@@ -34,6 +35,9 @@ def test_local_issues_config_defaults() -> None:
     cfg = LocalIssuesConfig()
     assert cfg.enabled is False
     assert cfg.issues_dir == "docs/issues"
+    # Issue #2434: tracker writes commit at the end of every pass by default;
+    # the flag exists only to be turned OFF as a kill switch.
+    assert cfg.commit_writes is True
 
 
 def test_local_issues_config_is_frozen() -> None:
@@ -58,17 +62,59 @@ def test_load_config_local_issues_section(tmp_path: Path) -> None:
     assert config.local_issues.issues_dir == "tickets"
 
 
+def _legacy_id(yaml_body: str, old_match: str) -> str:
+    """Pre-migration parametrize id: the collect-only gate keys leaves by it (ADR-0007)."""
+    return f"{yaml_body}-{old_match}"
+
+
 @pytest.mark.parametrize(
     ("yaml_body", "match"),
     [
-        ('local_issues:\n  enabled: "yes"\n', "must be a bool"),
-        ('local_issues:\n  issues_dir: ""\n', "must be a non-empty string"),
-        ("local_issues:\n  issues_dir: 5\n", "must be a non-empty string"),
-        ("local_issues:\n  issues_dir: ../x\n", "must not contain '..'"),
-        ("local_issues:\n  issues_dir: a/../../x\n", "must not contain '..'"),
-        ("local_issues:\n  issues_dir: /etc/x\n", "must be relative to the"),
-        ("local_issues:\n  issues_dir: 'C:\\x'\n", "must be relative to the"),
-        ("local_issues:\n  nope: 1\n", "unknown key"),
+        pytest.param(
+            'local_issues:\n  enabled: "yes"\n',
+            r"^local_issues\.enabled: expected bool, got 'yes' \(str\)$",
+            id=_legacy_id('local_issues:\n  enabled: "yes"\n', "must be a bool"),
+        ),
+        pytest.param(
+            'local_issues:\n  issues_dir: ""\n',
+            r"^local_issues\.issues_dir: expected non-empty string, got ''$",
+            id=_legacy_id('local_issues:\n  issues_dir: ""\n', "must be a non-empty string"),
+        ),
+        pytest.param(
+            "local_issues:\n  issues_dir: 5\n",
+            r"^local_issues\.issues_dir: expected string, got 5 \(int\)$",
+            id=_legacy_id("local_issues:\n  issues_dir: 5\n", "must be a non-empty string"),
+        ),
+        pytest.param(
+            "local_issues:\n  issues_dir: ../x\n",
+            r"^local_issues\.issues_dir: expected relative path without '\.\.', got '\.\./x'$",
+            id=_legacy_id("local_issues:\n  issues_dir: ../x\n", "must not contain '..'"),
+        ),
+        pytest.param(
+            "local_issues:\n  issues_dir: a/../../x\n",
+            r"^local_issues\.issues_dir: expected relative path without '\.\.', got 'a/",
+            id=_legacy_id("local_issues:\n  issues_dir: a/../../x\n", "must not contain '..'"),
+        ),
+        pytest.param(
+            "local_issues:\n  issues_dir: /etc/x\n",
+            r"^local_issues\.issues_dir: expected relative path without '\.\.', got '/etc/x'$",
+            id=_legacy_id("local_issues:\n  issues_dir: /etc/x\n", "must be relative to the"),
+        ),
+        pytest.param(
+            "local_issues:\n  issues_dir: 'C:\\x'\n",
+            r"^local_issues\.issues_dir: expected relative path without '\.\.', got 'C:",
+            id=_legacy_id("local_issues:\n  issues_dir: 'C:\\x'\n", "must be relative to the"),
+        ),
+        pytest.param(
+            "local_issues:\n  nope: 1\n",
+            r"^local_issues: expected known keys .*got unknown key\(s\) nope$",
+            id=_legacy_id("local_issues:\n  nope: 1\n", "unknown key"),
+        ),
+        pytest.param(
+            'local_issues:\n  commit_writes: "yes"\n',
+            r"^local_issues\.commit_writes: expected bool, got 'yes' \(str\)$",
+            id=_legacy_id('local_issues:\n  commit_writes: "yes"\n', "must be a bool"),
+        ),
     ],
 )
 def test_load_config_local_issues_validation_errors(
@@ -142,7 +188,7 @@ def _own_call_names(node: ast.AST) -> set[str]:
 def find_bypass_violations(source: str, filename: str = "<source>") -> list[str]:
     """Return ``filename:function`` for every function calling an app builder
     AND a bare ``GitHub(`` in its own (non-nested) body."""
-    tree = ast.parse(source, filename=filename)
+    tree = parsed_source(source, filename)
     violations = []
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -154,7 +200,7 @@ def find_bypass_violations(source: str, filename: str = "<source>") -> list[str]
 
 
 def _app_builder_function_names(source: str, filename: str = "<source>") -> list[str]:
-    tree = ast.parse(source, filename=filename)
+    tree = parsed_source(source, filename)
     found = []
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):

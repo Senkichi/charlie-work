@@ -15,6 +15,7 @@ import inspect
 from pathlib import Path
 
 import charlie_work.github as _github_module
+from _src_ast import parsed
 
 
 def _compatible_signature(proto_sig: inspect.Signature, concrete_sig: inspect.Signature) -> None:
@@ -51,8 +52,7 @@ def _lexical_github_defs() -> set[str]:
     ``_install_delegates()`` has since added via ``setattr`` -- a class-level
     assignment is not an AST ``FunctionDef`` node and would not show up here.
     """
-    source = Path(_github_module.__file__).read_text(encoding="utf-8")
-    tree = ast.parse(source)
+    tree = parsed(Path(_github_module.__file__))
     for node in ast.walk(tree):
         if isinstance(node, ast.ClassDef) and node.name == "GitHub":
             return {

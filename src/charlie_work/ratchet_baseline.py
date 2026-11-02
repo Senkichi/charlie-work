@@ -38,6 +38,8 @@ import re
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 
+from .atomic_write import write_text_atomic
+
 COUNT_SUFFIX = ".count"
 
 _COUNT_LINE = re.compile(r"[0-9]+")
@@ -151,10 +153,7 @@ def load_set_baseline(directory: Path) -> frozenset[str]:
 
 def _write_entry_file(path: Path, payload: str) -> None:
     """Atomic temp-file + replace write, per the repo's state-write invariant."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(payload, encoding="utf-8")
-    tmp.replace(path)
+    write_text_atomic(path, payload)
 
 
 def write_count_baseline(directory: Path, counts: Mapping[str, int]) -> None:

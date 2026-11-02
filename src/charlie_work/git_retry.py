@@ -13,7 +13,7 @@ a second (see the design investigation this module implements).
 
 ``run_git_with_retry`` mirrors ``GitHub.run()``'s backoff+jitter shape
 against the *same* shared classifier, but deliberately drops its
-mutation-safety split (``_is_pre_connection_error``): that split exists so a
+mutation-safety split (``github_transport.guarded.is_retryable``): that split exists so a
 *mutating* gh call (merge, label, comment) is never retried after an
 ambiguous post-send failure, to avoid double-applying it server-side. Every
 git command this module is meant for -- fetch, ff-only pull, ls-remote -- is

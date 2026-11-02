@@ -1,0 +1,4 @@
+warning
+# Issue #2439: a primary GitHub rate limit (hourly quota spent, 403/429 with
+# x-ratelimit-remaining 0, or a GraphQL RATE_LIMITED error) was hit. Emitted once
+# per resource window by the guarded transport, wherever the limit is hit.

@@ -27,7 +27,6 @@ threads the same ``deadline_exceeded`` predicate three ways:
 from __future__ import annotations
 
 import datetime
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -41,6 +40,7 @@ from _fleet_dispatch_fixtures import (
     _patch_self_deploy_for_fleet_tests as _patch_self_deploy_for_fleet_tests,
     _per_repo_runtime_paths,
 )
+from _fake_transport import FakeAdapter, failure, make_github, ok
 from charlie_work import github as github_module
 from charlie_work import layout
 from charlie_work.config import (
@@ -57,6 +57,7 @@ from charlie_work.fleet_dispatch import fleet_loop
 from charlie_work.fleet_lanes import _run_fleet_repo_lane
 from charlie_work.fleet_paths import fleet_dir
 from charlie_work.github import GitHub
+from charlie_work.github_transport import FailureKind
 from charlie_work.instrumentation import query_events
 from charlie_work.pass_deadline import (
     PassDeadlineExceeded,
@@ -64,7 +65,8 @@ from charlie_work.pass_deadline import (
 )
 from charlie_work.paths import runtime_paths
 from charlie_work.state import empty_state, save_state
-from charlie_work.workflow import CommandResult, OrchestratorApp
+from charlie_work.command_result import CommandResult
+from charlie_work.workflow import OrchestratorApp
 
 
 # ---------------------------------------------------------------------------
@@ -82,19 +84,16 @@ def test_gh_run_refuses_call_when_pass_deadline_exceeded(
     existing allow_failure consumer misreads a refusal-shaped result as a
     real gh failure (the review finding this contract answers).
     """
-    gh = GitHub(tmp_path)
+    gh, http, _ = make_github(tmp_path)
     set_pass_deadline_exceeded(gh, lambda: True)
-
-    spawn = MagicMock()
-    monkeypatch.setattr(github_module, "run_gh_command", spawn)
 
     with pytest.raises(PassDeadlineExceeded, match="in-pass deadline"):
         gh.run(["api", "rate_limit"], allow_failure=True)
-    spawn.assert_not_called()
+    assert http.calls == []
 
     with pytest.raises(PassDeadlineExceeded, match="in-pass deadline"):
         gh.run(["api", "rate_limit"], allow_failure=False)
-    spawn.assert_not_called()
+    assert http.calls == []
 
 
 def test_pass_deadline_exceeded_is_cancellation_not_an_exception() -> None:
@@ -118,12 +117,10 @@ def test_pass_deadline_exceeded_is_cancellation_not_an_exception() -> None:
 
 def test_gh_run_unarmed_deadline_is_inert(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """No armed hook (every non-fleet caller) means zero behavior change."""
-    gh = GitHub(tmp_path)
-    spawn = MagicMock(return_value=subprocess.CompletedProcess([], 0, "ok-out", ""))
-    monkeypatch.setattr(github_module, "run_gh_command", spawn)
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok("ok-out")]))
 
     assert gh.run(["api", "rate_limit"]) == "ok-out"
-    spawn.assert_called_once()
+    assert len(http.calls) == 1
 
 
 def test_gh_run_aborts_retry_chain_at_deadline(
@@ -131,30 +128,29 @@ def test_gh_run_aborts_retry_chain_at_deadline(
 ) -> None:
     """A deadline reached mid-retry-chain aborts without burning a backoff.
 
-    The predicate is False for the first attempt's boundary check and True
+    The predicate is False until the first attempt has been sent and True
     for the pre-sleep re-check, so the run must refuse rather than sleeping
     into a second spawn -- the whole point of #1948 is that the lane stops
     accumulating timeout+backoff cycles once the budget is spent.
     """
-    gh = GitHub(tmp_path)
-    checks = {"n": 0}
+    http = FakeAdapter("http", [failure(FailureKind.TIMEOUT, "timed out after 30s")])
+    gh, _http, _ = make_github(tmp_path, http=http)
 
     def _deadline() -> bool:
-        checks["n"] += 1
-        return checks["n"] > 1
+        # Open for the pre-attempt checks (including the one gating the
+        # ``gh auth token`` mint), spent once the first request has failed.
+        return len(http.api_requests) >= 1
 
     set_pass_deadline_exceeded(gh, _deadline)
 
-    spawn = MagicMock(side_effect=subprocess.TimeoutExpired(cmd="gh api rate_limit", timeout=30))
     sleeps: list[float] = []
-    monkeypatch.setattr(github_module, "run_gh_command", spawn)
     monkeypatch.setattr(github_module.time, "sleep", lambda seconds: sleeps.append(seconds))
 
     with pytest.raises(PassDeadlineExceeded, match="in-pass deadline"):
         gh.run(["api", "rate_limit"], allow_failure=True)
-    assert spawn.call_count == 1, (
-        "a retryable timeout followed by a tripped deadline must not spawn "
-        "another gh -- the refusal replaces the whole remaining retry chain"
+    assert len(http.calls) == 1, (
+        "a retryable timeout followed by a tripped deadline must not send "
+        "another request -- the refusal replaces the whole remaining retry chain"
     )
     assert sleeps == [], "the deadline refusal must precede the backoff sleep"
 
@@ -167,32 +163,27 @@ def test_gh_run_checks_deadline_before_transient_retry_backoff(
     ``test_gh_run_aborts_retry_chain_at_deadline`` covers the
     ``TimeoutExpired`` branch; this covers the sibling branch -- a
     transient non-timeout gh failure ("connection reset") that
-    ``_should_retry`` classifies retryable for a read call. The predicate
+    ``is_retryable`` classifies retryable for a read call. The predicate
     is False for the pre-attempt check and True for the pre-sleep check.
     """
-    gh = GitHub(tmp_path)
-    checks = {"n": 0}
+    http = FakeAdapter("http", [failure(FailureKind.SENT_NO_RESPONSE, "connection reset by peer")])
+    gh, _http, _ = make_github(tmp_path, http=http)
 
     def _deadline() -> bool:
-        checks["n"] += 1
-        return checks["n"] > 1
+        # Open for the pre-attempt checks (including the one gating the
+        # ``gh auth token`` mint), spent once the first request has failed.
+        return len(http.api_requests) >= 1
 
     set_pass_deadline_exceeded(gh, _deadline)
 
-    spawn = MagicMock(
-        return_value=subprocess.CompletedProcess(
-            ["gh", "api", "rate_limit"], 1, "", "connection reset by peer"
-        )
-    )
     sleeps: list[float] = []
-    monkeypatch.setattr(github_module, "run_gh_command", spawn)
     monkeypatch.setattr(github_module.time, "sleep", lambda seconds: sleeps.append(seconds))
 
     with pytest.raises(PassDeadlineExceeded, match="in-pass deadline"):
         gh.run(["api", "rate_limit"], allow_failure=True)
-    assert spawn.call_count == 1, (
+    assert len(http.calls) == 1, (
         "a retryable transient failure followed by a tripped deadline must "
-        "not spawn another gh -- the refusal replaces the retry chain"
+        "not send another request -- the refusal replaces the retry chain"
     )
     assert sleeps == [], "the deadline refusal must precede the backoff sleep"
 
@@ -224,6 +215,7 @@ def test_fleet_repo_lane_arms_deadline_on_real_github(tmp_path: Path) -> None:
         limit=3,
         merge=True,
         ensure_labels=False,
+        fleet_state_path=tmp_path / "state.json",
         deadline_exceeded=predicate,
     )
 
@@ -235,7 +227,7 @@ def test_fleet_repo_lane_arms_deadline_on_real_github(tmp_path: Path) -> None:
         real_gh.run(["api", "rate_limit"], allow_failure=True)
 
 
-def test_fleet_repo_lane_stops_between_dispatch_and_review_dispatch() -> None:
+def test_fleet_repo_lane_stops_between_dispatch_and_review_dispatch(tmp_path: Path) -> None:
     """work_only lane: deadline tripped after dispatch defers dispatch_reviews."""
     app = MagicMock()
     app.dispatch.return_value = CommandResult(True, "dispatched", {"selected_count": 1})
@@ -253,6 +245,7 @@ def test_fleet_repo_lane_stops_between_dispatch_and_review_dispatch() -> None:
         limit=3,
         merge=None,
         ensure_labels=False,
+        fleet_state_path=tmp_path / "state.json",
         deadline_exceeded=lambda: next(checks),
     )
 
@@ -263,7 +256,7 @@ def test_fleet_repo_lane_stops_between_dispatch_and_review_dispatch() -> None:
     lock.release.assert_called_once()
 
 
-def test_fleet_repo_lane_bails_before_first_phase() -> None:
+def test_fleet_repo_lane_bails_before_first_phase(tmp_path: Path) -> None:
     """Deadline already spent at lane start: no dispatch/loop call at all."""
     app = MagicMock()
     lock = _lane_lock()
@@ -278,6 +271,7 @@ def test_fleet_repo_lane_bails_before_first_phase() -> None:
         limit=3,
         merge=None,
         ensure_labels=False,
+        fleet_state_path=tmp_path / "state.json",
         deadline_exceeded=lambda: True,
     )
 
@@ -288,7 +282,7 @@ def test_fleet_repo_lane_bails_before_first_phase() -> None:
     lock.release.assert_called_once()
 
 
-def test_fleet_repo_lane_threads_deadline_into_loop() -> None:
+def test_fleet_repo_lane_threads_deadline_into_loop(tmp_path: Path) -> None:
     """The full-loop lane forwards the SAME predicate object into app.loop()."""
     app = MagicMock()
     app.loop.return_value = CommandResult(True, "ok", {})
@@ -304,13 +298,14 @@ def test_fleet_repo_lane_threads_deadline_into_loop() -> None:
         limit=3,
         merge=True,
         ensure_labels=False,
+        fleet_state_path=tmp_path / "state.json",
         deadline_exceeded=predicate,
     )
 
     app.loop.assert_called_once_with(3, merge=True, deadline_exceeded=predicate)
 
 
-def test_fleet_repo_lane_no_deadline_is_inert() -> None:
+def test_fleet_repo_lane_no_deadline_is_inert(tmp_path: Path) -> None:
     """deadline_exceeded=None keeps the pre-#1948 lane behavior byte-identical."""
     app = MagicMock()
     app.loop.return_value = CommandResult(True, "ok", {})
@@ -325,6 +320,7 @@ def test_fleet_repo_lane_no_deadline_is_inert() -> None:
         limit=3,
         merge=True,
         ensure_labels=False,
+        fleet_state_path=tmp_path / "state.json",
     )
 
     app.loop.assert_called_once_with(3, merge=True, deadline_exceeded=None)

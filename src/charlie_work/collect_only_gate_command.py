@@ -46,7 +46,7 @@ from .collect_only_gate import (
     resolve_collect_gate_exemption,
 )
 from .github import label_names
-from .workflow import CommandResult
+from .command_result import CommandResult
 
 
 def register_collect_only_check_subparser(

@@ -32,19 +32,9 @@ from ci_fleet.github import GitHubError
 # must be a normal top-level import, not the ``TYPE_CHECKING``-only one this
 # module used while RepoMeta was still empty in L01 -- mirroring
 # ``checks.py``'s L04 promotion of the same import for the same reason.
+from ..github_transport.request import ACCEPT_DIFF, RestRequest
 from ._base import CapabilityCollaborator, GitHubRunResult
-
-# Narrow field list for ``gh repo view --json nameWithOwner`` (issue #1609):
-# ``name_with_owner`` needs only the repository's ``nameWithOwner`` scalar, so
-# it must not go through a broader field list. Kept as a module-level constant
-# rather than an inline literal so the field-list lint
-# (tests/test_doctor.py::test_gh_field_lists_use_constants_no_inline_literals)
-# covers the single-positional-list ``self.run([...], json_output=True)`` call
-# shape this body uses -- the matcher's third branch, added by #1609, inspects
-# that shape; before the fix this call was skipped entirely because it lived in
-# ``github.py`` (the file the lint skips by design). It moved here with the
-# RepoMeta body (Track 2, issue #1589, L05), exposing it to the lint.
-REPO_NAME_WITH_OWNER_FIELDS = "nameWithOwner"
+from ._send import send_json, send_result
 
 
 @runtime_checkable
@@ -112,25 +102,10 @@ class RepoMeta(CapabilityCollaborator):
         (TLS blip vs rate limit vs auth vs 404) at the boundary that most
         needs it, consistent with this repo's errors-as-values invariant.
         """
-        result = self.run(
-            ["api", f"repos/{{owner}}/{{repo}}/commits/{sha}"],
+        return send_result(
+            self,
+            RestRequest.of("GET", f"repos/{{owner}}/{{repo}}/commits/{sha}"),
             json_output=True,
-            allow_failure=True,
-        )
-        if isinstance(result, GitHubRunResult):
-            return result
-        # Dry-run short-circuit or an unexpected double that returned a raw
-        # value instead of a GitHubRunResult. Normalize so the contract is
-        # uniform -- callers never need to branch on the return type.
-        if isinstance(result, dict):
-            return GitHubRunResult(ok=True, returncode=0, stdout="", stderr="", value=result)
-        return GitHubRunResult(
-            ok=False,
-            returncode=0,
-            stdout="",
-            stderr="",
-            value=None,
-            error=f"unexpected response from gh.run: {type(result).__name__}",
         )
 
     def compare(self, base: str, head: str) -> dict[str, Any] | None:
@@ -141,14 +116,12 @@ class RepoMeta(CapabilityCollaborator):
         ``merge_base_commit``, or ``None`` on failure. Errors are returned as
         values, never raised.
         """
-        result = self.run(
-            ["api", f"repos/{{owner}}/{{repo}}/compare/{base}...{head}"],
+        result = send_result(
+            self,
+            RestRequest.of("GET", f"repos/{{owner}}/{{repo}}/compare/{base}...{head}"),
             json_output=True,
-            allow_failure=True,
         )
-        if isinstance(result, GitHubRunResult):
-            return result.value if result.ok and isinstance(result.value, dict) else None
-        return result if isinstance(result, dict) else None
+        return result.value if result.ok and isinstance(result.value, dict) else None
 
     def compare_diff(self, base: str, head: str) -> str | None:
         """Return the plain unified-diff text between two commits (three-dot compare).
@@ -161,23 +134,18 @@ class RepoMeta(CapabilityCollaborator):
         compare does. Returns ``None`` on any failure (404, API error, gh not
         installed) — errors are returned as values, never raised.
         """
-        result = self.run(
-            [
-                "api",
-                f"repos/{{owner}}/{{repo}}/compare/{base}...{head}",
-                "-H",
-                "Accept: application/vnd.github.v3.diff",
-            ],
-            allow_failure=True,
+        result = send_result(
+            self,
+            RestRequest.of(
+                "GET", f"repos/{{owner}}/{{repo}}/compare/{base}...{head}", accept=ACCEPT_DIFF
+            ),
         )
-        if isinstance(result, GitHubRunResult):
-            return result.value if result.ok and isinstance(result.value, str) else None
-        return result if isinstance(result, str) else None
+        return result.value if result.ok and isinstance(result.value, str) else None
 
     def name_with_owner(self) -> str:
         """Return the repository's nameWithOwner (e.g., "owner/repo").
 
-        Uses `gh repo view --json nameWithOwner`. Raises GitHubError on failure
+        Uses ``GET repos/{owner}/{repo}`` (``full_name``). Raises GitHubError on failure
         (offline, not a GitHub repo, gh missing, etc.).
 
         Cached per orchestrator pass in ``_list_cache`` (issue #1770 review
@@ -199,13 +167,14 @@ class RepoMeta(CapabilityCollaborator):
         if isinstance(cached, str):
             return cached
 
-        result = self.run(
-            ["repo", "view", "--json", REPO_NAME_WITH_OWNER_FIELDS], json_output=True
-        )
+        # The local remote names the repo; the API confirms it (and canonicalises
+        # case or a rename) with ``GET repos/{owner}/{repo}`` -- ``full_name`` is
+        # what ``gh repo view --json nameWithOwner`` printed (ADR-0006, B1).
+        result = send_json(self, RestRequest.of("GET", "repos/{owner}/{repo}"))
         if not isinstance(result, dict):
-            raise GitHubError("Expected dict from gh repo view")
-        name_with_owner = result.get("nameWithOwner")
+            raise GitHubError("Expected dict from GET repos/{owner}/{repo}")
+        name_with_owner = result.get("full_name")
         if not isinstance(name_with_owner, str):
-            raise GitHubError("Expected nameWithOwner string in gh repo view output")
+            raise GitHubError("Expected full_name string in GET repos/{owner}/{repo} output")
         self._list_cache[cache_key] = name_with_owner
         return name_with_owner

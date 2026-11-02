@@ -23,6 +23,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from _src_ast import parsed, parsed_source
 
 _SRC_DIR = Path(__file__).resolve().parents[2] / "src" / "charlie_work" / "attachment_contracts"
 _PKG_DIR = Path(__file__).resolve().parents[2] / "packages" / "attachment-contracts"
@@ -40,7 +41,7 @@ def _intra_repo_imports(source: str, filename: str) -> list[str]:
     or a submodule thereof.  Any other ``charlie_work.*`` import is an
     intra-repo import that would break the standalone distribution.
     """
-    tree = ast.parse(source, filename=filename)
+    tree = parsed_source(source, filename)
     violations: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module:
@@ -78,8 +79,7 @@ def test_windows_helper_inlined() -> None:
     """The ``_windows`` module exists and defines ``no_console_window_kwargs``."""
     windows_path = _SRC_DIR / "_windows.py"
     assert windows_path.is_file(), "_windows.py must exist in attachment_contracts/"
-    source = windows_path.read_text(encoding="utf-8")
-    tree = ast.parse(source, filename=str(windows_path))
+    tree = parsed(windows_path)
     func_names = {
         node.name
         for node in ast.walk(tree)

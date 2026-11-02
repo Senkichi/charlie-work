@@ -34,6 +34,7 @@ from collections.abc import Iterable
 from pathlib import Path
 
 import pytest
+from _src_ast import parsed, source_text
 
 from charlie_work import layout
 from charlie_work.config import DispatchConfig, OrchestratorConfig, RuntimeConfig
@@ -610,6 +611,7 @@ REVIEW_MD_SUPPLIED_KEYS = {
     "over_cap_section",
     "attachment_budget_section",
     "prior_review_section",
+    "incremental_review_procedure",
 }
 
 # orchestration/local_lanes.py::_local_build_packet, the literal values dict
@@ -633,6 +635,7 @@ REVIEW_LOCAL_MD_SUPPLIED_KEYS = {
     "over_cap_section",
     "attachment_budget_section",
     "prior_review_section",
+    "incremental_review_procedure",
 }
 
 _PINNED_KEY_SETS = {
@@ -711,6 +714,7 @@ def test_review_md_renders_with_production_paths_and_no_state_dir_literal(
         "over_cap_section": "",
         "attachment_budget_section": "",
         "prior_review_section": "",
+        "incremental_review_procedure": "",
     }
     assert set(values) == REVIEW_MD_SUPPLIED_KEYS
 
@@ -777,6 +781,7 @@ def test_review_md_repo_local_override_render_with_no_state_dir_literal(
         "over_cap_section": "",
         "attachment_budget_section": "",
         "prior_review_section": "",
+        "incremental_review_procedure": "",
     }
     assert set(values) == REVIEW_MD_SUPPLIED_KEYS
 
@@ -936,10 +941,10 @@ def _resolve_cited_symbol_spans(
         cached = file_index.get(path)
         if cached is not None:
             return cached
-        text = Path(path).read_text(encoding="utf-8")
+        text = source_text(Path(path))
         offset = len(combined_lines)
         combined_lines.extend(text.splitlines())
-        entry = (offset, _resolve_symbols(ast.parse(text)))
+        entry = (offset, _resolve_symbols(parsed(Path(path))))
         file_index[path] = entry
         return entry
 

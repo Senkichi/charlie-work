@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from charlie_work import issue_priority
+
 
 def _sort_by_dependency_depth(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Sort unblocked candidates by out-degree (number of blocked dependents).
@@ -182,3 +184,19 @@ def _filter_blocked_issues(
         issue for issue in candidates if int(issue["number"]) not in blocked_issues
     ]
     return filtered_candidates, blocked_issues, open_blockers_by_issue
+
+
+def _order_dispatch_candidates(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The one fresh-dispatch candidate order, shared by the real and dry-run passes.
+
+    ``dispatch.order`` picks the base order: ``newest`` sorts by creation date,
+    the default is dependency-aware oldest-first. ``priority:<level>`` labels
+    then re-rank it, ``critical`` first, stably, so the base order holds within
+    a level (TIS-CW-7).
+    """
+    if self.config.dispatch.order == "newest":
+        ordered = self._sort_by_dispatch_order(candidates)
+    else:
+        # Default: dependency-aware ordering (out-degree) with oldest-first tiebreaker
+        ordered = self._sort_by_dependency_depth(candidates)
+    return issue_priority.order_by_priority(ordered, self.config.labels.priority_prefix)

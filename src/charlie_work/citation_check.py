@@ -35,8 +35,19 @@ It mechanically detects **coordinate drift**:
   line range validates against it. The citation is usable, just imprecise
   (a bare basename rather than a full path). Excluded from
   ``drifted_verdicts`` so it surfaces without raising a false alarm.
+* ``RESOLVED_BY_SIBLING`` — info-level (not drift, issue #1881): the cited
+  literal path does not exist, more than one tracked file shares the basename,
+  but a *qualified* citation elsewhere in the same body (a citation whose
+  asserted literal path exists in the working tree) picks out exactly one
+  candidate. Two tiers, strongest first: the sibling cites that exact file, or
+  the sibling cites a different file in the same (non-root) directory as
+  exactly one candidate. The sibling citation deterministically disambiguates
+  the basename, so the verdict surfaces ``resolved_path`` without raising a
+  false alarm -- ``AMBIGUOUS_BASENAME`` only when no sibling citation in the
+  same body disambiguates.
 * ``AMBIGUOUS_BASENAME`` — the cited literal path does not exist and more
-  than one tracked file shares the basename. This is a real citation defect:
+  than one tracked file shares the basename, with no same-body sibling
+  citation picking out one candidate. This is a real citation defect:
   the author must disambiguate with a directory prefix. The verdict's
   ``candidates`` tuple lists every match.
 
@@ -82,15 +93,19 @@ __all__ = [
 class CitationStatus(str, Enum):
     """Verdict on a single ``path:line`` citation.
 
-    ``OK`` and ``RESOLVED_BY_BASENAME`` are the non-drift statuses. Every other
-    value means the citation's coordinates no longer match the working tree and
-    a worker should not trust the bare line number. ``RESOLVED_BY_BASENAME`` is
-    info-level: the cited literal path did not exist, but a unique tracked file
-    with that basename was found and the line range validates against it -- the
-    citation is usable, just imprecise (a bare basename rather than a full
-    path). It surfaces the citation-quality issue without a false missing-file
-    claim, and is excluded from ``drifted_verdicts`` so it does not raise a
-    drift alarm.
+    ``OK``, ``RESOLVED_BY_BASENAME``, and ``RESOLVED_BY_SIBLING`` are the
+    non-drift statuses. Every other value means the citation's coordinates no
+    longer match the working tree and a worker should not trust the bare line
+    number. ``RESOLVED_BY_BASENAME`` is info-level: the cited literal path did
+    not exist, but a unique tracked file with that basename was found and the
+    line range validates against it -- the citation is usable, just imprecise
+    (a bare basename rather than a full path). ``RESOLVED_BY_SIBLING`` is
+    info-level for the ambiguous case (issue #1881): several tracked files
+    share the basename, but a qualified citation elsewhere in the same body
+    matches exactly one candidate -- by exact path or by sharing its
+    directory -- so the citation is deterministically usable. Both surface the citation-quality issue without a false
+    missing-file claim, and are excluded from ``drifted_verdicts`` so they do
+    not raise a drift alarm.
     """
 
     OK = "ok"
@@ -100,6 +115,7 @@ class CitationStatus(str, Enum):
     STALE_PREFIX = "stale_prefix"
     CONTENT_DRIFT = "content_drift"
     RESOLVED_BY_BASENAME = "resolved_by_basename"
+    RESOLVED_BY_SIBLING = "resolved_by_sibling"
     AMBIGUOUS_BASENAME = "ambiguous_basename"
 
 
@@ -280,6 +296,92 @@ def _read_lines(path: Path) -> list[str]:
         return []
 
 
+def _repo_relative_posix(path: Path, repo_root: Path) -> str | None:
+    """Return ``path`` as a repo-root-relative POSIX string, or ``None`` if outside.
+
+    POSIX separators keep comparisons and comments identical on Windows and
+    POSIX. A path outside ``repo_root`` has no repo-relative form, so it can
+    neither be a basename candidate nor disambiguate one.
+    """
+    try:
+        return str(path.relative_to(repo_root)).replace("\\", "/")
+    except ValueError:
+        return None
+
+
+def _sibling_evidence(
+    literal_resolves: list[Path | None], repo_root: Path
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Collect same-body sibling evidence for basename disambiguation (issue #1881).
+
+    ``literal_resolves`` holds, per citation, the file its asserted literal path
+    resolved to (``None`` when that path does not exist). Only citations whose
+    literal path exists contribute -- an ambiguous or missing citation never
+    vouches for another one. Returns ``(paths, dirs)``:
+
+    * ``paths`` -- the repo-root-relative POSIX path of every such citation
+      (tier 1: the *same file* is cited elsewhere in the body).
+    * ``dirs`` -- the repo-root-relative POSIX parent directory of every such
+      citation that is directory-qualified (tier 2: a *different file in the
+      same directory* is cited elsewhere in the body). The bare repo root (a
+      root-level file, which has no directory component) is excluded here --
+      the single enforcement point: a root-level file says nothing about which
+      directory the body is discussing, and it would match every root-level
+      candidate.
+    """
+    paths: set[str] = set()
+    dirs: set[str] = set()
+    for lit in literal_resolves:
+        if lit is None:
+            continue
+        rel = _repo_relative_posix(lit, repo_root)
+        if rel is None:
+            continue
+        paths.add(rel)
+        parent = rel.rpartition("/")[0]
+        if parent:
+            dirs.add(parent)
+    return frozenset(paths), frozenset(dirs)
+
+
+def _pick_sibling_candidate(
+    matches: list[Path],
+    repo_root: Path,
+    sibling_paths: frozenset[str],
+    sibling_dirs: frozenset[str],
+) -> Path | None:
+    """Pick the one basename candidate that same-body sibling evidence selects.
+
+    Evidence is tiered, strongest first, and each tier must pick out *exactly
+    one* candidate or it is not used:
+
+    1. **Exact path** -- the candidate's repo-relative path equals a sibling
+       citation's path (the same file is cited elsewhere in the body).
+    2. **Same directory** -- the candidate's repo-relative parent directory
+       equals the parent directory of a directory-qualified sibling citation
+       (a different file in the same directory is cited elsewhere). A root-level
+       candidate has no directory to match and never qualifies.
+
+    Tier 2 is consulted only when tier 1 did not uniquely resolve, so a body
+    that cites the exact file keeps winning even if another sibling happens to
+    sit in a second candidate's directory. Returns ``None`` when neither tier
+    is unique -- the caller then reports ``AMBIGUOUS_BASENAME``.
+    """
+    rel_by_match = [(m, _repo_relative_posix(m, repo_root)) for m in matches]
+    by_path = [m for m, rel in rel_by_match if rel is not None and rel in sibling_paths]
+    if len(by_path) == 1:
+        return by_path[0]
+    # The repo root is excluded from ``sibling_dirs`` at the single point where
+    # that set is built (``_sibling_evidence``), so a root-level candidate's
+    # empty parent can never match here.
+    by_dir = [
+        m for m, rel in rel_by_match if rel is not None and rel.rpartition("/")[0] in sibling_dirs
+    ]
+    if len(by_dir) == 1:
+        return by_dir[0]
+    return None
+
+
 def verify_citations(
     body: str,
     repo_root: Path,
@@ -310,13 +412,35 @@ def verify_citations(
       (the asserted prefix is wrong). A range beyond EOF on the resolved file
       is still ``OUT_OF_RANGE`` -- line-range validation runs against the
       resolved path, not the missing literal one.
-    * **Multiple** tracked files share the basename -> ``AMBIGUOUS_BASENAME``
-      with the candidate list. This is a real citation defect the author must
-      fix (disambiguate with a directory prefix); it is not a false alarm.
+    * **Multiple** tracked files share the basename -> sibling
+      disambiguation first (issue #1881): a *qualified* citation elsewhere in
+      the same body -- one whose asserted literal path exists in the working
+      tree -- supplies evidence in two tiers: (1) its repo-root-relative path
+      equals exactly one candidate's (the same file is cited elsewhere), else
+      (2) its parent directory, when directory-qualified (not the bare repo
+      root), equals exactly one candidate's parent directory (a different file
+      in the same directory is cited elsewhere). Tier 2 is consulted only when
+      tier 1 did not uniquely resolve. A unique candidate -> resolve against it
+      and validate the line range there; a bare citation that validates
+      reports ``RESOLVED_BY_SIBLING`` (info-level), a prefixed one reports
+      ``STALE_PREFIX`` (the asserted prefix is still false). No sibling
+      evidence, or more than one candidate matching in both tiers -> fall back
+      to ``AMBIGUOUS_BASENAME`` with the candidate list. This is a real
+      citation defect the author must fix (disambiguate with a directory
+      prefix); it is not a false alarm.
 
     Never raises on a missing/unreadable file; that is a verdict, not an error.
     """
     citations = parse_citations(body)
+    # Evidence for same-body sibling disambiguation (issue #1881): the exact
+    # paths and the parent directories of every citation whose asserted
+    # literal path exists in the working tree. An ambiguous basename citation
+    # consults this evidence before flagging (see ``_pick_sibling_candidate``).
+    # Computing it in one pre-pass keeps the per-citation loop single-pass and
+    # captures qualified siblings that appear *after* the ambiguous citation
+    # in the body.
+    literal_resolves: list[Path | None] = [_literal_resolve(c.path, repo_root) for c in citations]
+    sibling_paths, sibling_dirs = _sibling_evidence(literal_resolves, repo_root)
     verdicts: list[CitationVerdict] = []
     # Cache file reads (current and at-commit) by path so a file cited many
     # times is read once.
@@ -334,8 +458,8 @@ def verify_citations(
     if any(not Path(c.path).is_absolute() for c in citations):
         basename_index = _build_basename_index(repo_root)
 
-    for cite in citations:
-        literal = _literal_resolve(cite.path, repo_root)
+    for cite, literal in zip(citations, literal_resolves):
+        sibling_resolved = False
         if literal is not None:
             resolved = literal
             basename_resolved = False
@@ -348,31 +472,50 @@ def verify_citations(
                 continue
             if len(matches) > 1:
                 # Ambiguous: the author cited a bare basename (or a wrong
-                # prefix) that matches more than one tracked file. This is a
-                # real citation defect -- surface every candidate so the author
-                # can disambiguate. Repo-root-relative POSIX strings keep the
-                # comment readable on both Windows and POSIX.
-                candidates = tuple(
-                    str(p.relative_to(repo_root)).replace("\\", "/") for p in matches
+                # prefix) that matches more than one tracked file. Before
+                # flagging (issue #1881), try same-body sibling
+                # disambiguation: a qualified citation elsewhere in the body
+                # picking out exactly one candidate -- by exact path, else by
+                # shared directory -- resolves the basename deterministically.
+                # No sibling evidence, or more than one candidate matching it,
+                # keeps today's ambiguous flag -- repo-root-relative POSIX
+                # strings keep the comment readable on both Windows and POSIX.
+                sibling_pick = _pick_sibling_candidate(
+                    matches, repo_root, sibling_paths, sibling_dirs
                 )
-                verdicts.append(
-                    CitationVerdict(
-                        cite,
-                        CitationStatus.AMBIGUOUS_BASENAME,
-                        candidates=candidates,
+                if sibling_pick is not None:
+                    resolved = sibling_pick
+                    # The basename is disambiguated, but no per-candidate
+                    # fallback happened -- remember it so the status line
+                    # reports ``RESOLVED_BY_SIBLING``, not
+                    # ``RESOLVED_BY_BASENAME``.
+                    basename_resolved = True
+                    sibling_resolved = True
+                else:
+                    candidates = tuple(
+                        str(p.relative_to(repo_root)).replace("\\", "/") for p in matches
                     )
-                )
-                continue
-            resolved = matches[0]
-            basename_resolved = True
+                    verdicts.append(
+                        CitationVerdict(
+                            cite,
+                            CitationStatus.AMBIGUOUS_BASENAME,
+                            candidates=candidates,
+                        )
+                    )
+                    continue
+            else:
+                resolved = matches[0]
+                basename_resolved = True
             # Stale directory prefix: the citation asserted a path with a
             # directory prefix (``"/" in cite.path``), the literal path does not
-            # exist, but the basename resolved uniquely via fallback. The prefix
-            # was asserted and is now false -- flag it so a worker is not
-            # silently pointed at the right file via a wrong path. Bare
-            # (no-prefix) citations that resolve uniquely fall through to
-            # line-range validation and report ``RESOLVED_BY_BASENAME``.
-            # ``resolved_path`` surfaces where the file actually moved to.
+            # exist, but the basename resolved via fallback (uniquely, or by
+            # same-body sibling evidence). The prefix was asserted and is now
+            # false -- flag it so a worker is not silently pointed at the
+            # right file via a wrong path. Bare (no-prefix) citations that
+            # resolve fall through to line-range validation and report
+            # ``RESOLVED_BY_BASENAME`` (unique) or ``RESOLVED_BY_SIBLING``
+            # (sibling-disambiguated, issue #1881). ``resolved_path`` surfaces
+            # where the file actually moved to.
             if "/" in cite.path:
                 verdicts.append(
                     CitationVerdict(
@@ -418,13 +561,19 @@ def verify_citations(
             )
             continue
         if basename_resolved:
-            # Bare basename resolved uniquely and the line range validates.
-            # Info-level: the citation is usable, just imprecise. Surface the
-            # resolved path so a reader sees where the basename landed.
+            # Bare basename resolved (uniquely, or via same-body sibling
+            # evidence) and the line range validates. Info-level: the
+            # citation is usable, just imprecise. Surface the resolved path
+            # so a reader sees where the basename landed.
+            status = (
+                CitationStatus.RESOLVED_BY_SIBLING
+                if sibling_resolved
+                else CitationStatus.RESOLVED_BY_BASENAME
+            )
             verdicts.append(
                 CitationVerdict(
                     cite,
-                    CitationStatus.RESOLVED_BY_BASENAME,
+                    status,
                     current_line_text=current_slice,
                     resolved_path=str(resolved),
                 )
@@ -436,21 +585,29 @@ def verify_citations(
     return verdicts
 
 
-# Statuses that are not drift: ``OK`` (a correct citation) and
-# ``RESOLVED_BY_BASENAME`` (a bare basename that resolved uniquely and validates
-# -- info-level, not an alarm). Everything else is a defect a worker or author
+# Statuses that are not drift: ``OK`` (a correct citation),
+# ``RESOLVED_BY_BASENAME`` (a bare basename that resolved uniquely and
+# validates -- info-level), and ``RESOLVED_BY_SIBLING`` (an ambiguous basename
+# deterministically resolved by a qualified sibling citation in the same body,
+# issue #1881 -- info-level). Everything else is a defect a worker or author
 # must act on.
-_NON_DRIFT = frozenset({CitationStatus.OK, CitationStatus.RESOLVED_BY_BASENAME})
+_NON_DRIFT = frozenset(
+    {
+        CitationStatus.OK,
+        CitationStatus.RESOLVED_BY_BASENAME,
+        CitationStatus.RESOLVED_BY_SIBLING,
+    }
+)
 
 
 def drifted_verdicts(verdicts: list[CitationVerdict]) -> list[CitationVerdict]:
     """Return only the verdicts that need attention -- the drift, not the info.
 
-    ``OK`` and ``RESOLVED_BY_BASENAME`` are excluded: the former is a correct
-    citation, the latter is an info-level bare-basename resolution that is
-    usable as-is. Every other status (``FILE_MISSING``, ``OUT_OF_RANGE``,
-    ``EMPTY_LINE``, ``STALE_PREFIX``, ``CONTENT_DRIFT``, ``AMBIGUOUS_BASENAME``)
-    is a defect a worker or author must act on.
+    ``OK``, ``RESOLVED_BY_BASENAME``, and ``RESOLVED_BY_SIBLING`` are excluded:
+    the first is a correct citation, the other two are info-level basename
+    resolutions that are usable as-is. Every other status (``FILE_MISSING``,
+    ``OUT_OF_RANGE``, ``EMPTY_LINE``, ``STALE_PREFIX``, ``CONTENT_DRIFT``,
+    ``AMBIGUOUS_BASENAME``) is a defect a worker or author must act on.
     """
     return [v for v in verdicts if v.status not in _NON_DRIFT]
 

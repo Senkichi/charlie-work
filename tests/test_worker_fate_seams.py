@@ -86,7 +86,17 @@ def test_n6_build_profiles_completeness_check_survives_dash_o(
     monkeypatch.setattr(adapter_fate_profile, "_PROFILES", None)
     monkeypatch.setattr(
         "charlie_work.harnesses.WORKER_HARNESSES",
-        frozenset({"devin-shell", "claude-code", "api", "command", "manual", "bogus-harness"}),
+        frozenset(
+            {
+                "devin-shell",
+                "claude-code",
+                "api",
+                "opencode",
+                "command",
+                "manual",
+                "bogus-harness",
+            }
+        ),
     )
     with pytest.raises(AssertionError, match="WORKER_HARNESSES"):
         adapter_fate_profile._build_profiles()
@@ -236,6 +246,39 @@ def test_persist_failure_writes_cooldown_and_kind_together_without_mutating() ->
     assert entry["dead_worker_failure_kind"] == "rate_limited"
     assert entry["dead_worker_failure_classified_at"] == "2026-01-01T12:10:00Z"
     assert before == {"throttled_until": None, "issues": {"7": {"status": "dispatched"}}}
+
+
+def test_persist_failure_stamps_the_window_with_the_role_key_that_died() -> None:
+    """Issue #2279: the per-repo window carries the dead session's stamped
+    ``(harness, model)`` so a fallback's window can be told apart from a
+    recovered primary's on the same adapter."""
+    before = {"throttled_until": None, "issues": {"7": {"status": "dispatched"}}}
+    failure = FailureEvidence.from_classification(
+        "quota_exhausted",
+        "2026-01-01T12:15:00Z",
+        fresh=True,
+        role_key=("devin-shell", "gemini-flash"),
+    )
+
+    new = persist_failure(before, 7, failure, adapter_kind="devin", now=NOW, source="test")
+
+    assert new["throttle_adapter_kind"] == "devin"
+    assert new["throttle_harness"] == "devin-shell"
+    assert new["throttle_model"] == "gemini-flash"
+
+
+def test_persist_failure_without_a_role_stamp_leaves_the_window_untagged() -> None:
+    """A death whose session predates ``role_entry`` (no stamp) writes the
+    same adapter-wide window shape as before -- it must keep blocking."""
+    before = {"throttled_until": None, "issues": {"7": {"status": "dispatched"}}}
+    failure = FailureEvidence.from_classification(
+        "rate_limited", "2026-01-01T12:15:00Z", fresh=True
+    )
+
+    new = persist_failure(before, 7, failure, adapter_kind="devin", now=NOW, source="test")
+
+    assert new["throttle_harness"] is None
+    assert new["throttle_model"] is None
 
 
 def test_persist_failure_without_cooldown_leaves_throttled_until_alone() -> None:
@@ -459,6 +502,12 @@ def test_stale_evidence_events_emit_a_shared_key_once() -> None:
             "charlie_work.claude_code",
             "update_worker_record_with_failure_classification",
             {"adapter_kind": "api"},
+        ),
+        (
+            "opencode",
+            "charlie_work.claude_code",
+            "update_worker_record_with_failure_classification",
+            {"adapter_kind": "opencode"},
         ),
     ],
 )

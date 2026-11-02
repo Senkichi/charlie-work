@@ -16,7 +16,8 @@ from _fakes_github import FakeGitHub
 from charlie_work.config import OrchestratorConfig
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state
-from charlie_work.workflow import CommandResult, OrchestratorApp
+from charlie_work.command_result import CommandResult
+from charlie_work.workflow import OrchestratorApp
 from _dispatch_fixtures import _main_ci_reclaim_app
 from _dispatch_fixtures import _reconcile_pass_app
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401

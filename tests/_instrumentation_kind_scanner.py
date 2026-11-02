@@ -10,10 +10,23 @@ target for shared test helpers (see
 from __future__ import annotations
 
 import ast
+import inspect
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from charlie_work.instrumentation import _LEVEL_BY_KIND
+from charlie_work.instrumentation import log_event as _instrumentation_log_event
+from charlie_work.state import append_event as _state_append_event
+from charlie_work.workflow import OrchestratorApp
+from charlie_work.write_gate import WriteGate
+from _instrumentation_kind_scopes import (
+    LazyScopeAssignments,
+    LocalAssignments,
+    _collect_local_assignments,
+)
+from _src_ast import parsed, source_files, source_text
 
 
 # ---------------------------------------------------------------------------
@@ -47,35 +60,15 @@ _EMIT_FUNCS = {"log_event", "append_event", "_record_event", "record_event"}
 
 _WRAPPER_FUNCS = {"_route_to_rework"}
 
+# Every emit call the scanner can resolve spells one of these names literally
+# in the file's source text, so a file carrying none of them holds no call
+# ``_emit_func_name`` could match and is skipped before ``parsed()``: under
+# xdist the shared ``_src_ast`` cache's cold fill otherwise lands on whichever
+# whole-tree scanner runs first on the worker (issue #2751; same filter shape
+# as #2447/#2548, #2406, #2422, #2493, #2516, #2554).
+_EMIT_NAMES = _EMIT_FUNCS | _WRAPPER_FUNCS
+
 _VALID_LEVELS = {"info", "warning", "error"}
-
-
-def _is_scope_boundary(node: ast.AST) -> bool:
-    """True for nodes that start a new variable-assignment scope."""
-    return isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef))
-
-
-def _collect_local_assignments(scope: ast.AST) -> dict[str, list[ast.expr]]:
-    """Every ``name = <expr>`` assigned directly within ``scope``.
-
-    Descends through control flow (if/for/while/try/with) but stops at any
-    nested function, lambda, or class body -- those are separate scopes with
-    their own assignment map, not this one.
-    """
-    assigns: dict[str, list[ast.expr]] = {}
-
-    def walk(node: ast.AST) -> None:
-        for child in ast.iter_child_nodes(node):
-            if _is_scope_boundary(child):
-                continue
-            if isinstance(child, ast.Assign):
-                for target in child.targets:
-                    if isinstance(target, ast.Name):
-                        assigns.setdefault(target.id, []).append(child.value)
-            walk(child)
-
-    walk(scope)
-    return assigns
 
 
 def _collect_param_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> frozenset[str]:
@@ -91,7 +84,7 @@ def _collect_param_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> frozen
 
 def _resolve_literal(
     node: ast.expr,
-    local_assigns: dict[str, list[ast.expr]],
+    local_assigns: LocalAssignments,
     module_constants: dict[str, set[str]],
     local_params: frozenset[str] = frozenset(),
 ) -> set[str] | None:
@@ -224,16 +217,16 @@ class _UnresolvedKindSite:
 
 
 def _emit_func_name(node: ast.Call) -> str | None:
-    if isinstance(node.func, ast.Name) and node.func.id in _EMIT_FUNCS | _WRAPPER_FUNCS:
+    if isinstance(node.func, ast.Name) and node.func.id in _EMIT_NAMES:
         return node.func.id
-    if isinstance(node.func, ast.Attribute) and node.func.attr in _EMIT_FUNCS | _WRAPPER_FUNCS:
+    if isinstance(node.func, ast.Attribute) and node.func.attr in _EMIT_NAMES:
         return node.func.attr
     return None
 
 
 def _has_explicit_level(
     node: ast.Call,
-    local_assigns: dict[str, list[ast.expr]],
+    local_assigns: LocalAssignments,
     module_constants: dict[str, set[str]],
     local_params: frozenset[str],
 ) -> bool:
@@ -253,23 +246,114 @@ def _has_explicit_level(
     return False
 
 
-def _locate_arg(node: ast.Call, position: int, keyword: str) -> ast.expr | None:
-    """Find an argument by position or by keyword name, whichever the call used.
+# ---------------------------------------------------------------------------
+# Issue #2481: the ``kind`` argument's positional slot belongs to the callee,
+# not the emit-call name
+#
+# The scanner used to read every emit call's kind from positional slot 1,
+# which only fits the ``instrumentation.log_event(state_path, kind, payload)``
+# shape. ``WriteGate.log_event(kind, payload)`` auto-binds ``state_path``, so
+# its kind sits at slot 0 -- a correct positional ``gate.log_event("x", {...})``
+# call had the payload dict quoted back as the "unresolved kind" and failed CI
+# on a bug that did not exist (PR #2458). The slot is now derived from the
+# callee's own signature via ``inspect``: whichever parameter is named ``kind``
+# (or ``event_kind`` for the ``_route_to_rework`` wrapper) determines the index,
+# so a future signature change moves the index with it instead of silently
+# re-breaking the read.
+# ---------------------------------------------------------------------------
 
-    A call that supplies the kind (or ``event_kind``) as a keyword argument
-    -- ``log_event(state_path, kind=k, payload=p)`` -- must not silently fall
-    through just because it doesn't match the common positional shape. That
-    is the same fail-open pattern #995 was filed against, one layer down: a
-    scanner that only recognizes the arity/shape it expects and drops
-    everything else. No call site in this package currently uses ``*args``
-    unpacking into these functions, so positional lookup by index is sound;
-    if that ever changes, the returned ``None`` correctly routes the site to
+# Emit-call name -> the module-level callable that name reaches.
+# ``record_event`` is deliberately absent: the only callable by that name is
+# ``WriteGate.record_event``, reached through a ``write_gate`` receiver. A bare
+# or non-gate ``record_event(...)`` has no known callee and surfaces as
+# unresolved rather than trusting a guessed slot.
+_EMIT_CALLEES: dict[str, Callable[..., Any]] = {
+    "log_event": _instrumentation_log_event,
+    "append_event": _state_append_event,
+    # ``OrchestratorApp`` methods read off the class so the scanned
+    # ``self._record_event``/``self._route_to_rework`` shapes resolve against
+    # the installed delegate -- importing the delegate submodule directly
+    # would trip workflow_delegation's partial-init guard.
+    "_record_event": OrchestratorApp._record_event,
+    "_route_to_rework": OrchestratorApp._route_to_rework,
+}
+
+# The parameter that carries the event kind on each emit callable.
+_KIND_PARAMS = {name: "kind" for name in _EMIT_FUNCS} | {"_route_to_rework": "event_kind"}
+
+
+def _is_write_gate_receiver(expr: ast.expr) -> bool:
+    """True when an attribute receiver denotes a ``WriteGate``.
+
+    Recognises ``write_gate``/``WriteGate`` as a bare name and any
+    ``<x>.write_gate`` attribute tail (``self.write_gate``, ``app.write_gate``,
+    ``ctx.write_gate``). A ``WriteGate`` bound to a differently-named variable
+    is not statically distinguishable from a module re-exporting ``log_event``;
+    its calls fall through to the module-level callee, and a kind read from the
+    wrong slot lands on the unresolved list (fail closed) rather than being
+    silently trusted.
+    """
+    if isinstance(expr, ast.Name):
+        return expr.id in {"write_gate", "WriteGate"}
+    return isinstance(expr, ast.Attribute) and expr.attr == "write_gate"
+
+
+def _emit_callee(node: ast.Call, func_name: str) -> Callable[..., Any] | None:
+    """The real callable an emit-site shape invokes, or ``None`` if unknown."""
+    func = node.func
+    if isinstance(func, ast.Attribute) and _is_write_gate_receiver(func.value):
+        return getattr(WriteGate, func_name, None)
+    return _EMIT_CALLEES.get(func_name)
+
+
+def _kind_param_index(func: Callable[..., Any], param: str) -> int | None:
+    """Positional-call index of ``param`` in ``func``'s signature, or ``None``.
+
+    ``func`` is inspected unbound, so a leading ``self`` is dropped: scanned
+    call sites use bound-call syntax (``self._record_event(...)``,
+    ``gate.log_event(...)``) where ``self`` is never passed positionally.
+    ``None`` means the signature could not be inspected or has no positional
+    parameter named ``param`` (e.g. a hypothetical keyword-only ``kind``).
+    """
+    try:
+        parameters = inspect.signature(func).parameters.values()
+    except (TypeError, ValueError):
+        return None
+    positional = [
+        p.name
+        for p in parameters
+        if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    if positional and positional[0] == "self":
+        positional.pop(0)
+    try:
+        return positional.index(param)
+    except ValueError:
+        return None
+
+
+def _emit_kind_arg(node: ast.Call, func_name: str) -> ast.expr | None:
+    """Locate the emit call's kind argument against the callee's signature.
+
+    Positional first, keyword second -- the same precedence the old fixed-slot
+    lookup had -- but the index is the callee's own ``kind`` (or ``event_kind``)
+    parameter position, derived by ``_kind_param_index``. A keyword ``kind=``
+    is unambiguous whichever callee the shape resolves to, so it is still
+    consulted when the positional slot is absent or the callee is unknown.
+    A call supplying neither returns ``None``, which ``_record_kind_site``
+    records as an unresolved site. No call site in this package uses ``*args``
+    unpacking into these functions; if that ever changes, the starred
+    expression itself fails to resolve and correctly routes the site to
     "unresolved" rather than silently skipping it.
     """
-    if len(node.args) > position:
-        return node.args[position]
+    param = _KIND_PARAMS[func_name]
+    callee = _emit_callee(node, func_name)
+    if callee is not None:
+        index = _kind_param_index(callee, param)
+        if index is not None and len(node.args) > index:
+            return node.args[index]
     for kw in node.keywords:
-        if kw.arg == keyword:
+        if kw.arg == param:
             return kw.value
     return None
 
@@ -278,7 +362,7 @@ def _record_kind_site(
     kind_node: ast.expr | None,
     call_node: ast.Call,
     module_constants: dict[str, set[str]],
-    local_assigns: dict[str, list[ast.expr]],
+    local_assigns: LocalAssignments,
     local_params: frozenset[str],
     scope_name: str,
     rel_path: str,
@@ -316,7 +400,7 @@ def _record_kind_site(
 def _scan_node(
     node: ast.AST,
     module_constants: dict[str, set[str]],
-    local_assigns: dict[str, list[ast.expr]],
+    local_assigns: LocalAssignments,
     local_params: frozenset[str],
     scope_name: str,
     rel_path: str,
@@ -327,7 +411,7 @@ def _scan_node(
         func_name = _emit_func_name(node)
         if func_name in _EMIT_FUNCS:
             if not _has_explicit_level(node, local_assigns, module_constants, local_params):
-                kind_node = _locate_arg(node, 1, "kind")
+                kind_node = _emit_kind_arg(node, func_name)
                 _record_kind_site(
                     kind_node,
                     node,
@@ -339,8 +423,8 @@ def _scan_node(
                     used,
                     unresolved,
                 )
-        elif func_name == "_route_to_rework":
-            kind_node = _locate_arg(node, 4, "event_kind")
+        elif func_name in _WRAPPER_FUNCS:
+            kind_node = _emit_kind_arg(node, func_name)
             _record_kind_site(
                 kind_node,
                 node,
@@ -356,7 +440,7 @@ def _scan_node(
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         # Entering a new function scope: its local assignments and parameters
         # shadow the enclosing ones rather than extending them.
-        scoped_assigns = _collect_local_assignments(node)
+        scoped_assigns = LazyScopeAssignments(node)
         scoped_params = _collect_param_names(node)
         for child in ast.iter_child_nodes(node):
             _scan_node(
@@ -422,10 +506,11 @@ def _scan_event_kinds(root: Path) -> tuple[set[str], list[_UnresolvedKindSite]]:
     """Walk every Python file under ``root``; return (used kinds, unresolved sites)."""
     used: set[str] = set()
     unresolved: list[_UnresolvedKindSite] = []
-    for path in sorted(root.rglob("*.py")):
-        text = path.read_text(encoding="utf-8")
+    for path in source_files(root):
+        if not any(name in source_text(path) for name in _EMIT_NAMES):
+            continue
         try:
-            tree = ast.parse(text, filename=str(path))
+            tree = parsed(path)
         except SyntaxError:
             continue
         file_used, file_unresolved = _scan_tree(tree, path.relative_to(root).as_posix())
@@ -461,6 +546,38 @@ _ALLOWED_UNRESOLVED_KIND_SITES: tuple[_UnresolvedKindSite, ...] = (
             "The literal is chosen at each call site, and append_event is "
             "itself in _EMIT_FUNCS, so every call site is already scanned -- "
             "this is the same site observed from inside the callee."
+        ),
+    ),
+    _UnresolvedKindSite(
+        path="dead_worker_sweep/apply_commits.py",
+        scope="_emit_under_lock",
+        source="commit.kind",
+        reason=(
+            "The sweep apply shell forwards the ``Emit`` commit's kind to "
+            "append_event. The literal is chosen where decide*.py builds the "
+            "commit, and tests/test_dws_event_kinds.py verifies every one of "
+            "those literals (and that the level-less ones are registered)."
+        ),
+    ),
+    _UnresolvedKindSite(
+        path="dead_worker_sweep/apply_requests_lock.py",
+        scope="guarded_update",
+        source="kind",
+        reason=(
+            "The sweep apply shell forwards the ``GuardedUpdate.event`` kind to "
+            "append_event inside the write's lock window (#2113). The literal is "
+            "chosen in decide_post.py, and tests/test_dws_event_kinds.py scans "
+            "every ``event=(kind, ...)`` literal there."
+        ),
+    ),
+    _UnresolvedKindSite(
+        path="dead_worker_sweep/apply_stalled.py",
+        scope="_state_txn",
+        source="commit.event_kind",
+        reason=(
+            "The stalled-sweep apply shell forwards the ``StateTxn`` commit's "
+            "event_kind to append_event. The literal is chosen in "
+            "decide_stalled.py, verified by tests/test_dws_event_kinds.py."
         ),
     ),
     _UnresolvedKindSite(
@@ -576,7 +693,7 @@ _ALLOWED_UNRESOLVED_KIND_SITES: tuple[_UnresolvedKindSite, ...] = (
         ),
     ),
     _UnresolvedKindSite(
-        path="dead_worker_reap.py",
+        path="dead_worker_sweep/effects_pr.py",
         scope="_attempt_salvage",
         source="salvage_skip_event_kind(skip_reason)",
         reason=(
@@ -589,16 +706,19 @@ _ALLOWED_UNRESOLVED_KIND_SITES: tuple[_UnresolvedKindSite, ...] = (
         ),
     ),
     _UnresolvedKindSite(
-        path="reconcile.py",
-        scope="apply_fixes",
+        path="reconcile_salvage.py",
+        scope="apply_unpublished_work_salvage",
         source="salvage_skip_event_kind(skip_reason)",
         reason=(
             "Issue #1241: same salvage_skip_event_kind mapping as the "
-            "dead_worker_reap.py/_attempt_salvage entry above -- the reconcile "
+            "dead_worker_sweep/effects_pr.py/_attempt_salvage entry above -- the reconcile "
             "salvage lane and the workflow salvage lane share the single "
             "enforcement point in salvage_superseded.py. Both target literals "
             "are in _LEVEL_BY_KIND and verified by "
-            "test_salvage_skip_event_kind_only_returns_registered_kinds."
+            "test_salvage_skip_event_kind_only_returns_registered_kinds. "
+            "Issue #2226: the site moved verbatim from "
+            "reconcile.py/apply_fixes into reconcile_salvage.py when the "
+            "salvage lane was extracted for the file-size ratchet."
         ),
     ),
 )
@@ -615,8 +735,10 @@ def _scan_sweep_append_kinds(root: Path) -> tuple[set[str], list[str]]:
     """
     found: set[str] = set()
     unresolved: list[str] = []
-    for path in sorted(root.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for path in source_files(root):
+        if "sweep_events" not in source_text(path):
+            continue
+        tree = parsed(path)
         for node in ast.walk(tree):
             if not (
                 isinstance(node, ast.Call)

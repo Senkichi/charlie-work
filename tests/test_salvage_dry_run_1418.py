@@ -249,9 +249,9 @@ def test_reap_restore_rework_requested_salvage_threads_dry_run(tmp_path: Path) -
         return SalvagePushResult(pushed=False, skip_reason="dry_run_fake")
 
     # Issue #1317: _reap_restore_rework_requested moved verbatim to
-    # dead_worker_reap.py, so its bare-name call to salvage_push_stranded_commits
+    # dead_worker_sweep/effects_rework.py, so its bare-name call to salvage_push_stranded_commits
     # resolves via that module's globals -- patch it there, not on workflow.py.
-    import charlie_work.dead_worker_reap as reap_module
+    import charlie_work.dead_worker_sweep.effects_rework as reap_module
 
     with patch.object(reap_module, "salvage_push_stranded_commits", fake_salvage):
         _reap_restore_rework_requested(

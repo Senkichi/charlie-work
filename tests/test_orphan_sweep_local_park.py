@@ -46,8 +46,9 @@ from unittest.mock import patch
 
 import pytest
 
-import charlie_work.dead_worker_reap as dead_worker_reap
+import charlie_work.dead_worker_sweep.effects_pr as effects_pr
 from _fakes_github import FakeGitHub
+from _host_fixtures import host_probe
 from charlie_work.config import (
     ClaudeCodeConfig,
     LabelConfig,
@@ -228,10 +229,11 @@ def _run_sweep(
     gh,
     write_gate: WriteGate,
     fleet_dir: Path,
+    monkeypatch,
 ) -> None:
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(monkeypatch, alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir,
             state_file,
@@ -266,7 +268,9 @@ def _label_names(gh: LocalFileGitHub, issue_number: int) -> set[str]:
 # ---------------------------------------------------------------------------
 
 
-def test_orphan_sweep_parks_completed_local_work(tmp_path: Path, shallow_wts: Path) -> None:
+def test_orphan_sweep_parks_completed_local_work(
+    tmp_path: Path, shallow_wts: Path, monkeypatch
+) -> None:
     """The #1923 regression itself: a dead dispatched worker whose worktree
     holds commits ahead of the local base is parked ``agent:review-ready``
     with status ``open_passive`` -- never relabeled ``ready`` for a
@@ -302,11 +306,19 @@ def test_orphan_sweep_parks_completed_local_work(tmp_path: Path, shallow_wts: Pa
     sessions_dir.mkdir(parents=True, exist_ok=True)
     fleet_dir = tmp_path / "fleet"
 
-    with patch.object(dead_worker_reap, "push_branch") as push_mock:
+    with patch.object(effects_pr, "push_branch") as push_mock:
         push_mock.side_effect = AssertionError(
             "push_branch must not be called for a no-PR backend"
         )
-        _run_sweep(sessions_dir, paths.state_file, config, gh, _wg(paths.state_file), fleet_dir)
+        _run_sweep(
+            sessions_dir,
+            paths.state_file,
+            config,
+            gh,
+            _wg(paths.state_file),
+            fleet_dir,
+            monkeypatch=monkeypatch,
+        )
 
     # Labels: the local_work_ready edge applied -- review_ready added,
     # in_progress removed, ready (not a workflow label) survives.
@@ -352,7 +364,15 @@ def test_orphan_sweep_parks_completed_local_work(tmp_path: Path, shallow_wts: Pa
     # Second pass: the entry no longer has status "dispatched", so
     # ``partition_dispatched_by_pid_liveness`` never re-discovers it. The
     # sweep must be fully quiet -- no rediscovery, no drift, no backstop.
-    _run_sweep(sessions_dir, paths.state_file, config, gh, _wg(paths.state_file), fleet_dir)
+    _run_sweep(
+        sessions_dir,
+        paths.state_file,
+        config,
+        gh,
+        _wg(paths.state_file),
+        fleet_dir,
+        monkeypatch=monkeypatch,
+    )
     state = load_state(paths.state_file)
     entry = state["issues"][str(issue_number)]
     assert entry["status"] == "open_passive"
@@ -363,7 +383,7 @@ def test_orphan_sweep_parks_completed_local_work(tmp_path: Path, shallow_wts: Pa
 
 
 def test_orphan_sweep_parks_when_worktree_gone_but_branch_has_commits(
-    tmp_path: Path, shallow_wts: Path
+    tmp_path: Path, shallow_wts: Path, monkeypatch
 ) -> None:
     """The worktree-missing fallback: the worktree may already be reclaimed
     while the branch (the deliverable on a no-remote repo) still carries the
@@ -396,7 +416,13 @@ def test_orphan_sweep_parks_when_worktree_gone_but_branch_has_commits(
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
     _run_sweep(
-        sessions_dir, paths.state_file, config, gh, _wg(paths.state_file), tmp_path / "fleet"
+        sessions_dir,
+        paths.state_file,
+        config,
+        gh,
+        _wg(paths.state_file),
+        tmp_path / "fleet",
+        monkeypatch=monkeypatch,
     )
 
     current = _label_names(gh, issue_number)
@@ -413,7 +439,7 @@ def test_orphan_sweep_parks_when_worktree_gone_but_branch_has_commits(
 
 
 def test_orphan_sweep_reclaims_local_orphan_with_no_commits(
-    tmp_path: Path, shallow_wts: Path
+    tmp_path: Path, shallow_wts: Path, monkeypatch
 ) -> None:
     """Control: an identical dead dispatched worker on a local backend whose
     worktree has ZERO commits ahead takes the unchanged #417 reclaim --
@@ -447,7 +473,13 @@ def test_orphan_sweep_reclaims_local_orphan_with_no_commits(
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
     _run_sweep(
-        sessions_dir, paths.state_file, config, gh, _wg(paths.state_file), tmp_path / "fleet"
+        sessions_dir,
+        paths.state_file,
+        config,
+        gh,
+        _wg(paths.state_file),
+        tmp_path / "fleet",
+        monkeypatch=monkeypatch,
     )
 
     # The plain reclaim ran: active label stripped, ready kept, no
@@ -466,7 +498,7 @@ def test_orphan_sweep_reclaims_local_orphan_with_no_commits(
 
 
 def test_orphan_sweep_pr_capable_backend_ignores_local_park(
-    tmp_path: Path, shallow_wts: Path
+    tmp_path: Path, shallow_wts: Path, monkeypatch
 ) -> None:
     """Control: the identical git state (worktree with commits ahead) on a
     PR-capable backend keeps the existing reclaim behavior -- the
@@ -518,6 +550,7 @@ def test_orphan_sweep_pr_capable_backend_ignores_local_park(
         fake_gh,
         _wg(paths.state_file),
         tmp_path / "fleet",
+        monkeypatch=monkeypatch,
     )
 
     # Normal reclaim ran; the park lane never touched anything.
@@ -534,7 +567,7 @@ def test_orphan_sweep_pr_capable_backend_ignores_local_park(
 
 
 def test_orphan_sweep_park_label_failure_is_loud_and_retryable(
-    tmp_path: Path, shallow_wts: Path
+    tmp_path: Path, shallow_wts: Path, monkeypatch
 ) -> None:
     """A failed park label write must NOT silently strand the active label
     or falsely advance the status: the sweep falls through to the normal
@@ -584,7 +617,13 @@ def test_orphan_sweep_park_label_failure_is_loud_and_retryable(
     # Pass 1: label backend down. Park fails, reclaim also fails its label
     # writes, but the event must record WHY commits were not parked.
     _run_sweep(
-        sessions_dir, paths.state_file, config, gh, _wg(paths.state_file), tmp_path / "fleet"
+        sessions_dir,
+        paths.state_file,
+        config,
+        gh,
+        _wg(paths.state_file),
+        tmp_path / "fleet",
+        monkeypatch=monkeypatch,
     )
 
     state = load_state(paths.state_file)
@@ -605,7 +644,13 @@ def test_orphan_sweep_park_label_failure_is_loud_and_retryable(
     # Pass 2: backend recovered -- the SAME sweep parks the work.
     gh.fail_labels = False
     _run_sweep(
-        sessions_dir, paths.state_file, config, gh, _wg(paths.state_file), tmp_path / "fleet"
+        sessions_dir,
+        paths.state_file,
+        config,
+        gh,
+        _wg(paths.state_file),
+        tmp_path / "fleet",
+        monkeypatch=monkeypatch,
     )
 
     current = _label_names(gh, issue_number)
@@ -619,7 +664,9 @@ def test_orphan_sweep_park_label_failure_is_loud_and_retryable(
     assert [e["payload"]["label_write_ok"] for e in park_events] == [False, True]
 
 
-def test_orphan_sweep_park_dry_run_writes_nothing(tmp_path: Path, shallow_wts: Path) -> None:
+def test_orphan_sweep_park_dry_run_writes_nothing(
+    tmp_path: Path, shallow_wts: Path, monkeypatch
+) -> None:
     """Dry-run: the park's label transition and the status flip are both
     WriteGate-gated, so a dry-run sweep must leave the issue file and the
     state file byte-identical while still reporting the issue as handled
@@ -658,6 +705,7 @@ def test_orphan_sweep_park_dry_run_writes_nothing(tmp_path: Path, shallow_wts: P
         gh,
         _wg(paths.state_file, dry_run=True),
         tmp_path / "fleet",
+        monkeypatch=monkeypatch,
     )
 
     assert issue_path.read_bytes() == before_issue

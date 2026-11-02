@@ -364,6 +364,28 @@ def test_file_fallback_requires_started_at(tmp_path: Path) -> None:
 # --- End-to-end through the reaper ------------------------------------------
 
 
+def _suppress_events_db_writes(monkeypatch) -> None:
+    """No-op the ``events.db`` dual-write for these end-to-end reaps (#2423).
+
+    Each recorded verdict emits a ``record_review`` instrumentation event and
+    a ``lifecycle_transition`` label event, each dual-written to a per-test
+    SQLite ``events.db`` next to the state file. The db create + WAL setup +
+    inserts are the largest avoidable file-I/O cost in these tests — pure
+    host overhead that takes multi-hundred-ms stall tails under AV scanning on
+    the self-hosted Windows runners (ledger regression 799260ee3d: 0.084s →
+    0.64s median). Nothing here reads ``events.db``; the ``state.json`` event
+    ring these tests assert on is written by ``state.append_event`` itself
+    before the dual-write, and ``log_event`` is bound into ``labels`` /
+    ``write_gate`` at import time so all three names must be patched.
+    """
+    for target in (
+        "charlie_work.instrumentation.log_event",
+        "charlie_work.labels.log_event",
+        "charlie_work.write_gate.log_event",
+    ):
+        monkeypatch.setattr(target, lambda *a, **k: None)
+
+
 def test_reap_records_verdict_from_stream_json_log(monkeypatch, tmp_path: Path) -> None:
     """A dead reviewer whose stream-json log carries the verdict in its result
     event has the verdict recorded (previously: counted as a failed attempt)."""
@@ -394,6 +416,7 @@ def test_reap_records_verdict_from_stream_json_log(monkeypatch, tmp_path: Path) 
     _make_dead_review_sidecar(reviews_dir, 100, log_text)
     _set_review_dispatched_state(app, 100, 10, "2026-07-06T12:00:00Z")
     monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
+    _suppress_events_db_writes(monkeypatch)
 
     result = app._reap_review_verdicts(reviews_dir)
 
@@ -437,6 +460,7 @@ def test_reap_records_verdict_via_file_fallback(monkeypatch, tmp_path: Path) -> 
     _make_dead_review_sidecar(reviews_dir, 100, log_text, started_at=started_at)
     _set_review_dispatched_state(app, 100, 10, started_at)
     monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
+    _suppress_events_db_writes(monkeypatch)
 
     result = app._reap_review_verdicts(reviews_dir)
 
@@ -488,6 +512,7 @@ def test_reap_does_not_record_previous_rounds_events_verdict(monkeypatch, tmp_pa
     )
     _set_review_dispatched_state(app, 100, 10, started_at)
     monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
+    _suppress_events_db_writes(monkeypatch)
 
     result = app._reap_review_verdicts(reviews_dir)
 
@@ -528,6 +553,7 @@ def test_reap_still_records_verdict_from_this_sessions_events_file(
     _make_dead_review_sidecar(reviews_dir, 100, "truncated log\n", started_at=started_at)
     _set_review_dispatched_state(app, 100, 10, started_at)
     monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
+    _suppress_events_db_writes(monkeypatch)
 
     result = app._reap_review_verdicts(reviews_dir)
 

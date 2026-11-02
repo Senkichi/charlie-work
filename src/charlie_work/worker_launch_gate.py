@@ -19,7 +19,8 @@ Gate sequence -- the ONE implementation, inside
    point, so a pre-check deferral carries ``throttled_until`` and NO governor
    report fields -- only the step-4 deferral carries those;
 1. fleet lock (``try_acquire_fleet_lock``) realized when
-   ``fleet.global_max_concurrent_sessions > 0``, retried with jitter for up
+   ``fleet.global_max_concurrent_sessions > 0`` or
+   ``fleet.max_concurrent_sessions_by_harness`` is non-empty, retried with jitter for up
    to ``fleet.launch_lock_wait_seconds`` -- held only across
    governor -> claim -> launch so independently-running repos cannot both
    read a stale fleet live count and over-dispatch the shared cap, and a
@@ -32,6 +33,39 @@ Gate sequence -- the ONE implementation, inside
    ordered after the governor so the provider-throttled deferral payload
    carries the governor's report fields as it always has.
 
+Role chain (issue #2086): before gate 0 the worker role chain is resolved
+against the fleet quota ledger (:func:`charlie_work.role_selection.select_for_launch`).
+Every entry restricted defers ``provider_throttled`` with the chain fields; a
+per-repo throttle window the ledger fully explains is *covered* (selection
+already routed past the restricted entry) and does not block gates 0 or 4.
+The selection rides on the permit, and :func:`_launch_workers` launches the
+worker-role settings on the selected entry, stamps each launched session's
+sidecar with it, and emits ``role_fallback_selected`` past the primary. A
+length-1 chain never reads the ledger and behaves exactly as before.
+
+Per-harness ceilings (issue #2757): ``fleet.global_max_concurrent_sessions``
+counts every live session whatever its harness, but a provider quota (e.g. a
+shared Devin account) binds only the sessions that draw on it.
+``fleet.max_concurrent_sessions_by_harness`` adds a ceiling per harness. The
+governor measures the fleet-wide live count per harness under the fleet lock
+(step 3); right after it :func:`_apply_harness_caps` bounds the launch by the
+role-chain entry selected above. An entry whose harness is full is passed over
+for the next entry whose harness has room (the same fall-through a quota
+restriction takes); with none left -- a length-1 chain, or every entry full or
+restricted -- the launch is clamped to zero with ``clamped_by: harness_max``
+(a deferral, never a provider throttle). The total cap still bounds every
+harness, so a launch on an uncapped harness is limited only by it. A
+``model:<tier>`` group that lands on a different capped harness than the
+permit's is bounded in :func:`_tier_groups`. The rescue tier (role ``""``)
+launches on its own configured harness exactly as configured and is not
+bounded by a per-harness ceiling; it still counts against the total.
+
+Model tier (TIS-CW-6): :func:`_launch_workers` splits a worker-role batch by the
+issues' ``model:<tier>`` labels (``model_tier``). Each tier the chain can
+serve launches on the first unrestricted entry of that model family and emits
+``worker_model_tier_selected``; unlabelled issues, and tiers the chain cannot
+serve (``worker_model_tier_fallback``), launch on the permit's selection.
+
 The fresh and remote-rework lanes mint a *pending* lock handle at their entry
 point via :func:`acquire_fleet_launch_lock` -- which does NOT touch the OS
 lock -- and hand it to :func:`issue_worker_launch_permit`; the local lane lets
@@ -40,7 +74,9 @@ lock handle or permit: validity is a private mint token checked by identity at
 launch time, so a hand-built permit is refused rather than trusted.
 
 ``tests/test_worker_launch_gate_guard.py`` AST-scans ``src/charlie_work`` and
-fails if any function other than :func:`_launch_workers` references
+fails if any function other than :func:`_launch_workers` touches the
+``worker_launch`` port, or anything other than the port's Real /
+:func:`_launch_workers` itself / the ``workflow`` re-export references
 ``dispatch_sessions`` -- a new lane that bypasses the gate fails CI.
 """
 
@@ -52,13 +88,25 @@ import os
 import random
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from charlie_work import layout
-from charlie_work.adapters import AdapterSettings, SessionDispatchResult, SessionRequest
+# The dotted form, not ``from charlie_work import model_tier``: the dormant-module
+# import graph (tests/test_dormant_fleet_marking.py) cannot see the bare-package
+# form, and this is model_tier's only importer.
+import charlie_work.model_tier as model_tier
+from charlie_work import layout, role_selection
+from charlie_work.adapters import (
+    AdapterSettings,
+    SessionDispatchResult,
+    SessionRequest,
+    manifest_adapter_label,
+    write_session_results,
+)
+from charlie_work.atomic_write import write_json_atomic
 from charlie_work.fleet_registry import try_acquire_fleet_lock
+from charlie_work.host.launch import worker_error_results
 
 if TYPE_CHECKING:
     from charlie_work.workflow import OrchestratorApp
@@ -83,6 +131,10 @@ REASON_FLEET_LOCK_HELD = "fleet_lock_held"
 REASON_PROVIDER_THROTTLED = "provider_throttled"
 REASON_CONCURRENCY_CAP = "concurrency_cap"
 REASON_LAUNCH_LOCK_INVALID = "launch_lock_invalid"
+
+# ``ConcurrencyGovernorResult.clamped_by`` when a per-harness ceiling (issue #2757)
+# is the term that bound ``dispatch_limit``.
+CLAMPED_BY_HARNESS_MAX = "harness_max"
 
 FleetLockAcquirer = Callable[[str | None], Any]
 
@@ -188,9 +240,7 @@ class FleetLaunchLock:
         }
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(path.suffix + ".tmp")
-            tmp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
-            tmp.replace(path)
+            write_json_atomic(path, payload)
         except OSError:
             return  # best-effort metadata -- never the reason a launch fails
         self._wrote_holder = True
@@ -266,6 +316,10 @@ class _LaunchLedger:
     """
 
     launched: int = 0
+    # Issue #2757: free slots left under each ``max_concurrent_sessions_by_harness``
+    # ceiling when the permit was issued, drawn down by tier groups that launch on
+    # a harness other than the permit's own (see ``_tier_groups``).
+    harness_free: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -287,6 +341,8 @@ class WorkerLaunchPermit:
     _owns_lock: bool = field(default=False, repr=False, compare=False)
     _ledger: _LaunchLedger = field(default_factory=_LaunchLedger, repr=False, compare=False)
     _token: object = field(default=None, repr=False, compare=False)
+    # Issue #2086: the worker role-chain entry this permit launches on.
+    role_selection: Any = field(default=None, repr=False, compare=False)
 
     @property
     def clamped(self) -> bool:
@@ -332,6 +388,11 @@ def acquire_fleet_launch_lock(
     """
     if cap is None:
         cap = app.config.fleet.global_max_concurrent_sessions
+        if cap <= 0 and app.config.fleet.max_concurrent_sessions_by_harness:
+            # Issue #2757: a per-harness ceiling is cross-repo accounting too -- two
+            # repos reading the same stale per-harness live count would both launch
+            # past it -- so it needs the lock even with no total cap configured.
+            cap = 1
     if cap <= 0:
         return FleetLaunchLock(None, _MINT)
     return FleetLaunchLock(
@@ -422,8 +483,25 @@ def issue_worker_launch_permit(
     # below, so a throttle set after this check cannot slip through. The
     # deferred payload from THAT path keeps its governor fields; a pre-check
     # deferral carries none -- the governor has not run.
+    # Issue #2086: resolve the worker role chain against the fleet quota
+    # ledger first. Every entry restricted is the chained form of "provider
+    # throttled"; a per-repo window the ledger explains is covered below.
+    selection = role_selection.select_for_launch(app.config.worker.chain)
+    if selection.exhausted:
+        return WorkerLaunchDeferral(
+            REASON_PROVIDER_THROTTLED,
+            throttled_until=selection.report_fields().get("chain_retry_at"),
+            extra=selection.report_fields(),
+        )
     pre_state = _wf.load_state(app.paths.state_file)
-    if _wf.is_throttled(pre_state):
+    if _wf.is_throttled(pre_state) and not role_selection.window_covered(
+        pre_state.get("throttled_until"),
+        selection,
+        reason=pre_state.get("throttle_reason"),
+        adapter_kind=pre_state.get("throttle_adapter_kind"),
+        harness=pre_state.get("throttle_harness"),
+        model=pre_state.get("throttle_model"),
+    ):
         return WorkerLaunchDeferral(
             REASON_PROVIDER_THROTTLED, throttled_until=pre_state.get("throttled_until")
         )
@@ -446,16 +524,26 @@ def issue_worker_launch_permit(
 
     try:
         if live_count is None:
-            live_count = _wf._count_live_sessions(app._layout.sessions_dir, app.paths.state_file)
+            live_count = app.host.sessions.live_workers(
+                app._layout.sessions_dir, app.paths.state_file
+            )
         governor_kwargs: dict[str, Any] = {"live_count": live_count}
         if apply_open_pr_backpressure:
             governor_kwargs["apply_open_pr_backpressure"] = True
         gov = app._apply_concurrency_governor(requested, **governor_kwargs)
+        selection, gov = _apply_harness_caps(app, selection, gov)
 
         with _wf.state_lock(app.paths.state_file):
             state = _wf.load_state(app.paths.state_file)
-            throttled = _wf.is_throttled(state)
             throttled_until = state.get("throttled_until")
+            throttled = _wf.is_throttled(state) and not role_selection.window_covered(
+                throttled_until,
+                selection,
+                reason=state.get("throttle_reason"),
+                adapter_kind=state.get("throttle_adapter_kind"),
+                harness=state.get("throttle_harness"),
+                model=state.get("throttle_model"),
+            )
     except BaseException:
         if owns_lock:
             launch_lock.release()
@@ -473,8 +561,58 @@ def issue_worker_launch_permit(
         governor=gov,
         _launch_lock=launch_lock,
         _owns_lock=owns_lock,
+        _ledger=_LaunchLedger(harness_free=_harness_free_slots(app, gov)),
         _token=_MINT,
+        role_selection=selection,
     )
+
+
+def _harness_free_slots(app: OrchestratorApp, gov: Any) -> dict[str, int]:
+    """Free slots under each configured per-harness ceiling (empty when none is set)."""
+    free: dict[str, int] = {}
+    if not app.config.fleet.max_concurrent_sessions_by_harness:
+        return free
+    for harness in gov.harness_caps:
+        slots = gov.harness_available(harness)
+        if slots is not None:
+            free[harness] = slots
+    return free
+
+
+def _apply_harness_caps(
+    app: OrchestratorApp, selection: role_selection.RoleSelection, gov: Any
+) -> tuple[role_selection.RoleSelection, Any]:
+    """Bound the launch by the selected entry's harness ceiling (issue #2757).
+
+    ``fleet.max_concurrent_sessions_by_harness`` limits only the sessions that
+    draw on a given harness's quota, so it can only be enforced once the harness
+    is known -- i.e. after role-chain selection -- and, like the fleet cap, on a
+    live count taken under the fleet lock (the governor measured it). Unset map:
+    ``gov`` and ``selection`` come back untouched.
+
+    * Selected entry's harness has no ceiling, or has room: the launch is bounded
+      to the free slots (``clamped_by="harness_max"`` when that binds).
+    * Selected entry's harness is full: fall through to the next chain entry that
+      is neither quota-restricted nor on a full harness
+      (:func:`role_selection.reselect_within_harness_caps`), exactly as a quota
+      restriction routes past an entry, then bound by that entry's free slots.
+    * No such entry (a length-1 chain, or every entry restricted / full): the
+      launch is clamped to zero with ``clamped_by="harness_max"`` -- a deferral,
+      not a provider throttle, so no repo-wide throttle window is implied.
+    """
+    # Gated on config, the source of truth, not on ``gov``: the governor only
+    # populates the harness fields when the same map is set.
+    if not app.config.fleet.max_concurrent_sessions_by_harness or selection.entry is None:
+        return selection, gov
+    reselected = role_selection.reselect_within_harness_caps(selection, gov.harness_available)
+    if reselected.entry is None:
+        if gov.dispatch_limit > 0:
+            gov = replace(gov, dispatch_limit=0, clamped=True, clamped_by=CLAMPED_BY_HARNESS_MAX)
+        return selection, gov
+    free = gov.harness_available(reselected.entry.harness)
+    if free is not None and free < gov.dispatch_limit:
+        gov = replace(gov, dispatch_limit=free, clamped=True, clamped_by=CLAMPED_BY_HARNESS_MAX)
+    return reselected, gov
 
 
 def _refusal_reason(permit: object, count: int) -> str | None:
@@ -490,13 +628,91 @@ def _refusal_reason(permit: object, count: int) -> str | None:
     return None
 
 
+def _tier_groups(
+    app: OrchestratorApp,
+    selection: Any,
+    settings: AdapterSettings,
+    requests: list[SessionRequest],
+    harness_free: dict[str, int] | None = None,
+) -> list[tuple[Any, str | None, list[SessionRequest]]]:
+    """Split a worker batch by ``model:<tier>`` label (TIS-CW-6): ``(selection, tier, requests)``.
+
+    The first group launches on the permit's own selection (the fleet's default
+    tier): unlabelled requests, plus every request whose tier the chain cannot
+    serve, each recorded as ``worker_model_tier_fallback``. Each tier the chain
+    serves gets its own group on that tier's entry. Rescue-tier settings (role
+    ``""``), a permit without a selection, or an empty prefix give one group,
+    launched exactly as before TIS-CW-6; so does an empty batch, so the manifest is
+    still written.
+
+    ``harness_free`` (issue #2757, the permit ledger's free slots under each
+    ``fleet.max_concurrent_sessions_by_harness`` ceiling) bounds a tier group that
+    would land on a capped harness *other than the permit's own*: the permit's
+    ``max_launches`` was clamped by the permit's harness only, so a tier entry on
+    a different capped harness needs its own check. A group that does not fit in
+    that harness's free slots launches on the permit's selection instead
+    (``worker_model_tier_fallback`` with reason ``harness_cap``); one that fits
+    draws the slots down so a second tier on the same harness sees what is left.
+    A tier group on the permit's own harness needs no check -- the whole batch is
+    already within the permit's clamp.
+    """
+    prefix = app.config.labels.model_tier_prefix
+    if selection is None or settings.role != "worker" or not prefix:
+        return [(selection, None, list(requests))]
+    default: list[SessionRequest] = []
+    by_tier: dict[str, list[SessionRequest]] = {}
+    for request in requests:
+        tiers = model_tier.model_tiers(request.labels, prefix)
+        if len(tiers) == 1:
+            by_tier.setdefault(tiers[0], []).append(request)
+            continue
+        if tiers:
+            model_tier.emit_tier_fallback(
+                app.write_gate,
+                tier=",".join(tiers),
+                reason=model_tier.CONFLICTING,
+                numbers=[request.issue_number],
+            )
+        default.append(request)
+    served: list[tuple[Any, str | None, list[SessionRequest]]] = []
+    for tier, members in sorted(by_tier.items()):
+        tier_selection, reason = model_tier.select_tier_for_launch(selection.chain, tier)
+        if tier_selection is None:
+            model_tier.emit_tier_fallback(
+                app.write_gate,
+                tier=tier,
+                reason=reason,
+                numbers=[request.issue_number for request in members],
+            )
+            default.extend(members)
+            continue
+        harness = tier_selection.entry.harness
+        own_harness = selection.entry is not None and selection.entry.harness == harness
+        if harness_free is not None and harness in harness_free and not own_harness:
+            free = harness_free[harness]
+            if len(members) > free:
+                model_tier.emit_tier_fallback(
+                    app.write_gate,
+                    tier=tier,
+                    reason=model_tier.HARNESS_CAP,
+                    numbers=[request.issue_number for request in members],
+                )
+                default.extend(members)
+                continue
+            harness_free[harness] = free - len(members)
+        served.append((tier_selection, tier, members))
+    if default or not served:
+        return [(selection, None, default), *served]
+    return served
+
+
 def _launch_workers(
     app: OrchestratorApp,
     permit: WorkerLaunchPermit,
     settings: AdapterSettings,
     requests: list[SessionRequest],
 ) -> list[SessionDispatchResult]:
-    """Launch ``requests`` against ``permit`` -- the only ``dispatch_sessions`` caller.
+    """Launch ``requests`` against ``permit`` -- the only worker-launch-port caller.
 
     Refuses (never raises -- errors from launches come back as values) when
     the permit was not minted by :func:`issue_worker_launch_permit`, its
@@ -521,12 +737,63 @@ def _launch_workers(
         ]
     permit._ledger.launched += len(requests)
     _wf = _workflow()
-    # Reached through the workflow re-export so test fakes that patch
-    # ``charlie_work.workflow.dispatch_sessions`` keep intercepting.
-    return _wf.dispatch_sessions(
-        app.repo_root,
-        app._layout.session_manifest,
-        app._layout.session_results,
-        settings,
-        requests,
+    groups = _tier_groups(
+        app, permit.role_selection, settings, requests, permit._ledger.harness_free
     )
+    results: list[SessionDispatchResult] = []
+    adapters: set[str] = set()
+    for selection, tier, group in groups:
+        if results and group and settings.launch_stagger_seconds > 0 and not settings.dry_run:
+            # A batch split by tier is still one burst: pace the boundary launch
+            # the way ``dispatch_sessions`` paces launches within a group.
+            time.sleep(settings.launch_stagger_seconds)
+        group_settings = settings
+        if selection is not None and settings.role == "worker" and selection.is_fallback:
+            # Issue #2086: worker-role settings follow the chain entry -- the
+            # permit's, or the one a ``model:<tier>`` label picked (TIS-CW-6);
+            # rescue-tier settings (role "") launch exactly as configured.
+            group_settings = role_selection.worker_settings_for(app, selection)
+        adapters.add(group_settings.adapter)
+        # Reached through the host's worker-launch port (issue #2229); the
+        # Real resolves ``adapters.dispatch_sessions`` at call time so test
+        # fakes that patch it on ``charlie_work.adapters`` keep intercepting.
+        try:
+            group_results = app.host.worker_launch.launch(
+                app.repo_root,
+                app._layout.session_manifest,
+                app._layout.session_results,
+                group_settings,
+                group,
+            )
+        except Exception as exc:
+            # The permit ledger already debited this batch above; a raise at
+            # the launch seam still comes back as per-request failure values
+            # (never a propagate) so the pass completes and the lane's normal
+            # path releases the permit's fleet lock.
+            group_results = worker_error_results(
+                app.repo_root, group_settings, group, f"launch failed: {exc}"
+            )
+        results.extend(group_results)
+        if selection is not None and group_settings.role == "worker":
+            launched = [result.issue_number for result in group_results if result.ok]
+            for number in launched:
+                role_selection.stamp_launch(
+                    group_settings.sessions_dir, number, "worker", selection
+                )
+            if launched and tier is None:
+                role_selection.emit_fallback_selected(
+                    app.write_gate, role="worker", selection=selection, numbers=launched
+                )
+            elif launched:
+                model_tier.emit_tier_selected(
+                    app.write_gate, tier=tier, selection=selection, numbers=launched
+                )
+    if len(groups) > 1:
+        # Each group's ``dispatch_sessions`` overwrote the manifest and results
+        # files with its own subset; rewrite both once with the whole batch, as
+        # dispatch_rework does for its rescue-tier split.
+        _wf.write_session_manifest(
+            app._layout.session_manifest, requests, adapter=manifest_adapter_label(adapters)
+        )
+        write_session_results(app._layout.session_results, results)
+    return results

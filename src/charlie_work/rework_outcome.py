@@ -30,7 +30,7 @@ and no PR mutation, so a malformed outcome cannot wedge the dispatch pass.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Any
 from . import worker_fate
 from .config import WORKER_OUTCOME_FILENAME
 from .instrumentation import log_event
+from .no_op_rework_body import _body_content_sha256
 from .process_utils import find_worker_terminal_status
 from .rework_prompts import _write_text_atomic
 from .state import load_state, state_lock
@@ -56,6 +57,26 @@ logger = logging.getLogger(__name__)
 # State key holding {issue_number: applied_head_sha} — the dedup record that
 # makes outcome application exactly-once per reported head.
 APPLIED_HEADS_KEY = "rework_outcome_applied_heads"
+
+# State key holding {pr_number: _applied_body_sha256} — the body an apply last wrote
+# to each PR (only recorded when a ``pr_body`` was actually pushed). It lets the
+# reviewer-packet currency check tell "the body changed because of an apply" (rebuild
+# the verdictless packet, issue #2826) from "someone edited the body" (no new trigger).
+APPLIED_BODIES_KEY = "rework_outcome_applied_bodies"
+
+
+def _applied_body_sha256(body: object) -> str:
+    """Hash of a PR body as the apply record and its currency check compare it (#2826).
+
+    The record is written from the worker-authored ``pr_body`` but compared with the
+    body GitHub echoes back, and the server may trim leading/trailing whitespace (a
+    trailing newline from the worker's file, say). Both sides are stripped here, in one
+    place, so that artifact never reads as "the body changed" -- the recorded hash and
+    the live hash must agree on exactly the apply's own text. This is deliberately NOT
+    ``_body_content_sha256`` itself: that hash feeds the no-op-rework gate (#1939),
+    where whitespace is real content, so it stays whitespace-sensitive.
+    """
+    return _body_content_sha256(body.strip() if isinstance(body, str) else body)
 
 
 def _emit_event(
@@ -124,6 +145,10 @@ def _read_rework_outcome(
     worktrees_dir: Path,
     issue_number: int,
     branch: str | None,
+    *,
+    dispatched_at: datetime | None = None,
+    live_head_sha: str | None = None,
+    on_fate: Callable[[worker_fate.WorkerFate], None] | None = None,
 ) -> dict[str, Any] | None:
     """Read the worker's outcome: durable terminal status first, worktree fallback.
 
@@ -134,11 +159,13 @@ def _read_rework_outcome(
     Obtains this pick from the module (design doc §8, step B1, A13):
     ``worker_fate.resolve_fate``'s freshness step (rules 1/7) already
     implements "terminal, if fresh, else worktree, if fresh, else nothing".
-    Neither a ``dispatched_at`` nor a live head is known at this call site
-    (this function takes neither), so timestamp/head freshness never
-    rejects a candidate here (rule 1's legacy mode: an unset
-    ``dispatched_at`` accepts unconditionally, and an unknown head never
-    proves a mismatch) -- but an empty terminal ``worker_outcome`` (``{}``)
+    A caller that knows the current dispatch passes ``dispatched_at`` (and
+    the live head, when it has one) so evidence from an earlier round is
+    dropped (issue #2102); ``on_fate`` receives the resolved fate so that
+    caller can report the dropped evidence out of its lock. A caller that
+    passes neither (``apply_rework_outcome``) gets rule 1's legacy mode: an
+    unset ``dispatched_at`` accepts unconditionally, and an unknown head never
+    proves a mismatch -- but an empty terminal ``worker_outcome`` (``{}``)
     is still not decisive: ``worker_fate._carries_no_claim`` (N1,
     wf-review-opus.md; design doc §3 step 0) keeps a content-empty terminal
     candidate from out-ranking the worktree's real content even though
@@ -150,32 +177,49 @@ def _read_rework_outcome(
     terminal_evidence: worker_fate.TerminalEvidence | None = None
     record = find_worker_terminal_status(sessions_dir, issue_number)
     if isinstance(record, dict):
+        ended_at = worker_fate.parse_iso_timestamp(record.get("ended_at"))
+        # The embedded outcome may be a prior round's leftover copied out of a
+        # reused worktree, so its own write time -- not the record's ended_at --
+        # is what freshness must judge (same anchor as blocked_worker_outcome).
+        terminal_written_at = (
+            worker_fate.parse_iso_timestamp(record.get("worker_outcome_written_at")) or ended_at
+        )
         terminal_evidence = worker_fate.TerminalEvidence(
-            ended_at=worker_fate.parse_iso_timestamp(record.get("ended_at")) or datetime.now(UTC),
+            ended_at=ended_at or datetime.now(UTC),
             exit_code=record.get("exit_code"),
             outcome=_outcome_evidence(
-                record.get("worker_outcome"), source=worker_fate.EvidenceSource.TERMINAL
+                record.get("worker_outcome"),
+                source=worker_fate.EvidenceSource.TERMINAL,
+                written_at=terminal_written_at,
             ),
         )
 
     worktree_outcome_evidence: worker_fate.OutcomeEvidence | None = None
     if branch:
         worktree_path = worktree_path_for_branch(repo_root, branch, worktrees_dir)
+        try:
+            outcome_mtime: datetime | None = datetime.fromtimestamp(
+                (worktree_path / WORKER_OUTCOME_FILENAME).stat().st_mtime, tz=UTC
+            )
+        except OSError:
+            outcome_mtime = None
         worktree_outcome_evidence = _outcome_evidence(
-            read_worker_outcome(worktree_path), source=worker_fate.EvidenceSource.WORKTREE
+            read_worker_outcome(worktree_path),
+            source=worker_fate.EvidenceSource.WORKTREE,
+            written_at=outcome_mtime,
         )
 
     fate = worker_fate.resolve_fate(
         worker_fate.FateEvidence(
             issue_number=issue_number,
             adapter="unknown",
-            dispatched_at=None,
+            dispatched_at=dispatched_at,
             pid_alive=False,
             health=None,
             terminal=terminal_evidence,
             worktree_outcome=worktree_outcome_evidence,
             branch=worker_fate.BranchEvidence(
-                remote_head_sha=None,
+                remote_head_sha=live_head_sha,
                 remote_ahead=None,
                 unpushed=None,
                 open_pr_number=None,
@@ -185,6 +229,8 @@ def _read_rework_outcome(
         ),
         now=datetime.now(UTC),
     )
+    if on_fate is not None:
+        on_fate(fate)
     return dict(fate.basis.outcome.raw) if fate.basis.outcome is not None else None
 
 
@@ -401,7 +447,9 @@ def apply_rework_worker_outcome(
     head that advanced past the last verdict is routed back to review — so
     the edits land before the review packet is regenerated, and still land
     when the packet itself is blocked (a rerouted-but-blocked review must
-    not drop the worker's body/comment updates).
+    not drop the worker's body/comment updates). The dead-worker sweep reaches
+    it through ``apply_collected_rework_outcomes`` on every with-PR route that
+    saw a fresh outcome (issue #2826), not only the completed-outcome one.
 
     Never raises; never mutates the PR unless the live remote head equals
     the worker-reported ``head_sha``.
@@ -512,6 +560,10 @@ def apply_rework_worker_outcome(
         applied_heads = state.setdefault(APPLIED_HEADS_KEY, {})
         if isinstance(applied_heads, dict):
             applied_heads[str(issue_number)] = head_sha
+        if body_updated and pr_body:
+            applied_bodies = state.setdefault(APPLIED_BODIES_KEY, {})
+            if isinstance(applied_bodies, dict):
+                applied_bodies[str(pr_number)] = _applied_body_sha256(pr_body)
         state = write_gate.append_event(
             state,
             "rework_outcome_applied",
@@ -523,6 +575,34 @@ def apply_rework_worker_outcome(
             },
         )
         write_gate.save_state(state)
+
+
+def applied_body_outdates_packet(
+    state: Mapping[str, Any],
+    pr_number: int,
+    live_body: object,
+    packet_body: str | None,
+) -> bool:
+    """True when an outcome apply wrote the live PR body and the packet predates it (issue #2826).
+
+    The reviewer-packet currency check keys staleness on the head and the template, and
+    on the body only for ``request_changes`` drift (#1983), so a verdictless packet built
+    from the OLD body is served to the reviewer after the apply edits the body -- the
+    reviewer then asks for a body fix no worker can make. The trigger is deliberately
+    narrow: it needs a recorded apply for this PR whose body hash EQUALS the live body's
+    (both whitespace-stripped, so a server-side trim of the applied text still matches).
+    A body edited by anyone else since (or never applied) matches no record, so it
+    never rebuilds a packet. A packet with no readable body cannot show it carries the
+    applied text, so it reads as outdated (rebuilt once; the rebuilt packet stores the body).
+    """
+    recorded_bodies = state.get(APPLIED_BODIES_KEY)
+    if not isinstance(recorded_bodies, Mapping):
+        return False
+    recorded = recorded_bodies.get(str(pr_number))
+    live_sha = _applied_body_sha256(live_body)
+    if not isinstance(recorded, str) or not recorded or recorded != live_sha:
+        return False
+    return packet_body is None or _applied_body_sha256(packet_body) != live_sha
 
 
 def apply_collected_rework_outcomes(
@@ -590,7 +670,9 @@ def apply_collected_rework_outcomes(
 
 
 __all__ = [
+    "APPLIED_BODIES_KEY",
     "APPLIED_HEADS_KEY",
+    "applied_body_outdates_packet",
     "apply_collected_rework_outcomes",
     "apply_rework_worker_outcome",
     "fresh_completed_worker_outcome",

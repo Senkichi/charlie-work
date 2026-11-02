@@ -17,6 +17,7 @@ from .closing_keyword_gate_command import (
     run_closing_keyword_check_command,
 )
 from .mojibake_gate import find_mojibake_in_diff
+from .wait_pr import register_wait_pr_subparser, run_wait_pr_command
 from .ast_equivalence_gate_command import (
     register_ast_equivalence_check_subparser,
     run_ast_equivalence_check_command,
@@ -47,17 +48,25 @@ from .fleet_dispatch import (
 )
 from .supervise_loop import (
     DEFAULT_MAX_RELAUNCHES,
+    EXIT_FLEET_PAUSED,
     EXIT_RESTART_REQUESTED,
     PREFLIGHT_REFUSAL_EXIT_CODE,
 )
+from .fleet_pause import register_fleet_pause_subparsers, run_fleet_pause, run_fleet_resume
+from .control_plane_priority import raise_supervisor_to_normal
 from .fleet_paths import fleet_dir
+from .dashboard_command import (
+    DASHBOARD_COMMAND,
+    register_dashboard_subparsers,
+    run_dashboard_command,
+)
 from .fleet_registry import _load_registry, touch_repo, count_fleet_runners
 from .fleet_status import (  # noqa: F401  (deliberate re-export)
     FLEET_STATUS_REPO_TIMEOUT_SECONDS,
     run_fleet_status,
 )
 from .fleet_stop import register_fleet_stop_subparser, run_fleet_stop
-from .global_config import load_layered_config
+from .global_config import load_fleet_global_config, load_layered_config
 from .github import (
     GitHub,
     GitHubError,
@@ -116,8 +125,9 @@ from ci_fleet.charlie_work_adapter import (
 # importing back out through the adapter -- see that module's docstring on
 # the one-way boundary); the confinement here is about blast radius, not
 # layering.
-from .worktree import clean_worktrees
-from .workflow import CommandResult, OrchestratorApp
+from .worktree import clean_worktrees, merge_clean_results
+from .command_result import CommandResult
+from .workflow import OrchestratorApp
 
 
 def _add_dry_run(parser: argparse.ArgumentParser) -> None:
@@ -185,6 +195,7 @@ def build_parser() -> argparse.ArgumentParser:
             "to GitHub."
         ),
     )
+    register_dashboard_subparsers(subparsers)
     subparsers.add_parser("bootstrap-labels")
     subparsers.add_parser("intake")
 
@@ -484,6 +495,7 @@ def build_parser() -> argparse.ArgumentParser:
     # file-size ratchet mark) — same register_*_subparser convention as the
     # *_command modules below.
     register_fleet_stop_subparser(fleet_sub)
+    register_fleet_pause_subparsers(fleet_sub)  # issue #1776
 
     runners = subparsers.add_parser("runners")
     runners_sub = runners.add_subparsers(dest="runners_command", required=True)
@@ -572,6 +584,7 @@ def build_parser() -> argparse.ArgumentParser:
     register_collect_only_check_subparser(subparsers)
     register_junit_recorded_check_subparser(subparsers)
     register_experiment_report_subparser(subparsers)
+    register_wait_pr_subparser(subparsers)
 
     migrate_parser = subparsers.add_parser(
         "migrate-state-dir",
@@ -930,13 +943,16 @@ def run_doctor_command(args: argparse.Namespace) -> CommandResult:
 def run_worktree_clean_command(args: argparse.Namespace) -> CommandResult:
     ctx = bootstrap_command(args)
     state = load_state_locked(ctx.paths.state_file)
-    result = clean_worktrees(
-        ctx.repo_root,
-        resolved_layout(ctx.config, ctx.repo_root).worktrees,
-        state,
-        ctx.config,
-        ctx.gh,
-        dry_run=args.dry_run,
+    result = merge_clean_results(
+        [
+            (
+                root,
+                clean_worktrees(
+                    ctx.repo_root, root, state, ctx.config, ctx.gh, dry_run=args.dry_run
+                ),
+            )
+            for root in resolved_layout(ctx.config, ctx.repo_root).sweep_roots()
+        ]
     )
     return CommandResult(result.ok, result.message, result.data)
 
@@ -1240,27 +1256,19 @@ def run_fleet_work(args: argparse.Namespace) -> CommandResult:
     # Load global config for notifier integration (optional, may be None).
     # A failure here turns off every config-gated fleet behavior (notify and the
     # runner prologues), so it is reported rather than swallowed.
-    try:
-        global_config = load_layered_config(
-            Path.cwd(),
-            None,
-            fleet_dir_override=args.fleet_dir,
-            require_global=True,
-        )
-    except (ConfigError, RepoNotFoundError) as exc:
-        print(f"config load failed, fleet running without global config: {exc}", flush=True)
-        # The global layer is required, but the per-repo config is still valid
-        # and must not be discarded with it -- discarding both regresses the
-        # #623 silent-disable failure (every per-repo knob reverting to its
-        # dataclass default while passes keep reporting success). Reload
-        # without the global requirement so per-repo settings survive; only
-        # fall back to None if the per-repo load itself fails.
-        try:
-            global_config = load_layered_config(
-                Path.cwd(), None, fleet_dir_override=args.fleet_dir
-            )
-        except (ConfigError, RepoNotFoundError):
-            global_config = None
+    # The global layer is required, but the per-repo config is still valid and
+    # must not be discarded with it (#623); only a failing per-repo load too
+    # falls back to None. A host-wide ConstructionError is the one error that
+    # never degrades -- see load_fleet_global_config.
+    global_config = load_fleet_global_config(
+        load_layered_config,
+        Path.cwd(),
+        fleet_dir_override=args.fleet_dir,
+        fallback=None,
+        report=lambda exc: print(
+            f"config load failed, fleet running without global config: {exc}", flush=True
+        ),
+    )
 
     return fleet_loop(
         fleet_dir_override=args.fleet_dir,
@@ -1287,27 +1295,19 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
     # Load global config for notifier integration (optional, may be None).
     # A failure here turns off every config-gated fleet behavior (notify and the
     # runner prologues), so it is reported rather than swallowed.
-    try:
-        global_config = load_layered_config(
-            Path.cwd(),
-            None,
-            fleet_dir_override=args.fleet_dir,
-            require_global=True,
-        )
-    except (ConfigError, RepoNotFoundError) as exc:
-        print(f"config load failed, fleet running without global config: {exc}", flush=True)
-        # The global layer is required, but the per-repo config is still valid
-        # and must not be discarded with it -- discarding both regresses the
-        # #623 silent-disable failure (every per-repo knob reverting to its
-        # dataclass default while passes keep reporting success). Reload
-        # without the global requirement so per-repo settings survive; only
-        # fall back to None if the per-repo load itself fails.
-        try:
-            global_config = load_layered_config(
-                Path.cwd(), None, fleet_dir_override=args.fleet_dir
-            )
-        except (ConfigError, RepoNotFoundError):
-            global_config = None
+    # The global layer is required, but the per-repo config is still valid and
+    # must not be discarded with it (#623); only a failing per-repo load too
+    # falls back to None. A host-wide ConstructionError is the one error that
+    # never degrades -- see load_fleet_global_config.
+    global_config = load_fleet_global_config(
+        load_layered_config,
+        Path.cwd(),
+        fleet_dir_override=args.fleet_dir,
+        fallback=None,
+        report=lambda exc: print(
+            f"config load failed, fleet running without global config: {exc}", flush=True
+        ),
+    )
 
     # Self-deploy before running the pass: FF-pull origin/main and sync
     # dependencies when pyproject.toml/uv.lock changed. Non-fatal on a
@@ -1439,7 +1439,7 @@ def run_fleet_review_queue(args: argparse.Namespace) -> CommandResult:
     - Aggregates per-repo queue entries keyed by repo_key (nameWithOwner)
     - Isolates per-repo errors (missing/broken repos) without aborting aggregation
     """
-    fleet_json_path = layout.fleet_registry_path()
+    fleet_json_path = layout.fleet_registry_path(override=args.fleet_dir)
     registry = _load_registry(fleet_json_path)
     per_repo: dict[str, Any] = {}
     errors: list[dict[str, str]] = []
@@ -1475,7 +1475,7 @@ def run_fleet_operator_queue(args: argparse.Namespace) -> CommandResult:
     per-repo queue entries keyed by repo_key (nameWithOwner), and isolates
     per-repo errors without aborting aggregation.
     """
-    fleet_json_path = layout.fleet_registry_path()
+    fleet_json_path = layout.fleet_registry_path(override=args.fleet_dir)
     registry = _load_registry(fleet_json_path)
     per_repo: dict[str, Any] = {}
     errors: list[dict[str, str]] = []
@@ -2403,11 +2403,14 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
         # --force-rereview is the explicit opt-out. ``getattr`` because
         # run_command is also invoked with hand-built Namespaces that
         # never went through argparse (mirroring the no_cache read above).
-        if not getattr(args, "force_rereview", False):
+        force_rereview = bool(getattr(args, "force_rereview", False))
+        if not force_rereview:
             refusal = app.review_verdict_guard(args.pr)
             if refusal is not None:
                 return refusal
-        return app.review(args.pr)
+        # Issue #2081: the flag must also reach review(), which voids a
+        # live-head verdict only when forced.
+        return app.review(args.pr, force=force_rereview)
     if args.command == "verdict":
         try:
             return app.record_review(
@@ -2516,8 +2519,10 @@ def _render_backlog_reachability(reachability: Any) -> str:
             f"{reason}={reachability[reason]}"
             for reason in (
                 "missing_ready",
+                "parked_unready",
                 "terminal_label",
                 "active_label",
+                "other_host",
                 "operator_claimed",
                 "blocked_by_open_dependency",
                 "mention_covered_awaiting_operator",
@@ -2579,8 +2584,10 @@ def main(argv: list[str] | None = None) -> int:
             elif args.fleet_command == "bash-rats":
                 result = run_fleet_bash_rats(args)
             elif args.fleet_command == "supervise":
+                raise_supervisor_to_normal()
                 result = run_fleet_supervise_command(args)
             elif args.fleet_command == "supervise-loop":
+                raise_supervisor_to_normal()
                 result = run_fleet_supervise_loop(
                     supervise_args=tuple(args.supervise_args),
                     max_relaunches=args.max_relaunches,
@@ -2588,6 +2595,10 @@ def main(argv: list[str] | None = None) -> int:
                 )
             elif args.fleet_command == "stop":
                 result = run_fleet_stop(args)
+            elif args.fleet_command == "pause":
+                result = run_fleet_pause(args)
+            elif args.fleet_command == "resume":
+                result = run_fleet_resume(args)
             else:
                 result = CommandResult(False, f"unknown fleet command: {args.fleet_command}", {})
         elif args.command == "runners":
@@ -2609,6 +2620,8 @@ def main(argv: list[str] | None = None) -> int:
                 result = CommandResult(
                     False, f"unknown runners command: {args.runners_command}", {}
                 )
+        elif args.command == DASHBOARD_COMMAND:
+            result = run_dashboard_command(args)
         elif args.command == "worktree-clean":
             result = run_worktree_clean_command(args)
         elif args.command == "migrate-state-dir":
@@ -2627,6 +2640,8 @@ def main(argv: list[str] | None = None) -> int:
             result = run_junit_recorded_check_command(args)
         elif args.command == "experiment-report":
             result = run_experiment_report_command(args)
+        elif args.command == "wait-pr":
+            result = run_wait_pr_command(args)
         else:
             app = build_app(args)
             result = run_command(app, args)
@@ -2830,8 +2845,14 @@ def main(argv: list[str] | None = None) -> int:
                     print("  Errors:")
                     for error in errors:
                         print(f"    {error}")
+    elif args.command == "wait-pr" and not args.json_output:
+        print(result.message)
     else:
         print_result(result, json_output=args.json_output)
+
+    # #2444: wait-pr distinguishes failed (1) from timeout (2); ok alone can't.
+    if isinstance(result.data, dict) and "wait_pr_exit_code" in result.data:
+        return int(result.data["wait_pr_exit_code"])
 
     # #862: a supervisor exit that asked to be replaced must be distinguishable
     # from a deliberate stop, so the wrapper relaunches on the former and not
@@ -2856,6 +2877,11 @@ def main(argv: list[str] | None = None) -> int:
     # signal out of the command-name dispatch.
     if isinstance(result.data, dict) and result.data.get("preflight_refused"):
         return PREFLIGHT_REFUSAL_EXIT_CODE
+
+    # Issue #1776: an honored pause flag exits EXIT_FLEET_PAUSED (5) so the
+    # launcher log reads "paused", not "clean stop" or "crash".
+    if isinstance(result.data, dict) and result.data.get("fleet_paused"):
+        return EXIT_FLEET_PAUSED
 
     return 0 if result.ok else 1
 

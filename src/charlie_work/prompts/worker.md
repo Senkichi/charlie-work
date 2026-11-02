@@ -49,10 +49,7 @@ $section_available_skills
 4. Implement the smallest correct change.
 
    $section_invariant_enumeration
-5. Run the tests impacted by your change from the worktree root: the test
-   file(s) you added or modified, plus `grep tests/` for every
-   module/function/symbol your production diff touched and run every
-   matching test file — not just the tests you wrote:
+5. $test_step_instruction
    ```bash
    $targeted_test_command
    ```

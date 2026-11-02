@@ -199,6 +199,8 @@ def _probe_adapter(add: Any, repo_root: Path, config: OrchestratorConfig) -> Non
             probe.ok,
             (probe.stdout.strip() or "ok") if probe.ok else (probe.error or probe.stderr.strip()),
         )
+    elif adapter == "opencode":
+        _probe_opencode(add, repo_root, config)
     elif adapter == "claude-code":
         from .claude_code import probe_claude
 
@@ -220,6 +222,23 @@ def _probe_adapter(add: Any, repo_root: Path, config: OrchestratorConfig) -> Non
             f"adapter `{adapter}` launches nothing itself — no CLI probe applies",
             severity="warning",
         )
+    # A fallback harness is only exercised on failover -- probe it now so a
+    # missing binary surfaces here rather than as a launch failure mid-wave.
+    if adapter != "opencode" and any(e.harness == "opencode" for e in config.worker.chain):
+        _probe_opencode(add, repo_root, config)
+
+
+def _probe_opencode(add: Any, repo_root: Path, config: OrchestratorConfig) -> None:
+    from .claude_code import probe_claude
+    from .opencode_worker import DEFAULT_COMMAND_TEMPLATE
+
+    binary = (config.opencode.command or DEFAULT_COMMAND_TEMPLATE)[0]
+    probe = probe_claude(repo_root, command=(binary, "--version"))
+    add(
+        "opencode CLI probe",
+        probe.ok,
+        (probe.stdout.strip() or "ok") if probe.ok else (probe.error or probe.stderr.strip()),
+    )
 
 
 def _probe_api_worker(
@@ -618,10 +637,10 @@ def _check_provenance_refusal_streak(add: Any, fleet_dir_override: str | None = 
 
 
 def _check_fleet_dir_virtualization(add: Any, fleet_dir_override: str | None = None) -> None:
-    """Warn when the fleet directory is per-process virtualized (issue #624).
+    """Warn when the fleet directory or its files are virtualized (issues #624, #2806).
 
-    MSIX/container copy-on-write redirection makes the literal fleet-dir path
-    string identical in both the container and the host while naming different
+    MSIX/container copy-on-write redirection makes the literal path string
+    identical in both the container and the host while naming different
     files: reads pass through to the real file, but the first write forks a
     private copy that daemons reading the same path string never see. This
     cost a full day on #590 — ``runner_allocation`` was believed deployed and
@@ -630,31 +649,45 @@ def _check_fleet_dir_virtualization(add: Any, fleet_dir_override: str | None = N
 
     The signal is that the literal path and its resolved form disagree — never
     a hardcoded package moniker (which would rot on the next app update, only
-    cover one container, and violate the no-hardcoded-lists rule). A
-    virtualized fleet dir is not fatal for an interactive human running
+    cover one container, and violate the no-hardcoded-lists rule). Since
+    #2806 the probe covers files, not only the directory: MSIX redirection is
+    per file and the directory always resolves to itself, so a state file
+    forked by an earlier packaged-session write was invisible here (e.g. a
+    stale private ``fleet.json`` of 3 repos while the real one lists 9,
+    silently bypassing the merge-preflight hook for the missing repos, and a
+    stale private ``config.yaml`` layered over every repo-scoped command).
+
+    A diverged fleet directory is not fatal for an interactive human running
     ``charlie doctor`` from a packaged terminal — reads still pass through
-    until something writes — so this is a warning, not an error. It names both
-    paths and states plainly that any write forks a private copy daemons will
-    never see, referencing #590 for the failure it produced.
+    until something writes — so it is a warning. A diverged state file the
+    fleet machinery actually depends on (``fleet.json``: the merge guard and
+    the registry readers; ``config.yaml``: the config layering) is an error:
+    those reads are already wrong before anything writes. Each finding names
+    both paths and states plainly that any write forks a private copy
+    daemons will never see, referencing #590 for the failure it produced.
 
     Repo-agnostic by construction: the fleet dir is a host-wide per-process
     property, so the same probe fires regardless of which registered repo the
     operator ran ``charlie doctor`` from.
     """
-    diverged = fleet_dir_virtualization(override=fleet_dir_override)
-    if diverged is None:
+    findings = fleet_dir_virtualization(override=fleet_dir_override)
+    if not findings:
         return
-    literal, resolved = diverged
-    add(
-        "fleet dir virtualization",
-        False,
-        f"fleet dir {literal} resolves to {resolved} — host-wide state written "
-        f"here is invisible to scheduled tasks and daemons reading the same "
-        f"path string: the first write forks a private copy they will never "
-        f"see (this is the exact shape of the #590 failure). Daemon-visible "
-        f"state must be written via a non-redirected route (e.g. a UNC path).",
-        severity="warning",
-    )
+    pairs: list[tuple[Path, Path]] = [findings] if isinstance(findings, tuple) else list(findings)
+    state_file_names = frozenset({layout.FLEET_REGISTRY_FILENAME, layout.GLOBAL_CONFIG_FILENAME})
+    for literal, resolved in pairs:
+        add(
+            "fleet dir virtualization",
+            False,
+            f"fleet {'file' if literal.name in state_file_names else 'dir'} "
+            f"{literal} resolves to {resolved} — host-wide state written here "
+            f"is invisible to scheduled tasks and daemons reading the same "
+            f"path string: the first write forks a private copy they will "
+            f"never see (this is the exact shape of the #590 failure). "
+            f"Daemon-visible state must be written via a non-redirected route "
+            f"(e.g. a UNC path).",
+            severity=("error" if literal.name in state_file_names else "warning"),
+        )
 
 
 def _check_fleet_supervisor(add: Any, fleet_dir_override: str | None = None) -> None:
@@ -805,6 +838,8 @@ def _validate_gh_field_lists(add: Any, gh: GitHubLike) -> None:
             ["pr", "checks", str(pr_number)] if pr_number else None,
             PR_CHECKS_FIELDS,
         ),
+        # `label list` is a REST read with no `gh ... --json` argv row, so this
+        # probe goes through `label_list()` instead of `gh.run` (see below).
         "LABEL_LIST_FIELDS": (["label", "list", "--limit", "1"], LABEL_LIST_FIELDS),
         "RECONCILE_PR_FIELDS": (
             ["pr", "list", "--state", "all", "--limit", "1"],
@@ -837,27 +872,30 @@ def _validate_gh_field_lists(add: Any, gh: GitHubLike) -> None:
 
         cmd = [*base_cmd, "--json", fields]
         try:
-            gh.run(cmd, json_output=True)
+            if list_name == "LABEL_LIST_FIELDS":
+                gh.label_list()  # raises GitHubError on any failed read (#756)
+            else:
+                gh.run(cmd, json_output=True)
             add(f"gh field list: {list_name}", True, f"valid ({len(fields.split(','))} fields)")
         except GitHubError as exc:
             error_msg = str(exc)
-            # Classify errors: only actual field errors get the "invalid field(s)" label
-            # Field errors have a specific shape: "Unknown JSON field: ..." or "invalid JSON field: ..."
+            # Classify errors: only actual field errors get the "invalid field(s)" label.
+            # The probes are GraphQL reads (B13), so a field the schema lacks reads
+            # "Field 'x' doesn't exist on type ..." and one the transport has no
+            # mapping for reads "unknown --json field(s) for ...".
             is_field_error = any(
                 phrase in error_msg
-                for phrase in ("Unknown JSON field:", "invalid JSON field:", "invalid field")
+                for phrase in (
+                    "doesn't exist on type",
+                    "unknown --json field",
+                    "unknown run field",
+                    "Unknown JSON field:",
+                    "invalid JSON field:",
+                    "invalid field",
+                )
             )
 
-            # Special case: gh pr checks fails with non-zero exit when no CI is configured
-            # This is not a field error - it's a missing feature
-            if list_name == "PR_CHECKS_FIELDS" and "no checks reported" in error_msg.lower():
-                add(
-                    f"gh field list: {list_name}",
-                    True,
-                    "skipped (no CI configured on probe PR)",
-                    severity="warning",
-                )
-            elif is_field_error:
+            if is_field_error:
                 add(
                     f"gh field list: {list_name}",
                     False,
@@ -950,12 +988,18 @@ def _check_worktrees_root_agreement(
     sites (``OrchestratorApp._adapter_settings()`` and
     ``run_worktree_clean_command``'s ``clean_worktrees`` call).
     """
-    effective_root = resolved_layout(config, repo_root).worktrees
-    add(
-        "worktrees root",
-        True,
-        f"{effective_root} (dispatch and `worktree-clean` both resolve here)",
-    )
+    resolved = resolved_layout(config, repo_root)
+    detail = f"{resolved.worktrees} (dispatch and `worktree-clean` both resolve here)"
+    status = resolved.worker_io
+    if status.io is not None:
+        detail += f"; on the host I/O volume {status.io.drive}, uv cache {status.io.uv_cache}"
+    elif status.note:
+        detail += f"; host I/O not in use: {status.note}"
+    legacy = resolved.sweep_roots()[1:]
+    if legacy:
+        entries = sum(1 for _ in legacy[0].iterdir())
+        detail += f"; legacy root {legacy[0]} still swept ({entries} entries)"
+    add("worktrees root", True, detail)
 
 
 _LANE_FAILURE_LOOKBACK_HOURS = 24

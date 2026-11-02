@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
-import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from _time_shift import shifted_datetime
 
 from charlie_work.paths import runtime_paths
 
@@ -478,6 +478,7 @@ def test_fleet_registry_touch_repo_first_call(tmp_path: Path) -> None:
 
 def test_fleet_registry_touch_repo_second_call(tmp_path: Path) -> None:
     """Test that touch_repo preserves first_seen and bumps last_seen on subsequent calls."""
+    from charlie_work import fleet_registry
     from charlie_work.fleet_registry import touch_repo
     from charlie_work.github import GitHub
 
@@ -496,11 +497,10 @@ def test_fleet_registry_touch_repo_second_call(tmp_path: Path) -> None:
     first_first_seen = registry["repos"]["owner/repo"]["first_seen"]
     first_last_seen = registry["repos"]["owner/repo"]["last_seen"]
 
-    # Small delay to ensure timestamp difference (need >1s due to second resolution)
-    time.sleep(2.0)
-
-    # Second call
-    registry = touch_repo(str(tmp_path / "fleet"), repo_root, paths, gh)
+    # Second call, stamped 2 s later: last_seen has whole-second resolution, so
+    # shift the module's clock instead of sleeping across the boundary.
+    with patch.object(fleet_registry, "datetime", shifted_datetime(2)):
+        registry = touch_repo(str(tmp_path / "fleet"), repo_root, paths, gh)
     second_first_seen = registry["repos"]["owner/repo"]["first_seen"]
     second_last_seen = registry["repos"]["owner/repo"]["last_seen"]
 

@@ -98,16 +98,6 @@ class FleetReviewCap:
         return fields
 
 
-def _workflow() -> Any:
-    # Reached through ``charlie_work.workflow`` (resolved at call time -- it
-    # imports the orchestration delegates that import this module) so a test
-    # patching ``charlie_work.workflow.count_fleet_live_reviews`` intercepts,
-    # exactly as ``_wf.count_fleet_live_sessions`` does for the worker cap.
-    import charlie_work.workflow as wf
-
-    return wf
-
-
 def acquire_fleet_review_launch_lock(
     app: OrchestratorApp, *, acquire: FleetLockAcquirer | None = None
 ) -> FleetLaunchLock:
@@ -143,6 +133,23 @@ def fleet_review_lock_deferral(
     }
 
 
+def fleet_lock_held_result_data(lock_deferral: dict[str, Any], **carried: Any) -> dict[str, Any]:
+    """Result ``data`` for a review pass deferred on the fleet lock.
+
+    Nothing was selected or launched; ``carried`` are the pre-lock sweep
+    results (recorded/missed/reconciled verdicts, rescue reviews) the pass
+    already produced and must still report.
+    """
+    return {
+        "selected_count": 0,
+        "attempted_count": 0,
+        "failed_count": 0,
+        "launched_count": 0,
+        **carried,
+        **lock_deferral,
+    }
+
+
 def read_fleet_review_cap(app: OrchestratorApp) -> FleetReviewCap | None:
     """Read the fleet reviewer budget now; ``None`` when the cap is disabled.
 
@@ -153,7 +160,7 @@ def read_fleet_review_cap(app: OrchestratorApp) -> FleetReviewCap | None:
     fleet_max = app.config.fleet.global_max_concurrent_reviews
     if fleet_max <= 0:
         return None
-    live_count, _skipped_repos = _workflow().count_fleet_live_reviews(app.fleet_dir_override)
+    live_count, _skipped_repos = app.host.sessions.fleet_live_reviews(app.fleet_dir_override)
     return FleetReviewCap(fleet_max=fleet_max, fleet_live_count=live_count)
 
 

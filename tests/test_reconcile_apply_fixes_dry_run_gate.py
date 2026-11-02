@@ -22,6 +22,7 @@ from __future__ import annotations
 import ast
 import textwrap
 from pathlib import Path
+from _src_ast import parsed, source_files, source_text
 
 _SRC_ROOT = Path(__file__).parents[1] / "src" / "charlie_work"
 
@@ -423,8 +424,16 @@ def test_every_apply_fixes_call_site_is_dry_run_gated() -> None:
     """
     violations: list[str] = []
     site_count = 0
-    for path in sorted(_SRC_ROOT.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for path in source_files(_SRC_ROOT):
+        # A call to ``apply_fixes``/``apply_drift_fixes`` cannot exist in a
+        # file whose text lacks the identifier; the text filter keeps the
+        # ~440 untouched files out of the (shared-cache) parse without
+        # changing what the guard sees (issue #2404; same filter shape as
+        # #2361's dry_run call-site scan).
+        text = source_text(path)
+        if not any(name in text for name in _APPLY_FIXES_NAMES):
+            continue
+        tree = parsed(path)
         for call, guards in _apply_fixes_call_sites(tree):
             site_count += 1
             if not _site_is_dry_run_gated(guards):

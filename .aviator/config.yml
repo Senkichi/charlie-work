@@ -1,6 +1,9 @@
 merge_rules:
   labels:
     trigger: "mergequeue"
+    # TIS-CW-7: charlie-work adds this beside the trigger for PRs whose issue is
+    # priority:critical (auto_merge.mergequeue_skip_line_label).
+    skip_line: "mergequeue-skip-line"
   preconditions:
     number_of_approvals: 0
     required_checks:

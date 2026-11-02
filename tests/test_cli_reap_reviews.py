@@ -24,6 +24,7 @@ from _review_fixtures import (
 )
 from charlie_work import cli, layout
 from charlie_work.claude_code import ClaudeWorkerRecord
+from charlie_work.host.fakes import FakeProcessProbe
 from charlie_work.instrumentation import query_events
 from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.supervise import try_acquire_supervisor_lock
@@ -208,7 +209,7 @@ def test_reap_reviews_skips_fresh_dead_claim(tmp_path: Path) -> None:
     assert sidecar.exists()
 
 
-def test_reap_reviews_skips_live_reviewer(monkeypatch, tmp_path: Path) -> None:
+def test_reap_reviews_skips_live_reviewer(monkeypatch, tmp_path: Path, fake_host) -> None:
     """A stale-timestamped claim whose reviewer pid is still alive is left
     alone: liveness, not the timestamp alone, decides the reap."""
     app = _dispatch_reviews_app(tmp_path, prs=[_open_pr(100)])
@@ -217,7 +218,7 @@ def test_reap_reviews_skips_live_reviewer(monkeypatch, tmp_path: Path) -> None:
     sidecar = _make_dead_review_sidecar(reviews_dir, 100, "ordinary crash output\n")
 
     monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: True)
-    monkeypatch.setattr("charlie_work.stalled_review_reap.is_pid_alive", lambda *a: True)
+    fake_host(probe=FakeProcessProbe({999999999: 1.0}))
 
     lock = try_acquire_supervisor_lock(layout.supervisor_lock_path(app.paths.root))
     assert lock is not None

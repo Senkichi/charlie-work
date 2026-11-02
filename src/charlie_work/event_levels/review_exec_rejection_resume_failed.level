@@ -1,0 +1,4 @@
+warning
+# Issue #2090: an exec-rejected devin-shell review could NOT be resumed (no session id,
+# checkout gone, or the relaunch failed). The reaper falls through to
+# review_verdict_missed; the payload carries the reason.

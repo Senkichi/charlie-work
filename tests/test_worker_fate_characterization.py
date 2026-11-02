@@ -43,6 +43,7 @@ from _worker_fate_characterization_fixtures import (
     _seed_no_pr_dispatched_issue,
     _wg,
 )
+from _host_fixtures import host_probe
 
 
 # ---------------------------------------------------------------------------
@@ -52,7 +53,9 @@ from _worker_fate_characterization_fixtures import (
 # ---------------------------------------------------------------------------
 
 
-def test_flip1_a9_workflow_uses_stale_worker_outcome_from_prior_dispatch(tmp_path: Path) -> None:
+def test_flip1_a9_workflow_uses_stale_worker_outcome_from_prior_dispatch(
+    tmp_path: Path, monkeypatch
+) -> None:
     """FLIP 1: was `worker_outcomes[issue_number] = terminal_outcome or
     worktree_outcome` with no `dispatched_at` comparison anywhere (a
     `.worker-outcome.json` left over from a PRIOR dispatch of this
@@ -91,7 +94,7 @@ def test_flip1_a9_workflow_uses_stale_worker_outcome_from_prior_dispatch(tmp_pat
     fake_gh = _no_pr_fake_gh(tmp_path, config, issue_number)
 
     with (
-        patch("charlie_work.workflow._worker_pid_alive", return_value=False),
+        host_probe(monkeypatch, alive=False),
         patch("charlie_work.workflow.remote_branch_head_sha", return_value=None),
         patch("charlie_work.workflow.remote_branch_ahead_count", return_value=(0, None)),
     ):
@@ -120,7 +123,7 @@ def test_flip1_a5_live_handoff_finalize_ignores_dispatched_at(tmp_path: Path) ->
     the live entry's `dispatched_at`, regardless of how old it is by wall
     clock.
     """
-    from charlie_work.live_handoff_finalize import collect_stale_live_handoff_pids
+    from charlie_work.dead_worker_sweep.live_handoff import collect_stale_live_handoff_pids
 
     now = datetime.now(UTC)
     branch = "agent/issue-9102"
@@ -180,7 +183,7 @@ def test_flip5_live_handoff_finalize_withholds_fresh_outcome_until_threshold(
     regardless of `worker_outcome_finalize_minutes` -- that threshold now
     only gates the kill decision elsewhere (rule 5).
     """
-    from charlie_work.live_handoff_finalize import collect_stale_live_handoff_pids
+    from charlie_work.dead_worker_sweep.live_handoff import collect_stale_live_handoff_pids
 
     now = datetime.now(UTC)
     branch = "agent/issue-9105"
@@ -226,7 +229,7 @@ def test_b9_live_handoff_finalize_omitted_pr_created_is_not_a_confirmed_no_pr(
     same as an explicit ``false``. That widening was never one of the nine
     reviewed flips; this pins the restored strict gate.
     """
-    from charlie_work.live_handoff_finalize import collect_stale_live_handoff_pids
+    from charlie_work.dead_worker_sweep.live_handoff import collect_stale_live_handoff_pids
 
     now = datetime.now(UTC)
     branch = "agent/issue-9106"
@@ -267,7 +270,9 @@ def test_b9_live_handoff_finalize_omitted_pr_created_is_not_a_confirmed_no_pr(
 # ---------------------------------------------------------------------------
 
 
-def test_flip2_with_pr_fresh_blocked_outcome_falls_through_to_redispatch(tmp_path: Path) -> None:
+def test_flip2_with_pr_fresh_blocked_outcome_falls_through_to_redispatch(
+    tmp_path: Path, monkeypatch
+) -> None:
     """FLIP 2: was a fresh, on-target `blocked` outcome on the with-PR lane
     silently indistinguishable from no evidence at all (auto-reset to
     `rework_requested` and redispatched); now the with-PR lane escalates it
@@ -298,7 +303,7 @@ def test_flip2_with_pr_fresh_blocked_outcome_falls_through_to_redispatch(tmp_pat
         mtime=datetime.now(UTC),  # fresh: after dispatched_at (~1h ago)
     )
 
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -328,7 +333,7 @@ def test_flip2_with_pr_fresh_blocked_outcome_falls_through_to_redispatch(tmp_pat
 
 
 def test_flip2_with_pr_fresh_blocked_outcome_and_clean_exit_still_escalates(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """B2 (wf-review-opus.md): FLIP 2 must fire on a clean (exit code 0)
     exit too -- the normal way a claude-code/api worker ends a blocked
@@ -365,7 +370,7 @@ def test_flip2_with_pr_fresh_blocked_outcome_and_clean_exit_still_escalates(
         mtime=datetime.now(UTC),
     )
 
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -394,7 +399,7 @@ def test_flip2_with_pr_fresh_blocked_outcome_and_clean_exit_still_escalates(
 
 
 def test_flip2_approved_rework_fresh_blocked_outcome_and_clean_exit_still_escalates(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """B2 companion for the second call site (the `approved` +
     `rework_requested`-PR-state branch of `handle_dead_worker_with_pr`,
@@ -428,7 +433,7 @@ def test_flip2_approved_rework_fresh_blocked_outcome_and_clean_exit_still_escala
         mtime=datetime.now(UTC),
     )
 
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -480,7 +485,9 @@ def test_flip3_dead_worker_reap_salvage_pushes_local_only_commits(
     config = OrchestratorConfig()
     active_labels, issue_labels = _salvage_labels(config)
     gh = _SalvageTestGitHub(repo_root=tmp_path)
-    monkeypatch.setattr("charlie_work.dead_worker_reap.push_branch", lambda *a, **k: (True, None))
+    monkeypatch.setattr(
+        "charlie_work.dead_worker_sweep.effects_pr.push_branch", lambda *a, **k: (True, None)
+    )
 
     from charlie_work.workflow import _attempt_salvage
 

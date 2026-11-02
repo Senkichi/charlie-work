@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from _cli_fixtures import _FakeGitHub
+from _worktree_fixtures import _init_repo, _init_repo_with_origin
 from charlie_work import cli
 from charlie_work.config import (
     ConfigError,
@@ -28,20 +29,20 @@ from charlie_work.paths import runtime_paths
 
 def _init_git_repo_with_origin(root: Path, remote_url: str) -> Path:
     """Create a real git repo with one commit and an ``origin`` remote."""
-    import subprocess
-
-    root.mkdir(parents=True, exist_ok=True)
-    run = lambda args: subprocess.run(  # noqa: E731
-        args, cwd=root, check=True, capture_output=True, text=True
-    )
-    run(["git", "init", "--initial-branch=main"])
-    run(["git", "config", "user.email", "test@example.test"])
-    run(["git", "config", "user.name", "Test User"])
-    (root / "README.md").write_text("hello\n", encoding="utf-8")
-    run(["git", "add", "README.md"])
-    run(["git", "commit", "-m", "initial commit"])
-    run(["git", "remote", "add", "origin", remote_url])
+    _init_repo_with_origin(root, remote_url)
     return root
+
+
+@pytest.fixture(autouse=True)
+def _prewarmed_git_templates(tmp_path: Path) -> None:
+    """Build this module's git-repo template shapes during setup so no test's
+    call phase pays the once-per-process template build (~6 spawns on
+    Windows). The ledger alerts on per-test ``call`` time only (issue #2570;
+    the setup exclusion is deliberate — see #2515). The conftest env fixtures
+    run first, so the fingerprinted environment matches what test bodies see.
+    """
+    _init_repo(tmp_path / "_warm-plain")
+    _init_repo_with_origin(tmp_path / "_warm-origin", "https://github.com/test/canonical.git")
 
 
 def _write_fleet_registry(
@@ -69,6 +70,37 @@ def _make_sibling_clone_ctx(sibling_root: Path, config: OrchestratorConfig) -> c
     paths = runtime_paths(sibling_root, config.runtime.state_dir)
     gh = GitHub(repo_root=sibling_root, runtime=config.runtime, dry_run=True)
     return cli.CommandContext(repo_root=sibling_root, config=config, paths=paths, gh=gh)
+
+
+def test_init_git_repo_with_origin_goes_through_git_template(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #2345: the sibling-clone repo builder must materialize through the
+    per-process git template machinery (``_git_templates``, HS-CW-4) instead of
+    re-running the init sequence per call — the ledger measured this module's
+    tests at ~2x baseline because each repo paid the full spawn cost on
+    Windows CI. Issue #2570: the per-call ``git remote add`` spawn plus two
+    verification spawns kept the call phase at three subprocesses and
+    reflagged it at 2.4x once the host's spawn cost drifted; the remote now
+    lives in the ``plain-origin`` template (built once per process, its
+    placeholder URL rewritten per copy) and the assertions read the copied
+    files directly, so the call phase spawns no process at all. The sibling
+    tests below still exercise the copied repos' origin through real ``git
+    remote get-url`` inside ``_repo_owner_name``."""
+    import _git_templates
+
+    monkeypatch.delenv(_git_templates.REUSE_ENV, raising=False)
+    remote_url = "https://github.com/test/canonical.git"
+    before = _git_templates._REGISTRY.materialized["plain-origin"]
+    repo = _init_git_repo_with_origin(tmp_path / "repo", remote_url)
+    assert _git_templates._REGISTRY.materialized["plain-origin"] == before + 1
+
+    config_text = (repo / ".git" / "config").read_text(encoding="utf-8")
+    assert '[remote "origin"]' in config_text
+    assert f"url = {remote_url}" in config_text
+    assert _git_templates._ORIGIN_URL_PLACEHOLDER not in config_text
+    main_ref = repo / ".git" / "refs" / "heads" / "main"
+    assert main_ref.is_file() and main_ref.read_text(encoding="utf-8").strip()
 
 
 def test_sibling_clone_verdict_refused(tmp_path: Path) -> None:
@@ -281,10 +313,8 @@ def test_guard_fails_open_for_no_origin_remote(tmp_path: Path) -> None:
     """Issue #1376: when the repo has no ``origin`` remote (or a non-GitHub
     URL), ``nameWithOwner`` cannot be resolved and the guard must allow the
     command — the guard is for GitHub-fleet repos, not arbitrary checkouts."""
-    from _helpers import _init_git_repo
-
     repo = tmp_path / "no-remote"
-    _init_git_repo(repo)
+    _init_repo(repo)
 
     fleet_dir = tmp_path / "fleet"
     _write_fleet_registry(

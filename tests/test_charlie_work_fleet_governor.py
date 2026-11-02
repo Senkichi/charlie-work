@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from _fakes_github import FakeGitHub
+from charlie_work.host.fakes import FakeSessionCounter
 from charlie_work.config import (
     DevinConfig,
     DispatchConfig,
@@ -27,22 +28,18 @@ from charlie_work.config import (
 from charlie_work.devin_shell import SessionRecord
 from charlie_work.paths import runtime_paths
 from charlie_work.state import save_state
-from charlie_work.workflow import (
-    CommandResult,
-    ConcurrencyGovernorResult,
-    OrchestratorApp,
-)
+from charlie_work.command_result import CommandResult
+from charlie_work.workflow import ConcurrencyGovernorResult, OrchestratorApp
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
 
 
-def test_fleet_concurrency_governor_unlimited_when_unset(tmp_path: Path, monkeypatch) -> None:
+def test_fleet_concurrency_governor_unlimited_when_unset(
+    tmp_path: Path, monkeypatch, fake_host
+) -> None:
     """When fleet.global_max_concurrent_sessions is 0 (default), dispatch should behave as before (unlimited)."""
 
     # Mock count_fleet_live_sessions to return 0 fleet live sessions
-    def mock_count_fleet_live(fleet_dir_override):
-        return 0, []
-
-    monkeypatch.setattr("charlie_work.workflow.count_fleet_live_sessions", mock_count_fleet_live)
+    fake_host(sessions=FakeSessionCounter(fleet_workers=(0, [])))
 
     config = OrchestratorConfig(
         fleet=FleetConfig(global_max_concurrent_sessions=0),
@@ -64,15 +61,12 @@ def test_fleet_concurrency_governor_unlimited_when_unset(tmp_path: Path, monkeyp
 
 
 def test_fleet_concurrency_governor_clamps_when_fleet_live_at_cap(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, fake_host
 ) -> None:
     """When fleet.global_max_concurrent_sessions is set and fleet live count meets cap, dispatch should be clamped."""
 
     # Mock count_fleet_live_sessions to return 3 fleet live sessions (at cap)
-    def mock_count_fleet_live(fleet_dir_override):
-        return 3, []
-
-    monkeypatch.setattr("charlie_work.workflow.count_fleet_live_sessions", mock_count_fleet_live)
+    fake_host(sessions=FakeSessionCounter(fleet_workers=(3, [])))
 
     config = OrchestratorConfig(
         fleet=FleetConfig(global_max_concurrent_sessions=3),
@@ -95,19 +89,15 @@ def test_fleet_concurrency_governor_clamps_when_fleet_live_at_cap(
     assert result.data["fleet_live_session_count"] == 3
 
 
-def test_fleet_concurrency_governor_tighter_cap_wins(tmp_path: Path, monkeypatch) -> None:
+def test_fleet_concurrency_governor_tighter_cap_wins(
+    tmp_path: Path, monkeypatch, fake_host
+) -> None:
     """When both per-repo and fleet caps are set, the tighter constraint wins."""
 
     # Mock count_fleet_live_sessions to return 1 fleet live session
-    def mock_count_fleet_live(fleet_dir_override):
-        return 1, []
-
-    # Mock _count_live_sessions to return 1 local live session
-    def mock_count_live(sessions_dir, state_file=None):
-        return 1
-
-    monkeypatch.setattr("charlie_work.workflow.count_fleet_live_sessions", mock_count_fleet_live)
-    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
+    # Fake the local live-session count to return 1 local live session
+    fake_host(sessions=FakeSessionCounter(fleet_workers=(1, [])))
+    fake_host(sessions=FakeSessionCounter(fleet_workers=(1, []), workers=1))
 
     config = OrchestratorConfig(
         fleet=FleetConfig(global_max_concurrent_sessions=1),
@@ -132,19 +122,15 @@ def test_fleet_concurrency_governor_tighter_cap_wins(tmp_path: Path, monkeypatch
     assert result.data["fleet_live_session_count"] == 1  # fleet live
 
 
-def test_fleet_concurrency_governor_per_repo_cap_tighter(tmp_path: Path, monkeypatch) -> None:
+def test_fleet_concurrency_governor_per_repo_cap_tighter(
+    tmp_path: Path, monkeypatch, fake_host
+) -> None:
     """When per-repo cap is tighter than fleet cap, per-repo wins."""
 
     # Mock count_fleet_live_sessions to return 1 fleet live session
-    def mock_count_fleet_live(fleet_dir_override):
-        return 1, []
-
-    # Mock _count_live_sessions to return 1 local live session
-    def mock_count_live(sessions_dir, state_file=None):
-        return 1
-
-    monkeypatch.setattr("charlie_work.workflow.count_fleet_live_sessions", mock_count_fleet_live)
-    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
+    # Fake the local live-session count to return 1 local live session
+    fake_host(sessions=FakeSessionCounter(fleet_workers=(1, [])))
+    fake_host(sessions=FakeSessionCounter(fleet_workers=(1, []), workers=1))
 
     config = OrchestratorConfig(
         fleet=FleetConfig(global_max_concurrent_sessions=5),
@@ -333,7 +319,7 @@ def test_fleet_lock_serializes_cross_repo_dispatch(tmp_path: Path, monkeypatch) 
         )
         apps.append(app)
 
-    # Seed the fleet registry so both repos are visible to count_fleet_live_sessions.
+    # Seed the fleet registry so both repos are visible to the fleet live-session walker.
     save_state(fleet_dir / "fleet.json", {"repos": repo_entries})
 
     # Launch both dispatch() calls concurrently from the same barrier.
@@ -390,24 +376,16 @@ def test_fleet_dir_env_var() -> None:
             os.environ["CHARLIE_WORK_FLEET_DIR"] = original
 
 
-def test_fleet_dir_platform_defaults() -> None:
-    """Test that fleet_dir uses platform-specific defaults."""
+def test_fleet_dir_platform_defaults(tmp_path: Path, monkeypatch) -> None:
+    """Test that fleet_dir uses platform-specific defaults.
+
+    The platform base points at a fresh temp dir: the host's real fleet dir may hold
+    MSIX-virtualized files, which reroute the result to a UNC path (issue #2806).
+    """
     from charlie_work.fleet_paths import fleet_dir
 
-    # Clear env var to test platform defaults
-    original = os.environ.get("CHARLIE_WORK_FLEET_DIR")
-    try:
-        os.environ.pop("CHARLIE_WORK_FLEET_DIR", None)
-        result = fleet_dir()
+    monkeypatch.delenv("CHARLIE_WORK_FLEET_DIR", raising=False)
+    base_var = "LOCALAPPDATA" if sys.platform == "win32" else "XDG_STATE_HOME"
+    monkeypatch.setenv(base_var, str(tmp_path))
 
-        if sys.platform == "win32":
-            expected_base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
-        else:
-            expected_base = Path(
-                os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")
-            )
-
-        assert result == expected_base / "charlie-work"
-    finally:
-        if original is not None:
-            os.environ["CHARLIE_WORK_FLEET_DIR"] = original
+    assert fleet_dir() == tmp_path / "charlie-work"

@@ -142,3 +142,10 @@ def test_tests_timeout_minutes_at_hosted_derived_bound() -> None:
         "self-hosted box; on a dedicated hosted VM they only let a genuine "
         "hang burn longer before being killed (issue #1504)"
     )
+
+
+def test_shard_job_has_no_job_level_concurrency_group() -> None:
+    """DD-4: the suite now runs in ``tests-shard``; the #1399 rule
+    (no job-level concurrency on the suite job) applies to it too."""
+    shard = _load_ci_workflow()["jobs"]["tests-shard"]
+    assert shard.get("concurrency") is None

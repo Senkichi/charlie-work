@@ -1,0 +1,4 @@
+warning
+# cw#2185: a verified_no_changes claim was refused (escalated issue, dirty or
+# ahead-of-base worktree, no worktree, dry-run, or close failure); the orphan sweep falls
+# through to its normal handling, so the refusal must be visible.

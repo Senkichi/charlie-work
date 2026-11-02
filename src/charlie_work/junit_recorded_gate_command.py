@@ -35,10 +35,10 @@ from typing import Any
 
 from .junit_recorded_gate import (
     JunitRecordedResult,
-    compare_recorded_vs_collected,
+    compare_recorded_vs_collected_multi,
     render_gate_report,
 )
-from .workflow import CommandResult
+from .command_result import CommandResult
 
 
 def register_junit_recorded_check_subparser(
@@ -60,9 +60,12 @@ def register_junit_recorded_check_subparser(
     parser.add_argument(
         "--junit",
         required=True,
+        action="append",
         help=(
-            "Path to the junit XML file written by "
-            "'pytest --junit-xml=<file>'. May be relative to the repo root."
+            "Path to a junit XML file written by 'pytest --junit-xml=<file>', "
+            "relative to the repo root. Repeat for several files (one per CI "
+            "shard); a value containing * ? or [ is a glob. Counts are summed "
+            "and a test recorded in two files fails the gate."
         ),
     )
     parser.add_argument(
@@ -108,6 +111,26 @@ def _read_file(path: Path, label: str) -> str:
         ) from exc
 
 
+_GLOB_CHARS = frozenset("*?[")
+
+
+def _resolve_junit_paths(repo_root: Path, raw: str | list[str]) -> list[Path]:
+    """Expand ``--junit`` values; a glob with no match raises ``ConfigError``."""
+    from .config import ConfigError
+
+    values = [raw] if isinstance(raw, str) else list(raw)
+    paths: list[Path] = []
+    for value in values:
+        if _GLOB_CHARS & set(value):
+            matches = sorted(repo_root.glob(value))
+            if not matches:
+                raise ConfigError(f"junit-recorded-check: --junit {value!r} matched no files")
+            paths.extend(matches)
+        else:
+            paths.append(repo_root / value)
+    return paths
+
+
 def run_junit_recorded_check_command(
     args: argparse.Namespace,
 ) -> CommandResult:
@@ -115,7 +138,7 @@ def run_junit_recorded_check_command(
 
     Reads the junit XML file (``--junit``) and the collect-only output file
     (``--collect``), runs the pure comparison logic
-    (:func:`compare_recorded_vs_collected`), and returns ``ok=False`` when
+    (:func:`compare_recorded_vs_collected_multi`), and returns ``ok=False`` when
     the junit ``<testcase>`` count differs from the collected count, when
     either side is emptily zero, or when the junit document is internally
     inconsistent.
@@ -127,16 +150,17 @@ def run_junit_recorded_check_command(
     from . import cli  # deferred: see module docstring (circular-import / -m guard)
 
     ctx = cli.bootstrap_command(args)
-    junit_path = ctx.repo_root / getattr(args, "junit")
+    raw_junit = getattr(args, "junit")
     collect_path = ctx.repo_root / getattr(args, "collect")
 
     try:
-        junit_xml = _read_file(junit_path, "junit")
+        junit_paths = _resolve_junit_paths(ctx.repo_root, raw_junit)
+        junit_xmls = [_read_file(path, "junit") for path in junit_paths]
     except Exception as exc:
         return CommandResult(
             False,
             f"junit-recorded-check: {exc}",
-            {"junit": str(junit_path)},
+            {"junit": raw_junit if isinstance(raw_junit, str) else list(raw_junit)},
         )
     try:
         collect_output = _read_file(collect_path, "collect")
@@ -147,7 +171,7 @@ def run_junit_recorded_check_command(
             {"collect": str(collect_path)},
         )
 
-    result: JunitRecordedResult = compare_recorded_vs_collected(junit_xml, collect_output)
+    result: JunitRecordedResult = compare_recorded_vs_collected_multi(junit_xmls, collect_output)
     report = render_gate_report(result)
 
     # Write to --output file and/or $GITHUB_STEP_SUMMARY (CI rendering).
@@ -166,7 +190,11 @@ def run_junit_recorded_check_command(
             pass  # non-fatal: report is also on stdout
 
     data: dict[str, Any] = {
-        "junit": str(junit_path),
+        "junit": (
+            str(junit_paths[0])
+            if isinstance(raw_junit, str) or len(junit_paths) == 1
+            else [str(p) for p in junit_paths]
+        ),
         "collect": str(collect_path),
         "recorded": result.recorded,
         "collected": result.collected,

@@ -87,6 +87,10 @@ review_dispatch:
   # recorded verdict). Prevents a dead provider from being probed with a
   # real reviewer launch every pass, forever.
   # quota_probe_max_interval_minutes: 240
+  # Issue #2090: a devin-shell reviewer whose exec is refused (headless auto mode) ends
+  # with no verdict. The reaper resumes the same Devin session with a nudge up to this many
+  # times per dispatch before recording review_verdict_missed. 0 disables resuming.
+  # review_exec_rejection_max_resumes: 2
   # Issue #1445: repo file-size cap (lines). A diff that adds code to a file
   # whose post-diff line count exceeds this cap is a REPORTABLE FINDING in the
   # review packet. 0 (default) disables the over-cap finding probe; the
@@ -223,5 +227,5 @@ supervisor:
 # host-wide `fleet_supervisor:` section in issue #1978. Declare it in the
 # GLOBAL fleet layer (<fleet_dir>/config.yaml), not here -- a per-repo
 # `fleet_supervisor:` section is a ConfigError. See docs/RUNBOOK.md.
-# The legacy `supervisor.<key>` spellings still parse during the migration
-# window (they emit config_key_deprecated_read; removal tracked by #1979).
+# The legacy `supervisor.<key>` spellings were removed by #1979: they now
+# fail like any other unknown key.

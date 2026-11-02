@@ -23,6 +23,13 @@ stdlib-only; see the notes below before "fixing" one.
   `cmd`-redirect workaround (native stderr reordering/dropping under
   PowerShell — see the inline comments) are load-bearing; do not touch them
   when editing this file.
+- **`fleet-pass.sh`** — the POSIX port of `fleet-pass.ps1` for the Mac host (spec C2
+  of the hosts repo's Mac host adoption design). Same contract: repo root from the
+  script's location, the same log file and markers, the same pause flag
+  (`fleet-pause.json` under `CHARLIE_WORK_FLEET_DIR`, else
+  `${XDG_STATE_HOME:-~/.local/state}/charlie-work`), exit 0 when paused. A launchd
+  LaunchDaemon with a 300 s `StartInterval` runs it; launchd never starts a second
+  instance while one runs. bash 3.2 and BSD-userland safe.
 - **`fleet-pass-hidden.vbs`** — windowless launcher for `fleet-pass.ps1`,
   invoked by the scheduled task via `wscript.exe` so no console window
   flashes. Already self-locating (derives `fleet-pass.ps1`'s path from its
@@ -74,6 +81,20 @@ stdlib-only; see the notes below before "fixing" one.
   Anything else needing sharing from inside the package still needs the
   reimplement-locally treatment `fleet_dir` and the stale-open-issue-mention
   primitives already get, not a new exception in either file.
+- **`heartbeat_armable_gate.py`** — `check_armable_backlog` and its
+  dependency/sweep gates (issue #2004), extracted out of
+  `heartbeat_check.py` for file-size-ratchet headroom (PR #2023 rework) —
+  relocation only, no behavior change. Loaded by `heartbeat_check.py` via
+  `importlib` from the sibling script path like the siblings below, and
+  re-exported so `hb.check_armable_backlog`/`hb.ARMABLE_*` still resolve.
+  Unlike the other siblings it needs `heartbeat_check` helpers at call time
+  (`run_gh_json`, `get_dispatch_cap`), so the loader block calls its
+  `bind(sys.modules[__name__])` and it reads those helpers off the bound
+  module — keeping `hb.*` monkeypatches effective in tests. It holds two
+  more guarded `charlie_work` leaf imports in the family's set above:
+  `github_body_scan.parse_blockers` and `config_deprecations.DEPRECATED_CONFIG_KEYS`,
+  each degrade-to-no-op with a named caveat on the emitted verdict line.
+  Stdlib-only, same constraint as `heartbeat_check.py`.
 - **`heartbeat_event_alarms.py`** — the five per-repo `events.db` kind/level
   anomaly checks (`check_error_events`, `check_warning_events`,
   `check_infra_blocked_events`, `check_draft_pr_blocked_events`,

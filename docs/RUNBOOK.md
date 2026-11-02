@@ -77,7 +77,7 @@ definitions and the experiment's stopping rule.
 | `agent:done` | PR merged via `ship-it`. Every `active` label is removed in the same transition. | `ship-it` → event `merged`. |
 | `agent:human-needed` | `verdict --decision blocked` (a product/security decision is needed) or the rework cap exhausted. Terminal — no further automation happens until a human clears it. | `verdict` → event `escalated`/`blocked`. |
 | `agent:operator-queue` | Mechanical escalations (`reason_class == "mechanical"`) land here instead of `agent:human-needed`, so human attention is reserved for judgment calls. Terminal. | `operator_queued` / `redispatch_operator_queued` edges and the de-escalation cap-exhaustion path. |
-| `agent:prose-only-deps` | Issue has prose-only dependencies that need structured blocker declarations (`Blocked by #N`). Terminal — held out of dispatch. | Intake pass (`workflow.py`, event `intake_prose_only_deps`). |
+| `agent:prose-only-deps` | Issue has prose-only dependencies that need structured blocker declarations (`Blocked by #N`). Terminal — held out of dispatch. Intake re-checks the body every pass and strips the label again once the trigger no longer trips (issue #1902, event `intake_prose_only_deps_cleared`). | Intake pass (event `intake_prose_only_deps` / `intake_prose_only_deps_cleared`). |
 | `agent:merge-hold` | Transient operator signal, not a workflow state: while present on the PR or its issue, `ship-it`/merge-ready refuses to merge. Survives non-terminal transitions; stripped by `merged` and `closed_unmerged`. | Human, on GitHub. |
 | `collect-gate-exempt` | PR-only, operator-applied escape hatch for the collect-only gate's fail-closed verdict (legitimate test deletions/renames); the gate reads the PR's live labels. Not a workflow or terminal label. | Human, on the PR (see the collect-only gate section below). |
 | `agent:cross-repo-override` | Operator's one-step recovery valve for a cross-repo-gate false positive: when present, both `cross_repo_gate` and `cross_repo_scope_gate` are skipped for that issue. Not a workflow or terminal label. | Human, on the issue. |
@@ -335,6 +335,55 @@ location) and re-link surviving worktrees, or simply tear down and recreate
 every active worktree — there is no partial-recovery path once the target
 directory's contents are gone.
 
+## Worker worktrees on the host I/O volume
+
+When ci-fleet's host I/O manifest is present and valid (`runner_allocation.host_io_manifest`,
+else `CI_FLEET_HOST_IO_MANIFEST`, else ci-fleet's default path) and its volume is mounted,
+charlie-work moves worker I/O onto that volume:
+
+- New worktrees go under `<worker_root>/<repo directory name>/worktrees`.
+- Every worker launch gets `UV_CACHE_DIR=<worker_uv_cache>`, so `uv` hardlinks
+  from the cache instead of copying. An operator `claude_code.worker_env` key
+  still wins.
+- The per-session temp dir needs nothing: it lives inside the worktree
+  (`.var/worker-tmp`), so it moves with it.
+
+`charlie doctor` shows which root is active on its `worktrees root` line, and
+why the volume is not in use when it is not.
+
+**Precedence.** An explicit `claude_code.worktrees_dir` beats the manifest
+(and then `UV_CACHE_DIR` is not set either). The manifest beats the
+`runtime.state_dir` default.
+
+**Kill switch.** Set `claude_code.host_io_worktrees: false` and restart the
+daemon. New worktrees go back to the default root, and the ones on the volume
+are still found by branch, because git registers them.
+
+**Fallback.** If the manifest is unreadable or the volume is missing, the
+default root is used for that resolution. charlie-work logs a warning and
+`doctor` names the reason. Nothing is raised, and ci-fleet's own
+`host_io_fallback` event reports the volume problem.
+
+**The old root.** Worktrees created before the switch stay where they are.
+`worktree-clean` and the tick's cleanup sweep the old root as well as the new
+one until the old root is empty. `doctor` shows the old root and its entry
+count while that lasts. Nothing needs to be moved by hand.
+
+**Host-load governor.** Worktrees on the volume carry no `.var/charlie-work`
+path marker, so while the volume is in use the dispatch governor also scopes
+its pytest-load reading to `<worker_root>`. Suites in every repo's volume
+worktrees are counted, as they were under the default layout.
+
+**Cutover marker.** The first live dispatch on the volume writes
+`<fleet_dir>/host-io-worker-cutover.json` (`{"schema": 1, "cutover_at": ...}`).
+ci-fleet's worker A/B analysis uses it to split before and after. Do not
+delete it; if it is deleted, it is rewritten with a later time, and the A/B
+then compares the wrong windows.
+
+**Two repos with the same directory name** would share
+`<worker_root>/<name>/worktrees`. Give one of them an explicit
+`claude_code.worktrees_dir`.
+
 ## Local host saturation ceiling (claude-code adapter)
 
 The `claude-code` adapter runs every worker as a **local** `claude -p` process
@@ -425,6 +474,67 @@ entirely. A deferred launch writes a `dispatch_backpressure` event
 and `host_load_term` naming the binding term) to the repo's `events.db`, and a
 failed measurement fails *open* — dispatch proceeds — with a rate-limited
 `host_load_unavailable` warning instead of a silent missing clamp.
+
+### Tool allowlist and MCP isolation (claude_code, #2836)
+
+Every Claude Code session the fleet launches (workers and reviewers) launches
+with a hostile-adjacent tool surface reduced to what its role actually used:
+
+- `claude_code.worker_tools` — default `Bash,Read,Edit,Write,Grep,Glob,Monitor,TaskStop`,
+  pinned via `--tools` on every worker launch.
+- `claude_code.reviewer_tools` — default `Bash,Read,Grep,Glob,Write`, pinned on
+  every reviewer launch (and on the quota probe).
+- `claude_code.isolate_mcp` — default `true`. Appends `--strict-mcp-config
+  --mcp-config {"mcpServers":{}}` (no MCP servers) to the launch argv and sets
+  `ENABLE_CLAUDEAI_MCP_SERVERS=false` in every sanitized worker environment, so
+  claude.ai connectors never load either.
+
+Together this removes the operator's user-scope MCP servers (GitHub remote-MCP
+*write* tools, Gmail's `create_draft`, Drive, Calendar) from sessions that read
+attacker-controlled issue text under `bypassPermissions`, and cuts the unused
+tool-schema block (~40k of the ~57k default first-call context) off every API
+call. Workers and reviewers do their GitHub reads through `gh` in Bash; no
+prompt references MCP tools. Dropped *built-in* tools reviewers had used but
+no longer get: **PowerShell, WebFetch and Agent** — a review that genuinely
+needs one of them must argue for it in code, not widen the pin silently.
+
+**Kill switches.** Setting `claude_code.worker_tools` (resp.
+`claude_code.reviewer_tools`) to the empty string `""` removes the `--tools`
+pin (the CLI default tool set loads); `isolate_mcp: false` restores ambient
+MCP/connector loading and leaves `ENABLE_CLAUDEAI_MCP_SERVERS` unset. The
+doctor's "claude-code worker tool scope" check reports the effective worker
+scope and warns on the two worker-side opt-outs (`worker_tools: ""` and
+`isolate_mcp: false`); it inspects only the worker launch, so
+`reviewer_tools: ""` is **not** reported. A caller-supplied
+`claude_code.command` cannot widen the scope: any `--tools`/`--mcp-config` it
+carries is stripped and the configured scope re-pinned. The
+`merge_preflight_hook.py` `mcp__github__merge_pull_request` guard stays in
+place unchanged.
+
+### Host test-slot pool (`test_slots`, issue #2124)
+
+Dispatch admission only bounds how many sessions *start*; after that each worker
+picks when to run a wide suite. The slot pool bounds it at execution time:
+`S = cpu_count // width` fixed-width slots (default width 4 -> 4 slots on 16
+cores), each an OS file lock under `%LOCALAPPDATA%\charlie-work	est-slots\`
+held for the life of one wide suite. A killed holder frees its slot; there is no
+lease, heartbeat, or daemon. Slot 0 is the merge gate's alone; agent suites share
+slots `1..S-1`, so the gate never queues behind workers.
+
+- Enforced by `plugins/test_slot/test_slot_plugin.py`, a standalone pytest plugin
+  armed through `worker_env` (`PYTEST_PLUGINS` + `PYTHONPATH`) for every worker
+  and through the launch env for the gate. Only a run collecting at least
+  `min_items` (default 300) takes a slot, so targeted runs never wait.
+- Waiting prints `test-slot: waiting (N held, M queued)` every 30s. After
+  `wait_timeout_seconds` (default 480, under Claude's 10-minute Bash ceiling) the
+  run exits **75** with `test-slot: host busy; retry or run targeted tests` and a
+  `test_slot_wait_timeout` event is recorded on the next loop pass.
+- Config is host-wide (global config only): `test_slots.enabled` (default on; the
+  kill switch), `width`, `min_items`, `wait_timeout_seconds`.
+- Self-hosted CI runners run on this host but are provisioned by `ci_fleet`, not
+  this repo: to draw from the same pool, give the runner service the same
+  `PYTEST_PLUGINS`/`PYTHONPATH`/`CHARLIE_TEST_SLOT_*` environment (see
+  `charlie_work.test_slots.arm_env`). Until then CI suites are unmetered.
 
 ## Shared-venv isolation for devin-shell
 
@@ -540,6 +650,20 @@ does not bound CPU or RAM. The governor applies this cap at every dispatch
 path alongside the per-repo `dispatch.max_concurrent_sessions` cap
 (`_apply_concurrency_governor()` in `workflow.py`).
 
+**Per-harness budget**: `fleet.max_concurrent_sessions_by_harness` (issue #2757,
+default empty = off) scopes a ceiling to the provider quota it protects, e.g.
+`{devin-shell: 3}` for a shared Devin account, while
+`global_max_concurrent_sessions` stays the host-level total across every harness.
+Without it a free-model worker (say an `opencode` chain entry) occupies a slot
+sized for the Devin ceiling. The live count per harness is derived from session
+sidecars through the harness registry's `adapter_kind`, measured under the fleet
+lock. After role-chain selection, a launch whose entry is on a full harness falls
+through to the next entry with room; with none left it is clamped to zero and the
+`dispatch` event reports `clamped_by: harness_max` plus
+`harness_concurrency_limits` / `harness_live_session_counts`. A state.json "ghost"
+(live pid, no sidecar) has no known harness, so it counts toward the total only.
+The rescue tier launches on its configured harness and is not bounded per harness.
+
 **Reviewer budget**: `fleet.global_max_concurrent_reviews` (issue #2084, default
 `0` = disabled) is the same kind of cap for live *reviewer* sessions across all
 registered repos -- a separate budget from the worker one, stacking on the
@@ -554,6 +678,18 @@ fleet_max` when the fleet cap bound the launch. A held lock defers the pass with
 `deferred_reason: fleet_lock_held` (`dispatch_deferred`, then `dispatch_starved`
 after 3 in a row, lane `dispatch_reviews`). The knob is read from the layered
 config every pass -- no supervisor restart needed.
+
+**Devin reviewer exec-rejection resume**: `review_dispatch.review_exec_rejection_max_resumes`
+(issue #2090, default `2`, `0` = disabled). A headless `devin-shell` reviewer whose exec
+is refused ends its session with no verdict (`review_verdict_missed`, cause
+`reviewer_exec_rejected`). The reaper instead relaunches the *same* Devin session
+(`devin --resume <id> --print`, id from `devin list --format json` in the review checkout)
+with a nudge naming the allowed commands, up to this many times per dispatch, emitting
+`review_exec_rejection_resumed` (`pr_number`, `attempt`, `session_id`). The resumed process
+takes over the same sidecar and review slot, so neither the per-repo nor the fleet reviewer
+cap counts it twice. `review_verdict_missed` is recorded only when resumes are exhausted; a
+resume that cannot launch (no session id, checkout gone, relaunch error) emits
+`review_exec_rejection_resume_failed` and falls back to the miss. Read every pass; no restart.
 
 **Scoped claim**: The fleet budget bounds worker *count*, not CPU. When running
 the fleet across multiple repos on one host, you must still respect the
@@ -692,11 +828,80 @@ Enable-ScheduledTask -TaskName charlie-fleet-pass
 `charlie fleet stop` reports whether the task is armed, so an armed task is
 called out in the command's own output.
 
+**Pausing (preferred, #1776)**: `charlie fleet pause [--reason TEXT]` writes a
+persistent `fleet-pause.json` next to `fleet.json`. The supervisor reads it at
+the top of each loop iteration (between passes, never mid-pass), stamps
+`exit_code`=5 / `exited_at` on the heartbeat, and exits without killing
+anything; `scripts/fleet-pass.ps1` refuses to launch while the flag exists, so
+the scheduled task stays enabled and the pause survives reboot/logon. No
+`Disable-ScheduledTask`, no PID kills. `charlie fleet resume` removes the flag
+and the next tick relaunches. `fleet status` reports the pause while it is set.
+**A pause also freezes runner allocation** (same supervisor pass) at the last
+converged parked floor. To verify a pause, check that no new supervisor starts
+for one full watchdog window, not just that the process is gone.
+
 **Restarting**: re-enable the task (the next tick relaunches
 `supervise-loop`), or run `uv run charlie fleet supervise-loop` in a visible
 console — Ctrl+C there is handled cleanly: the wrapper logs one line and
 exits without a traceback, leaving its supervisor child (and any workers)
 running; follow with `charlie fleet stop` to stop the child too.
+
+## Main sync: local mains follow origin
+
+Once per full supervisor pass (after `self_deploy`, skipped while draining), the
+supervisor brings every `fleet.json` repo's **primary checkout** up to
+`origin/<default>`, except its own checkout (`orchestrator_root()`, owned by
+`self_deploy`). Design: `docs/specs/main-sync.md`.
+
+- **What it does:** a working-tree `merge --ff-only` when the default branch is
+  checked out, or a compare-and-swap `update-ref` when another branch is. Anything
+  unsafe is skipped with a reason in that repo's `events.db` (`main_sync_skipped`:
+  `blocked`, `diverged`, `unrelated_history`, `shallow_history` (dry run only),
+  `checked_out_elsewhere`, `rebase_in_progress`, `index_locked`, `detached_head`,
+  ...), logged once per sha pair.
+  A shallow clone is unshallowed by main-sync's fetch, once.
+- **Kill switch:** `main_sync: {enabled: false}` in `<fleet_dir>/config.yaml`
+  (everywhere) or in one repo's `orchestrator.config.yaml`.
+- **Dependencies:** never touched unless the repo opts in:
+
+  ```yaml
+  main_sync:
+    post_sync_command: ["uv", "sync", "--locked"]
+    post_sync_when_paths: ["uv.lock", "pyproject.toml"]
+    post_sync_timeout_seconds: 300
+  ```
+
+  The command must exit 0 for the advance to stand. It should exit 75 to mean "not
+  now", for example while its venv is in use. Any other exit rolls back with
+  `git reset --keep` and backs off up to 60 minutes.
+- **Alarms** (`main_sync_alarm`, also an `ERROR` fleet attention entry
+  `main-sync <repo>`):
+  - `unrelated_history`: origin was re-rooted (full clone only; a shallow graft is
+    unshallowed instead); reset the checkout by hand after checking nothing local
+    is lost;
+  - `post_sync_failing`: 3 consecutive failures;
+  - `deferred_4h`: 4h of deferral;
+  - `rollback_refused`: the tree was left at the new sha with a failed post_sync.
+- **Counters:** `<fleet_dir>/main-sync/<owner>__<repo>.json`; deleting one resets it.
+
+### Marker contract (schema 1)
+
+After a working-tree advance stands, main-sync writes
+`<git-common-dir>/charlie-main-sync.json` atomically:
+
+```json
+{"schema": 1, "from": "<sha>", "to": "<sha>", "commits": 4,
+ "instruction_paths": ["CLAUDE.md", ".claude/settings.json"],
+ "ts": "2026-10-25T17:00:00+00:00"}
+```
+
+- `instruction_paths` lists the changed paths that a live agent session loaded as
+  instructions: `CLAUDE.md`/`AGENTS.md` at any depth, or anything under a `.claude/`
+  directory.
+- The file is overwritten on each advance and never deleted. A ref-only update never
+  writes it.
+- Consumers (for example a prompt-submit hook) must treat unknown `schema` values as
+  absent. Adding keys keeps `schema: 1`; renaming or removing a key bumps it.
 
 ## Supervisor: worker health & escalation
 
@@ -844,14 +1049,9 @@ fleet_supervisor:
   dependency_sync_starvation_seconds: 14400
 ```
 
-During the migration window the legacy `supervisor.<key>` spellings still
-parse in *either* layer — emitting `config_key_deprecated_read`, removal
-tracked by #1979. Each layer resolves `fleet_supervisor` > `supervisor`
-before the repo-over-global merge: both spellings disagreeing inside one
-file is a `ConfigError` naming both, while a repo layer's leftover
-`supervisor.<key>` that disagrees with the global `fleet_supervisor.<key>`
-simply wins that key (the ordinary repo-wins rule) — deterministic, and
-visible in the deprecation events until the legacy key is deleted.
+Issue #1979 removed the migration window's legacy `supervisor.<key>`
+fallback: a moved key still written under `supervisor:` — in any layer —
+is now an ordinary unknown-key `ConfigError`.
 
 ### Detection latency
 
@@ -918,8 +1118,8 @@ workers like any other, and dead-worker reconciliation is unchanged. Selection
 is whole-pass, not per-issue: set `worker.harness: api` and every issue this
 pass dispatches uses the api worker. (Phase 2 of the role-config refactor
 deleted the per-issue routing/fallback layer that used to send only reworks
-and `complexity:high` first-pass issues to api — see the budget-exhaustion
-note below for the one open question that deletion left.)
+and `complexity:high` first-pass issues to api; its launch-time budget
+preflight lives on in `launch_api_worker` — see Budget operations below.)
 
 Design reference: [docs/design/api-worker-adapter.md](design/api-worker-adapter.md).
 The config dataclasses are `ApiWorkerConfig`, `ApiProviderConfig`, and
@@ -975,6 +1175,49 @@ via `os.environ.get(provider.api_key_env)`; a missing/empty var is an error
 travels only in the child process env — it is never written to a sidecar, log,
 prompt, or command argv. `doctor`'s launched-sessions probe surfaces
 `provider-auth` and `budget-exceeded` failure kinds on dead sidecars.
+
+**Where the key is stripped — and the residual exposure (issue #2795).** Because
+the key value sits in the supervisor process's own environment, every
+worker/reviewer *session* env is sanitized of it: `sanitize_env()` pops each
+configured provider's `api_key_env` name (derived from `api_worker.providers`,
+never hardcoded) for the `claude-code`, `devin-shell`, resumed-review, and
+cross-family rescue launches; the api adapter keeps working because its
+routing env (`ANTHROPIC_AUTH_TOKEN` et al.) is merged *after* sanitization.
+
+The strip does **not** cover every child process the supervisor or
+orchestrator spawns. A dedicated helper, `env_sanitize.strip_provider_api_keys`,
+applies the same config-derived pop to any env built by copying the
+supervisor's ambient environment; it runs in `sanitize_env()` and in the local
+merge gate's suite launch (`orchestration.local_merge_gate` ->
+`local_suite_runner.launch_suite_gate`), which executes the PR branch's
+worker-authored test suite, so that child no longer inherits the key. The
+remaining surfaces, documented here as **accepted** for this repo, are:
+
+- **ci_runner listeners and CI job steps** (owned by `ci_fleet`, not here):
+  `ci_fleet.runners._sanitize_env` strips only `UV_`/`VIRTUAL_ENV`/`PYTHON`/
+  `PIP_`/`CLAUDE` prefixes, so the runner listeners the allocator starts — and,
+  transitively, every self-hosted CI job step — still inherit the configured
+  provider key. Mitigation belongs at the allocator's env boundary in
+  `ci_fleet`, stripping the same config-derived provider-key names. That fix
+  is tracked in `ci_fleet`'s own issue tracker: it adds the strip behind a seam,
+  which charlie-work then installs with
+  `env_sanitize.provider_api_key_env_vars`.
+- **Raw `run_captured` children**: `charlie_work.subprocess_runner.run_captured`
+  builds its env as `{**os.environ, ...}`, so every child the supervisor or
+  orchestrator spawns through it also sees the key. That includes
+  `claude_code.run_quota_probe` (a real Claude CLI session launched via
+  `run_captured` with a raw `os.environ`), self-deploy/pending-sync `uv sync`
+  runs (whose build backends are third-party tooling), and the first-party
+  git/GitHub/doctor/housekeeping commands. These children run first-party,
+  reviewed command lines against in-repo targets for seconds, not minutes —
+  narrower than a worker session, but still external code running under the
+  supervisor's credential, so the exposure remains recorded rather than
+  dismissed.
+
+Operators who consider either surface provider key-sensitive should treat the
+fleet host as holding the key in the clear (it does — the whole point of
+`secretenv`'s DPAPI storage is lost the moment any child inherits it) and scope
+`api_worker.enabled` / self-hosted CI accordingly.
 
 **Validation at config load** (`ApiWorkerConfig.__post_init__`): when
 `enabled: true`, `provider` must be a non-empty string naming a key in
@@ -1034,8 +1277,8 @@ measure first:
 
 **Daily/lifetime caps while the per-session cap is unset.** With
 `max_usd_per_session: 0`, `budget.max_usd_per_day` and `budget.lifetime_usd`
-are the only caps in play — see the budget-exhaustion note below for what
-currently enforces them.
+are the only caps in play — `launch_api_worker` refuses a new api launch
+once either is exhausted (see Budget operations below).
 
 ### Budget operations
 
@@ -1055,24 +1298,46 @@ Get-Content .var\charlie-work\api-budget.json | ConvertFrom-Json
 Today's spend is `days[<UTC date>].usd`; lifetime is `lifetime_usd`;
 per-session detail is `sessions` (the calibration source).
 
-**What happens at daily/lifetime exhaustion — a known open gap.** Before the
-role-config refactor's Phase 2, a preflight in the now-deleted per-issue
-routing layer (`routing._api_preflight`) refused a new api launch once
-`spent_today + reserve > max_usd_per_day` or lifetime spend reached
-`lifetime_usd`, falling back to a different adapter for that issue. That
-preflight lived nowhere else — it was called only from the routing-selection
-path Phase 2 deletes wholesale (per-issue routing is gone; the api adapter is
-now selected for a whole pass via `worker.harness: api`, not per issue), and
-no replacement pre-launch budget check was introduced in its place. Until a
-follow-up adds one, `days[<date>].usd`/`lifetime_usd` in the ledger are
-monitoring figures only (`doctor` / `fleet status`'s attention digest can
-surface them) — dispatching a pass with `worker.harness: api` set does not
-itself stop at either cap. A follow-up issue should be filed for this gap
-before relying on an automatic cutoff in production.
+**What happens at daily/lifetime exhaustion — launch refusal.**
+`launch_api_worker` refuses a new api launch once either cap is exhausted
+(`_budget_exhausted_error`, added by issue #1514 to replace the preflight
+the deleted per-issue routing layer used to run). It calls
+`api_budget.budget_status` against the ledger: the daily check is
+`spent_today + reserve <= max_usd_per_day` (reserve is
+`max_usd_per_session` when set above 0, else `preflight_reserve_usd`), and
+the lifetime check is strict `ledger.lifetime_usd < budget.lifetime_usd` —
+ledger spend exactly at the `budget.lifetime_usd` cap is exhausted. On
+exhaustion no worker process is spawned: an `api_budget_refused` warning
+event is recorded (via `instrumentation.log_event`) in `events.db`, the
+SQLite audit log beside `state.json` — not in the state.json `events` ring.
+Query it with
+`query_events(Path('.var/charlie-work/state.json'), kind='api_budget_refused')`,
+or run the one-liner from the Events section above and read the
+`api_budget_refused` count (event_counts_by_kind prints counts for all kinds;
+there is no kind filter). The
+launch also comes back as an error record (sidecar) whose launch error
+class is `budget` (`launch_events.LAUNCH_ERR_BUDGET`, "spend-cap refusal").
+A missing or corrupt ledger is treated as empty spend. That lifts the lifetime
+refusal only when `budget.lifetime_usd` is above `0` (empty-ledger spend `0`
+compares `0 < budget.lifetime_usd`); when `budget.lifetime_usd` is `0` the
+strict check is `0 < 0`, which refuses every launch — so a zero value is a
+zero cap, never "unlimited" or "disabled". With an empty ledger the daily
+check refuses exactly when the configured reserve (`max_usd_per_session`
+when set above 0, else `preflight_reserve_usd`) exceeds `max_usd_per_day`
+(so a `max_usd_per_day: 0` cap plus a positive reserve also refuses every
+launch), and the check is skipped when no `config` is passed
+(direct construction only — the production dispatch path always passes one).
+Current and remaining headroom is surfaced by `doctor`'s api-worker probe and
+the `fleet status` snapshot. See Failure modes below for the accounting and
+recovery path.
 
 **Raising caps.** Edit `budget.max_usd_per_day` and/or `budget.lifetime_usd` in
-config (global or per-repo) and reload. There is no ledger reset — raising
-`lifetime_usd` above the current `lifetime_usd` immediately restores headroom.
+config (global or per-repo) and reload. Raising a cap lets *new* launches
+through as soon as the check passes. There is no ledger reset — raising
+`budget.lifetime_usd` above the ledger's `lifetime_usd` immediately restores
+headroom for new launches. Raising a cap does **not**, however, clear issues already
+escalated for repeated refusals under `dispatch_failed_cap_exceeded` (see
+Failure modes below): re-queue those with `charlie unescalate --issue <n>`.
 To start a fresh accounting period (e.g. a new billing month), the lifetime
 total is the cumulative sum of all settled sessions; you raise the ceiling, you
 do not zero the ledger.
@@ -1093,8 +1358,9 @@ write makes a torn final file rare, but does not protect a manually edited file.
 
 ### Failure modes
 
-Two api-specific failure kinds, both surfaced as values on the sidecar
-(`failure_kind` field of `issue-<n>.api.json`) and never raised:
+Three api-specific failure outcomes. The first two are surfaced as values on
+the sidecar (`failure_kind` field of `issue-<n>.api.json`) and never raised;
+the third is a launch refusal before any worker process exists:
 
 **`budget_exceeded` (in-flight per-session cap).** When
 `budget.max_usd_per_session` is set (`> 0`), each supervision pass accumulates
@@ -1115,7 +1381,7 @@ budget-evaluated.
 
 **`provider_auth` (dead/invalid API key).** When an api session exits, its log
 tail is matched against 401/403/authentication/invalid-api-key patterns
-(`claude_code._PROVIDER_AUTH_PATTERN`, api-kind only, checked **before** generic
+(`throttle_signatures._PROVIDER_AUTH_PATTERN`, api-kind only, checked **before** generic
 throttle markers so a dead key is never mislabeled as a throttle). On a match,
 `failure_kind` is set to `provider_auth` and the provider enters a cooldown
 reusing the existing `throttled_until` state mechanism
@@ -1135,6 +1401,54 @@ itself. Recovery:
    `now >= throttled_until`) or **clear the throttle state** by setting
    `throttled_until` to `null` in `.var/charlie-work/state.json` (atomic write —
    never edit in place while a pass is running).
+
+**`budget` launch refusal (daily/lifetime cap exhausted).** Before any
+process spawns, `launch_api_worker` refuses the launch when
+`api_budget.budget_status` reports the daily or lifetime cap exhausted (see
+Budget operations above for the exact checks). The launch returns an error
+record — the sidecar `issue-<n>.api.json` with `.error` set — with launch
+error class `budget` (`launch_events.LAUNCH_ERR_BUDGET`), and an
+`api_budget_refused` warning event is recorded (via
+`instrumentation.log_event`) in `events.db` — query it with
+`query_events(Path('.var/charlie-work/state.json'), kind='api_budget_refused')`.
+Recovery depends on which cap is exhausted. (A missing or corrupt ledger makes
+`budget_status` report empty spend. That lifts the lifetime refusal only when
+`budget.lifetime_usd` is above `0`; with `budget.lifetime_usd: 0` the strict
+check is `0 < 0`, which refuses every launch. The daily check fails on an
+empty ledger exactly when the configured reserve exceeds `max_usd_per_day`.)
+
+- **Daily cap exhaustion: the refusal itself lifts at the UTC date
+  rollover.** The daily check reads `ledger.days[<UTC date today>]`, so once
+  the clock ticks into a new UTC date the ledger shows no spend for "today"
+  and launches are allowed again. To lift it sooner, raise
+  `budget.max_usd_per_day` in config (global or per-repo) and reload.
+- **Lifetime cap exhaustion does not self-clear.** Lifetime spend never
+  decays; the only recovery is raising `budget.lifetime_usd` in config
+  (global or per-repo) and reloading. There is no ledger reset (see
+  "Raising caps" above).
+
+**What lifting the cap does and does not do.** For a *fresh first-pass*
+dispatch, each refusal is accounted as a launch failure: the refused launch
+carries `failure_kind: None` (the refusal records only the `budget` launch
+error class), so it flows through the generic dispatch-failure path
+(`orchestration/dispatch_state.py`, the `dispatch_failed` branch) and every
+refusal appends one timestamp to the issue entry's `dispatch_failed_at` list.
+Within `watchdog.redispatch_window_minutes` (default 240), once more than
+`watchdog.max_auto_redispatch` (default 3) refusals have accumulated, the
+issue escalates with reason `dispatch_failed_cap_exceeded`
+(`reason_class: mechanical` — see
+`orchestration/state_mechanical.py`). Escalations with this reason are never
+auto-cleared: the mechanical de-escalation sweep skips them (`no_open_pr` —
+the launch never produced a PR). Lifting the cap (UTC rollover for the daily
+cap, or raising `max_usd_per_day`/`lifetime_usd`) restores headroom for
+*future* launches only; an issue already escalated this way stays escalated
+until you re-queue it explicitly with `charlie unescalate --issue <n>` —
+which also resets the issue's `dispatch_failed_at` window (add `--requeue`
+if the issue's own branch already carries a diff against the base and you
+want a fresh worker anyway), so the next refusal starts a fresh count. The
+sub-bullets above therefore describe only when new launches stop being
+refused — recovering an issue already escalated under
+`dispatch_failed_cap_exceeded` requires this operator action.
 
 `doctor` surfaces both failure kinds: its launched-sessions probe appends
 `provider-auth: <issues>` and `budget-exceeded: <issues>` fragments to the

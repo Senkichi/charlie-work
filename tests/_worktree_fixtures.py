@@ -24,6 +24,10 @@ the #1548 Track-1 wave-2 split: a moved ``test_charlie_work.py`` test needs
 them, and they are this module's domain -- a bare-remote-plus-clone builder
 and a worktree-with-a-commit builder. ``test_charlie_work.py`` keeps its own
 byte-identical ``_git`` for the same reason as ``test_reconcile.py``.
+The template-unaware copy ``tests/_reconcile_fixtures.py`` used to carry
+was removed under issue #2303; its former importers take this module's
+builder directly so the reconcile suite shares the per-process git
+template.
 
 ``_FakeGH`` joined under the #1713 rework: the new
 ``tests/test_worktree_clean_head_fallback.py`` needs the same
@@ -44,6 +48,14 @@ instead of ``tmp_path`` for their repo roots.
 rework adoption vs recovery / teardown / probe), and both sides need the same
 bare-remote-plus-pushed-branch builders, so they live here rather than being
 duplicated.
+
+The repo builders (``_init_repo``, ``_init_repo_with_origin``,
+``_clone_repo``, ``_init_bare_remote_and_clone``) copy a per-process template
+when they can (HS-CW-4, ``tests/_git_templates.py``): same files, same
+config, same refs as a fresh build, but one commit SHA shared by every copy
+of a shape. Pass ``fresh=True`` where a test needs
+independently-timestamped histories; the ``_fresh`` variants are the
+original bodies, unchanged.
 """
 
 from __future__ import annotations
@@ -57,6 +69,7 @@ from pathlib import Path
 
 import pytest
 
+import _git_templates
 from _git_leak_guard import assert_repo_scoped_config
 from charlie_work.github import GitHubRunResult
 from charlie_work.worktree import WorktreeCleanGH, create_worktree
@@ -112,7 +125,80 @@ def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
 
 
-def _clone_repo(remote_repo: Path, repo_root: Path) -> None:
+def _seed_staged_addition_bubble(repo_root: Path) -> None:
+    """Build the overwritten-paths commit bubble for the staged-addition
+    scenario in one ``git fast-import`` process and check ``feature`` out.
+
+    ``feature`` branches from the template's initial ``main`` commit; ``main``
+    then gains a commit changing ``tracked.txt`` and one independently adding
+    ``new_file.txt``. One spawn replaces the ~10 ``git`` children (add /
+    commit / checkout per step) the inline version spawned — the per-spawn
+    host cost was what the ledger's 2x call-phase regression on
+    ``test_modified_paths_overwritten_by_ref_excludes_staged_addition``
+    tracked (issue #2569).
+
+    Caller leaves here exactly where it must before applying its local dirty
+    state: on ``feature`` with the initial commit checked out.
+    """
+    subprocess.run(
+        ["git", "fast-import", "--quiet"],
+        cwd=repo_root,
+        # input as bytes: text=True would translate \n to \r\n on Windows
+        # stdin, and git parses the \r as part of each command line.
+        input=b"""\
+commit refs/heads/feature
+mark :1
+committer Test User <test@example.test> 0 +0000
+data <<MSG
+add ancestor file
+MSG
+from refs/heads/main
+M 100644 inline tracked.txt
+data <<EOT
+ancestor v0
+EOT
+commit refs/heads/main
+mark :2
+committer Test User <test@example.test> 0 +0000
+data <<MSG
+base changes tracked file
+MSG
+from :1
+M 100644 inline tracked.txt
+data <<EOT
+main committed v1
+EOT
+commit refs/heads/main
+mark :3
+committer Test User <test@example.test> 0 +0000
+data <<MSG
+base adds new file
+MSG
+from :2
+M 100644 inline new_file.txt
+data <<EOT
+base version
+EOT
+""",
+        check=True,
+        capture_output=True,
+    )
+    # fast-import advances refs only — the index and worktree still reflect the
+    # initial commit while main's tip moved, so a plain checkout would refuse
+    # the stale state as local changes. ``checkout -f`` repopulates both from
+    # the feature tree and moves HEAD to it.
+    _git(repo_root, "checkout", "-f", "feature")
+
+
+def _clone_repo(remote_repo: Path, repo_root: Path, *, fresh: bool = False) -> None:
+    """``git clone`` plus the test identity; a template copy when ``remote_repo`` is an
+    unchanged repo this process materialized (``_git_templates``)."""
+    if not fresh and _git_templates.clone_repo(remote_repo, repo_root, build=_clone_repo_fresh):
+        return
+    _clone_repo_fresh(remote_repo, repo_root)
+
+
+def _clone_repo_fresh(remote_repo: Path, repo_root: Path) -> None:
     subprocess.run(
         ["git", "clone", str(remote_repo), str(repo_root)],
         check=True,
@@ -124,7 +210,15 @@ def _clone_repo(remote_repo: Path, repo_root: Path) -> None:
     _git(repo_root, "config", "user.name", "Test User")
 
 
-def _init_repo(repo_root: Path, bare: bool = False) -> None:
+def _init_repo(repo_root: Path, bare: bool = False, *, fresh: bool = False) -> None:
+    """One-commit ``main`` repo (``bare``: a bare clone of one); a template copy unless
+    ``fresh`` or ``CI_FLEET_TEST_REUSE=off`` (``_git_templates``)."""
+    if not fresh and _git_templates.init_repo(repo_root, bare=bare, build=_init_repo_fresh):
+        return
+    _init_repo_fresh(repo_root, bare)
+
+
+def _init_repo_fresh(repo_root: Path, bare: bool = False) -> None:
     repo_root.mkdir(parents=True, exist_ok=True)
     run = lambda args: subprocess.run(  # noqa: E731
         args, cwd=repo_root, check=True, capture_output=True, text=True
@@ -189,8 +283,34 @@ def _init_repo(repo_root: Path, bare: bool = False) -> None:
         run(["git", "commit", "-m", "initial commit"])
 
 
-def _init_bare_remote_and_clone(tmp_path: Path) -> tuple[Path, Path]:
-    """Create a bare remote repo and a local clone, return (remote, clone)."""
+def _init_repo_with_origin(repo_root: Path, remote_url: str, *, fresh: bool = False) -> None:
+    """``_init_repo`` plus ``git remote add origin <remote_url>``; the
+    remote-add spawn is paid once per process inside the template build
+    (``_git_templates.init_repo_with_origin``), so a materialized call spawns
+    no process at all."""
+    if not fresh and _git_templates.init_repo_with_origin(
+        repo_root, remote_url, build=_init_repo_fresh
+    ):
+        return
+    _init_repo_fresh(repo_root)
+    _git(repo_root, "remote", "add", "origin", remote_url)
+
+
+def _init_bare_remote_and_clone(tmp_path: Path, *, fresh: bool = False) -> tuple[Path, Path]:
+    """Create a bare remote repo and a local clone, return (remote, clone).
+
+    A template copy unless ``fresh`` or ``CI_FLEET_TEST_REUSE=off`` (``_git_templates``).
+    """
+    if not fresh:
+        pair = _git_templates.bare_remote_and_clone(
+            tmp_path, build=_init_bare_remote_and_clone_fresh
+        )
+        if pair is not None:
+            return pair
+    return _init_bare_remote_and_clone_fresh(tmp_path)
+
+
+def _init_bare_remote_and_clone_fresh(tmp_path: Path) -> tuple[Path, Path]:
     remote = tmp_path / "remote"
     remote.mkdir(parents=True, exist_ok=True)
     _git(remote, "init", "--bare", "--initial-branch=main")
@@ -267,6 +387,12 @@ class _FakeGH(WorktreeCleanGH):
     issue-#1713 fallback lookup ``clean_worktrees`` makes when state.json
     has no linked PR. Every invocation is recorded in ``calls`` so tests
     can assert whether the fallback ran at all.
+
+    ``issue_states`` maps an issue number to the ``state`` a
+    ``gh issue view <n> --json state`` call should report -- the
+    issue-#2487 closed-issue check ``clean_worktrees`` makes per
+    candidate. Issues absent from the map report ``OPEN`` so the
+    closed-issue lane stays inactive unless a test opts in.
     """
 
     def __init__(
@@ -278,6 +404,7 @@ class _FakeGH(WorktreeCleanGH):
         available: bool = True,
         error: str = "gh: could not resolve to a PullRequest",
         head_branch_prs: dict[str, list[int]] | None = None,
+        issue_states: dict[int, str] | None = None,
     ) -> None:
         self.pr_state = pr_state
         self.merged_at = merged_at
@@ -285,6 +412,7 @@ class _FakeGH(WorktreeCleanGH):
         self.available = available
         self.error = error
         self.head_branch_prs = head_branch_prs or {}
+        self.issue_states = issue_states or {}
         self.calls: list[list[str]] = []
 
     def run(
@@ -330,6 +458,28 @@ class _FakeGH(WorktreeCleanGH):
                     "mergedAt": self.merged_at,
                     "headRefOid": self.head_sha,
                 },
+                error=None,
+            )
+        if args[:2] == ["issue", "view"] and json_output and allow_failure:
+            if not self.available:
+                return GitHubRunResult(
+                    ok=False,
+                    returncode=1,
+                    stdout="",
+                    stderr=self.error,
+                    value=None,
+                    error=self.error,
+                )
+            try:
+                issue_number = int(args[2])
+            except (IndexError, ValueError):
+                issue_number = -1
+            return GitHubRunResult(
+                ok=True,
+                returncode=0,
+                stdout="",
+                stderr="",
+                value={"state": self.issue_states.get(issue_number, "OPEN")},
                 error=None,
             )
         return GitHubRunResult(

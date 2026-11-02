@@ -409,9 +409,9 @@ def test_list_processes_windows_parses_snapshot(monkeypatch: pytest.MonkeyPatch)
 
     monkeypatch.setattr("shutil.which", lambda _name: "C:\\Windows\\powershell.exe")
     monkeypatch.setattr("subprocess.run", lambda *a, **k: _FakeResult())
-    # Deterministic overlay: a real psutil map would stamp a fabricated pid
+    # Deterministic overlay: a real chain probe would stamp a fabricated pid
     # that happened to collide with a live one.
-    monkeypatch.setattr("charlie_work.quiesce.win32_process_ppid_snapshot", lambda: {})
+    monkeypatch.setattr("charlie_work.quiesce.win32_ancestor_rows", lambda _pid, **_k: {})
 
     processes, error = list_processes()
 
@@ -444,6 +444,25 @@ def test_list_processes_windows_subprocess_error(monkeypatch: pytest.MonkeyPatch
     assert "powershell invocation failed" in error
 
 
+@pytest.fixture(scope="module")
+def _real_process_snapshot() -> tuple[tuple[ProcessInfo, ...], str | None]:
+    """The real-host process snapshot, acquired once for the module.
+
+    A full ``Get-CimInstance Win32_Process`` enumeration via PowerShell is
+    environment-bound resource acquisition -- its cost is the host's process
+    count plus spawn overhead under runner load -- not the test's own work.
+    Keeping it in one test's ``call`` phase let a per-spawn cost drift on the
+    shared runner register as a 2.4x per-test regression (issue #2538) even
+    though nothing in the repo touched quiesce; the ledger deliberately
+    excludes setup from per-test alerting for exactly this reason (precedent:
+    ``test_dashboard_now_a11y``'s module-scoped node boot). The snapshot
+    stays ledger-visible under ``--section slow-fixtures`` either way.
+    """
+    if sys.platform != "win32":
+        pytest.skip("list_processes is win32-only")
+    return list_processes()
+
+
 # ---------------------------------------------------------------------------
 # check_quiescence() -- lister + assert_quiescent glued together.
 # ---------------------------------------------------------------------------
@@ -472,7 +491,9 @@ def test_check_quiescence_delegates_to_assert_quiescent_on_success() -> None:
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="list_processes is win32-only")
-def test_list_processes_actually_runs_against_this_host() -> None:
+def test_list_processes_actually_runs_against_this_host(
+    _real_process_snapshot: tuple[tuple[ProcessInfo, ...], str | None],
+) -> None:
     """Execute the real PowerShell snapshot -- no injected lister.
 
     Every other test in this file substitutes a fake ``lister``, which is why a
@@ -485,9 +506,14 @@ def test_list_processes_actually_runs_against_this_host() -> None:
     This asserts the level the fake-lister tests structurally cannot: that the
     real command runs on the real interpreter and returns parseable data. The
     running interpreter must appear in its own snapshot, which also pins the
-    ProcessId/CommandLine field names the parser depends on.
+    ProcessId/CommandLine field names the parser depends on. The snapshot is
+    acquired once per module by `_real_process_snapshot` -- acquiring it is
+    host-bound resource acquisition, not this test's call-phase work, so its
+    drift with runner load lands in the fixture ledger, not the per-test alert.
     """
-    processes, error = list_processes()
+    processes, error = _real_process_snapshot
+
+    assert error is None, f"real process listing failed: {error}"
 
     assert error is None, f"real process listing failed: {error}"
     assert processes, "process listing returned no processes"
@@ -495,6 +521,9 @@ def test_list_processes_actually_runs_against_this_host() -> None:
     own = [p for p in processes if p.pid == os.getpid()]
     assert own, "the running interpreter did not appear in its own process snapshot"
     assert own[0].command_line, "own process reported an empty command line"
+    # The recycled-parent guard's stamp source is the self chain itself --
+    # an unstamped self pid means the whole guard is inert (issue #2376).
+    assert own[0].created is not None, "own process carried no creation stamp"
 
 
 # ---------------------------------------------------------------------------
@@ -516,9 +545,9 @@ def _win32_listing_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Get ``list_processes`` past its win32/PATH guards on any platform."""
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setattr(shutil, "which", lambda name: name)
-    # Keep the creation-time overlay deterministic: the real psutil map
+    # Keep the creation-time overlay deterministic: the real chain probe
     # would stamp a fabricated pid that happened to collide with a live one.
-    monkeypatch.setattr("charlie_work.quiesce.win32_process_ppid_snapshot", lambda: {})
+    monkeypatch.setattr("charlie_work.quiesce.win32_ancestor_rows", lambda _pid, **_k: {})
 
 
 def test_list_processes_retries_once_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:

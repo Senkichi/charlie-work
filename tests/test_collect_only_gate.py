@@ -50,6 +50,7 @@ from charlie_work.collect_only_gate import (
 from charlie_work.collect_only_gate_command import (
     run_collect_only_check_command,
 )
+from _src_ast import parsed
 
 
 # ---------------------------------------------------------------------------
@@ -556,8 +557,7 @@ def test_no_hardcoded_test_name_list_in_gate_source() -> None:
     """
     import charlie_work.collect_only_gate as gate_mod
 
-    source = Path(gate_mod.__file__).read_text(encoding="utf-8")
-    tree = ast.parse(source, filename=gate_mod.__file__)
+    tree = parsed(Path(gate_mod.__file__))
 
     # Collect all string-literal lists (list/tuple/set of string constants).
     suspicious: list[str] = []

@@ -12,7 +12,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from charlie_work import cli
-from charlie_work.workflow import CommandResult
+from charlie_work.command_result import CommandResult
 
 
 def test_run_fleet_work_loud_on_absent_global_layer(

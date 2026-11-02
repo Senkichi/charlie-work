@@ -1,0 +1,5 @@
+info
+# Issue #2086: a worker or reviewer launch selected a role-chain entry past
+# the primary because the fleet quota ledger restricts the earlier entries.
+# Payload lists the skipped entries and their `until`. Expected operation,
+# not a fault: the fallback chain is doing its job.

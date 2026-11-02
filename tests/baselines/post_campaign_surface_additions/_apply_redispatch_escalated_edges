@@ -1,0 +1,7 @@
+issue #2226: applies the ``redispatch_escalated`` (mechanical) label edge to
+each issue in the no-op-rework, worker-death, and blocked-environment cap
+lanes of ``_dispatch_rework_impl`` through the WriteGate so the lifecycle
+transition binds ``state_path`` and ``repo``. Installed from
+``orchestration/state_dispatch_rework.py``. Net-new OrchestratorApp member
+(the three per-lane loops were inlined in ``_dispatch_rework_impl`` before,
+not delegates) added after the surface baseline was pinned.

@@ -1,0 +1,4 @@
+info
+# Issue #2289: a fresh redispatch was seeded from the work a provider-throttle
+# death preserved (rescue or attempt ref). Expected operation: the provider ended
+# the session, not a fault in the work.

@@ -91,7 +91,7 @@ Every metric carries a `measure` label:
 | `escalation_rate` | activity | share of assigned PRs named by any `*_escalated` event |
 | `merge_rate` | activity | share of assigned PRs recorded merged — `state.json` `prs[n].status == "merged"` unioned with merge events. The merge-event vocabulary alone is **not** the merge rate: most merges land via the Aviator merge queue, which emits no `merge_succeeded`, so events alone counted under half of state-merged PRs on the live fleet. The report prints a `merge coverage` line — merge events observed for X of Y state-merged PRs — so the size of the event blind spot is always visible |
 | `dispatch_to_merge_seconds_median` | activity | median dispatch→merge latency over merged assigned PRs with a dispatch timestamp; the merge timestamp is the earliest of the state's `merged_at` and any merge event |
-| `post_approval_defect_rate` | **outcome** | share of approved PRs later routed to rework by a post-approval **review-correctness** defect signal — an approval that did not hold up. Today the only derivable such signal is `cross_pr_revert_rework_requested` (the approved branch silently reverted a base commit). `check_failure_rework_requested` is excluded by construction: its rework brief keeps the approval standing ("do not re-litigate the review"), so it cannot measure review correctness |
+| `post_approval_defect_rate` | **outcome** | share of assigned PRs whose recorded outcome is a post-approval **review-correctness** defect — an approval or merge that did not hold up. Three event kinds fold in (`REVIEW_DEFECT_KINDS` in `src/charlie_work/experiment_report.py`): `cross_pr_revert_rework_requested` (the approved branch silently reverted a base commit), `post_merge_main_ci_failure` (a required main-branch check failed on the merged PR's merge commit), and `post_merge_followup_attribution` (a later fix/revert-style PR names the merged PR; recorded with the matched text). The last two are recorded by the per-pass post-merge attribution lane (issue **#1717**). `check_failure_rework_requested` is excluded by construction: its rework brief keeps the approval standing ("do not re-litigate the review"), so it cannot measure review correctness |
 | `post_approval_ci_failure_rate` | activity | share of approved PRs later routed to rework for genuinely failing required checks (`check_failure_rework_requested`). Pipeline state, **not** a review-correctness outcome — the emitter's own brief says the approval stands — so it never feeds the stopping rule |
 | `no_op_kickback_rate` | activity | share of `request_changes` PRs whose next rework cycle produced **no content change** relative to the verdict (`no_op_rework_repair_requested`). That is what the emitter measures — an empty or stalled rework cycle (unpushed commits, a dead session, or nothing left to change) — **not** that the kickback was wrong |
 
@@ -102,34 +102,35 @@ interval cannot collapse to `[0, 0]` at zero observed events (unlike the
 Wald approximation), so a no-evidence window reads as "unbounded", never
 as a degenerate point estimate of equivalence.
 
-### Outcome coverage caveat
+### Outcome coverage
 
-Two candidate outcomes from the issue are **not derivable** from recorded
-events today, and the report says so explicitly rather than implying a
-conclusion from activity metrics:
+All three candidate outcomes from the issue are derivable from recorded
+events: the original `cross_pr_revert_rework_requested` signal, plus the
+post-merge attribution recording that landed via **#1717** — a merged PR's
+main-branch CI failure on a required check (`post_merge_main_ci_failure`)
+and a follow-up fix/revert-style PR naming the merged PR
+(`post_merge_followup_attribution`). Both post-merge events are recorded by
+a per-pass lane (`src/charlie_work/pass_deadline.py` →
+`orchestration/post_merge_attribution.py`), so the report folds them into
+the outcome aggregate without a schema change.
 
-* post-merge main-branch CI failure attributed to the merged PR — no event
-  links a post-merge main CI failure back to the PR;
-* a follow-up fix or revert naming the merged PR — no event attributes a
-  later fix/revert to a previously merged PR.
-
-Issue **#1717** tracks adding the missing recording (a post-merge
-attribution event such as a main-CI failure or a follow-up fix/revert
-naming the merged PR). The issue's contract applies transitively: if the
-remaining outcome set ever empties, the report emits the explicit "no
+The contract from the issue still applies negatively: if the remaining
+outcome set were ever empty again, the report emits the explicit "no
 outcome metric is derivable" statement and the stopping rule stays
 `not_met` — it cannot be met on activity metrics alone.
 
 **"Derivable" means the emitter exists — not that events were observed.**
 The report prints the observed outcome-event count per arm next to the
-derivable list for exactly this reason: on the live fleet the sole outcome
-signal (`cross_pr_revert_rework_requested`) had **zero** recorded events,
-which is indistinguishable from a dead outcome channel. With no outcome
-events observed the stopping rule stays `not_met` regardless of PR counts
-— it reports "cannot conclude" (a channel-liveness problem to
+derivable list for exactly this reason: on the live fleet the original
+outcome signal (`cross_pr_revert_rework_requested`) had **zero** recorded
+events, which is indistinguishable from a dead outcome channel. With no
+outcome events observed the stopping rule stays `not_met` regardless of PR
+counts — it reports "cannot conclude" (a channel-liveness problem to
 investigate), never "keep running" toward a bound at which the interval
-math still cannot decide. Until #1717 lands, the experiment's only exit is
-the operational-end path in *Inconclusive results* below.
+math still cannot decide. The attribution channel also converges on
+coverage, not immediately: a merged PR is probed once per pass until its
+CI-outcome record is terminal (or the attempt cap runs out), so a freshly
+merged PR's outcome arrives a few passes later.
 
 ## Stopping rule
 

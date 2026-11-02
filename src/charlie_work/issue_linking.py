@@ -7,7 +7,7 @@ that ``linked_issue_number`` and the closing-keyword chain it uses are a
 text/policy primitive with zero ``gh`` coupling, so
 ``github_capabilities/_base.py`` -- the shared base for gh-transport
 capability collaborators -- is the wrong home for it (unlike
-``_LIST_LIMIT``/``_is_mutating``, which are genuine gh-transport concerns
+``_LIST_LIMIT``, which is a genuine gh-transport concern
 sharing that base). ``closing_reference.py`` already duplicates this exact
 keyword vocabulary on purpose "to stay free of a ``github.py`` import" -- the
 codebase had already signalled that this cluster wants a neutral, non-``gh``

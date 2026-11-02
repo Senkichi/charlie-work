@@ -76,9 +76,9 @@ def test_self_deploy_repairs_venv_pth_mismatch(
 
     runner, calls = _make_fake_runner(
         [
-            RunResult(0, "abc123\n", ""),  # before HEAD
-            RunResult(0, "", ""),  # pull ok
-            RunResult(0, "abc123\n", ""),  # after HEAD (no change)
+            RunResult(0, "abc123\n", ""),  # HEAD
+            RunResult(0, "", ""),  # fetch ok
+            RunResult(0, "abc123\n", ""),  # origin/main (no change)
         ],
     )
 
@@ -92,8 +92,8 @@ def test_self_deploy_repairs_venv_pth_mismatch(
     assert result.to_sha == "abc123"
     assert [c[0] for c in calls] == [
         ["git", "rev-parse", "HEAD"],
-        ["git", "pull", "--ff-only", "origin", "main"],
-        ["git", "rev-parse", "HEAD"],
+        ["git", "fetch", "origin", "main"],
+        ["git", "rev-parse", "origin/main"],
     ]
     assert pth_path.read_text(encoding="utf-8").strip() == str((tmp_path / "src").resolve())
 
@@ -122,9 +122,9 @@ def test_self_deploy_repairs_venv_pth_mismatch_with_runners_active(
 
     runner, calls = _make_fake_runner(
         [
-            RunResult(0, "abc123\n", ""),  # before HEAD
-            RunResult(0, "", ""),  # pull ok
-            RunResult(0, "abc123\n", ""),  # after HEAD (no change)
+            RunResult(0, "abc123\n", ""),  # HEAD
+            RunResult(0, "", ""),  # fetch ok
+            RunResult(0, "abc123\n", ""),  # origin/main (no change)
         ],
     )
 
@@ -139,8 +139,8 @@ def test_self_deploy_repairs_venv_pth_mismatch_with_runners_active(
         assert pth_path.read_text(encoding="utf-8").strip() == str((tmp_path / "src").resolve())
         assert [c[0] for c in calls] == [
             ["git", "rev-parse", "HEAD"],
-            ["git", "pull", "--ff-only", "origin", "main"],
-            ["git", "rev-parse", "HEAD"],
+            ["git", "fetch", "origin", "main"],
+            ["git", "rev-parse", "origin/main"],
         ]
     finally:
         msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)

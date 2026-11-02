@@ -164,6 +164,62 @@ present. See
 [RUNBOOK.md](RUNBOOK.md#worktree-cleanup-gone-wrong-junction-hazard) for the
 full hazard writeup and manual recovery steps.
 
+## (d) opencode worker harness
+
+`worker.harness: opencode` -- or, more usefully, an `opencode` entry in
+`worker.fallbacks` -- launches a headless `opencode run` session through the
+same worktree/sidecar/terminal-watcher stack as a claude-code worker
+(`opencode_worker.launch_opencode_worker`; sidecar `issue-<n>.opencode.json`).
+Worker-only: opencode is not a reviewer harness.
+
+```yaml
+worker:
+  harness: devin-shell
+  model: swe-2-high
+  fallbacks:
+    - {harness: devin-shell, model: gemini-3-8-flash-high}
+    - {harness: opencode, model: glm-5.3-flash}   # OpenCode Go subscription
+
+opencode:            # all optional
+  provider: opencode-go   # prefixed onto a bare model -> opencode-go/glm-5.3-flash
+  variant: ""             # --variant (low | high | max for glm-5.3-flash)
+  worker_env: {}          # merged last; operator values win
+```
+
+What the launcher pins, and why:
+
+- `opencode run --auto --format json --model <provider>/<model>`, prompt on
+  stdin. `--auto` matters: without it `run` auto-*rejects* permission requests
+  (e.g. `external_directory`) instead of prompting. An empty model is refused
+  as a launch error rather than falling back to opencode's last-used model.
+- `OPENCODE_CONFIG_CONTENT` allows every tool (parity with the claude-code
+  worker's `bypassPermissions`) and turns off autoupdate, sharing and
+  snapshots.
+- A per-worker `XDG_DATA_HOME` (`<sessions_dir>/opencode-data/issue-<n>`):
+  concurrent runs sharing one `opencode.db` die at startup with `database is
+  locked`. The host `opencode auth login` credentials are forwarded in memory
+  via `OPENCODE_AUTH_CONTENT` (child env only -- never a sidecar, log or argv).
+- `OPENCODE_DISABLE_CLAUDE_CODE_PROMPT=1`: opencode otherwise injects the
+  operator's personal `~/.claude/CLAUDE.md` into the worker. The repo's own
+  `CLAUDE.md`/`AGENTS.md` and `.claude/skills` still load.
+- `OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS=1800000`: the default 2-minute
+  bash-tool timeout kills a full local test run.
+
+**Usage-limit cooldowns.** OpenCode Go meters a rolling 5-hour, a weekly and a
+monthly budget, and opencode logs only "Usage limit reached" -- never which one
+tripped or when it resets. When an opencode death classifies `quota_exhausted`,
+`opencode_limits.go_quota_reset` (`AdapterFateProfile.quota_reset`) probes the
+Go API once (`GET /models`, then a 1-token chat request with the host
+credential): a `GoUsageLimitError` 429 gives the real reset (`retry-after`, else
+the `limitName` window), so the ledger restricts the entry until exactly then; a
+200 means the limit already reset (15-minute cooldown). No credential, a
+network error or any other answer keeps the fixed 24h. One probe per 2 minutes
+per process.
+
+`charlie doctor --adapter-probe` probes the opencode binary whenever opencode is
+the primary *or* any fallback entry, so a missing binary surfaces before a
+failover needs it.
+
 ## Cross-family review flow (removed)
 
 The automatic non-Claude "second opinion" pass this section used to document
@@ -178,6 +234,55 @@ every PR) still runs a comparable non-Claude second-opinion pass internally,
 but it is not an operator-invoked workflow — see
 [RUNBOOK.md](RUNBOOK.md#handling-agenthuman-needed-escalations) for how that
 tier's outcome surfaces.
+
+## Role chain (model waterfall)
+
+Both roles may name ordered fallbacks after their primary (issue #2086):
+
+```yaml
+worker:
+  harness: devin-shell
+  model: swe-2
+  fallbacks:
+    - {harness: claude-code, model: claude-sonnet-5-5}
+reviewer:
+  harness: claude-code
+  model: claude-opus-5-5
+  fallbacks:
+    - {harness: devin-shell, model: swe-2, effort: high}
+```
+
+- **Selection.** Every worker launch (fresh, remote rework, local rework --
+  all through the one launch permit) and every reviewer launch (remote and
+  local review lanes) calls `role_selection.select_role_entry`: the first
+  chain entry whose `(harness, model)` is not restricted in the **quota
+  ledger** (`<fleet_dir>/role_quota_ledger.json`) at launch time. The chosen
+  entry is stamped on the session sidecar (`role_entry`: role, harness,
+  model, `chain_index`); a launch past the primary emits
+  `role_fallback_selected` listing each skipped entry and its `until`.
+- **Learning.** When a worker or reviewer death is classified
+  `rate_limited` / `quota_exhausted` (worker failure classification, the
+  stalled rate-limit defer, the stalled-review sweep, a launch-time reviewer
+  quota hit), the ledger restricts the `(harness, model)` stamped on *that*
+  session until the classified reset. Writes are atomic and monotonic
+  (a shorter window never shortens an active one); entries only expire.
+  Sessions launched before this shipped carry no stamp and record nothing.
+- **Per-repo windows.** `throttled_until` (workers) and `reviewer_quota`
+  (reviewers) keep blocking for a chained role unless the ledger explains
+  them -- a window that ends no later than the latest ledger restriction on
+  a chain entry is *covered*, and the launch proceeds on the selected entry.
+  An operator hold or any other unexplained window still blocks. When every
+  entry is restricted the launch defers exactly as the per-repo window
+  always did (`provider_throttled` / `reviewer_quota_probe_backoff`, plus
+  `chain_retry_at`).
+- **Unchanged without fallbacks.** A chain of length 1 never reads the
+  ledger: per-repo throttles, the reviewer probe backoff and its single-probe
+  recovery behave exactly as before. The ledger is still written from its
+  sessions, so a chained repo elsewhere in the fleet learns from them.
+- **Downstream.** Reap and classification read the harness from the
+  sidecar's own type, so a fallback session is classified as what it ran on.
+  Worker prompts use the slash-command skills loop only when every chain
+  harness can load every declared skill.
 
 ## Fleet dispatch loop
 

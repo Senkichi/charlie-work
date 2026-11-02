@@ -25,6 +25,7 @@ from charlie_work.config import (
     WatchdogConfig,
     WorkerRoleConfig,
 )
+from charlie_work.host.fakes import FakeProcessProbe
 from charlie_work.paths import runtime_paths
 from charlie_work.state import (
     load_state,
@@ -36,7 +37,7 @@ from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # no
 
 
 def test_phantom_live_worker_preserves_sidecar_for_dirty_worktree_with_commits(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, fake_host
 ) -> None:
     """Issue #1130: a phantom live worker whose worktree is PARTIAL (dirty
     working tree but commits ahead of base) must NOT have its sidecar reaped.
@@ -63,7 +64,7 @@ def test_phantom_live_worker_preserves_sidecar_for_dirty_worktree_with_commits(
         )
 
     monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
-    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
+    fake_host(probe=FakeProcessProbe())
 
     config = OrchestratorConfig(
         devin=DevinConfig(), worker=WorkerRoleConfig(harness="claude-code")

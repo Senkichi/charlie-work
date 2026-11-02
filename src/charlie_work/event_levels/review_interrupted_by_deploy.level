@@ -1,0 +1,4 @@
+warning
+# Issue #2103: a reviewer in flight when a code-only self_deploy restarted the
+# daemon died through no fault of its PR. Rolled back and re-dispatched; not a
+# review_verdict_missed and not a counted attempt.

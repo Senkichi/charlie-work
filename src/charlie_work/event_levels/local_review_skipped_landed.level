@@ -1,0 +1,11 @@
+warning
+# Issue #2739: a local lane record whose three-dot branch diff is empty
+# (all content already on the base) finalized through the terminal merge
+# bookkeeping without running review or the suite gate. Warning, not info:
+# a record reaching this edge means work landed by another path -- exactly
+# the shape that used to livelock -- so each fire is worth an operator's
+# glance. The event fires only when the base advance completes (merged or
+# already-contained), so it cannot repeat while a deferred advance holds
+# the record non-terminal (review round 2): a deferral reports
+# local_merge_deferred instead and the record retries the merge on a
+# later pass without re-emitting this event.

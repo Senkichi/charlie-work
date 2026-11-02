@@ -1,1 +1,9 @@
-9
+10
+# Issue #1983: +1 raw save_state call in
+# _emit_request_changes_body_changed_requeued (the audit event for a
+# request_changes verdict superseded by a drifted PR body). It mirrors the
+# existing raw save_state in _emit_stale_ci_verdict_requeued (#1120): the
+# per-head+body dedup key and the event must land in one state_lock
+# critical section, so there is no gated path to route through. Same
+# out-of-wave raw-site class as that sibling. The ratchet holds at the new
+# count.

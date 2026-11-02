@@ -162,7 +162,10 @@ def test_adapter_settings_api_branch_carries_api_worker_config(
     assert settings.api_worker_config is api_cfg
     # The api branch reuses the claude-code venv_source/worker_env resolution.
     assert settings.venv_source == tmp_path / ".venv"
-    assert settings.worker_env == {"PYTEST_XDIST_AUTO_NUM_WORKERS": "2"}
+    # The operator's worker_env wins over the armed test-slot defaults (#2124),
+    # which ride alongside it.
+    assert settings.worker_env["PYTEST_XDIST_AUTO_NUM_WORKERS"] == "2"
+    assert settings.worker_env["PYTEST_PLUGINS"].startswith("test_slot_plugin")
     # tee_stream_json is read from claude_code config (launch_api_worker
     # force-enables it internally, but AdapterSettings still carries the
     # configured value for the manifest/results surface).

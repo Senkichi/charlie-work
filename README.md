@@ -212,6 +212,10 @@ when empty),
 escalates to `agent:human-needed`), `auto_merge.required_checks` (verify with
 `doctor`), `runtime.prompts_dir` (repo-local template overrides),
 `worker.harness` (`manual` | `command` | `devin-shell` | `claude-code`),
+`worker.fallbacks` / `reviewer.fallbacks` (the role chain: up to 3 ordered
+`{harness, model}` entries -- reviewer entries may add `effort` -- tried in
+order when the fleet quota ledger restricts the earlier ones; see
+[WORKFLOWS.md](docs/WORKFLOWS.md#role-chain-model-waterfall)),
 `claude_code.*` (worktree/venv settings for the claude-code adapter),
 `test_adequacy.*` (opt-in test-adequacy gate), `watchdog.*` (supervisor tripwires: stall/wall-clock/
 loop/cost-token budgets, WARN-first by default), `fleet.*`

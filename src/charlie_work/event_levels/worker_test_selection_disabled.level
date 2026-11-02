@@ -1,0 +1,4 @@
+info
+# The repo's ci-fleet.toml sets ``[test_selection] enabled = false``, so the
+# prompt kept the hand-picked targeted command. The repo's own choice, not a
+# fault.

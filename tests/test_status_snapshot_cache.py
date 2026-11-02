@@ -408,20 +408,28 @@ def test_loop_pass_dry_run_does_not_write_status_snapshot(tmp_path: Path) -> Non
 def test_status_snapshot_ttl_seconds_rejects_non_int() -> None:
     """``runtime.status_snapshot_ttl_seconds`` must be an int; a string value
     must raise ConfigError."""
-    with pytest.raises(ConfigError, match="status_snapshot_ttl_seconds.*must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^runtime\.status_snapshot_ttl_seconds: expected int, got '900' \(str\)$",
+    ):
         build_config_from_data({"runtime": {"status_snapshot_ttl_seconds": "900"}})
 
 
 def test_status_snapshot_ttl_seconds_rejects_bool() -> None:
     """``bool`` is a subclass of ``int`` in Python but must be rejected —
     ``True`` would silently mean a 1-second TTL."""
-    with pytest.raises(ConfigError, match="status_snapshot_ttl_seconds.*must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^runtime\.status_snapshot_ttl_seconds: expected int, got True \(bool\)$",
+    ):
         build_config_from_data({"runtime": {"status_snapshot_ttl_seconds": True}})
 
 
 def test_status_snapshot_ttl_seconds_rejects_negative() -> None:
     """A negative TTL is nonsensical; must raise ConfigError."""
-    with pytest.raises(ConfigError, match="status_snapshot_ttl_seconds.*must be >= 0"):
+    with pytest.raises(
+        ConfigError, match=r"^runtime\.status_snapshot_ttl_seconds: expected >= 0, got -1$"
+    ):
         build_config_from_data({"runtime": {"status_snapshot_ttl_seconds": -1}})
 
 
@@ -571,7 +579,7 @@ def test_fleet_status_human_readable_shows_cache_age_when_cached(
     cached response from a live one — the ``snapshot_written_at`` /
     ``cache_age_seconds`` fields round-1 required need a real consumer."""
     from charlie_work import cli
-    from charlie_work.workflow import CommandResult
+    from charlie_work.command_result import CommandResult
 
     fake_result = CommandResult(
         True,
@@ -608,7 +616,7 @@ def test_fleet_status_human_readable_omits_cache_age_when_live(
     renderer must NOT print a cache-age line, so a live response is
     distinguishable from a cached one by the absence of the line."""
     from charlie_work import cli
-    from charlie_work.workflow import CommandResult
+    from charlie_work.command_result import CommandResult
 
     fake_result = CommandResult(
         True,

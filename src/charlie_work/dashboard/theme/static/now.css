@@ -1,0 +1,117 @@
+/* Shared page frame (pages/now.py, drill_shell.py, history.py): header, nav, source chips,
+   banners, skip link, key help, and the chart-svg classes charts/*.py emit. The Now page's
+   own layout lives in now-page.css. Served after dashboard.css; colours come only from the
+   --lj-* custom properties generated from tokens.json (no literals). The CSP forbids inline
+   styles, so every variable geometry is an SVG attribute. */
+
+html, body { min-height: 100%; }
+.sr {
+  position: absolute; width: 1px; height: 1px; overflow: hidden;
+  clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap;
+}
+/* A number is a link only once its drill-down route is registered (pages/routes.py);
+   until then it renders as span.n, with no underline that promises a click. */
+a.n { text-decoration: none; border-bottom: 1px dotted var(--lj-gray); }
+a.n:hover { text-decoration: none; border-bottom-style: solid; }
+/* Numerals. The vendored Fraunces subset has no tnum feature (measured: "1111" and "0000"
+   differ by 30% with tabular-nums on), so numbers that align in columns or refresh in
+   place use Inter, whose tnum works; Fraunces keeps the isolated headline numerals. */
+.n, .big { font-variant-numeric: lining-nums tabular-nums; }
+.fresh .n, .hn { font-family: var(--lj-sans); font-variant-numeric: lining-nums tabular-nums; }
+.skip { position: absolute; left: var(--lj-space-4); top: -100px; z-index: 20; background: var(--lj-card); padding: var(--lj-space-2) var(--lj-space-3); border: 1px solid var(--lj-ink); }
+.skip:focus { top: var(--lj-space-2); }
+.calm { font-family: var(--lj-serif); font-style: italic; font-size: var(--lj-text-5); color: var(--lj-gray-text); padding: var(--lj-space-4) 0; }
+.calm-sm { font-family: var(--lj-serif); font-style: italic; color: var(--lj-gray-text); }
+.sub { font-size: var(--lj-text-2); color: var(--lj-gray-text); margin: var(--lj-space-1) 0; }
+.sub .n { font-family: var(--lj-serif); font-weight: 600; color: var(--lj-ink); }
+.hn { font-weight: 600; color: var(--lj-ink); }
+
+/* ---------- header ---------- */
+.top { grid-column: 1 / -1; border-bottom: var(--lj-stroke-accentRule) solid var(--lj-ink); padding-bottom: var(--lj-space-2); }
+.top-line { display: flex; align-items: baseline; gap: var(--lj-space-4); flex-wrap: wrap; }
+.top-line .spacer { flex: 1; }
+.brand { font-family: var(--lj-serif); font-size: var(--lj-text-6); font-weight: 600; letter-spacing: -0.01em; }
+.brand em { font-weight: 400; color: var(--lj-gray-text); }
+.views { display: flex; gap: var(--lj-space-3); font-size: var(--lj-text-3); }
+.views a { text-decoration: none; color: var(--lj-gray-text); }
+.views a[aria-current] { color: var(--lj-ink); font-weight: 600; border-bottom: 2px solid var(--lj-ink); }
+.views .soon { color: var(--lj-gray-text); }
+.asof { margin-left: auto; font-size: var(--lj-text-3); color: var(--lj-gray-text); }
+.asof b { font-family: var(--lj-serif); font-weight: 600; color: var(--lj-ink); font-size: var(--lj-text-4); }
+.fresh { display: flex; flex-wrap: wrap; gap: var(--lj-space-1) var(--lj-space-4); margin-top: var(--lj-space-2); font-size: var(--lj-text-2); color: var(--lj-gray-text); align-items: baseline; }
+.fresh .label { margin-right: var(--lj-space-1); }
+.fresh .chip { color: var(--lj-gray-text); text-decoration: none; white-space: nowrap; }
+.fresh a.chip:hover { color: var(--lj-ink); }
+.fresh .chip .n { font-weight: 600; color: var(--lj-ink); }
+.fresh a.chip .n { border-bottom: 1px dotted var(--lj-gray); }
+.fresh .is-warn, .fresh .is-warn .n { color: var(--lj-warn); }
+.fresh a.is-warn .n { border-bottom: 1px dashed var(--lj-warn); }
+.fresh .is-danger, .fresh .is-danger .n { color: var(--lj-danger); border-color: var(--lj-danger); font-weight: 700; }
+.fresh .thr { margin-left: auto; }
+.banner {
+  grid-column: 1 / -1;
+  padding: var(--lj-space-2) var(--lj-space-3);
+  border: 1.5px solid var(--lj-danger);
+  border-radius: var(--lj-radius-tab);
+  background: var(--lj-card);
+  font-weight: 600;
+}
+/* Client-side "Not updating" banner (dashboard.js): outside #now, so swaps never touch it. */
+.client-status { padding: 0 var(--lj-space-5); }
+body:not(.now) .client-status { max-width: 1600px; margin: 0 auto; }
+.client-status > .banner { margin-top: var(--lj-space-3); border-color: var(--lj-warn); }
+/* Stale page: every number goes muted so nothing reads as live (cleared on next success). */
+html.is-stale #now .n, html.is-stale #now .big, html.is-stale #now .num,
+html.is-stale #now .age, html.is-stale #now .asof b { color: var(--lj-gray-text); }
+html.is-stale #now svg .bar, html.is-stale #now svg .fill, html.is-stale #now svg .hbar,
+html.is-stale #now svg .hb-fill, html.is-stale #now svg .cbar { fill: var(--lj-gray); }
+
+/* ---------- chart svg (charts/*.py) ---------- */
+svg .bar { fill: var(--lj-ink); }
+svg .bar.zero { fill: none; stroke: var(--lj-gray); stroke-width: 1; }
+svg .bar.done { fill: var(--lj-green); }
+svg .base { stroke: var(--lj-gray); stroke-width: 1; shape-rendering: crispEdges; }
+svg .arrow { stroke: var(--lj-gray); stroke-width: 1; fill: none; }
+svg .arrow.rework { stroke-dasharray: 2 2; }
+svg .unit-sep { stroke: var(--lj-rule); stroke-width: 1; stroke-dasharray: 3 3; }
+svg .arrowhead { fill: var(--lj-gray); }
+svg .hbar { fill: var(--lj-gray); }
+svg .hbar-track { fill: var(--lj-rule); }
+svg.hbar-svg { display: block; width: 100%; height: 12px; }
+svg.bullet-svg { display: block; flex: 1 1 auto; min-width: 0; height: 16px; }
+svg .trk { fill: var(--lj-rule); }
+svg .fill { fill: var(--lj-ink); }
+svg .fill.hot { fill: var(--lj-warn); }
+svg .captick { stroke: var(--lj-ink); stroke-width: 2; }
+svg .trk-open { stroke: var(--lj-gray); stroke-width: 2; stroke-dasharray: 4 3; }
+svg .parked { fill: none; stroke: var(--lj-gray); stroke-width: 1; stroke-dasharray: 2 1; }
+svg .demand { stroke: var(--lj-ink); stroke-width: 1.5; }
+svg.mini { display: inline-block; width: 4px; height: 12px; margin-right: 3px; vertical-align: -1px; }
+svg .mbar { fill: var(--lj-series-3); }
+svg .mzero { fill: var(--lj-rule); }
+svg.rsvg { width: 36px; height: 12px; flex: none; }
+
+@media (max-width: 699px) {
+  .top-line { gap: var(--lj-space-2) var(--lj-space-3); }
+  .asof { margin-left: 0; width: 100%; }
+  .banner { margin-top: var(--lj-space-2); }
+  .fresh .thr { display: none; }
+}
+
+/* ---------- interaction (dashboard.js) ---------- */
+.themebtn { font-size: var(--lj-text-1); text-transform: uppercase; letter-spacing: var(--lj-label-spacing); color: var(--lj-gray-text); }
+button.copy {
+  font-size: var(--lj-text-1); padding: 0 var(--lj-space-2); line-height: 1.6;
+  border-radius: var(--lj-radius-tab); flex: none; text-transform: uppercase;
+  letter-spacing: var(--lj-label-spacing); font-weight: 600; color: var(--lj-gray-text);
+}
+button.copy:hover, button.copy:focus-visible { color: var(--lj-ink); border-color: var(--lj-ink); }
+.keyhelp {
+  position: fixed; right: var(--lj-space-5); bottom: var(--lj-space-5); z-index: 10;
+  background: var(--lj-card); border: var(--lj-stroke-cardHairline) solid var(--lj-hair);
+  border-radius: var(--lj-radius-card); padding: var(--lj-space-3) var(--lj-space-4);
+}
+.keyhelp[hidden] { display: none; }
+.keyhelp dl { display: grid; grid-template-columns: auto 1fr; gap: var(--lj-space-1) var(--lj-space-3); margin: var(--lj-space-2) 0 0; }
+.keyhelp dt, .keyhelp dd { margin: 0; font-size: var(--lj-text-2); }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }

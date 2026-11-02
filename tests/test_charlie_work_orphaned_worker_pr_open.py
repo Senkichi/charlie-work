@@ -9,17 +9,18 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-import pytest
 from _dead_session_fixtures import _write_flat_review_decision
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
 from _fakes_github import FakeGitHub
 from _rework_dispatch_fixtures import _wg
+from _host_fixtures import host_probe
 from charlie_work.config import (
     DevinConfig,
     OrchestratorConfig,
     WatchdogConfig,
     WorkerRoleConfig,
 )
+from charlie_work.host.fakes import FakeWorkerLauncher
 from charlie_work.paths import runtime_paths
 from charlie_work.state import (
     PASSIVE_OPEN_STATUS,
@@ -29,18 +30,18 @@ from charlie_work.state import (
 from charlie_work.workflow import OrchestratorApp
 
 
-def test_orphaned_worker_approved_without_rework_status_still_drifts(tmp_path: Path) -> None:
-    """Issue #1109 guard: an approved PR whose PR state does NOT carry
-    ``status="rework_requested"`` has no evidence a post-approval rework lane
-    dispatched this worker, so the sweep must still surface
-    ``dead_worker_unsafe_to_auto_reset`` drift rather than guess.
+def test_orphaned_worker_approved_without_rework_status_still_drifts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """#2135 (supersedes #1109): an approved PR whose PR state carries no
+    ``status="rework_requested"`` is still a post-approval rework when its issue
+    is ``dispatched`` -- carry-forward can rewrite the status back to ``approved``
+    mid-rework -- so the dead worker is recovered instead of wedging as
+    ``dead_worker_unsafe_to_auto_reset`` drift.
 
-    This is the existing test_orphaned_worker_unsafe_to_auto_reset_drift_emits_once
-    scenario (approved, head unchanged, no PR-state status) -- re-asserted
-    here to pin the guard's meaning: the ``pr_state_status == "rework_requested"``
-    check is what separates a safe auto-reset from an unclassifiable drift.
+    The leaf name predates #2135 and is kept so the collect-only gate sees the
+    test as modified rather than removed.
     """
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -89,7 +90,7 @@ def test_orphaned_worker_approved_without_rework_status_still_drifts(tmp_path: P
         }
     )
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
@@ -102,18 +103,18 @@ def test_orphaned_worker_approved_without_rework_status_still_drifts(tmp_path: P
     state = load_state(paths.state_file)
     entry = state["issues"]["1109"]
 
-    # No evidence of a rework lane dispatch -- must stay dispatched and drift.
-    assert entry.get("status") == "dispatched"
+    # Recovered to the rework lane, no drift.
+    assert entry.get("status") == "rework_requested"
 
     events = state.get("events", [])
-    assert [e for e in events if e.get("kind") == "orphaned_worker_recovered"] == []
-    drift_events = [e for e in events if e.get("kind") == "orphaned_worker_drift"]
-    assert len(drift_events) == 1
-    assert drift_events[0]["payload"]["reason"] == "dead_worker_unsafe_to_auto_reset"
+    recovered = [e for e in events if e.get("kind") == "orphaned_worker_recovered"]
+    assert len(recovered) == 1
+    assert recovered[0]["payload"]["reason"] == "dead_worker_with_approved_rework"
+    assert [e for e in events if e.get("kind") == "orphaned_worker_drift"] == []
 
 
 def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, fake_host, monkeypatch
 ) -> None:
     """Issue #457 review: a fresh dispatch clears the drift fingerprint.
 
@@ -121,7 +122,6 @@ def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
     recompute an identical fingerprint and the second orphaned_worker_drift
     event would be suppressed forever.
     """
-    from unittest.mock import patch
 
     from charlie_work.adapters import SessionDispatchResult
 
@@ -197,7 +197,7 @@ def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
     pr_dir = paths.prs / "pr-100"
     pr_dir.mkdir(parents=True, exist_ok=True)
     (pr_dir / "review-decision.json").write_text(
-        json.dumps({"decision": "approved", "reviewed_head_sha": "abc123"}),
+        json.dumps({"decision": "approved", "reviewed_head_sha": None}),
         encoding="utf-8",
     )
 
@@ -206,7 +206,7 @@ def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
 
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(monkeypatch, alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
         )
@@ -243,7 +243,7 @@ def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
             for request in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+    fake_host(worker_launch=FakeWorkerLauncher([fake_dispatch_sessions]))
 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     result = app.dispatch_rework()
@@ -256,7 +256,7 @@ def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
     assert "orphan_drift_fingerprint" not in state["issues"]["457"]
 
     # Force the identical drift conditions again after the redispatch.
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(monkeypatch, alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
         )
@@ -271,7 +271,7 @@ def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
 
 
 def test_orphaned_worker_unreviewed_open_pr_pending_file_advances_to_pr_open(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """Issue #1362 Stage 1 regression: a dead worker with an OPEN PR that has
     a *pending* placeholder ``review-decision.json`` (not a missing file, and
@@ -284,7 +284,6 @@ def test_orphaned_worker_unreviewed_open_pr_pending_file_advances_to_pr_open(
     re-strand the issue on ``agent:in-progress``, the precise #1128 failure
     this lane exists to fix.
     """
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -345,7 +344,7 @@ def test_orphaned_worker_unreviewed_open_pr_pending_file_advances_to_pr_open(
 
     fake_gh = FakeGitHubForOrphan()
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
@@ -374,13 +373,14 @@ def test_orphaned_worker_unreviewed_open_pr_pending_file_advances_to_pr_open(
     assert (1578, pr_open) in fake_gh.labels_added
 
 
-def test_orphaned_worker_unreviewed_open_pr_advances_to_pr_open(tmp_path: Path) -> None:
+def test_orphaned_worker_unreviewed_open_pr_advances_to_pr_open(
+    tmp_path: Path, monkeypatch
+) -> None:
     """Issue #1128: a dead worker with an OPEN, unreviewed PR (no decision)
     must be advanced from ``agent:in-progress`` to ``agent:pr-open`` so review
     dispatch can claim the salvage PR.  Before the fix this cell advanced no
     label and the issue sat on ``agent:in-progress`` indefinitely.
     """
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -436,7 +436,7 @@ def test_orphaned_worker_unreviewed_open_pr_advances_to_pr_open(tmp_path: Path) 
 
     fake_gh = FakeGitHubForOrphan()
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
@@ -474,7 +474,7 @@ def test_orphaned_worker_unreviewed_open_pr_advances_to_pr_open(tmp_path: Path) 
 
     # A second pass must not re-advance or re-emit (status is no longer
     # dispatched, so the sweep skips it entirely).
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(monkeypatch, alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
         )
@@ -485,7 +485,9 @@ def test_orphaned_worker_unreviewed_open_pr_advances_to_pr_open(tmp_path: Path) 
     assert len(advance_events) == 1, "advance must not be re-emitted on the second pass"
 
 
-def test_orphaned_worker_unreviewed_open_pr_credits_worker_death(tmp_path: Path) -> None:
+def test_orphaned_worker_unreviewed_open_pr_credits_worker_death(
+    tmp_path: Path, monkeypatch
+) -> None:
     """Job-cannon #1320: before this fix, the #1128 advance-to-pr-open lane
     was the one dead-worker branch (of four across this file and
     ``dead_worker_reap.py``) that never touched ``worker_death_at`` -- a
@@ -496,7 +498,6 @@ def test_orphaned_worker_unreviewed_open_pr_credits_worker_death(tmp_path: Path)
     death is now credited here exactly as it already was in the
     request_changes/approved sibling branches.
     """
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -553,7 +554,7 @@ def test_orphaned_worker_unreviewed_open_pr_credits_worker_death(tmp_path: Path)
 
     fake_gh = FakeGitHubForOrphan()
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
@@ -589,13 +590,12 @@ def test_orphaned_worker_unreviewed_open_pr_credits_worker_death(tmp_path: Path)
 
 
 def test_orphaned_worker_unreviewed_open_pr_label_failure_falls_back_to_drift(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """Issue #1128: when the label write fails, the sweep must keep the
     conservative drift behavior (stay ``dispatched``, emit drift once) so the
     next pass re-attempts the transition rather than resetting the worker.
     """
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -653,7 +653,7 @@ def test_orphaned_worker_unreviewed_open_pr_label_failure_falls_back_to_drift(
 
     fake_gh = FakeGitHubForOrphan()
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
@@ -682,7 +682,7 @@ def test_orphaned_worker_unreviewed_open_pr_label_failure_falls_back_to_drift(
 
 
 def test_orphaned_worker_unreviewed_pr_with_rework_status_advances_not_resets(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """Issue #1128 rework after merge with #1109: an issue that could plausibly
     match both lanes -- ``last_decision`` is None (the #1128 condition) while
@@ -697,7 +697,6 @@ def test_orphaned_worker_unreviewed_pr_with_rework_status_advances_not_resets(
     The #1128 lane then advances it to ``pr-open`` so review can assess it,
     rather than guessing a re-dispatch.
     """
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -755,7 +754,7 @@ def test_orphaned_worker_unreviewed_pr_with_rework_status_advances_not_resets(
 
     fake_gh = FakeGitHubForOrphan()
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"

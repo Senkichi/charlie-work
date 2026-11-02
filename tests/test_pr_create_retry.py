@@ -3,7 +3,7 @@
 Covers ``pr_create_retry.create_pr_with_retry`` in isolation (AC1-AC4, using a
 lightweight fake that satisfies the ``PrCreator`` protocol) and its
 composition with ``GitHub.run()``'s existing inner pre-connection-only retry
-(AC5, using the real ``GitHub`` class with a monkeypatched ``subprocess.run``,
+(AC5, using the real ``GitHub`` class over a scripted fake transport,
 mirroring ``tests/test_github.py``'s own harness -- a hand-rolled fake could
 assert "outer didn't retry" without ever proving the two layers actually
 compose against real code).
@@ -11,14 +11,16 @@ compose against real code).
 
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from _fake_transport import FakeAdapter, failure, graphql_ok, make_github, ok
 from charlie_work import github as github_module
 from charlie_work.config import RuntimeConfig
+from charlie_work.github_transport import FailureKind
+from charlie_work.github_transport.request import GraphQLRequest
 from charlie_work.instrumentation import _LEVEL_BY_KIND
 from charlie_work.pr_create_retry import (
     DEFAULT_BASE_SECONDS,
@@ -398,52 +400,40 @@ def test_precheck_failure_blocks_creation_only_once_one_is_already_in_flight() -
 
 # ---------------------------------------------------------------------------
 # AC5: composition with `GitHub.run()`'s existing inner pre-connection-only
-# retry. Uses the real `GitHub` class with a monkeypatched `subprocess.run`,
+# retry. Uses the real `GitHub` class over a scripted fake transport,
 # the same harness `tests/test_github.py` uses for the inner retry itself --
 # a fake that merely "remembers" which class an error belongs to would prove
 # nothing about whether the two layers actually compose.
 # ---------------------------------------------------------------------------
 
 
-def _fake_run_dispatcher(responses_by_command: dict[str, list[subprocess.CompletedProcess]]):
-    """Route `subprocess.run(["gh", *args], ...)` calls by their `gh pr create`
-    vs `gh pr list` shape, popping one canned response per call."""
-
-    def _fake_run(cmd: list[str], *args: Any, **kwargs: Any) -> subprocess.CompletedProcess:
-        key = "create" if "create" in cmd else "list"
-        queue = responses_by_command[key]
-        assert queue, f"no more canned responses for {key!r} (cmd={cmd!r})"
-        return queue.pop(0)
-
-    return _fake_run
-
-
-def _cp(returncode: int, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess:
-    return subprocess.CompletedProcess(
-        args=["gh"], returncode=returncode, stdout=stdout, stderr=stderr
-    )
-
-
 def test_composition_inner_pre_connection_retry_to_success_never_triggers_outer_retry(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A pre-connection error is exactly the shape `GitHub.run()`'s inner
-    retry already absorbs. By the time it reaches `create_pr_with_retry`,
-    `gh.pr_create()` has already turned two subprocess calls (1 fail + 1
-    success) into a single successful return -- the outer ladder must see
-    one clean attempt and never call its own `sleep_fn`."""
-    responses = {
-        "create": [
-            _cp(1, stderr="Post: net/http: TLS handshake timeout"),
-            _cp(0, stdout="https://github.com/o/r/pull/9"),
+    """A pre-connection error is exactly the shape the transport's inner retry
+    already absorbs. By the time it reaches `create_pr_with_retry`,
+    `gh.pr_create()` has already turned two requests (1 fail + 1 success) into
+    a single successful return -- the outer ladder must see one clean attempt
+    and never call its own `sleep_fn`."""
+    http = FakeAdapter(
+        "http",
+        [
+            failure(FailureKind.CONNECT, "TLS handshake timeout"),
+            ok({"number": 9, "html_url": "https://github.com/o/r/pull/9"}, status=201),
         ],
-        "list": [_cp(0, stdout="[]")],
-    }
-    monkeypatch.setattr(github_module.subprocess, "run", _fake_run_dispatcher(responses))
+    )
+    # The CONNECT failure falls back to gh for the same attempt; gh fails the same
+    # way, so the guard's own retry (not the outer ladder) recovers on the next try.
+    gh_list = FakeAdapter(
+        "gh", [failure(FailureKind.CONNECT, "TLS handshake timeout")], token="tok-1"
+    )
     monkeypatch.setattr(github_module.time, "sleep", lambda seconds: None)
 
-    gh = github_module.GitHub(
-        tmp_path, runtime=RuntimeConfig(gh_max_retries=3, gh_retry_base_seconds=1.0)
+    gh, http, _ = make_github(
+        tmp_path,
+        http=http,
+        gh=gh_list,
+        runtime=RuntimeConfig(gh_max_retries=3, gh_retry_base_seconds=1.0),
     )
     outer_sleeps, outer_sleep_fn = _sleep_recorder()
 
@@ -455,28 +445,38 @@ def test_composition_inner_pre_connection_retry_to_success_never_triggers_outer_
     assert result.pr_number == 9
     assert result.attempts == 1
     assert outer_sleeps == []
-    assert responses["create"] == []  # both canned inner responses were consumed
+    assert len(http.calls) == 2  # both scripted inner responses were consumed
 
 
 def test_composition_terminal_for_mutation_error_does_trigger_outer_retry(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The other class: an error `_should_retry` refuses for a mutation
+    """The other class: an error the transport refuses to retry for a mutation
     (HTTP 422 -- not pre-connection) gets zero attempts from the inner layer,
     so `gh.pr_create()` returns `None` on the very first outer attempt. The
     outer ladder must be the thing that retries here."""
-    responses = {
-        "create": [
-            _cp(1, stderr="HTTP 422: Validation Failed"),
-            _cp(0, stdout="https://github.com/o/r/pull/11"),
-        ],
-        "list": [_cp(0, stdout="[]")],
-    }
-    monkeypatch.setattr(github_module.subprocess, "run", _fake_run_dispatcher(responses))
+    creates = [
+        ok({"message": "Validation Failed"}, status=422),
+        ok({"number": 11, "html_url": "https://github.com/o/r/pull/11"}, status=201),
+    ]
+    empty_page = {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}}
+
+    def reply(request):
+        # The duplicate-PR precheck between outer attempts is a GraphQL list read
+        # (no PR yet); only the REST creates consume the script.
+        if isinstance(request, GraphQLRequest):
+            return graphql_ok({"repository": {"pullRequests": empty_page}})
+        return creates.pop(0)
+
+    http = FakeAdapter("http", handler=reply)
+    gh_list = FakeAdapter("gh", [ok("[]")], token="tok-1")
     monkeypatch.setattr(github_module.time, "sleep", lambda seconds: None)
 
-    gh = github_module.GitHub(
-        tmp_path, runtime=RuntimeConfig(gh_max_retries=3, gh_retry_base_seconds=1.0)
+    gh, http, _ = make_github(
+        tmp_path,
+        http=http,
+        gh=gh_list,
+        runtime=RuntimeConfig(gh_max_retries=3, gh_retry_base_seconds=1.0),
     )
     outer_sleeps, outer_sleep_fn = _sleep_recorder()
 

@@ -423,9 +423,9 @@ def test_write_json_atomic_never_leaves_a_partial_real_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Atomicity of the shared primitive itself: a failure while serializing
-    must never produce a partially-written file at the real path -- only
-    (at most) a ``.tmp`` sibling, which the next write overwrites and no
-    reader ever looks at directly."""
+    must never produce a partially-written file at the real path -- and the
+    helper unlinks its unique temp file on the way out (issue #2265), so no
+    ``.tmp`` sibling survives either."""
     path = tmp_path / "pr-1" / "review-decision.json"
 
     def boom(*_args: object, **_kwargs: object) -> None:

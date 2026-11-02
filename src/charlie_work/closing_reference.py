@@ -29,6 +29,7 @@ Two independent event kinds cover two independent gaps:
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -237,3 +238,50 @@ def closing_issues_referenced_numbers(pr_view: dict[str, Any]) -> set[int]:
         if isinstance(ref, dict) and isinstance(ref.get("number"), int):
             numbers.add(ref["number"])
     return numbers
+
+
+# cw#1868: GitHub indexes a just-created PR's body for closing keywords
+# asynchronously, so a probe seconds after ``gh pr create`` can read an empty
+# ``closingIssuesReferences`` that self-heals within minutes. Re-probe after
+# these pauses before treating "unlinked" as a verdict; the total (~13s) only
+# ever elapses on a genuine-or-lagging miss, never on the matched fast path.
+CLOSING_LINK_RECHECK_DELAYS_SECONDS: tuple[float, ...] = (3.0, 10.0)
+
+
+def _default_sleep(seconds: float) -> None:
+    """Module-local indirection so tests can neutralize the wait (see conftest)."""
+    time.sleep(seconds)
+
+
+def probe_closing_link(
+    gh: Any,
+    pr_number: int,
+    issue_number: int,
+    *,
+    fields: str,
+) -> set[int] | None:
+    """Return the issues GitHub links to ``pr_number``, settled across the indexing race.
+
+    Single enforcement point for both ``pr_closing_ref_unlinked`` call sites
+    (``dead_worker_reap._open_salvage_pr`` and the ``reconcile`` salvage branch).
+    Re-probes (after ``CLOSING_LINK_RECHECK_DELAYS_SECONDS``) until
+    ``issue_number`` appears, so a lagging index does not read as a miss.
+
+    Returns ``None`` when the final probe raised: a failed query is
+    indistinguishable from "unlinked" by result shape, so callers must not log
+    it as a miss. Otherwise returns the last-observed linked set; the caller
+    logs iff ``issue_number`` is absent from it.
+    """
+    attempts = len(CLOSING_LINK_RECHECK_DELAYS_SECONDS) + 1
+    linked: set[int] | None = None
+    for attempt in range(attempts):
+        if attempt:
+            _default_sleep(CLOSING_LINK_RECHECK_DELAYS_SECONDS[attempt - 1])
+        try:
+            linked = closing_issues_referenced_numbers(gh.pr_view(pr_number, fields=fields))
+        except Exception:
+            linked = None
+            continue
+        if issue_number in linked:
+            return linked
+    return linked

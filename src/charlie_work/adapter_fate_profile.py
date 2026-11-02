@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -42,9 +42,24 @@ class AdapterFateProfile:
     # devin-shell); command and manual never spawn a worker process, so
     # there is nothing to watch.
     writes_terminal_record: bool
+    # Narrows a log to the harness's own provider-error records before any
+    # tail classifier reads it -- for a harness whose log also carries tool
+    # output (opencode: opencode_log.provider_error_digest). None = raw log.
+    log_digest: Callable[[str], str] | None = None
+    # (provider-error tail) -> how long until the tripped quota resets, or None
+    # for the classifier's fixed 24h -- for a provider whose quota windows are
+    # not 24h (opencode Go: opencode_limits.go_quota_reset). None = 24h.
+    quota_reset: Callable[[str], timedelta | None] | None = None
 
 
 _PROFILES: dict[str, AdapterFateProfile] | None = None
+
+
+def _opencode_quota_reset(tail: str) -> timedelta | None:
+    """Late-bound ``opencode_limits.go_quota_reset`` (it imports the worker module)."""
+    from . import opencode_limits
+
+    return opencode_limits.go_quota_reset(tail)
 
 
 def _devin_record_failure(*args: Any, **kwargs: Any) -> tuple[str | None, str | None]:
@@ -72,6 +87,15 @@ def _api_record_failure(*args: Any, **kwargs: Any) -> tuple[str | None, str | No
     )
 
 
+def _opencode_record_failure(*args: Any, **kwargs: Any) -> tuple[str | None, str | None]:
+    """Late-bound ``claude_code.update_worker_record_with_failure_classification`` (opencode)."""
+    from . import claude_code
+
+    return claude_code.update_worker_record_with_failure_classification(
+        *args, adapter_kind="opencode", **kwargs
+    )
+
+
 def _build_profiles() -> dict[str, AdapterFateProfile]:
     """Build the by-harness profile table, then index it by ``view_kinds``.
 
@@ -96,6 +120,7 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
     first ``profile_for`` call.
     """
     from .harnesses import WORKER_HARNESSES
+    from .opencode_log import provider_error_digest
 
     by_harness = {
         "devin-shell": AdapterFateProfile(
@@ -124,6 +149,21 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
             record_failure=_api_record_failure,
             over_budget=_api_over_budget,
             writes_terminal_record=True,
+        ),
+        # opencode sessions are ClaudeWorkerRecord sidecars written by
+        # launch_claude_worker, so they share its classifier/terminal watcher.
+        # The api-only provider-account and Claude-CLI permission-denial
+        # detectors match claude-specific text and stay off.
+        "opencode": AdapterFateProfile(
+            harness="opencode",
+            view_kinds=frozenset({"opencode"}),
+            account_error_detection=False,
+            headless_permission_detection=False,
+            record_failure=_opencode_record_failure,
+            over_budget=None,
+            writes_terminal_record=True,
+            log_digest=provider_error_digest,
+            quota_reset=_opencode_quota_reset,
         ),
         # "command" and "manual" have no failure-classification or budget
         # consumer today: dead_worker_reap.py's 14 sites never branch on
@@ -235,4 +275,6 @@ def classify_for(
         account_error_detection=profile.account_error_detection,
         headless_permission_detection=profile.headless_permission_detection,
         now=now,
+        log_digest=profile.log_digest,
+        quota_reset=profile.quota_reset,
     )

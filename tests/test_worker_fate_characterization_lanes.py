@@ -31,6 +31,7 @@ from _worker_fate_characterization_fixtures import (
     _seed_no_pr_dispatched_issue,
     _wg,
 )
+from _host_fixtures import host_probe
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +60,7 @@ def _seed_dead_worker_fresh_outcome_and_clean_exit(
     )
 
 
-def test_flip4_request_changes_exit0_discards_fresh_outcome(tmp_path: Path) -> None:
+def test_flip4_request_changes_exit0_discards_fresh_outcome(tmp_path: Path, monkeypatch) -> None:
     """FLIP 4: was a clean exit code short-circuiting before the fresh
     outcome file was ever consulted; now the with-PR lane consults the
     fresh outcome first and only falls back to the exit code when there is
@@ -86,7 +87,7 @@ def test_flip4_request_changes_exit0_discards_fresh_outcome(tmp_path: Path) -> N
     sessions_dir.mkdir(parents=True, exist_ok=True)
     _seed_dead_worker_fresh_outcome_and_clean_exit(tmp_path, paths, sessions_dir)
 
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -113,7 +114,7 @@ def test_flip4_request_changes_exit0_discards_fresh_outcome(tmp_path: Path) -> N
     assert not any(e.get("kind") == "orphaned_worker_recovered" for e in events)
 
 
-def test_flip4_approved_rework_exit0_discards_fresh_outcome(tmp_path: Path) -> None:
+def test_flip4_approved_rework_exit0_discards_fresh_outcome(tmp_path: Path, monkeypatch) -> None:
     """FLIP 4: was a clean exit code short-circuiting before the fresh
     outcome file was ever consulted; now the with-PR lane consults the
     fresh outcome first (rule 4). Contrast/companion to the test above.
@@ -130,7 +131,7 @@ def test_flip4_approved_rework_exit0_discards_fresh_outcome(tmp_path: Path) -> N
     sessions_dir.mkdir(parents=True, exist_ok=True)
     _seed_dead_worker_fresh_outcome_and_clean_exit(tmp_path, paths, sessions_dir)
 
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -156,7 +157,7 @@ def test_flip4_approved_rework_exit0_discards_fresh_outcome(tmp_path: Path) -> N
 
 
 def test_flip4_nonzero_exit_still_consults_fresh_confirmed_push_outcome(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """B3 (wf-review-opus.md): rule 4 ("a fresh outcome file beats the exit
     code; the exit code decides only without one") is unconditional --
@@ -188,7 +189,7 @@ def test_flip4_nonzero_exit_still_consults_fresh_confirmed_push_outcome(
         mtime=datetime.now(UTC),
     )
 
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -215,7 +216,9 @@ def test_flip4_nonzero_exit_still_consults_fresh_confirmed_push_outcome(
 # ---------------------------------------------------------------------------
 
 
-def test_flip7_workflow_empty_terminal_outcome_falls_through_to_worktree(tmp_path: Path) -> None:
+def test_flip7_workflow_empty_terminal_outcome_falls_through_to_worktree(
+    tmp_path: Path, monkeypatch
+) -> None:
     """FLIP 7 / N1 (wf-review-opus.md), design doc §3 step 0: current
     (fixed) behaviour.
 
@@ -276,7 +279,7 @@ def test_flip7_workflow_empty_terminal_outcome_falls_through_to_worktree(tmp_pat
     fake_gh = _no_pr_fake_gh(tmp_path, config, issue_number)
 
     with (
-        patch("charlie_work.workflow._worker_pid_alive", return_value=False),
+        host_probe(monkeypatch, alive=False),
         patch("charlie_work.workflow.remote_branch_head_sha", return_value=None),
         patch("charlie_work.workflow.remote_branch_ahead_count", return_value=(0, None)),
     ):
@@ -459,7 +462,7 @@ def test_preserve_rule6_throttle_exemption_reads_failure_kind_directly(tmp_path:
     event. The new fate module must keep this exemption reachable the same
     way even once the field is read only through a fate accessor.
     """
-    from charlie_work.orphaned_worker_sweep import maybe_reap_dead_dispatched_worker
+    from _dws_facts import run_reap
 
     now = datetime.now(UTC)
     orphan_drift_at = (now - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
@@ -467,31 +470,24 @@ def test_preserve_rule6_throttle_exemption_reads_failure_kind_directly(tmp_path:
         "dead_worker_failure_kind": "rate_limited",
         "orphan_drift_at": orphan_drift_at,
     }
-    state: dict = {
-        "issues": {},
-        "throttled_until": (now + timedelta(minutes=30)).isoformat().replace("+00:00", "Z"),
-    }
-    sweep_events: list = []
 
-    new_state, escalated = maybe_reap_dead_dispatched_worker(
-        state=state,
-        entry=entry,
-        issue_number=9106,
-        sessions_dir=tmp_path / "sessions",
-        pr_data=None,
-        dead_dispatched_reap_minutes=60,
+    run = run_reap(
+        entry,
+        issue=9106,
+        reap_minutes=60,
+        max_rearms=3,
+        throttled_until=(now + timedelta(minutes=30)).isoformat().replace("+00:00", "Z"),
         now=now,
-        sweep_events=sweep_events,
-        max_throttle_rearms=3,
     )
 
-    assert escalated is False
-    assert new_state is state
+    assert run.reaped is False
     # No side effects: the throttled_until-in-future branch returns before
     # ever touching the rearm counter or re-arming orphan_drift_at.
+    assert run.commits == ()
+    assert "throttle_reap_rearm_count" not in run.entry
+    assert run.entry["orphan_drift_at"] == orphan_drift_at
     assert "throttle_reap_rearm_count" not in entry
     assert entry["orphan_drift_at"] == orphan_drift_at
-    assert sweep_events == []
 
 
 # ---------------------------------------------------------------------------
@@ -531,7 +527,7 @@ def test_preserve_a2_is_worker_alive_and_is_session_alive_agree(tmp_path: Path) 
     dead_pid = 999_999_937
     for pid in (None, 0, -1, dead_pid):
         expected = worker_fate.is_alive(pid, None)
-        for kind in ("devin", "claude-code", "api"):
+        for kind in ("devin", "claude-code", "api", "opencode"):
             assert view(kind, pid).is_alive() is expected, (kind, pid)
     # None / non-positive pids are dead by definition, independent of the host.
     assert worker_fate.is_alive(None, None) is False
@@ -540,5 +536,5 @@ def test_preserve_a2_is_worker_alive_and_is_session_alive_agree(tmp_path: Path) 
     # An unrecognised adapter kind has no fate profile -> conservatively dead.
     assert view("no-such-adapter", os.getpid()).is_alive() is False
     # A live pid reads alive through every adapter's view.
-    for kind in ("devin", "claude-code", "api"):
+    for kind in ("devin", "claude-code", "api", "opencode"):
         assert view(kind, os.getpid()).is_alive() is True, kind

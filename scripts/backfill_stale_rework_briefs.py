@@ -470,9 +470,14 @@ def check_deployment_gate(
     charlie-work's history, so the gate must run in a charlie-work checkout
     (the daemon deployment), never in the state root's checkout when that
     is a different repo.
+
+    HEAD is resolved lazily, on the first failure that needs it for the
+    message -- a passing gate costs exactly one ``merge-base`` spawn per ref
+    and no ``rev-parse`` at all (issue #2663; per-spawn cost on the CI runner
+    pool is what the test ledger bills to the gate tests' call phase).
     """
-    head = _current_head(renderer_repo)
     failures: list[str] = []
+    head: str | None = None
     for ref in require_commits:
         result = subprocess.run(
             ["git", "merge-base", "--is-ancestor", ref, "HEAD"],
@@ -483,6 +488,8 @@ def check_deployment_gate(
         )
         if result.returncode == 0:
             continue
+        if head is None:
+            head = _current_head(renderer_repo)
         if result.returncode == 1:
             failures.append(
                 f"{ref} is NOT an ancestor of {renderer_repo}'s HEAD ({head}) - "

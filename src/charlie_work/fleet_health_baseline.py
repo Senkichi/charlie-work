@@ -23,6 +23,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from . import layout
+from .atomic_write import write_json_atomic
 from .fleet_paths import warn_fleet_dir_virtualization_on_write
 from .notify import AttentionEntry
 from .state import state_lock, utc_now
@@ -72,11 +73,7 @@ def _save_fleet_health_state(path: Path, issues: dict[str, str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     warn_fleet_dir_virtualization_on_write(path.parent, context="writing notify_health_state.json")
     payload = {"version": 1, "generated_at": utc_now(), "issues": issues}
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    tmp_path.replace(path)
+    write_json_atomic(path, payload)
 
 
 def reconcile_fleet_health_baselines(

@@ -1,0 +1,7 @@
+warning
+# Issue #2739: a lane record whose tracker issue is already closed got no
+# packet rebuild or review_started edge because the branch could not prove
+# unmerged content. Warning: either the record should have been finalized
+# already (diff empty under a live writer) or its diff is uncomputable --
+# both are drift the reconciler owns, and this event is the audit trail of
+# the lane declining to reapply labels.

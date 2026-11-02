@@ -11,18 +11,23 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import psutil
+
+from .atomic_write import write_json_atomic
 from .orphan_sweep import (  # noqa: F401  (deliberate re-export)
     _enumerate_fingerprinted_children,
     _reap_enumerated_children,
     _self_ancestor_pids,
     sweep_orphan_processes,
 )
-from .subprocess_runner import hidden_console_kwargs, no_console_window_kwargs, run_captured
+from .posix_processes import list_processes_ps
+from .subprocess_runner import no_console_window_kwargs, run_captured
+from .worker_launch import CpuPriority, popen_worker  # noqa: F401 (deliberate re-export)
 
 logger = logging.getLogger(__name__)
 
@@ -189,7 +194,8 @@ def _enumerate_child_pids(pid: int) -> list[int]:
         try:
             proc_path = Path("/proc")
             if not proc_path.exists():
-                return children
+                # macOS has no procfs (spec C2): read the ppid column from ps.
+                return [row.pid for row in list_processes_ps()[0] if row.ppid == pid]
 
             for entry in proc_path.iterdir():
                 if not entry.name.isdigit():
@@ -253,6 +259,12 @@ def get_process_start_time(pid: int) -> float | None:
             return None
         finally:
             kernel32.CloseHandle(handle)
+    elif sys.platform == "darwin":
+        # No procfs on macOS (spec C2); psutil reads the kernel's start time.
+        try:
+            return psutil.Process(pid).create_time()
+        except (psutil.Error, OSError):
+            return None
     else:
         # POSIX: read /proc/<pid>/stat
         try:
@@ -268,7 +280,12 @@ def get_process_start_time(pid: int) -> float | None:
                 with open("/proc/uptime", "r") as f:
                     uptime_seconds = float(f.read().split()[0])
             except (OSError, ValueError, IndexError):
-                uptime_seconds = 0
+                # Indeterminate: substituting 0 would return
+                # ``time.time() + ticks/hz``, a value that drifts with the
+                # wall clock and makes later start-time fingerprints
+                # mismatch a live process (issue #2232).  ``None`` fails
+                # open the way the pre-dedup copies did.
+                return None
             boot_time = time.time() - uptime_seconds
             return boot_time + (starttime_ticks / tick_hz)
         except (OSError, ValueError, IndexError):
@@ -415,9 +432,7 @@ def write_worker_terminal_status(
     if worker_outcome_written_at is not None:
         payload["worker_outcome_written_at"] = worker_outcome_written_at
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    tmp_path.replace(path)
+    write_json_atomic(path, payload)
 
 
 def terminal_record_proves_completion(
@@ -528,8 +543,8 @@ def start_terminal_status_watcher(
     no such call to move. Never raises: a failure inside the thread (a
     poll() error, or a write failure) is swallowed, since this is best-effort
     telemetry that must not crash the orchestrator or the worker's own I/O
-    threads (e.g. the tee_stream_json reader thread also draining
-    ``process.stdout`` concurrently in ``claude_code.launch_claude_worker``).
+    (drained by the tee splitter child process spawned by
+    ``claude_code.launch_claude_worker`` — not by a reader thread here).
     """
     pid = process.pid
     started_monotonic = time.monotonic()
@@ -721,41 +736,6 @@ def kill_process_tree(pid: int, expected_start_time: float | None = None) -> lis
             _reap_enumerated_children(pid, child_starts, exempt_pids, expected_start_time)
         )
     return killed_pids
-
-
-def popen_worker(
-    args: Sequence[str] | str,
-    *,
-    cwd: str | os.PathLike[str] | None = None,
-    env: Mapping[str, str] | None = None,
-    **popen_kwargs: Any,
-) -> subprocess.Popen[Any]:
-    """Launch a worker process as the single point for creationflags/process-group composition.
-
-    Injects the worker hidden-console policy into the ``subprocess.Popen`` call:
-    - ``creationflags`` and ``startupinfo`` are composed through
-      ``hidden_console_kwargs()`` so ``CREATE_NEW_CONSOLE`` is combined with
-      ``CREATE_NEW_PROCESS_GROUP`` on Windows and the console is hidden via
-      ``STARTF_USESHOWWINDOW`` / ``SW_HIDE``. On POSIX it is a no-op.
-    - ``start_new_session`` defaults to ``True`` on POSIX and is omitted on
-      Windows; callers may override by passing it explicitly.
-
-    All other ``Popen`` keyword arguments are passed through. The helper returns
-    the ``Popen`` object immediately and never waits or communicates.
-    """
-    if cwd is not None:
-        popen_kwargs["cwd"] = cwd
-    if env is not None:
-        popen_kwargs["env"] = env
-
-    if "start_new_session" not in popen_kwargs and os.name != "nt":
-        popen_kwargs["start_new_session"] = True
-
-    extra_flags = popen_kwargs.pop("creationflags", 0)
-    process_group_flag = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    popen_kwargs.update(hidden_console_kwargs(extra_flags | process_group_flag))
-
-    return subprocess.Popen(args, **popen_kwargs)
 
 
 def kill_orphan_pid(pid: int) -> None:

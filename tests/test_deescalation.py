@@ -51,6 +51,7 @@ import pkgutil
 from pathlib import Path
 
 import pytest
+from _src_ast import parsed
 
 from charlie_work.instrumentation import event_counts_by_kind, log_event
 from charlie_work.janitor import JanitorVerdict
@@ -932,7 +933,7 @@ def _deescalate_issue_func() -> ast.FunctionDef:
     member = OrchestratorApp._deescalate_mechanical_issue
     module = inspect.getmodule(member)
     assert module is not None and getattr(module, "__file__", None) is not None
-    tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+    tree = parsed(Path(module.__file__))
     for node in ast.walk(tree):
         if (
             isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))

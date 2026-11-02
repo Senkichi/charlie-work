@@ -22,22 +22,24 @@ import json
 import logging
 import os
 import subprocess
-import sys
-import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from charlie_work import process_utils as _process_utils
+from charlie_work.ledger_context import ledger_env
 from charlie_work.process_utils import (
-    parse_proc_stat_starttime,
+    CpuPriority,
     popen_worker,
     start_terminal_status_watcher,
     terminal_record_proves_completion,
     worker_terminal_status_path,
 )
+from . import launch_events
+from .atomic_write import write_json_atomic
 from .config import (
     CLAUDE_CODE_PROMPT_FILENAME,
     ClaudeCodeConfig,
@@ -45,10 +47,18 @@ from .config import (
     ReviewerRoleConfig,
     _DEFAULT_CLAUDE_MODEL,
 )
-from .env_sanitize import resolve_pytest_cap, resolve_uv_no_sync, sanitize_env
+from .env_sanitize import build_worker_env, resolve_pytest_cap, resolve_uv_no_sync, sanitize_env
+from .failure_classifier import log_is_stream_json, signature_match_text
 from .post_mortem import merge_attempt_snapshot
 from .state import _canonical_started_at, utc_now
 from .subprocess_runner import RunResult, resolve_cli_binary, run_captured
+from .tee_launch import TeeLaunchError, launch_tee
+
+# Facade re-export (issue #2836 review): the tool-scope pin lives in its own
+# domain module (``tool_scope``) so new code never lands in this over-cap
+# monolith; every existing consumer (tests, doctor, sibling adapters) imports
+# it from here.
+from .tool_scope import _apply_tool_scope  # noqa: F401
 from .throttle_signatures import (
     PERMISSION_DENIED_FAILURE_KIND,
     is_headless_permission_denial,
@@ -56,6 +66,8 @@ from .throttle_signatures import (
     match_quota_tail,
     match_throttle_tail,
 )
+from .attempt_resume import apply_resume_notice
+from .iso_timestamp import parse_iso_timestamp
 from .worktree import (
     LiveWorkerRedispatchError,
     ReworkBranchConflictError,
@@ -75,6 +87,7 @@ PROMPT_FILENAME = CLAUDE_CODE_PROMPT_FILENAME
 
 logger = logging.getLogger(__name__)
 
+
 # Provider authentication failures (issue #484): matched against the log tail
 # of api-kind sessions only — a dead/invalid API key against a custom
 # Anthropic-compatible endpoint surfaces as 401/403 or an explicit
@@ -92,7 +105,18 @@ logger = logging.getLogger(__name__)
 
 def worker_permission_denied(sessions_dir: Path, issue_number: int, detail: str = "") -> bool:
     """Whether a dead claude-code worker's outcome ``detail`` or log tail shows
-    the headless permission-denial signature (issue #2010). Never raises."""
+    the headless permission-denial signature (issue #2010). Never raises.
+
+    The log-tail check runs through
+    ``failure_classifier.signature_match_text`` (issue #2814 rework), in
+    permission mode (round 4): in a tee'd stream-json log a ``tool_result``
+    merely *quoting* "requires approval" / "command was denied" is the worker
+    observing a denial, not the CLI surfacing one — matching it raw would
+    both suppress a real deny and manufacture a fake one. But a REAL headless
+    denial reports ``is_error: false`` in the terminal ``result`` event (and
+    the assistant's final turn), so unlike the throttle/quota matchers this
+    one admits those lines. The tail's shape comes off the whole log head and
+    the cut flag drops the slice's partial first line."""
     if is_headless_permission_denial(detail):
         return True
     try:
@@ -104,7 +128,15 @@ def worker_permission_denied(sessions_dir: Path, issue_number: int, detail: str 
         )
     except (OSError, ValueError, AttributeError):
         return False
-    return is_headless_permission_denial(log_text[-2048:])
+    tail = log_text[-2048:] if len(log_text) > 2048 else log_text
+    return is_headless_permission_denial(
+        signature_match_text(
+            tail,
+            cut=len(log_text) > len(tail),
+            stream_json=log_is_stream_json(log_text),
+            permission=True,
+        )
+    )
 
 
 # N3 (wf-review-opus.md, wf-8-review-fixes): the matching pattern itself now
@@ -118,7 +150,6 @@ def worker_permission_denied(sessions_dir: Path, issue_number: int, detail: str 
 # ``classify_failure`` merge (design doc §7); the classifier itself is now
 # ``worker_fate.classify_for``, which the sidecar writer below calls.
 
-_WIN_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
 # Default command templates. A headless (``-p``) worker cannot answer a
 # permission prompt, so any mode that prompts for Bash (acceptEdits/default/
@@ -221,7 +252,14 @@ class ClaudeWorkerRecord:
 _ADAPTER_SIDECAR_SUFFIXES: dict[str, str] = {
     "claude-code": "claude",
     "api": "api",
+    "opencode": "opencode",
 }
+
+# Adapter kinds whose sessions are ``ClaudeWorkerRecord`` sidecars written by
+# ``launch_claude_worker``. Callers branch on membership here -- never on a
+# hand-written ``("claude-code", "api")`` tuple -- so a new kind sharing this
+# record shape is picked up everywhere by adding one suffix above.
+CLAUDE_RECORD_KINDS: frozenset[str] = frozenset(_ADAPTER_SIDECAR_SUFFIXES)
 
 
 def _sidecar_suffix(adapter_kind: str) -> str:
@@ -540,13 +578,53 @@ def parse_claude_events(events_path: Path) -> ClaudeProgress | None:
     )
 
 
+def last_tool_call_timestamp(events_path: Path) -> datetime | None:
+    """Timestamp of the most recent tool call in a Claude Code events file.
+
+    One parser for the ``--output-format stream-json`` schema, beside
+    ``parse_claude_events`` (the two agree on what a tool call is: real
+    stream-json emits no ``tool_call`` event type — a tool call is an
+    ``assistant`` event carrying at least one ``tool_use`` content block,
+    timed by that event's top-level ISO ``timestamp``, which only
+    ``assistant`` and ``user`` events carry). The legacy simplified shape
+    ``{"type": "tool_call", "timestamp": ...}`` is still accepted so
+    adapters that emit it keep working.
+
+    Reads through ``iter_claude_events`` (the shared tolerant line-by-line
+    primitive): non-JSON and partial trailing lines — a session that is
+    still writing the file — are skipped, never raised. The last valid
+    tool-call timestamp in file order wins (the file is append-only).
+
+    Returns None for a missing file (absence is a valid, non-error state
+    matching ``parse_claude_events``), an unreadable one, or one with no
+    tool call.
+
+    Args:
+        events_path: Path to the events.jsonl file
+    """
+    last: datetime | None = None
+    for event in iter_claude_events(events_path):
+        if event.get("type") == "tool_call":
+            parsed = parse_iso_timestamp(event.get("timestamp"))
+            if parsed is not None:
+                last = parsed
+            continue
+        if event.get("type") != "assistant":
+            continue
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list) or not any(
+            isinstance(block, dict) and block.get("type") == "tool_use" for block in content
+        ):
+            continue
+        parsed = parse_iso_timestamp(event.get("timestamp"))
+        if parsed is not None:
+            last = parsed
+    return last
+
+
 def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(value, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    tmp_path.replace(path)
+    write_json_atomic(path, value)
 
 
 def _write_record(sessions_dir: Path, record: ClaudeWorkerRecord) -> ClaudeWorkerRecord:
@@ -573,8 +651,19 @@ def _error_record(
     session_id: str | None = None,
     adapter_kind: str = "claude-code",
     provider: str = "",
+    state_path: Path | None = None,
+    role: str = "worker",
+    model: str = "",
+    error_class: str = launch_events.LAUNCH_ERR_INTERNAL,
 ) -> ClaudeWorkerRecord:
-    return ClaudeWorkerRecord(
+    """The single ClaudeWorkerRecord-with-error constructor — issue #2246's
+    launch seam. Every error record produced anywhere emits exactly one
+    ``launch_failed`` event here, so no launch path can return an error value
+    without one (or emit two). ``role`` splits the numbered ref: a reviewer's
+    ``issue_number`` field is really the PR number, so reviewer events carry
+    it as ``pr_number`` and leave ``issue_number`` unset (the linked issue is
+    not known at this layer)."""
+    record = ClaudeWorkerRecord(
         issue_number=issue_number,
         branch=branch,
         worktree_path=worktree_path,
@@ -591,6 +680,18 @@ def _error_record(
         adapter_kind=adapter_kind,
         provider=provider,
     )
+    launch_events.emit_launch_failed(
+        state_path,
+        role=role,
+        harness=adapter_kind,
+        model=model,
+        issue_number=None if role == "reviewer" else issue_number,
+        pr_number=issue_number if role == "reviewer" else None,
+        error_class=error_class,
+        error=error,
+        failure_kind=failure_kind,
+    )
+    return record
 
 
 def _sanitize_review_command_template(
@@ -742,7 +843,7 @@ def resolve_review_effort(
     same deletion that removed the bridge itself. There is no fallback to a
     ``review_dispatch`` value here for the same reason ``devin.adapter`` was
     deleted rather than silently ignored: an old key that's still read halfway
-    is worse than one that errors loudly at load (config.py's ``_build_section``
+    is worse than one that errors loudly at load (config.py's ``validate_section``
     already rejects any surviving ``review_dispatch.review_effort*`` key as
     unknown before this function ever runs).
     """
@@ -807,6 +908,16 @@ def run_quota_probe(*, repo_root: Path, config: OrchestratorConfig) -> bool:
     probe = config.quota_probe
     command = _apply_model_pin(_REVIEW_COMMAND_TEMPLATE, probe.model)
     command = _apply_max_turns_pin(command, 1)
+    # Issue #2836: the probe gets the reviewer's tool scope so it does not pay
+    # the full default tool-schema block on a call that only exists to look
+    # at a throttle signature.
+    command = _apply_tool_scope(
+        command, config.claude_code.reviewer_tools, config.claude_code.isolate_mcp
+    )
+    # Load no settings files: quota is account-level, so the probe needs none, and
+    # running in ``repo_root`` would otherwise fire the operator's SessionStart
+    # hooks (a git fetch + fast-forward) inside the probe's timeout.
+    command = (*command, "--setting-sources", "")
     command = (resolve_cli_binary(command[0]), *command[1:])
     result = run_captured(
         list(command),
@@ -835,12 +946,21 @@ def _render_command(
 ) -> tuple[str, ...]:
     # Same placeholder set as devin_shell so the two adapters' command
     # templates are drop-in compatible: {prompt_path} {issue_number} {branch}.
+    # One literal allowance (issue #2836): the inline ``--mcp-config
+    # {"mcpServers":{}}`` token _apply_tool_scope appends carries literal
+    # braces and must pass through byte-identical, not through str.format
+    # (which would raise KeyError on `"mcpServers"` treated as field name).
+    # Everything else keeps the old format-everything behavior, including an
+    # unknown placeholder raising into the render-error record path.
     values = {
         "prompt_path": str(prompt_path),
         "issue_number": str(issue_number),
         "branch": branch,
     }
-    return tuple(part.format(**values) for part in command_template)
+    return tuple(
+        part if part.startswith('{"mcpServers"') else part.format(**values)
+        for part in command_template
+    )
 
 
 def launch_claude_worker(
@@ -867,6 +987,7 @@ def launch_claude_worker(
     resolved_review_effort: str | None = None,
     model_override: str | None = None,
     max_turns_override: int | None = None,
+    cli_pins: Callable[[tuple[str, ...]], tuple[str, ...]] | None = None,
 ) -> ClaudeWorkerRecord:
     """Create an isolated worktree/checkout and launch a headless Claude Code
     worker (or reviewer) in it.
@@ -937,6 +1058,10 @@ def launch_claude_worker(
     whatever ambient CLI/global state happens to be active for this
     headless process, exactly the failure this pin exists to prevent.
 
+    ``cli_pins`` replaces the Claude ``--model``/``--effort`` pins with the
+    caller's own (``opencode_worker`` pins ``--model provider/model``); the
+    caller then owns the never-empty-model guarantee for its CLI.
+
     ``max_turns_override``, when provided on a ``review=True`` launch, is
     pinned as the ``--max-turns`` value instead of
     ``resolved_config.review_dispatch.review_max_turns``. Issue #1439: the
@@ -989,7 +1114,18 @@ def launch_claude_worker(
     pinned_model = (
         model_override if model_override is not None else resolved_config.worker.model
     ) or _DEFAULT_CLAUDE_MODEL
-    command_template = _apply_model_pin(command_template, pinned_model)
+    # Issue #2246: shared context for the launch_failed event every error
+    # record below emits via _error_record -- state-dir resolution is a pure
+    # path computation (no event is written on the success path).
+    launch_state_path = launch_events.state_path_for(repo_root, resolved_config)
+    launch_role = "reviewer" if review else "worker"
+    # A non-Claude CLI sharing this launch path (opencode_worker) supplies its
+    # own flag pins; the Claude --model/--effort pins below would be invalid
+    # argv for it. ``cli_pins`` is worker-only (never combined with review).
+    if cli_pins is not None:
+        command_template = cli_pins(command_template)
+    else:
+        command_template = _apply_model_pin(command_template, pinned_model)
     # Reviewer sessions may pin their own effort independently of worker
     # effort (empty string means fall back to claude_code.effort), optionally
     # split into a per-PR randomized treatment/control experiment — see
@@ -1008,7 +1144,18 @@ def launch_claude_worker(
         )
     else:
         effort = resolved_config.claude_code.effort
-    command_template = _apply_effort_pin(command_template, effort)
+    if cli_pins is None:
+        command_template = _apply_effort_pin(command_template, effort)
+        # Issue #2836: narrow the tool surface and (by default) drop MCP
+        # servers for every Claude launch. Skipped on the cli_pins path — that
+        # is the non-Claude CLI (opencode), where these flags are invalid and
+        # the caller owns the argv.
+        _claude_code_cfg = resolved_config.claude_code
+        command_template = _apply_tool_scope(
+            command_template,
+            _claude_code_cfg.reviewer_tools if review else _claude_code_cfg.worker_tools,
+            _claude_code_cfg.isolate_mcp,
+        )
     if review:
         # Cap agentic turns for reviewer sessions to prevent unbounded
         # codebase exploration and runaway token spend. 0 = unlimited.
@@ -1099,6 +1246,10 @@ def launch_claude_worker(
             session_id=session_id,
             adapter_kind=adapter_kind,
             provider=provider,
+            state_path=launch_state_path,
+            role=launch_role,
+            model=pinned_model,
+            error_class=launch_events.LAUNCH_ERR_WORKTREE,
         )
         return _write_record(sessions_dir, record)
 
@@ -1116,6 +1267,11 @@ def launch_claude_worker(
     # closed (see worktree.ReworkMergeConflict).
     if worktree.rework_conflict is not None:
         prompt_text = apply_rework_conflict_notice(prompt_text, worktree.rework_conflict)
+
+    # Issue #2289: the worktree was seeded from a throttle-killed attempt's
+    # preserved work -- tell the worker to continue it, not restart.
+    if worktree.resumed_attempt is not None:
+        prompt_text = apply_resume_notice(prompt_text, worktree.resumed_attempt)
 
     def _teardown_on_launch_failure() -> None:
         # Review checkouts live in their own PR-keyed dir, never worktrees_dir,
@@ -1151,6 +1307,10 @@ def launch_claude_worker(
             error=f"failed to write prompt file: {exc}",
             adapter_kind=adapter_kind,
             provider=provider,
+            state_path=launch_state_path,
+            role=launch_role,
+            model=pinned_model,
+            error_class=launch_events.LAUNCH_ERR_PROMPT,
         )
         return _write_record(sessions_dir, record)
 
@@ -1170,6 +1330,10 @@ def launch_claude_worker(
             error=f"command template rendering failed: {exc}",
             adapter_kind=adapter_kind,
             provider=provider,
+            state_path=launch_state_path,
+            role=launch_role,
+            model=pinned_model,
+            error_class=launch_events.LAUNCH_ERR_RENDER,
         )
         return _write_record(sessions_dir, record)
 
@@ -1216,7 +1380,7 @@ def launch_claude_worker(
     # on a shared temp path (issue #1767). To give workers a scoped GitHub
     # token, set claude_code.worker_env={"GH_TOKEN": "<scoped-PAT>"}.
     try:
-        sanitized_env = sanitize_env(worktree.path)
+        sanitized_env = sanitize_env(worktree.path, config=config)
     except OSError as exc:
         _teardown_on_launch_failure()
         record = _error_record(
@@ -1229,12 +1393,18 @@ def launch_claude_worker(
             error=f"failed to prepare worker environment: {exc}",
             adapter_kind=adapter_kind,
             provider=provider,
+            state_path=launch_state_path,
+            role=launch_role,
+            model=pinned_model,
+            error_class=launch_events.LAUNCH_ERR_ENV,
         )
         return _write_record(sessions_dir, record)
-    worker_env = {
-        **sanitized_env,
-        **{str(k): str(v) for k, v in (env or {}).items()},
-    }
+    # Issue #2096: harness defaults (background tasks off) sit between the
+    # sanitized base and the operator `worker_env`.
+    # Test-ledger context: tags this worker's pytest runs; an operator worker_env key wins.
+    worker_env = build_worker_env(
+        sanitized_env, {**ledger_env("worker", issue_number), **(env or {})}
+    )
     # Issue #646: resolve what sanitize_env()+worker_env actually settled on,
     # purely for the launch-time diagnostic log below (does not affect
     # worker_env itself, which already carries the real values).
@@ -1242,77 +1412,45 @@ def launch_claude_worker(
     uv_no_sync, uv_no_sync_source = resolve_uv_no_sync(worktree.path, sanitized_env, env)
 
     try:
-        # If tee_stream_json is enabled, we need to tee stdout to both log and events file
-        # Use subprocess.PIPE and a thread to write to both files
+        # If tee_stream_json is enabled, the tee is a separate splitter child
+        # process (``tee_splitter.py``) that owns the pipe's read end: the
+        # worker CLI's stdout is wired to the splitter's stdin, so the pipe
+        # survives the launching supervisor process exiting (self-deploy
+        # restart, fleet pause). Destination pre-create, splitter spawn, and
+        # the stdin handoff live in ``tee_launch.launch_tee`` (issue #2814
+        # rework round 4 extraction); a TeeLaunchError here is the same
+        # pre-spawn launch error record every other launch step produces,
+        # while the WORKER spawn's OSError is re-raised into the shared
+        # handler below.
         if tee_stream_json and events_path:
-            # Open handles without 'with' blocks - the thread will manage their lifecycle
-            # This is necessary because the thread runs as a daemon and must keep handles
-            # open for the entire worker lifetime, not just during launch
-            log_handle = log_path.open("w", encoding="utf-8", errors="replace")
-            events_handle = events_path.open("w", encoding="utf-8", errors="replace")
-
-            try:
-                if feed_stdin:
-                    prompt_handle = prompt_path.open("r", encoding="utf-8")
-                    try:
-                        process = popen_worker(
-                            command,
-                            cwd=str(worktree.path),
-                            stdin=prompt_handle,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT,
-                            env=worker_env,
-                            start_new_session=(os.name != "nt"),
-                            text=True,
-                        )
-                    finally:
-                        prompt_handle.close()
-                else:
-                    process = popen_worker(
-                        command,
-                        cwd=str(worktree.path),
-                        stdin=subprocess.DEVNULL,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        env=worker_env,
-                        start_new_session=(os.name != "nt"),
-                        text=True,
-                    )
-            except OSError:
-                # Popen failed before the tee thread could start — nobody else
-                # will ever close these, so close them here. The outer
-                # `except OSError` below still handles worktree cleanup and
-                # the error record.
-                log_handle.close()
-                events_handle.close()
-                raise
-
-            # Start a thread to tee output to both files
-            def _tee_output():
-                try:
-                    for line in process.stdout:
-                        log_handle.write(line)
-                        log_handle.flush()
-                        events_handle.write(line)
-                        events_handle.flush()
-                except Exception:
-                    # Thread dies if process terminates or pipe breaks
-                    pass
-                finally:
-                    # Close handles when thread exits
-                    try:
-                        log_handle.close()
-                    except Exception:
-                        pass
-                    try:
-                        events_handle.close()
-                    except Exception:
-                        pass
-
-            import threading
-
-            tee_thread = threading.Thread(target=_tee_output, daemon=True)
-            tee_thread.start()
+            tee_result = launch_tee(
+                command=command,
+                cwd=str(worktree.path),
+                prompt_path=prompt_path,
+                feed_stdin=feed_stdin,
+                log_path=log_path,
+                events_path=events_path,
+                worker_env=worker_env,
+            )
+            if isinstance(tee_result, TeeLaunchError):
+                _teardown_on_launch_failure()
+                record = _error_record(
+                    issue_number=issue_number,
+                    branch=branch,
+                    worktree_path=str(worktree.path),
+                    prompt_path=str(prompt_path),
+                    command=command,
+                    log_path=str(log_path),
+                    error=tee_result.error,
+                    adapter_kind=adapter_kind,
+                    provider=provider,
+                    state_path=launch_state_path,
+                    role=launch_role,
+                    model=pinned_model,
+                    error_class=launch_events.LAUNCH_ERR_SPAWN,
+                )
+                return _write_record(sessions_dir, record)
+            process = tee_result.process
         else:
             # Original behavior: direct stdout to log file
             with log_path.open("w", encoding="utf-8", errors="replace") as log_handle:
@@ -1320,6 +1458,7 @@ def launch_claude_worker(
                     with prompt_path.open("r", encoding="utf-8") as prompt_handle:
                         process = popen_worker(
                             command,
+                            priority=CpuPriority.BELOW_NORMAL,
                             cwd=str(worktree.path),
                             stdin=prompt_handle,
                             stdout=log_handle,
@@ -1330,6 +1469,7 @@ def launch_claude_worker(
                 else:
                     process = popen_worker(
                         command,
+                        priority=CpuPriority.BELOW_NORMAL,
                         cwd=str(worktree.path),
                         stdin=subprocess.DEVNULL,
                         stdout=log_handle,
@@ -1349,6 +1489,10 @@ def launch_claude_worker(
             error=f"failed to launch claude: {exc}",
             adapter_kind=adapter_kind,
             provider=provider,
+            state_path=launch_state_path,
+            role=launch_role,
+            model=pinned_model,
+            error_class=launch_events.LAUNCH_ERR_SPAWN,
         )
         return _write_record(sessions_dir, record)
 
@@ -1485,67 +1629,8 @@ def probe_claude(
 
 
 def _get_process_start_time(pid: int) -> float | None:
-    """Get the process creation time as a Unix timestamp in seconds.
-
-    Returns None if the process does not exist or the start time cannot be retrieved.
-    This is used to verify that a PID has not been recycled by the OS.
-
-    On Windows: Uses GetProcessTimes via ctypes to retrieve process creation time.
-    On POSIX: Reads /proc/<pid>/stat field 22 (starttime in clock ticks).
-    """
-    if sys.platform == "win32":
-        import ctypes
-        from ctypes import wintypes
-
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        handle = kernel32.OpenProcess(_WIN_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            return None
-        try:
-            creation_time = wintypes.FILETIME()
-            exit_time = wintypes.FILETIME()
-            kernel_time = wintypes.FILETIME()
-            user_time = wintypes.FILETIME()
-            if not kernel32.GetProcessTimes(
-                handle,
-                ctypes.byref(creation_time),
-                ctypes.byref(exit_time),
-                ctypes.byref(kernel_time),
-                ctypes.byref(user_time),
-            ):
-                return None
-            # Convert FILETIME to Unix timestamp
-            # FILETIME is 100-nanosecond intervals since 1601-01-01
-            # Unix timestamp is seconds since 1970-01-01
-            # Difference between 1601-01-01 and 1970-01-01 is 11644473600 seconds
-            filetime = (creation_time.dwHighDateTime << 32) | creation_time.dwLowDateTime
-            unix_time = filetime / 10_000_000 - 11644473600
-            return unix_time
-        finally:
-            kernel32.CloseHandle(handle)
-    else:
-        # POSIX: read /proc/<pid>/stat
-        try:
-            with open(f"/proc/{pid}/stat", "r") as f:
-                stat = f.read()
-            starttime_ticks = parse_proc_stat_starttime(stat)
-            if starttime_ticks is None:
-                return None
-            # Convert to seconds: need system clock tick frequency
-            tick_hz = os.sysconf("SC_CLK_TCK")
-            if tick_hz <= 0:
-                tick_hz = 100  # Default fallback
-            # Get system uptime to convert to absolute time
-            try:
-                with open("/proc/uptime", "r") as f:
-                    uptime_seconds = float(f.read().split()[0])
-            except (OSError, ValueError, IndexError):
-                return None
-            # Process start time = current time - uptime + process starttime
-            boot_time = time.time() - uptime_seconds
-            return boot_time + (starttime_ticks / tick_hz)
-        except (OSError, ValueError, IndexError):
-            return None
+    """Process creation time as a Unix timestamp (delegates to ``process_utils``)."""
+    return _process_utils.get_process_start_time(pid)
 
 
 def update_worker_record_with_failure_classification(
@@ -1662,6 +1747,12 @@ def update_worker_record_with_failure_classification(
 
     payload["failure_kind"] = resolved_kind
     _write_json_atomic(sidecar_path, payload)
+    # Issue #2086: restrict the session's own (harness, model) fleet-wide.
+    from . import role_quota_ledger
+
+    role_quota_ledger.record_classified_death(
+        payload, resolved_kind, throttled_until, source="worker_failure_classification"
+    )
     return resolved_kind, throttled_until
 
 
@@ -1680,5 +1771,6 @@ __all__ = [
     "ClaudeProgress",
     "parse_claude_events",
     "iter_claude_events",
+    "last_tool_call_timestamp",
     "_events_path",
 ]

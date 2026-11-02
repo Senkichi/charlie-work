@@ -309,6 +309,10 @@ def test_apply_fixes_mergequeue_wedged_strips_mergequeue_and_escalates_issue() -
     # re-detect does not re-fire condition 1 for the same window.
     assert "mergequeue_since" not in new_state["prs"]["1751"]
     assert "mergequeue_head_sha" not in new_state["prs"]["1751"]
+    # The pull is recorded as reconcile's own revocation, so merge_ready reads
+    # the missing label as self-revoked, not a failed hand-off (no false
+    # "label failed to apply" alarm while the issue sits escalated).
+    assert new_state["prs"]["1751"]["mergequeue_revoked_reason"] == "mergequeue_wedged"
 
 
 def test_apply_fixes_mergequeue_wedged_records_label_write_failure() -> None:
@@ -316,6 +320,7 @@ def test_apply_fixes_mergequeue_wedged_records_label_write_failure() -> None:
     gh = FakeGitHub(prs=[], issues=[])
     gh._fail_remove_pr_labels = {(1751, "mergequeue")}
     state = empty_state()
+    state["prs"]["1751"] = {"status": "mergequeue", "mergequeue_head_sha": "sha-frozen"}
     drift = [
         DriftItem(
             kind="mergequeue_wedged",
@@ -334,6 +339,8 @@ def test_apply_fixes_mergequeue_wedged_records_label_write_failure() -> None:
     assert any(
         "label_write_failed: true" in e.get("payload", {}).get("fix_actions", []) for e in events
     )
+    # The label is still on the PR, so nothing was revoked.
+    assert "mergequeue_revoked_reason" not in new_state["prs"]["1751"]
 
 
 # ---------------------------------------------------------------------------

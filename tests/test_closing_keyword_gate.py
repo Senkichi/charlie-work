@@ -24,6 +24,8 @@ import argparse
 
 import pytest
 
+from _fake_transport import FakeAdapter, graphql_ok, make_github, ok
+
 from charlie_work import cli as cli_module
 from charlie_work.closing_keyword_gate import (
     UnexpectedClosingReference,
@@ -33,9 +35,9 @@ from charlie_work.closing_keyword_gate import (
 from charlie_work.config import OrchestratorConfig
 from charlie_work.github import (
     CLOSING_KEYWORD_PR_FIELDS,
-    GitHub,
-    GitHubRunResult,
 )
+from charlie_work.github_transport import GraphQLRequest, Request, Response
+from charlie_work.github_transport.gh_json_fields import document_for
 from charlie_work.issue_linking import iter_unnegated_closing_keyword_matches, linked_issue_number
 
 # --- find_unexpected_closing_references: core scanning behavior ---
@@ -283,30 +285,31 @@ def test_commit_without_sha_or_parents_is_kept() -> None:
 # --- GitHub.pr_commits: REST wrapper (not gh pr view --json commits) ---
 
 
-def test_pr_commits_extracts_raw_message_from_rest_shape(monkeypatch, tmp_path) -> None:
-    def fake_run(self, args, *, json_output=False, allow_failure=False):
-        assert args[0] == "api"
-        assert "pulls/999992/commits" in args[1]
-        return [
-            {"sha": "abc123", "commit": {"message": "fix: thing\n\nFixes #999999"}},
-            {"sha": "def456", "commit": {"message": "wip"}},
-        ]
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-    gh = GitHub(tmp_path)
+def test_pr_commits_extracts_raw_message_from_rest_shape(tmp_path) -> None:
+    http = FakeAdapter(
+        "http",
+        [
+            ok(
+                [
+                    {"sha": "abc123", "commit": {"message": "fix: thing\n\nFixes #999999"}},
+                    {"sha": "def456", "commit": {"message": "wip"}},
+                ]
+            )
+        ],
+    )
+    gh, http, _ = make_github(tmp_path, http=http)
 
     commits = gh.pr_commits(999992)
 
+    assert [r.route for r in http.api_requests] == ["repos/octo/hello/pulls/999992/commits"]  # type: ignore[union-attr]
     assert commits is not None
     assert [c["commit"]["message"] for c in commits] == ["fix: thing\n\nFixes #999999", "wip"]
 
 
-def test_pr_commits_returns_none_on_failure(monkeypatch, tmp_path) -> None:
-    def fake_run(self, args, *, json_output=False, allow_failure=False):
-        return GitHubRunResult(ok=False, returncode=1, stdout="", stderr="boom", error="boom")
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-    gh = GitHub(tmp_path)
+def test_pr_commits_returns_none_on_failure(tmp_path) -> None:
+    gh, _, _ = make_github(
+        tmp_path, http=FakeAdapter("http", [ok({"message": "Not Found"}, status=404)])
+    )
 
     assert gh.pr_commits(999992) is None
 
@@ -518,54 +521,61 @@ def test_closing_keyword_pr_fields_excludes_statuscheckrollup() -> None:
 def test_cli_closing_keyword_check_queries_narrow_pr_view_fields_end_to_end(
     monkeypatch, tmp_path
 ) -> None:
-    def fake_run(self, args, *, json_output=False, allow_failure=False):
-        if args[:2] == ["pr", "view"]:
-            fields = set(args[args.index("--json") + 1].split(","))
-            # This is the load-bearing assertion: a fake that unconditionally
-            # returns every field (like _FakeGitHubForCLI above) can't catch
-            # a regression to the wide PR_VIEW_FIELDS query -- this one
-            # inspects the actual `gh pr view --json <fields>` argv the CLI
-            # builds, the same argv `gh` itself would reject the
-            # statusCheckRollup portion of under a restricted Actions token.
-            assert fields == {
-                "title",
-                "body",
-                "headRefName",
-                "baseRefName",
-                "headRefOid",
-                "isCrossRepository",
-            }, (
-                "closing-keyword-check must query CLOSING_KEYWORD_PR_FIELDS only -- "
-                f"got {sorted(fields)}, which would re-trigger the statusCheckRollup "
-                "GraphQL failure from run 30609781476"
-            )
-            return {
-                "title": "",
-                "body": "Fixes #999999",
-                "headRefName": "agent/issue-999999-do-thing",
-                "baseRefName": "main",
-                "headRefOid": "headsha999992",
-                "isCrossRepository": False,
-            }
-        if args[:1] == ["api"] and "pulls/999992/commits" in args[1]:
-            return [
-                _commit(
-                    "c1",
-                    "fix: unrelated cleanup\n\nFixes #999997 as well",
-                    ["recordedbase"],
-                )
-            ]
-        if args[:1] == ["api"] and "/compare/" in args[1]:
-            return {"merge_base_commit": {"sha": "recordedbase"}}
-        raise AssertionError(f"unexpected gh invocation in this test: {args}")
+    documents: list[str] = []
 
-    monkeypatch.setattr(GitHub, "run", fake_run)
+    def handler(request: Request) -> Response:
+        if isinstance(request, GraphQLRequest):
+            documents.append(request.document)
+            # This is the load-bearing assertion: a fake that unconditionally
+            # returns every field (like _FakeGitHubForCLI above) can't catch a
+            # regression to the wide PR_VIEW_FIELDS query -- this one inspects
+            # the actual GraphQL selection the CLI builds, the same selection
+            # GitHub itself would reject the statusCheckRollup portion of under
+            # a restricted Actions token.
+            assert "statusCheckRollup" not in request.document, (
+                "closing-keyword-check must query CLOSING_KEYWORD_PR_FIELDS only -- "
+                "a statusCheckRollup selection would re-trigger the GraphQL failure "
+                "from run 30609781476"
+            )
+            assert request.document == document_for("pr", CLOSING_KEYWORD_PR_FIELDS, "view"), (
+                "pr_view must select exactly the narrow field set"
+            )
+            return graphql_ok(
+                {
+                    "repository": {
+                        "pullRequest": {
+                            "title": "",
+                            "body": "Fixes #999999",
+                            "headRefName": "agent/issue-999999-do-thing",
+                            "baseRefName": "main",
+                            "headRefOid": "headsha999992",
+                            "isCrossRepository": False,
+                        }
+                    }
+                }
+            )
+        route = getattr(request, "route", "")
+        if "pulls/999992/commits" in route:
+            return ok(
+                [
+                    _commit(
+                        "c1",
+                        "fix: unrelated cleanup\n\nFixes #999997 as well",
+                        ["recordedbase"],
+                    )
+                ]
+            )
+        if "/compare/" in route:
+            return ok({"merge_base_commit": {"sha": "recordedbase"}})
+        raise AssertionError(f"unexpected GitHub request in this test: {request}")
+
+    real_gh, _, _ = make_github(tmp_path, http=FakeAdapter("http", handler=handler))
     monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit, **kw: tmp_path)
     monkeypatch.setattr(cli_module, "load_layered_config", lambda *a, **k: OrchestratorConfig())
-    # Deliberately NOT monkeypatching cli_module.GitHub here -- the real
-    # GitHub class must be constructed so its real pr_view()/pr_commits()
-    # methods build the argv under test, with only the subprocess-level
-    # run() mocked out.
+    # The real GitHub class is what the CLI uses -- its real pr_view()/pr_commits()
+    # methods build the requests under test -- but constructed over a scripted
+    # transport (no gh, no network) instead of its production adapters.
+    monkeypatch.setattr(cli_module, "GitHub", lambda *a, **k: real_gh)
 
     result = cli_module.run_closing_keyword_check_command(_cli_args(999992))
 

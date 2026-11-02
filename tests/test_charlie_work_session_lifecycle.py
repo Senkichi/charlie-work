@@ -18,9 +18,11 @@ from typing import Any
 import pytest
 from _fakes_github import FakeGitHub
 from _rework_dispatch_fixtures import _wg
+from _run_captured_fakes import patch_run_captured
 from charlie_work.config import (
     DevinConfig,
     OrchestratorConfig,
+    PostMortemConfig,
     WatchdogConfig,
     WorkerRoleConfig,
 )
@@ -117,8 +119,8 @@ def test_worker_death_bounded_runtime_no_signal_returns_zero(tmp_path: Path) -> 
 
 
 def test_count_live_sessions_counts_both_adapters(tmp_path: Path) -> None:
-    """_count_live_sessions should count sessions from both devin-shell and claude-code adapters."""
-    from charlie_work.workflow import _count_live_sessions
+    """count_live_sessions should count sessions from both devin-shell and claude-code adapters."""
+    from charlie_work.live_session_count import WORKER_LANE, count_live_sessions
     from charlie_work.devin_shell import SessionRecord as DevinSessionRecord
     from charlie_work.claude_code import ClaudeWorkerRecord
 
@@ -157,7 +159,7 @@ def test_count_live_sessions_counts_both_adapters(tmp_path: Path) -> None:
     claude_path.write_text(json.dumps(claude_record.to_dict()), encoding="utf-8")
 
     # Count live sessions (both have pid=None, so count should be 0)
-    count = _count_live_sessions(sessions_dir)
+    count = count_live_sessions(sessions_dir, None, WORKER_LANE)
     assert count == 0  # No live sessions since both have pid=None
 
 
@@ -168,7 +170,7 @@ def test_count_live_sessions_corroborates_ghost_worker_via_state_json(
     corresponding session sidecar (a "ghost") must still be counted against
     the concurrency governor.
 
-    Before this fix, ``_count_live_sessions`` only counted sidecar files on
+    Before this fix, the live-session counter only counted sidecar files on
     disk. If a sidecar goes missing for a still-live process -- e.g. the
     dead-session reap lane removed it on ambiguous evidence, or any other
     path stranded state.json's dispatch record -- the live worker became
@@ -183,12 +185,12 @@ def test_count_live_sessions_corroborates_ghost_worker_via_state_json(
     now counted, without needing to spawn or mock a child process.
 
     MUTATION GATE: removing the ``if state_file is not None:`` state.json
-    corroboration block in ``_count_live_sessions``
-    (src/charlie_work/workflow.py) makes this test fail -- the count would
+    corroboration block in ``live_session_count.count_live_sessions``
+    (src/charlie_work/live_session_count.py) makes this test fail -- the count would
     revert to 0 and the ghost worker would look like free capacity again.
     """
     from charlie_work.devin_shell import _get_process_start_time
-    from charlie_work.workflow import _count_live_sessions
+    from charlie_work.live_session_count import WORKER_LANE, count_live_sessions
 
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -209,13 +211,13 @@ def test_count_live_sessions_corroborates_ghost_worker_via_state_json(
     }
     save_state(paths.state_file, state)
 
-    count = _count_live_sessions(sessions_dir, paths.state_file)
+    count = count_live_sessions(sessions_dir, paths.state_file, WORKER_LANE)
     assert count == 1, "a ghost worker_pid that is genuinely alive must count against the cap"
 
     # Without state.json corroboration (the pre-fix behavior), the same ghost
     # is invisible -- pin the contrast so a future regression that silently
     # drops the state_file argument elsewhere is easy to diagnose.
-    assert _count_live_sessions(sessions_dir) == 0
+    assert count_live_sessions(sessions_dir, None, WORKER_LANE) == 0
 
 
 def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> None:
@@ -230,6 +232,12 @@ def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> Non
             harness="devin-shell"
         ),  # Use devin-shell adapter for watchdog support
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+        # Keep the RecordPostMortem commit's sessions.db read off the real
+        # host store (%APPDATA%\devin\cli\sessions.db): the stalled sweep
+        # still runs classify_and_record, but against a path that cannot
+        # exist, so the extraction degrades to its fast "not found" branch
+        # instead of scanning a host-sized DB (issue #2599).
+        post_mortem=PostMortemConfig(db_path=str(tmp_path / "no-such-sessions.db")),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -302,9 +310,16 @@ def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> Non
         patch("charlie_work.worker_fate.is_alive", return_value=True),
         patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
         patch(
-            "charlie_work.dead_worker_reap.sweep_orphan_processes",
+            "charlie_work.dead_worker_sweep.effects_sessions.sweep_orphan_processes",
             return_value=[{"pid": 3492, "name": "python.exe", "command_line": "python worker.py"}],
         ),  # Fixed mock return
+        # The KillOrphans commit would otherwise run the real
+        # kill_orphan_pid against the fake pid: one host-wide ppid snapshot
+        # for the caller-ancestry guard plus a real taskkill spawn -- both
+        # host-load-dependent costs this event-payload test does not need
+        # (issue #2599). The orphan pid still reaches the kill seam, which
+        # the assertion below proves.
+        patch("charlie_work.write_gate.kill_orphan_pid") as orphan_kill,
         patch(
             "charlie_work.devin_shell.update_session_record_with_failure_classification",
             return_value=(None, None),
@@ -319,6 +334,10 @@ def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> Non
 
     # Check that the stalled issue was detected
     assert any(entry["issue"] == 109 for entry in result)
+
+    # The mocked orphan still went through the write_gate kill seam -- the
+    # stub removes the OS call, not the KillOrphans commit that issues it.
+    orphan_kill.assert_called_once_with(3492)
 
     # Load state and check for the event
     state = load_state(paths.state_file)
@@ -445,12 +464,14 @@ def test_sweep_orphan_processes_for_dead_sessions_unit(tmp_path: Path) -> None:
             side_effect=lambda pid, *_: pid not in (1000, 1002),
         ),
         patch(
-            "charlie_work.dead_worker_reap.sweep_orphan_processes", side_effect=mock_sweep_orphan
+            "charlie_work.dead_worker_sweep.effects_sessions.sweep_orphan_processes",
+            side_effect=mock_sweep_orphan,
         ),
-        patch("os.name", "nt"),  # Force Windows path (os.name check lives in dead_worker_reap;
-        # patching the os module directly avoids depending on which module happens to
-        # `import os` into its own namespace)
+        # Force the Windows kill path (process_utils.kill_orphan_pid runs taskkill
+        # under os.name == "nt"), which the taskkill assertions below rely on.
+        patch("os.name", "nt"),
         patch("subprocess.run", side_effect=mock_subprocess_run),
+        patch_run_captured(mock_subprocess_run),
     ):
         from charlie_work.workflow import _sweep_orphan_processes_for_dead_sessions
 

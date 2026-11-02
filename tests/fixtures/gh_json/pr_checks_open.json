@@ -1,0 +1,238 @@
+{
+  "fields": "name,state,bucket,link,workflow,event,startedAt,completedAt,description",
+  "gh_json": [
+    {
+      "bucket": "pass",
+      "completedAt": "2026-10-01T01:58:00Z",
+      "description": "",
+      "event": "",
+      "link": "https://github.com/Senkichi/charlie-work/runs/110183023764",
+      "name": "CodeQL",
+      "startedAt": "2026-10-01T01:57:58Z",
+      "state": "SUCCESS",
+      "workflow": ""
+    },
+    {
+      "bucket": "pending",
+      "completedAt": "0001-01-01T00:00:00Z",
+      "description": "",
+      "event": "pull_request",
+      "link": "https://github.com/Senkichi/charlie-work/actions/runs/36803548922/job/110182915548",
+      "name": "Tests",
+      "startedAt": "2026-10-01T01:57:32Z",
+      "state": "IN_PROGRESS",
+      "workflow": "CI"
+    },
+    {
+      "bucket": "pass",
+      "completedAt": "2026-10-01T01:58:06Z",
+      "description": "",
+      "event": "pull_request",
+      "link": "https://github.com/Senkichi/charlie-work/actions/runs/36803548915/job/110182915276",
+      "name": "Build attachment-contracts wheel",
+      "startedAt": "2026-10-01T01:57:32Z",
+      "state": "SUCCESS",
+      "workflow": "Attachment Contracts"
+    },
+    {
+      "bucket": "pass",
+      "completedAt": "2026-10-01T01:57:52Z",
+      "description": "",
+      "event": "pull_request",
+      "link": "https://github.com/Senkichi/charlie-work/actions/runs/36803548915/job/110182915125",
+      "name": "Attachment Contracts (shadow)",
+      "startedAt": "2026-10-01T01:57:31Z",
+      "state": "SUCCESS",
+      "workflow": "Attachment Contracts"
+    },
+    {
+      "bucket": "pass",
+      "completedAt": "2026-10-01T01:58:02Z",
+      "description": "",
+      "event": "pull_request",
+      "link": "https://github.com/Senkichi/charlie-work/actions/runs/36803548922/job/110182915369",
+      "name": "Lint",
+      "startedAt": "2026-10-01T01:57:31Z",
+      "state": "SUCCESS",
+      "workflow": "CI"
+    },
+    {
+      "bucket": "fail",
+      "completedAt": "2026-10-01T01:58:46Z",
+      "description": "",
+      "event": "pull_request",
+      "link": "https://github.com/Senkichi/charlie-work/actions/runs/36803548922/job/110182915499",
+      "name": "Collect-only gate",
+      "startedAt": "2026-10-01T01:57:31Z",
+      "state": "FAILURE",
+      "workflow": "CI"
+    },
+    {
+      "bucket": "pass",
+      "completedAt": "2026-10-01T01:58:06Z",
+      "description": "",
+      "event": "dynamic",
+      "link": "https://github.com/Senkichi/charlie-work/actions/runs/36803546785/job/110182911560",
+      "name": "Analyze (actions)",
+      "startedAt": "2026-10-01T01:57:30Z",
+      "state": "SUCCESS",
+      "workflow": "CodeQL"
+    },
+    {
+      "bucket": "pass",
+      "completedAt": "2026-10-01T01:58:18Z",
+      "description": "",
+      "event": "dynamic",
+      "link": "https://github.com/Senkichi/charlie-work/actions/runs/36803546785/job/110182911344",
+      "name": "Analyze (python)",
+      "startedAt": "2026-10-01T01:57:30Z",
+      "state": "SUCCESS",
+      "workflow": "CodeQL"
+    }
+  ],
+  "graphql_data": {
+    "repository": {
+      "pullRequest": {
+        "statusCheckRollup": {
+          "contexts": {
+            "nodes": [
+              {
+                "__typename": "CheckRun",
+                "checkSuite": {
+                  "workflowRun": {
+                    "event": "pull_request",
+                    "workflow": {
+                      "name": "CI"
+                    }
+                  }
+                },
+                "completedAt": null,
+                "conclusion": null,
+                "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36803548922/job/110182915548",
+                "name": "Tests",
+                "startedAt": "2026-10-01T01:57:32Z",
+                "status": "IN_PROGRESS"
+              },
+              {
+                "__typename": "CheckRun",
+                "checkSuite": {
+                  "workflowRun": {
+                    "event": "pull_request",
+                    "workflow": {
+                      "name": "Attachment Contracts"
+                    }
+                  }
+                },
+                "completedAt": "2026-10-01T01:57:52Z",
+                "conclusion": "SUCCESS",
+                "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36803548915/job/110182915125",
+                "name": "Attachment Contracts (shadow)",
+                "startedAt": "2026-10-01T01:57:31Z",
+                "status": "COMPLETED"
+              },
+              {
+                "__typename": "CheckRun",
+                "checkSuite": {
+                  "workflowRun": {
+                    "event": "dynamic",
+                    "workflow": {
+                      "name": "CodeQL"
+                    }
+                  }
+                },
+                "completedAt": "2026-10-01T01:58:06Z",
+                "conclusion": "SUCCESS",
+                "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36803546785/job/110182911560",
+                "name": "Analyze (actions)",
+                "startedAt": "2026-10-01T01:57:30Z",
+                "status": "COMPLETED"
+              },
+              {
+                "__typename": "CheckRun",
+                "checkSuite": {
+                  "workflowRun": {
+                    "event": "dynamic",
+                    "workflow": {
+                      "name": "CodeQL"
+                    }
+                  }
+                },
+                "completedAt": "2026-10-01T01:58:18Z",
+                "conclusion": "SUCCESS",
+                "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36803546785/job/110182911344",
+                "name": "Analyze (python)",
+                "startedAt": "2026-10-01T01:57:30Z",
+                "status": "COMPLETED"
+              },
+              {
+                "__typename": "CheckRun",
+                "checkSuite": {
+                  "workflowRun": {
+                    "event": "pull_request",
+                    "workflow": {
+                      "name": "Attachment Contracts"
+                    }
+                  }
+                },
+                "completedAt": "2026-10-01T01:58:06Z",
+                "conclusion": "SUCCESS",
+                "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36803548915/job/110182915276",
+                "name": "Build attachment-contracts wheel",
+                "startedAt": "2026-10-01T01:57:32Z",
+                "status": "COMPLETED"
+              },
+              {
+                "__typename": "CheckRun",
+                "checkSuite": {
+                  "workflowRun": {
+                    "event": "pull_request",
+                    "workflow": {
+                      "name": "CI"
+                    }
+                  }
+                },
+                "completedAt": "2026-10-01T01:58:02Z",
+                "conclusion": "SUCCESS",
+                "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36803548922/job/110182915369",
+                "name": "Lint",
+                "startedAt": "2026-10-01T01:57:31Z",
+                "status": "COMPLETED"
+              },
+              {
+                "__typename": "CheckRun",
+                "checkSuite": {
+                  "workflowRun": {
+                    "event": "pull_request",
+                    "workflow": {
+                      "name": "CI"
+                    }
+                  }
+                },
+                "completedAt": "2026-10-01T01:58:46Z",
+                "conclusion": "FAILURE",
+                "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36803548922/job/110182915499",
+                "name": "Collect-only gate",
+                "startedAt": "2026-10-01T01:57:31Z",
+                "status": "COMPLETED"
+              },
+              {
+                "__typename": "CheckRun",
+                "checkSuite": {
+                  "workflowRun": null
+                },
+                "completedAt": "2026-10-01T01:58:00Z",
+                "conclusion": "SUCCESS",
+                "detailsUrl": "https://github.com/Senkichi/charlie-work/runs/110183023764",
+                "name": "CodeQL",
+                "startedAt": "2026-10-01T01:57:58Z",
+                "status": "COMPLETED"
+              }
+            ]
+          }
+        }
+      }
+    }
+  },
+  "number": 2130,
+  "resource": "checks"
+}

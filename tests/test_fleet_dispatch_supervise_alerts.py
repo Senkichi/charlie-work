@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 from _fleet_dispatch_fixtures import (
-    _FakeClock,
     _drained_fleet_result,
     _make_fleet_json,
     _patch_ci_fleet_dirty_for_hermetic_tests as _patch_ci_fleet_dirty_for_hermetic_tests,
@@ -24,6 +23,7 @@ from charlie_work.config import (
     SupervisorConfig,
 )
 from charlie_work.fleet_dispatch import run_fleet_supervise
+from charlie_work.host.fakes import FakeClock
 from charlie_work.instrumentation import query_events
 from charlie_work.supervise import SelfDeployResult
 
@@ -211,11 +211,11 @@ def test_run_fleet_supervise_zero_pass_streak_never_fires_with_empty_registry(
     state_path = layout.state_file_path(layout.default_state_root(isolated_root))
 
     for _ in range(6):
-        fc = _FakeClock(auto_advance=1.0)
+        fc = FakeClock(auto_advance=1.0)
         result = run_fleet_supervise(
             fleet_dir_override=str(fleet_dir),
             max_passes=5,
-            clock=fc.now,
+            clock=fc.monotonic,
             sleep=fc.sleep,
         )
         assert result.ok is True
@@ -307,11 +307,11 @@ def test_run_fleet_supervise_zero_pass_streak_replays_851_outage_shape(
     state_path = layout.state_file_path(layout.default_state_root(isolated_root))
 
     for cycle in range(1, 4):
-        fc = _FakeClock(auto_advance=1.0)
+        fc = FakeClock(auto_advance=1.0)
         result = run_fleet_supervise(
             fleet_dir_override=str(fleet_dir),
             max_passes=5,
-            clock=fc.now,
+            clock=fc.monotonic,
             sleep=fc.sleep,
         )
         assert result.ok is True
@@ -399,9 +399,9 @@ def test_run_fleet_supervise_zero_pass_streak_resets_after_repo_work(
         "charlie_work.fleet_dispatch.self_deploy", lambda _repo_root, **_kwargs: head_moved
     )
     for _ in range(2):
-        fc = _FakeClock(auto_advance=1.0)
+        fc = FakeClock(auto_advance=1.0)
         run_fleet_supervise(
-            fleet_dir_override=str(fleet_dir), max_passes=5, clock=fc.now, sleep=fc.sleep
+            fleet_dir_override=str(fleet_dir), max_passes=5, clock=fc.monotonic, sleep=fc.sleep
         )
     assert query_events(state_path, kind="supervisor_zero_pass_alarm") == []
 
@@ -411,9 +411,9 @@ def test_run_fleet_supervise_zero_pass_streak_resets_after_repo_work(
         "charlie_work.fleet_dispatch.self_deploy", lambda _repo_root, **_kwargs: no_op
     )
     mock_fleet_loop.return_value = _drained_fleet_result()
-    fc = _FakeClock(auto_advance=1.0)
+    fc = FakeClock(auto_advance=1.0)
     result = run_fleet_supervise(
-        fleet_dir_override=str(fleet_dir), max_passes=1, clock=fc.now, sleep=fc.sleep
+        fleet_dir_override=str(fleet_dir), max_passes=1, clock=fc.monotonic, sleep=fc.sleep
     )
     assert result.data["total_repo_passes"] == 1
 
@@ -424,8 +424,8 @@ def test_run_fleet_supervise_zero_pass_streak_resets_after_repo_work(
         "charlie_work.fleet_dispatch.self_deploy", lambda _repo_root, **_kwargs: head_moved
     )
     for _ in range(2):
-        fc = _FakeClock(auto_advance=1.0)
+        fc = FakeClock(auto_advance=1.0)
         run_fleet_supervise(
-            fleet_dir_override=str(fleet_dir), max_passes=5, clock=fc.now, sleep=fc.sleep
+            fleet_dir_override=str(fleet_dir), max_passes=5, clock=fc.monotonic, sleep=fc.sleep
         )
     assert query_events(state_path, kind="supervisor_zero_pass_alarm") == []

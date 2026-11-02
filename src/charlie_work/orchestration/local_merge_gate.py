@@ -21,8 +21,8 @@ The gate is now a bounded two-phase state machine per approved record:
   that neither the branch head nor the base moved under the suite (drift ->
   re-sync + relaunch, never a merge of an untested pairing), then merges;
   red routes to rework through the existing #1972 capped path. Runtime past
-  ``SUITE_TIMEOUT_SECONDS`` kills the process tree and routes as a suite
-  failure. A dead runner with no result is *never* green -- the gate
+  the derived suite timeout kills the process tree, and a summary-less death
+  (timeout / killed runner) relaunches bounded (#2127), never rework. A dead runner with no result is *never* green -- the gate
   relaunches bounded by ``LOCAL_SUITE_GATE_MAX_ORPHANS``, then escalates the
   infrastructure anomaly.
 
@@ -45,36 +45,41 @@ record holding the gate sorts.
 Every top-level ``def`` is installed on ``OrchestratorApp`` by
 ``workflow_delegation._install_delegates``; workflow helpers are reached
 through ``_wf.<name>`` (the module-object form the monkeypatch seams need).
+
+Issue #2739's already-landed terminal edge, the packet phase's
+landed/closed pre-build check, and the abort-streak counter live in
+``orchestration/local_landed_finalize.py`` -- the net-new-member-in-its-own
+-submodule pattern that keeps this file under its file-size-ratchet mark.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from typing import Any
 
 import charlie_work.workflow as _wf
 from charlie_work import local_suite_runner
-from charlie_work.labels import TransitionOutcome
+from charlie_work.env_sanitize import build_local_gate_env
+from charlie_work.local_approval_carry import approval_survives_head_move
+from charlie_work.local_gate_infra import (
+    LOCAL_SUITE_GATE_MAX_INFRA_RELAUNCHES,  # noqa: F401  (re-export; defined with the classifier)
+    SuiteOutcome,
+    classify_suite_outcome,
+    effective_suite_timeout,
+)
 from charlie_work.local_lane import (
-    SUITE_TIMEOUT_SECONDS,
     _iso_dt,
     branch_diff,
     branch_head_sha,
     ensure_branch_worktree,
     local_base_branch,
     local_pr_records,
-    merge_branch_into_base,
     resolve_ref_sha,
     suite_command_argv,
-    worktree_for_branch,
 )
-from charlie_work.process_utils import is_pid_alive
-from charlie_work.safe_path import contains
-from charlie_work.state import without_review_dispatch_claim
+from charlie_work.orchestration.local_gate_finalize import LOCAL_SUITE_PASSED_FIELDS
+from charlie_work.selection_wrapper import DISABLED, ENFORCED, SHADOW, gate_selection
 from charlie_work.worktree import (
     _merge_update_rework_branch,
-    remove_review_checkout,
-    remove_worktree,
 )
 
 # In-flight claim fields on the lane record. Clearing writes None to each --
@@ -101,6 +106,17 @@ LOCAL_SUITE_CLAIM_FIELDS = (
 LOCAL_SUITE_GATE_MAX_RESYNCS = 3
 LOCAL_SUITE_GATE_MAX_ORPHANS = 3
 
+# Issue #2739: bound on consecutive "record left approved with a suite in
+# flight" aborts under an unchanged ``reviewed_patch_id``. The zero-net-diff
+# livelock's signature was exactly that abort firing once per review cycle
+# (rebuild -> re-approve -> sync-merge head move -> abort) against the same
+# approved content. The landed short-circuit makes the loop unreachable, but
+# if the shape ever re-forms some other way the streak escalates it
+# mechanically instead of burning a reviewer cycle per pass forever. A
+# patch-id change -- genuinely new content re-entered review -- re-baselines
+# the count.
+LOCAL_GATE_ABORT_STREAK_LIMIT = 3
+
 
 def _local_merge_approved(self) -> list[dict[str, Any]]:
     """Merge approved local branches: base-sync, async full suite, advance base.
@@ -120,6 +136,9 @@ def _local_merge_approved(self) -> list[dict[str, Any]]:
     4. Green results re-verify base/head stability, then advance the base
      (``_local_gate_finalize_merge`` -- fast-forward or ``--no-ff``, the
      same terminal bookkeeping as before).
+    5. A green pairing whose base advance was deferred is kept
+     (``LOCAL_SUITE_PASSED_FIELDS``); while head and base still match it,
+     later passes retry the merge alone and it holds the gate (issue #2189).
     """
     results: list[dict[str, Any]] = []
     state = _wf.load_state_locked(self.paths.state_file)
@@ -141,6 +160,10 @@ def _local_merge_approved(self) -> list[dict[str, Any]]:
         claimed = bool(record.get("local_suite_pid"))
 
         if record.get("status") != "approved":
+            if any(record.get(field) for field in LOCAL_SUITE_PASSED_FIELDS):
+                self._local_gate_update(
+                    pr_key, {field: None for field in LOCAL_SUITE_PASSED_FIELDS}
+                )
             if claimed:
                 # The record moved on (operator escalation, packet void)
                 # while its suite ran. The tested head is superseded -- the
@@ -152,6 +175,30 @@ def _local_merge_approved(self) -> list[dict[str, Any]]:
                     reason="record left approved with a suite in flight",
                 )
                 entry["outcome"] = "gate_aborted"
+                # Issue #2739: bound the abort -> rebuild -> re-approve
+                # cycle. One abort per review pass against an unchanged
+                # approved patch-id is the livelock's signature; at the
+                # bound the record escalates mechanically instead of
+                # spending another reviewer + suite cycle.
+                abort_streak = self._local_gate_abort_streak_tick(pr_key, record)
+                entry["abort_streak"] = abort_streak
+                if abort_streak >= LOCAL_GATE_ABORT_STREAK_LIMIT:
+                    detail = (
+                        f"local merge gate aborted {abort_streak} consecutive "
+                        "in-flight suites while the record's approved "
+                        "patch-id never changed (record keeps leaving "
+                        "'approved' after the gate claims it -- the "
+                        "zero-net-diff livelock shape, issue #2739)"
+                    )
+                    entry["outcome"] = "error"
+                    entry["detail"] = detail
+                    self._local_merge_error_escalate(
+                        pr_number,
+                        issue_number,
+                        branch,
+                        detail,
+                        reason="local_gate_abort_streak_exceeded",
+                    )
                 results.append(entry)
             continue
 
@@ -175,6 +222,26 @@ def _local_merge_approved(self) -> list[dict[str, Any]]:
             entry["detail"] = f"branch {branch!r} does not resolve"
             results.append(entry)
             continue
+        if branch_diff(self.repo_root, base_ref, branch) == "":
+            # Issue #2739: the branch carries no net delta against the base
+            # -- its content already landed (often by another path) and the
+            # gate's own sync merge has advanced the merge base past it.
+            # Neither the suite nor a reviewer can prove anything about an
+            # empty diff, so the record takes the terminal landed edge here
+            # (killing a stray claimed suite, if any) rather than stalling
+            # at ``skipped_head_moved`` until the packet phase gets to it.
+            self._local_finalize_landed(
+                pr_key=pr_key,
+                record=record,
+                entry=entry,
+                branch=branch,
+                base_ref=base_ref,
+                live_head=live_head,
+                decision=decision,
+            )
+            results.append(entry)
+            continue
+
         # A claimed record's expected head is ``local_suite_head`` -- the
         # post-sync-merge sha the suite is actually testing -- not
         # ``reviewed_head``: the gate's own base-sync merge at launch
@@ -188,13 +255,7 @@ def _local_merge_approved(self) -> list[dict[str, Any]]:
             # (a rogue push, rework landing mid-gate) falls through to the
             # packet phase's rebuild + re-review -- and kills the suite,
             # which is testing a superseded head.
-            reviewed_patch = decision.get("reviewed_patch_id")
-            live_diff = branch_diff(self.repo_root, base_ref, branch)
-            if not (
-                reviewed_patch
-                and live_diff is not None
-                and _wf._calculate_patch_id(live_diff) == reviewed_patch
-            ):
+            if not approval_survives_head_move(self.repo_root, base_ref, branch, decision):
                 if claimed:
                     self._local_gate_abort(
                         pr_key,
@@ -205,6 +266,25 @@ def _local_merge_approved(self) -> list[dict[str, Any]]:
                 entry["outcome"] = "skipped_head_moved"
                 results.append(entry)
                 continue
+
+        if record.get("local_suite_passed_head") and not claimed:
+            if self._local_gate_passed_pairing_current(record):
+                if self._local_gate_finalize_merge(
+                    pr_key=pr_key,
+                    record=record,
+                    entry=entry,
+                    branch=branch,
+                    base_ref=base_ref,
+                    live_head=live_head,
+                    decision=decision,
+                ):
+                    # Deferred again: the pairing still owns the gate, so
+                    # no other record may launch and move the base under it.
+                    gate_in_flight = True
+                results.append(entry)
+                continue
+            # Head or base moved since the green run: the pairing is stale.
+            self._local_gate_update(pr_key, {field: None for field in LOCAL_SUITE_PASSED_FIELDS})
 
         if claimed:
             if self._local_gate_poll(
@@ -272,6 +352,8 @@ def _local_gate_any_in_flight(
             return True
         if record.get("status") != "approved":
             continue
+        if self._local_gate_passed_pairing_current(record):
+            return True
         paths = local_suite_runner.suite_gate_paths(self.paths.dispatches, int(pr_key))
         if self._local_gate_live_runner_meta(paths) is not None:
             return True
@@ -364,7 +446,7 @@ def _local_gate_live_runner_meta(
     pid = meta.get("pid")
     if not isinstance(pid, int) or pid <= 0:
         return None
-    if not is_pid_alive(pid, meta.get("process_start_time")):
+    if not self.host.probe.is_alive(pid, meta.get("process_start_time")):
         return None
     return meta
 
@@ -402,6 +484,9 @@ def _local_gate_adopt(
             "local_suite_argv": meta.get("suite_argv"),
             "local_suite_resync_count": int(record.get("local_suite_resync_count") or 0),
             "local_suite_orphan_count": int(record.get("local_suite_orphan_count") or 0),
+            "local_suite_infra_relaunch_count": int(
+                record.get("local_suite_infra_relaunch_count") or 0
+            ),
         },
     )
     entry["outcome"] = "suite_running"
@@ -452,14 +537,13 @@ def _local_gate_poll(
     pid = record.get("local_suite_pid")
     start_time = record.get("local_suite_process_start_time")
     if isinstance(pid, int) and pid > 0:
-        if is_pid_alive(pid, start_time):
+        if self.host.probe.is_alive(pid, start_time):
             started = _iso_dt(record.get("local_suite_started_at"))
-            age = (datetime.now(UTC) - started).total_seconds() if started else 0
-            if age > SUITE_TIMEOUT_SECONDS:
+            age = (self.host.clock.now() - started).total_seconds() if started else 0
+            timeout = effective_suite_timeout(self.paths.dispatches, self.paths.state_file)
+            if age > timeout:
                 killed = self.write_gate.kill_process_tree(pid, start_time)
                 self._local_gate_clear_claim(pr_key)
-                entry["outcome"] = "suite_failed"
-                entry["timed_out"] = True
                 self._local_gate_event(
                     "local_suite_result",
                     {
@@ -467,6 +551,7 @@ def _local_gate_poll(
                         "issue_number": issue_number,
                         "ok": False,
                         "timed_out": True,
+                        "timeout_seconds": timeout,
                         "pid": pid,
                         "killed_pids": killed,
                         "argv": record.get("local_suite_argv") or [],
@@ -474,21 +559,17 @@ def _local_gate_poll(
                         "tail": local_suite_runner.read_log_tail(paths.log),
                     },
                 )
-                entry["routed_to"] = self._local_route_merge_rework(
-                    pr_number,
-                    issue_number,
-                    record,
-                    decision,
-                    reason="suite_failed",
-                    note=(
-                        "The full test suite exceeded the merge gate's "
-                        f"{SUITE_TIMEOUT_SECONDS}s limit and was killed. The "
-                        "code changes are already approved; make the suite "
-                        "pass within the limit. Tail of the suite output:\n\n"
-                        f"```\n{local_suite_runner.read_log_tail(paths.log)}\n```"
-                    ),
+                entry["timed_out"] = True
+                return self._local_gate_infra_relaunch(
+                    pr_key=pr_key,
+                    record=record,
+                    entry=entry,
+                    branch=branch,
+                    base_ref=base_ref,
+                    decision=decision,
+                    outcome=SuiteOutcome.SUITE_TIMED_OUT,
+                    duration_seconds=round(age, 3),
                 )
-                return False
             entry["outcome"] = "suite_running"
             entry["pid"] = pid
             return True
@@ -505,7 +586,7 @@ def _local_gate_poll(
         and meta_pid > 0
         and meta is not None
         and meta.get("head_sha") == gate_head
-        and is_pid_alive(meta_pid, meta.get("process_start_time"))
+        and self.host.probe.is_alive(meta_pid, meta.get("process_start_time"))
     ):
         self._local_gate_update(
             pr_key,
@@ -542,6 +623,7 @@ def _local_gate_poll(
         decision=decision,
         reason="orphaned_gate",
         orphan_count=orphans,
+        infra_relaunch_count=int(record.get("local_suite_infra_relaunch_count") or 0),
     )
 
 
@@ -590,6 +672,7 @@ def _local_gate_resolve_result(
             decision=decision,
             reason="resync",
             resync_count=resyncs,
+            infra_relaunch_count=int(record.get("local_suite_infra_relaunch_count") or 0),
         )
 
     ok = bool(result.get("ok"))
@@ -597,7 +680,11 @@ def _local_gate_resolve_result(
     tail = local_suite_runner.read_log_tail(paths.log)
     self._local_gate_update(
         pr_key,
-        {field: None for field in LOCAL_SUITE_CLAIM_FIELDS},
+        {
+            **{field: None for field in LOCAL_SUITE_CLAIM_FIELDS},
+            "local_suite_passed_head": gate_head if ok else None,
+            "local_suite_passed_base": gate_base if ok else None,
+        },
         event=(
             "local_suite_result",
             {
@@ -624,7 +711,7 @@ def _local_gate_resolve_result(
                 "duration_seconds": result.get("duration_seconds"),
             },
         )
-        self._local_gate_finalize_merge(
+        return self._local_gate_finalize_merge(
             pr_key=pr_key,
             record=record,
             entry=entry,
@@ -633,10 +720,22 @@ def _local_gate_resolve_result(
             live_head=live_head,
             decision=decision,
         )
-        return False
 
-    entry["outcome"] = "suite_failed"
     entry["returncode"] = result.get("returncode")
+    outcome = classify_suite_outcome(timed_out=False, tail=tail)
+    if outcome is not SuiteOutcome.CODE_FAILURE:
+        return self._local_gate_infra_relaunch(
+            pr_key=pr_key,
+            record=record,
+            entry=entry,
+            branch=branch,
+            base_ref=base_ref,
+            decision=decision,
+            outcome=outcome,
+            returncode=result.get("returncode"),
+            duration_seconds=result.get("duration_seconds"),
+        )
+    entry["outcome"] = "suite_failed"
     entry["routed_to"] = self._local_route_merge_rework(
         pr_number,
         issue_number,
@@ -666,12 +765,21 @@ def _local_gate_launch(
     reason: str,
     resync_count: int = 0,
     orphan_count: int = 0,
+    infra_relaunch_count: int = 0,
 ) -> bool:
     """Sync-merge the base, then spawn the detached suite runner.
 
     The base-sync merge is fast git plumbing and stays inline; everything
     after it (attach, spawn, claim write) returns in well under a second.
     Returns True only when a suite is actually in flight.
+
+    Precondition: the caller verified the branch diff is non-empty this
+    pass. Every launch path -- new launch, orphan relaunch, resync (this
+    module and ``local_gate_infra_relaunch.py``) -- runs inside
+    ``_local_merge_approved`` after its single landed check, which fires
+    the terminal edge and skips every downstream launch path in the same
+    walk. The launch-site re-check reviewed as redundant in issue #2739's
+    round 2 was removed here; the walk's per-pass check is the one seam.
     """
     pr_number = int(pr_key)
     issue_number = int(record.get("issue_number") or pr_number)
@@ -734,12 +842,46 @@ def _local_gate_launch(
     gate_head = branch_head_sha(self.repo_root, branch)
     gate_base = resolve_ref_sha(self.repo_root, base_ref)
     paths = local_suite_runner.suite_gate_paths(self.paths.dispatches, pr_number)
+
+    # Test impact selection: the suite runs inside ``ci-fleet test --context gate``
+    # for exactly this (head, base), in shadow until the repo's shadow window is
+    # met. Wrapped before the reuse check, so a result of another command is a
+    # miss. Fail open: unwrapped, with the reason recorded.
+    selection = gate_selection(self.repo_root, argv, head=gate_head, base=gate_base)
+    if selection.mode == DISABLED:
+        self._local_gate_event(
+            "local_suite_selection_disabled",
+            {"pr_number": pr_number, "issue_number": issue_number, "detail": selection.detail},
+        )
+    elif selection.mode not in (SHADOW, ENFORCED):
+        self._local_gate_event(
+            "local_suite_selection_unavailable",
+            {
+                "pr_number": pr_number,
+                "issue_number": issue_number,
+                "reason": selection.mode,
+                "detail": selection.detail,
+            },
+        )
+    argv = list(selection.argv)
+
+    reused = self._local_gate_try_reuse(
+        pr_key, record, entry, branch, base_ref, decision, argv, reason, gate_head, gate_base
+    )
+    if reused is not None:
+        return reused
+
+    # Issue #2795: the gate suite env is built (ambient copy + slot plugin +
+    # ledger tag) and stripped of configured provider keys in env_sanitize.
+    gate_env = build_local_gate_env(self.config.test_slots, issue_number, self.config)
     launch = local_suite_runner.launch_suite_gate(
         worktree_path,
         argv,
         paths=paths,
         head_sha=gate_head or "",
         base_sha=gate_base,
+        # Issue #2124: the gate draws the reserved slot 0, never an agent slot.
+        env=gate_env,
     )
     if not launch.ok:
         detail = f"suite runner failed to spawn: {launch.error}"
@@ -761,6 +903,7 @@ def _local_gate_launch(
             "local_suite_argv": list(argv),
             "local_suite_resync_count": resync_count,
             "local_suite_orphan_count": orphan_count,
+            "local_suite_infra_relaunch_count": infra_relaunch_count,
         },
         event=(
             "local_suite_launched",
@@ -771,10 +914,12 @@ def _local_gate_launch(
                 "head_sha": gate_head,
                 "base_sha": gate_base,
                 "argv": list(argv),
+                "selection": selection.mode,
                 "log": str(paths.log),
                 "reason": reason,
                 "resync_count": resync_count,
                 "orphan_count": orphan_count,
+                "infra_relaunch_count": infra_relaunch_count,
             },
         ),
     )
@@ -785,142 +930,14 @@ def _local_gate_launch(
     return True
 
 
-def _local_gate_finalize_merge(
-    self,
-    *,
-    pr_key: str,
-    record: dict[str, Any],
-    entry: dict[str, Any],
-    branch: str,
-    base_ref: str,
-    live_head: str,
-    decision: dict[str, Any],
-) -> None:
-    """Green suite + stable pairing: advance the base and run terminal bookkeeping.
-
-    Same merge outcomes the synchronous gate produced -- deferred / conflict /
-    error / merged -- only reached now from a later pass, after the result
-    file proved the tested pairing.
-    """
-    pr_number = int(pr_key)
-    issue_number = int(record.get("issue_number") or pr_number)
-    worktrees_dir = self._layout.worktrees
-    outcome = merge_branch_into_base(self.repo_root, base_ref, branch, worktrees_dir=worktrees_dir)
-    if outcome.status == "deferred":
-        entry["outcome"] = "deferred"
-        entry["detail"] = outcome.detail
-        self._local_gate_event(
-            "local_merge_deferred",
-            {
-                "pr_number": pr_number,
-                "issue_number": issue_number,
-                "detail": outcome.detail,
-            },
-        )
-        return
-    if outcome.status == "conflict":
-        entry["outcome"] = "conflict"
-        entry["conflicted_paths"] = list(outcome.conflicted_paths)
-        entry["routed_to"] = self._local_route_merge_rework(
-            pr_number,
-            issue_number,
-            record,
-            decision,
-            reason="merge_conflict",
-            note=(
-                f"Merging {branch!r} into the base branch {base_ref!r} "
-                f"conflicted ({len(outcome.conflicted_paths)} path(s)). "
-                "Merge the base into your branch and resolve the "
-                "conflicts. The code changes are already approved; do not "
-                "re-litigate the review."
-            ),
-        )
-        return
-    if outcome.status == "error":
-        entry["outcome"] = "error"
-        entry["detail"] = outcome.detail
-        self._local_merge_error_escalate(pr_number, issue_number, branch, outcome.detail)
-        return
-
-    # Merged (or already contained): terminal bookkeeping.
-    gate_head = record.get("local_suite_head")
-    merged_sha = outcome.merged_sha or gate_head or live_head
-    entry["outcome"] = "merged" if outcome.status == "merged" else "already_merged"
-    entry["fast_forward"] = outcome.fast_forward
-    entry["merged_sha"] = merged_sha
-    # force=True like every other worker-worktree teardown: the branch
-    # content is committed to base by construction, so remaining
-    # uncommitted material is worker scratch (.venv, build output,
-    # worker-tmp) -- a plain remove would refuse on a real .venv dir and
-    # leak a worktree per merged issue. ``branch`` also deletes the
-    # merged branch ref when auto_merge.delete_branch is configured,
-    # matching the remote lane's post-merge cleanup.
-    # Issue #1476: a worktree outside the managed dir is a foreign
-    # checkout (``ensure_branch_worktree`` returns the registered path
-    # wherever the branch happens to live) -- it belongs to whoever
-    # created it and is never removed; the branch ref can't be deleted
-    # while checked out anyway.
-    worktree_path = worktree_for_branch(self.repo_root, branch)
-    if worktree_path is not None and contains(worktrees_dir, worktree_path):
-        remove_worktree(
-            self.repo_root,
-            worktree_path,
-            force=True,
-            branch=(branch if self.config.auto_merge.delete_branch else None),
-        )
-    remove_review_checkout(self.repo_root, pr_number, reviews_dir=self._layout.reviews_dir)
-    with _wf.state_lock(self.paths.state_file):
-        state = _wf.load_state(self.paths.state_file)
-        pr_state = state["prs"].get(pr_key, {})
-        state["prs"][pr_key] = {
-            **without_review_dispatch_claim(pr_state),
-            "number": pr_number,
-            "local": True,
-            "status": "merged",
-            "merged_at": _wf.utc_now(),
-            "merged_sha": merged_sha,
-            "merge_method": "ff" if outcome.fast_forward else "no-ff",
-            # Issue #1972: the merge-gate rework episode is resolved --
-            # both per-kind attempt counters restart from zero. They
-            # deliberately survive packet re-mints and rework routing;
-            # this write plus the unescalate/de-escalation reset maps
-            # are the only resets.
-            "local_merge_conflict_rework_attempts": 0,
-            "local_suite_failed_rework_attempts": 0,
-            "local_merge_rework_reason": None,
-        }
-        issue_entry = state["issues"].get(str(issue_number), {})
-        state["issues"][str(issue_number)] = _wf._merged_issue_fields(issue_entry, issue_number)
-        state = self._record_event(
-            state,
-            "merge_succeeded",
-            {
-                "pr_number": pr_number,
-                "issue_number": issue_number,
-                "local": True,
-                "fast_forward": outcome.fast_forward,
-                "merged_sha": merged_sha,
-                "detail": outcome.detail,
-            },
-        )
-        self.write_gate.save_state(state)
-    transition_result = self.write_gate.transition(
-        self.gh, self.config.labels, issue_number, "merged"
-    )
-    if transition_result.outcome != TransitionOutcome.APPLIED:
-        entry["label_error"] = {
-            "edge": "merged",
-            "outcome": transition_result.outcome.value,
-        }
-    # The issue itself closes on merge, same as a merged remote PR.
-    try:
-        self.gh.close_issue(issue_number)
-    except Exception:
-        entry["close_error"] = True
-
-
 def _local_merge_error_escalate(
-    self, pr_number: int, issue_number: int, branch: str, detail: str
+    self,
+    pr_number: int,
+    issue_number: int,
+    branch: str,
+    detail: str,
+    *,
+    reason: str = "local_merge_error",
 ) -> None:
     """Escalate a merge-gate infrastructure failure (never a silent merge)."""
     with _wf.state_lock(self.paths.state_file):
@@ -931,12 +948,12 @@ def _local_merge_error_escalate(
         state["prs"][str(pr_number)] = {
             **(state["prs"].get(str(pr_number)) or {}),
             "status": status,
-            "escalation_reason": "local_merge_error",
+            "escalation_reason": reason,
         }
         state = _wf._escalate_issue(
             state,
             issue_number,
-            reason="local_merge_error",
+            reason=reason,
             reason_class="mechanical",
             issue_extra={"merge_alert": detail},
         )
@@ -947,6 +964,7 @@ def _local_merge_error_escalate(
                 "pr_number": pr_number,
                 "issue_number": issue_number,
                 "branch": branch,
+                "reason": reason,
                 "detail": _wf._truncate_for_event(detail),
             },
             level="error",

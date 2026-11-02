@@ -40,8 +40,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .atomic_write import write_json_atomic
 from .fleet_paths import fleet_dir, warn_fleet_dir_virtualization_on_write
 from .instrumentation import log_event, query_events
+from .supervise_loop import EXIT_FLEET_PAUSED
 from .wedge_watchdog import WEDGE_KILL_EVENT_KIND
 
 logger = logging.getLogger(__name__)
@@ -147,9 +149,7 @@ def _write_heartbeat(path: Path, payload: dict[str, Any]) -> None:
     warn_fleet_dir_virtualization_on_write(
         path.parent, context="writing supervisor-heartbeat.json"
     )
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    write_json_atomic(path, payload)
 
 
 def _parse_iso(value: str | None) -> datetime | None:
@@ -188,6 +188,7 @@ def record_supervisor_started(
     full_pass_interval_seconds: int,
     max_pass_runtime_seconds: int | None = None,
     wedge_kill_loop_alarm: int | None = None,
+    orchestrator_root: str | None = None,
 ) -> None:
     """Emit ``supervisor_started`` and write a fresh heartbeat.
 
@@ -201,6 +202,12 @@ def record_supervisor_started(
     logged) so ``scripts/heartbeat_check.py`` — which deliberately never
     imports ``charlie_work.config`` — can read the configured threshold
     without hardcoding a duplicate default (issue #1832).
+
+    ``orchestrator_root`` names the checkout this supervisor executes
+    (issue #2475): the ``self_deploy_*`` events it writes land in that
+    checkout's own ``events.db``, not necessarily a registry repo's, so
+    the dashboard derives the deploys source from this record rather
+    than hardcoding a daemon path.
     """
     if max_pass_runtime_seconds is None:
         max_pass_runtime_seconds = full_pass_interval_seconds
@@ -213,6 +220,7 @@ def record_supervisor_started(
         "full_pass_interval_seconds": full_pass_interval_seconds,
         "max_pass_runtime_seconds": max_pass_runtime_seconds,
         "wedge_kill_loop_alarm": wedge_kill_loop_alarm,
+        "orchestrator_root": orchestrator_root,
         "exited_at": None,
         "exit_code": None,
     }
@@ -233,6 +241,7 @@ def record_supervisor_started(
                 "full_pass_interval_seconds": full_pass_interval_seconds,
                 "max_pass_runtime_seconds": max_pass_runtime_seconds,
                 "wedge_kill_loop_alarm": wedge_kill_loop_alarm,
+                "orchestrator_root": orchestrator_root,
             },
             repo=_FLEET_REPO,
         )
@@ -245,6 +254,7 @@ def update_supervisor_heartbeat(
     *,
     pass_number: int,
     last_beat_at: str,
+    orchestrator_root: str | None = None,
 ) -> None:
     """Refresh ``last_beat_at`` / ``pass_number`` on the existing heartbeat.
 
@@ -256,6 +266,10 @@ def update_supervisor_heartbeat(
     is skipped (and logged) rather than overwriting it with a record
     that drops those fields. Best-effort: a write failure is logged and
     swallowed so a disk hiccup does not abort the pass.
+
+    ``orchestrator_root`` (issue #2475) is restamped each beat so the
+    record survives a mid-run heartbeat deletion instead of waiting for
+    the next supervisor start to restore it.
     """
     path = supervisor_heartbeat_path(fleet_dir_override)
     existing = _read_heartbeat_for_merge(path)
@@ -272,6 +286,8 @@ def update_supervisor_heartbeat(
             "pass_number": pass_number,
         }
     )
+    if orchestrator_root is not None:
+        existing["orchestrator_root"] = orchestrator_root
     try:
         _write_heartbeat(path, existing)
     except OSError as exc:
@@ -392,13 +408,14 @@ def is_exit_alertable(exit_code: int | None) -> bool:
     """Return True when a supervisor exit warrants an operator-facing alert.
 
     A ``0`` exit is routine (drain, HEAD-drift restart, self-deploy
-    restart, ``KeyboardInterrupt``). Anything else — a non-zero exit or
+    restart, ``KeyboardInterrupt``), and so is ``EXIT_FLEET_PAUSED``: the
+    operator asked for it (#1776). Anything else — a non-zero exit or
     an unknown ``None`` (gap-detected kill) — means something killed
     the supervisor and must reach the attention digest. This is the
     #621 ``alertable`` precedent applied to supervisor lifecycle: a
     routine restart must not page, a real kill must.
     """
-    return exit_code != 0
+    return exit_code not in (0, EXIT_FLEET_PAUSED)  # paused = operator's own act (#1776)
 
 
 def record_fleet_pass_completed(

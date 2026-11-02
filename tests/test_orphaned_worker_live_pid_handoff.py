@@ -23,6 +23,7 @@ from unittest.mock import patch
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
 from _fakes_github import FakeGitHub
 from _rework_dispatch_fixtures import _wg
+from _host_fixtures import host_probe
 from charlie_work.config import WorkerRoleConfig
 
 
@@ -123,7 +124,9 @@ def _config(*, finalize_minutes: int = 15):
     )
 
 
-def test_live_pid_stale_outcome_opens_pr_without_waiting_for_exit(tmp_path: Path) -> None:
+def test_live_pid_stale_outcome_opens_pr_without_waiting_for_exit(
+    tmp_path: Path, monkeypatch
+) -> None:
     """Issue #1867 (swole #163): a worker that pushed its branch and wrote a
     complete ``.worker-outcome.json`` has finished the handoff contract --
     the orchestrator must open the PR from the drafted title/body even while
@@ -166,7 +169,7 @@ def test_live_pid_stale_outcome_opens_pr_without_waiting_for_exit(tmp_path: Path
 
     # The incident's whole point: the PID is still alive, so the dead-PID
     # lanes must never see this issue -- yet the PR still gets opened.
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=True):
+    with host_probe(monkeypatch, alive=True):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
         )
@@ -202,7 +205,7 @@ def test_live_pid_stale_outcome_opens_pr_without_waiting_for_exit(tmp_path: Path
     assert "orphan_drift_at" not in entry
 
 
-def test_live_pid_fresh_outcome_does_not_finalize(tmp_path: Path) -> None:
+def test_live_pid_fresh_outcome_does_not_finalize(tmp_path: Path, monkeypatch) -> None:
     """FLIP 1: was outcome-age-vs-``worker_outcome_finalize_minutes``
     (younger than 15 minutes = "may still be finishing", so wait); now
     freshness is judged against ``dispatched_at`` (rule 1), not elapsed
@@ -246,7 +249,7 @@ def test_live_pid_fresh_outcome_does_not_finalize(tmp_path: Path) -> None:
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=True):
+    with host_probe(monkeypatch, alive=True):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
         )
@@ -261,7 +264,7 @@ def test_live_pid_fresh_outcome_does_not_finalize(tmp_path: Path) -> None:
     ] == []
 
 
-def test_live_pid_stale_outcome_disabled_by_config(tmp_path: Path) -> None:
+def test_live_pid_stale_outcome_disabled_by_config(tmp_path: Path, monkeypatch) -> None:
     """``worker_outcome_finalize_minutes: 0`` disables the PID-independent
     finalize (the config kill switch), reverting to wait-for-PID-exit."""
     from charlie_work.paths import resolved_layout, runtime_paths
@@ -293,7 +296,7 @@ def test_live_pid_stale_outcome_disabled_by_config(tmp_path: Path) -> None:
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=True):
+    with host_probe(monkeypatch, alive=True):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
         )
@@ -303,7 +306,7 @@ def test_live_pid_stale_outcome_disabled_by_config(tmp_path: Path) -> None:
     assert fake_gh.prs_created == []
 
 
-def test_live_pid_stale_non_handoff_outcome_does_not_finalize(tmp_path: Path) -> None:
+def test_live_pid_stale_non_handoff_outcome_does_not_finalize(tmp_path: Path, monkeypatch) -> None:
     """An outcome file that does not confirm ``push_succeeded``/
     ``pr_created: false`` -- e.g. the ``blocked`` shape -- is not a completed
     handoff and must never trigger PR creation."""
@@ -316,7 +319,16 @@ def test_live_pid_stale_non_handoff_outcome_does_not_finalize(tmp_path: Path) ->
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
     branch = "agent/issue-1867-stale-outcome-live-pid"
-    repo_root = _make_repo_with_pushed_branch(tmp_path, branch)
+    # A ``blocked`` outcome is rejected inside the filesystem-only
+    # live-handoff pre-check (``collect_stale_live_handoff_pids``) -- the sweep
+    # never asks git or gh anything on this path, and a worker that declared
+    # ``blocked`` never pushed in the first place, so the pushed-branch
+    # scaffold the handoff tests share was ~13 git spawns of fixture noise in
+    # the measured call phase (issue #2616). A bare directory is enough:
+    # ``worktree_path_for_branch``'s registered-worktree probe fails closed
+    # to the managed path.
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
     _seed_dispatched_issue(paths, issue_number=1867, branch=branch)
 
     worktrees_dir = resolved_layout(config, repo_root).worktrees
@@ -336,7 +348,7 @@ def test_live_pid_stale_non_handoff_outcome_does_not_finalize(tmp_path: Path) ->
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=True):
+    with host_probe(monkeypatch, alive=True):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
         )
@@ -349,7 +361,9 @@ def test_live_pid_stale_non_handoff_outcome_does_not_finalize(tmp_path: Path) ->
     ] == []
 
 
-def test_live_pid_stale_outcome_skipped_when_pr_already_exists(tmp_path: Path) -> None:
+def test_live_pid_stale_outcome_skipped_when_pr_already_exists(
+    tmp_path: Path, monkeypatch
+) -> None:
     """Idempotency: if a PR already exists for the issue, the finalize lane
     must not open a duplicate."""
     from charlie_work.paths import resolved_layout, runtime_paths
@@ -391,7 +405,7 @@ def test_live_pid_stale_outcome_skipped_when_pr_already_exists(tmp_path: Path) -
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=True):
+    with host_probe(monkeypatch, alive=True):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
         )
@@ -404,7 +418,7 @@ def test_live_pid_stale_outcome_skipped_when_pr_already_exists(tmp_path: Path) -
 
 
 def test_live_pid_stale_outcome_pr_create_failed_emits_stranded_drift_once(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """A failed ``gh pr create`` on the live-PID finalize lane surfaces as
     the fingerprinted ``pr_create_failed_branch_stranded`` drift -- emitted
@@ -441,7 +455,7 @@ def test_live_pid_stale_outcome_pr_create_failed_emits_stranded_drift_once(
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=True):
+    with host_probe(monkeypatch, alive=True):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
         )
@@ -462,7 +476,7 @@ def test_live_pid_stale_outcome_pr_create_failed_emits_stranded_drift_once(
     assert drift_events[0]["payload"]["branch_name"] == branch
 
 
-def test_live_pid_without_outcome_file_does_not_finalize(tmp_path: Path) -> None:
+def test_live_pid_without_outcome_file_does_not_finalize(tmp_path: Path, monkeypatch) -> None:
     """A live worker with no outcome file is still legitimately working --
     the lane must leave it entirely alone (the stall watchdog owns
     liveness)."""
@@ -491,7 +505,7 @@ def test_live_pid_without_outcome_file_does_not_finalize(tmp_path: Path) -> None
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=True):
+    with host_probe(monkeypatch, alive=True):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
         )
@@ -504,7 +518,7 @@ def test_live_pid_without_outcome_file_does_not_finalize(tmp_path: Path) -> None
     assert state.get("events", []) == []
 
 
-def test_live_pid_no_stale_outcome_never_calls_pr_list(tmp_path: Path) -> None:
+def test_live_pid_no_stale_outcome_never_calls_pr_list(tmp_path: Path, monkeypatch) -> None:
     """Round-2 review: the common case for an active fleet -- every
     dispatched worker's PID alive, none with a stale/handoff-confirmed
     outcome file -- must not pay for ``gh.pr_list()`` (network) or the
@@ -540,7 +554,7 @@ def test_live_pid_no_stale_outcome_never_calls_pr_list(tmp_path: Path) -> None:
 
     with (
         patch.object(fake_gh, "pr_list", wraps=fake_gh.pr_list) as pr_list_spy,
-        patch("charlie_work.workflow._worker_pid_alive", return_value=True),
+        host_probe(monkeypatch, alive=True),
     ):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
@@ -556,7 +570,9 @@ def test_live_pid_no_stale_outcome_never_calls_pr_list(tmp_path: Path) -> None:
     assert state.get("events", []) == []
 
 
-def test_live_pid_finalize_honors_workflow_patch_of_open_pr_helper(tmp_path: Path) -> None:
+def test_live_pid_finalize_honors_workflow_patch_of_open_pr_helper(
+    tmp_path: Path, monkeypatch
+) -> None:
     """Issue #1867 round 3: the live-handoff lane reaches
     ``_open_pr_for_orphaned_branch`` through the ``charlie_work.workflow``
     module object, so patching the name there (as every orphan test does)
@@ -584,7 +600,7 @@ def test_live_pid_finalize_honors_workflow_patch_of_open_pr_helper(tmp_path: Pat
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
     with (
-        patch("charlie_work.workflow._worker_pid_alive", return_value=True),
+        host_probe(monkeypatch, alive=True),
         patch(
             "charlie_work.workflow._open_pr_for_orphaned_branch",
             return_value=(None, "stubbed failure", None),
@@ -648,14 +664,14 @@ def _live_handoff_bed(tmp_path: Path, *, pr_create_return, existing_pr: bool):
     return config, paths, fake_gh, sessions_dir, outcome_path
 
 
-def _live_sweep(config, paths, fake_gh, sessions_dir) -> int:
+def _live_sweep(config, paths, fake_gh, sessions_dir, monkeypatch) -> int:
     """One orphan-sweep pass with the PID alive; returns how many times
     ``gh.pr_list()`` was called during it."""
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
     with (
         patch.object(fake_gh, "pr_list", wraps=fake_gh.pr_list) as pr_list_spy,
-        patch("charlie_work.workflow._worker_pid_alive", return_value=True),
+        host_probe(monkeypatch, alive=True),
     ):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
@@ -663,7 +679,9 @@ def _live_sweep(config, paths, fake_gh, sessions_dir) -> int:
     return pr_list_spy.call_count
 
 
-def test_routed_live_handoff_is_not_recollected_and_early_return_fires(tmp_path: Path) -> None:
+def test_routed_live_handoff_is_not_recollected_and_early_return_fires(
+    tmp_path: Path, monkeypatch
+) -> None:
     """N4 (wf-review-opus.md): a live PID whose fresh declared-push outcome has
     already been routed -- PR already open, or PR create failed -- must not be
     a candidate on the next pass, so the second pass never calls ``pr_list``.
@@ -680,14 +698,14 @@ def test_routed_live_handoff_is_not_recollected_and_early_return_fires(tmp_path:
             root, pr_create_return=pr_create_return, existing_pr=existing_pr
         )
 
-        first = _live_sweep(config, paths, fake_gh, sessions_dir)
-        second = _live_sweep(config, paths, fake_gh, sessions_dir)
+        first = _live_sweep(config, paths, fake_gh, sessions_dir, monkeypatch=monkeypatch)
+        second = _live_sweep(config, paths, fake_gh, sessions_dir, monkeypatch=monkeypatch)
 
         assert first >= 1, scenario
         assert second == 0, f"{scenario}: routed outcome was re-collected"
 
 
-def test_new_outcome_write_rearms_live_handoff(tmp_path: Path) -> None:
+def test_new_outcome_write_rearms_live_handoff(tmp_path: Path, monkeypatch) -> None:
     """A newer ``.worker-outcome.json`` write is a new fact: the marker (the
     routed outcome's mtime) no longer matches, so the lane runs again."""
     from charlie_work.state import load_state
@@ -697,20 +715,20 @@ def test_new_outcome_write_rearms_live_handoff(tmp_path: Path) -> None:
     )
 
     # A failed create re-lists PRs while retrying, so "ran" is ``>= 1`` calls.
-    assert _live_sweep(config, paths, fake_gh, sessions_dir) >= 1
-    assert _live_sweep(config, paths, fake_gh, sessions_dir) == 0
+    assert _live_sweep(config, paths, fake_gh, sessions_dir, monkeypatch=monkeypatch) >= 1
+    assert _live_sweep(config, paths, fake_gh, sessions_dir, monkeypatch=monkeypatch) == 0
     marker_before = load_state(paths.state_file)["issues"][str(_ISSUE)][_ROUTED_KEY]
 
     rewritten = time.time() - 1800
     os.utime(outcome_path, (rewritten, rewritten))
 
-    assert _live_sweep(config, paths, fake_gh, sessions_dir) >= 1
+    assert _live_sweep(config, paths, fake_gh, sessions_dir, monkeypatch=monkeypatch) >= 1
     marker_after = load_state(paths.state_file)["issues"][str(_ISSUE)][_ROUTED_KEY]
     assert marker_after != marker_before
-    assert _live_sweep(config, paths, fake_gh, sessions_dir) == 0
+    assert _live_sweep(config, paths, fake_gh, sessions_dir, monkeypatch=monkeypatch) == 0
 
 
-def test_pr_already_open_candidate_is_stamped_routed(tmp_path: Path) -> None:
+def test_pr_already_open_candidate_is_stamped_routed(tmp_path: Path, monkeypatch) -> None:
     """A candidate dropped because a PR already exists is stamped with the
     outcome file's mtime -- the marker is what stops the re-collection."""
     from datetime import UTC, datetime
@@ -721,7 +739,7 @@ def test_pr_already_open_candidate_is_stamped_routed(tmp_path: Path) -> None:
         tmp_path, pr_create_return=9001, existing_pr=True
     )
 
-    _live_sweep(config, paths, fake_gh, sessions_dir)
+    _live_sweep(config, paths, fake_gh, sessions_dir, monkeypatch=monkeypatch)
 
     entry = load_state(paths.state_file)["issues"][str(_ISSUE)]
     assert entry["status"] == "dispatched"
@@ -732,7 +750,9 @@ def test_pr_already_open_candidate_is_stamped_routed(tmp_path: Path) -> None:
     assert fake_gh.prs_created == []
 
 
-def test_live_handoff_stale_outcome_emits_worker_evidence_stale(tmp_path: Path) -> None:
+def test_live_handoff_stale_outcome_emits_worker_evidence_stale(
+    tmp_path: Path, monkeypatch
+) -> None:
     """B6 (wf-r2-s6): the live-handoff lane resolves a fate per live PID too, and
     a leftover outcome older than this dispatch must surface as a
     ``worker_evidence_stale`` warning -- once, deduped by the entry's marker."""
@@ -749,8 +769,8 @@ def test_live_handoff_stale_outcome_emits_worker_evidence_stale(tmp_path: Path) 
     dispatched_at = (datetime.now(UTC) - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
     _seed_dispatched_issue(paths, issue_number=_ISSUE, branch=_BRANCH, dispatched_at=dispatched_at)
 
-    assert _live_sweep(config, paths, fake_gh, sessions_dir) == 0
-    assert _live_sweep(config, paths, fake_gh, sessions_dir) == 0
+    assert _live_sweep(config, paths, fake_gh, sessions_dir, monkeypatch=monkeypatch) == 0
+    assert _live_sweep(config, paths, fake_gh, sessions_dir, monkeypatch=monkeypatch) == 0
 
     stale = query_events(paths.state_file, kind="worker_evidence_stale")
     assert len(stale) == 1

@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+from _git_templates import GIT_CONFIG_ENV
 from _worktree_fixtures import _git, _init_repo
 from charlie_work import worktree
 from charlie_work.subprocess_runner import RunResult
@@ -41,9 +42,8 @@ def _longpaths_for_nested_test_repos(monkeypatch: pytest.MonkeyPatch) -> None:
     spawned ``git`` without touching any config file; on shallow checkouts
     they are a no-op.
     """
-    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
-    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.longpaths")
-    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "true")
+    for key, value in GIT_CONFIG_ENV.items():
+        monkeypatch.setenv(key, value)
 
 
 def _force_git_remove_failure(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -12,19 +12,20 @@ with no change at any call site (``cli.py``, the test suite).
 
 Names reached through ``_wf.`` (module-object seam, design Section 3.1 rule 2,
 #1627): ``charlie_work.workflow``'s ``CommandResult`` and the Tier-D names the
-suite patches on it (``is_claim_stale``, ``is_pid_alive``, ``load_state_locked``)
+suite patches on it (``is_claim_stale``, ``load_state_locked``)
 -- the same convention ``state_operator_commands.py`` documents for its own
-sibling delegates.
+sibling delegates. Reviewer liveness reads go through ``self.host.probe``.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 
 from charlie_work import layout
 from charlie_work.state import _REVIEW_STALE_CLAIM_TIMEOUT_MINUTES
 import charlie_work.workflow as _wf
+from charlie_work.command_result import CommandResult
 
 
 def _open_review_claims(self, now: datetime) -> list[dict[str, Any]]:
@@ -43,9 +44,10 @@ def _open_review_claims(self, now: datetime) -> list[dict[str, Any]]:
     additionally reap on the sidecar's own ``started_at`` clock — this scan
     is the claim-level view, not a prediction of every branch outcome.
 
-    ``is_pid_alive``/``is_claim_stale``/``load_state_locked`` are reached
+    ``is_claim_stale``/``load_state_locked`` are reached
     through ``_wf`` because the suite patches them on ``charlie_work.workflow``
-    (the Tier-D convention documented in this module's sibling delegates).
+    (the Tier-D convention documented in this module's sibling delegates);
+    reviewer liveness reads ``self.host.probe`` instead.
     """
     state = _wf.load_state_locked(self.paths.state_file)
     claims: list[dict[str, Any]] = []
@@ -72,7 +74,7 @@ def _open_review_claims(self, now: datetime) -> list[dict[str, Any]]:
             )
         elif status == "review_dispatch_dispatched":
             pid = entry.get("reviewer_pid")
-            pid_alive = pid is not None and _wf.is_pid_alive(
+            pid_alive = pid is not None and self.host.probe.is_alive(
                 pid, entry.get("reviewer_process_start_time")
             )
             claim_at = entry.get("review_dispatched_at")
@@ -95,7 +97,7 @@ def _open_review_claims(self, now: datetime) -> list[dict[str, Any]]:
     return claims
 
 
-def reap_reviews(self, limit: int | None = None) -> _wf.CommandResult:
+def reap_reviews(self, limit: int | None = None) -> CommandResult:
     """Force-reap dead review claims without waiting for a loop pass (issue #1874).
 
     The dead-reviewer reap normally runs inside ``dispatch_reviews`` at the
@@ -124,12 +126,12 @@ def reap_reviews(self, limit: int | None = None) -> _wf.CommandResult:
     is a read-only claim scan (``_open_review_claims``) reporting liveness
     and staleness against the sweep's own predicates.
     """
-    resolved_now = datetime.now(UTC)
+    resolved_now = self.host.clock.now()
 
     if self.dry_run:
         claims = self._open_review_claims(resolved_now)
         reapable = [c["pr"] for c in claims if c["would_reap"]]
-        return _wf.CommandResult(
+        return CommandResult(
             True,
             f"dry-run: {len(reapable)} of {len(claims)} open review claim(s) would be reaped",
             {
@@ -149,9 +151,9 @@ def reap_reviews(self, limit: int | None = None) -> _wf.CommandResult:
             result = self.dispatch_reviews(limit, now=resolved_now)
         finally:
             lock.release()
-        # ``kind=`` by keyword: the event-kind scanner reads positional arg 1
-        # as the kind (the ``log_event(state_path, kind, ...)`` shape), so a
-        # positional kind here would leave the payload dict unresolved.
+        # ``kind=`` by keyword for readability; the event-kind scanner
+        # derives the kind slot from the callee's signature (#2481), so
+        # either spelling resolves.
         self.write_gate.log_event(
             kind="review_reap_invoked",
             payload={
@@ -161,7 +163,7 @@ def reap_reviews(self, limit: int | None = None) -> _wf.CommandResult:
         )
         data = dict(result.data)
         data["mode"] = "reap_and_dispatch"
-        return _wf.CommandResult(result.ok, result.message, data)
+        return CommandResult(result.ok, result.message, data)
 
     # Lock held: a supervisor owns this repo's lane — possibly the wedged
     # pass this command exists to route around. Reap anyway; the sweeps
@@ -171,8 +173,7 @@ def reap_reviews(self, limit: int | None = None) -> _wf.CommandResult:
     sweep = self._run_review_reap_sweeps(resolved_now)
     verdict_result = sweep["verdict_result"]
     stalled = sweep["stalled"]
-    # Same keyword-kind shape as the lock-free branch above — see that call
-    # site for why ``kind`` must not be positional.
+    # Same keyword-kind shape as the lock-free branch above.
     self.write_gate.log_event(
         kind="review_reap_invoked",
         payload={
@@ -182,7 +183,7 @@ def reap_reviews(self, limit: int | None = None) -> _wf.CommandResult:
             "reaped_prs": [entry.get("pr") for entry in stalled],
         },
     )
-    return _wf.CommandResult(
+    return CommandResult(
         True,
         f"reaped {len(stalled)} stalled review claim(s); dispatch skipped "
         "(supervisor lock held — freed claims re-dispatch on the next pass)",

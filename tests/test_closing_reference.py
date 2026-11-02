@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _src_ast import parsed, source_files, source_text
 
 from charlie_work.closing_reference import (
     ValidationResult,
@@ -416,8 +417,14 @@ def test_every_pr_create_call_site_routes_through_the_validator() -> None:
     # gh.pr_create directly) and instead flag pr_create_retry.py itself --
     # a module that forwards an already-built body and has no closing-ref
     # concern of its own.
-    for path in sorted(_SRC_ROOT.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for path in source_files(_SRC_ROOT):
+        # A call site of ``create_pr_with_retry`` requires the literal name
+        # in the file's source text; skip empty files before parsed() so the
+        # scan only fills the shared-cache parse for call-site candidates
+        # (issue #2578; same filter shape as #2422/#2548).
+        if "create_pr_with_retry" not in source_text(path):
+            continue
+        tree = parsed(path)
         if not _has_create_pr_with_retry_call_site(tree):
             continue
         scanned_with_call_site.append(path.name)
@@ -425,14 +432,17 @@ def test_every_pr_create_call_site_routes_through_the_validator() -> None:
             offenders.append(path.name)
 
     # Positive control: this scan must actually find the two known call
-    # sites (dead_worker_reap.py, reconcile.py) or the "zero offenders"
+    # sites (dead_worker_sweep/effects_pr.py, reconcile_salvage.py) or the
+    # "zero offenders"
     # result below would be indistinguishable from "the scan never matched
     # anything". Issue #1317 moved the workflow.py call site (inside
     # _open_salvage_pr / _open_pr_for_orphaned_branch) verbatim into
-    # dead_worker_reap.py; the call site itself is unchanged, only its
-    # module.
-    assert "dead_worker_reap.py" in scanned_with_call_site
-    assert "reconcile.py" in scanned_with_call_site
+    # dead_worker_reap.py, wave B (dead-worker sweep) moved it again into
+    # dead_worker_sweep/effects_pr.py, and #2226 moved the reconcile lane's
+    # call site into reconcile_salvage.py; the call site itself is
+    # unchanged, only its module.
+    assert "effects_pr.py" in scanned_with_call_site
+    assert "reconcile_salvage.py" in scanned_with_call_site
 
     assert offenders == [], (
         f"Module(s) call create_pr_with_retry without routing through "
@@ -452,8 +462,17 @@ def test_every_pr_create_call_site_routes_through_the_retry_wrapper() -> None:
     bypass_offenders: list[str] = []
     wrapper_consumers: list[str] = []
 
-    for path in sorted(_SRC_ROOT.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for path in source_files(_SRC_ROOT):
+        # Both detectors below need the literal token: a raw ``.pr_create``
+        # attribute call, a ``"pr_create"`` constant (the getattr shape), the
+        # ``def pr_create`` definition name, or a ``create_pr_with_retry``
+        # call all spell their identifier in the source text. Files with
+        # neither token are skipped before parsed() (issue #2578; same
+        # filter shape as #2422/#2548).
+        text = source_text(path)
+        if "pr_create" not in text and "create_pr_with_retry" not in text:
+            continue
+        tree = parsed(path)
         # pr_create_retry.py's own body is the one legitimate place a raw
         # `.pr_create(` call may live -- it *is* the routing target every
         # other module must call instead, the same way the definition of
@@ -469,9 +488,10 @@ def test_every_pr_create_call_site_routes_through_the_retry_wrapper() -> None:
     # an empty `bypass_offenders` below would be indistinguishable from
     # "the scan never matched anything". See the #1317 note above the other
     # positive control in this file -- the call site moved from workflow.py
-    # to dead_worker_reap.py verbatim.
-    assert "dead_worker_reap.py" in wrapper_consumers
-    assert "reconcile.py" in wrapper_consumers
+    # to dead_worker_reap.py verbatim, then to dead_worker_sweep/effects_pr.py,
+    # and (for the reconcile lane) to reconcile_salvage.py under #2226.
+    assert "effects_pr.py" in wrapper_consumers
+    assert "reconcile_salvage.py" in wrapper_consumers
 
     assert bypass_offenders == [], (
         f"Module(s) call gh.pr_create directly, bypassing the bounded outer "
@@ -530,7 +550,7 @@ def test_open_salvage_pr_logs_unlinked_event_on_mismatch(tmp_path: Path) -> None
 
     assert pr_number == 101
     assert error is None
-    assert gh.pr_view_calls == [101]
+    assert gh.pr_view_calls == [101, 101, 101]  # re-probed across the indexing race (#1868)
     events = query_events(state_file, kind="pr_closing_ref_unlinked", issue_number=42)
     assert len(events) == 1
     assert events[0]["payload"]["pr_number"] == 101
@@ -653,7 +673,9 @@ def test_open_salvage_pr_logs_rewritten_event_when_validator_changes_body(
             target_issue_open=None,
         )
 
-    monkeypatch.setattr("charlie_work.dead_worker_reap.validate_closing_reference", _fake_validate)
+    monkeypatch.setattr(
+        "charlie_work.dead_worker_sweep.effects_pr.validate_closing_reference", _fake_validate
+    )
 
     state_file = tmp_path / "state.json"
     state_file.write_text(json.dumps({"events": []}), encoding="utf-8")
@@ -690,10 +712,10 @@ def test_apply_fixes_salvage_logs_unlinked_event_on_mismatch(tmp_path: Path) -> 
     all (every existing reconcile salvage test omits ``state_path``)."""
     from _reconcile_fixtures import (
         FakeGitHub,
-        _init_bare_remote_and_clone,
         _issue,
         _setup_completed_worktree,
     )
+    from _worktree_fixtures import _init_bare_remote_and_clone
 
     from charlie_work.reconcile import DriftItem, apply_fixes
     from charlie_work.state import empty_state
@@ -747,10 +769,10 @@ def test_apply_fixes_salvage_no_unlinked_event_when_matched(tmp_path: Path) -> N
     """Discriminating negative case for the reconcile-side probe."""
     from _reconcile_fixtures import (
         FakeGitHub,
-        _init_bare_remote_and_clone,
         _issue,
         _setup_completed_worktree,
     )
+    from _worktree_fixtures import _init_bare_remote_and_clone
 
     from charlie_work.reconcile import DriftItem, apply_fixes
     from charlie_work.state import empty_state
@@ -812,10 +834,10 @@ def test_apply_fixes_salvage_passes_corrected_body_to_pr_create(
     already writes in the untouched case) but fail this one."""
     from _reconcile_fixtures import (
         FakeGitHub,
-        _init_bare_remote_and_clone,
         _issue,
         _setup_completed_worktree,
     )
+    from _worktree_fixtures import _init_bare_remote_and_clone
 
     from charlie_work.reconcile import DriftItem, apply_fixes
     from charlie_work.state import empty_state
@@ -843,7 +865,9 @@ def test_apply_fixes_salvage_passes_corrected_body_to_pr_create(
             target_issue_open=None,
         )
 
-    monkeypatch.setattr("charlie_work.reconcile.validate_closing_reference", _fake_validate)
+    monkeypatch.setattr(
+        "charlie_work.reconcile_salvage.validate_closing_reference", _fake_validate
+    )
 
     drift = [
         DriftItem(

@@ -28,21 +28,23 @@ from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from . import host as _host
 from .attempt_refs import AttemptSnapshot, snapshot_attempt_ref
+from .attempt_resume import ResumedAttempt, ResumeRestoreError, seed_from_throttled_attempt
 from .config import (
     OrchestratorConfig,
+    RuntimeConfig,
     WORKER_OUTCOME_FILENAME,
 )
 from . import git_pull_blockers
 from .git_retry import run_git_with_retry
-from .github import GitHubRunResult, PR_VIEW_MERGED_FIELDS
 from .issue_linking import linked_issue_number
 from .janitor import _calculate_patch_id
 from . import layout
 from .orphan_sweep import sweep_orphan_processes
 from .paths import runtime_paths
 from .post_mortem import real_activity_for_worker
-from .process_utils import is_pid_alive, kill_orphan_pid, kill_process_tree
+from .process_utils import kill_orphan_pid, kill_process_tree
 from .safe_path import contains
 from .safe_ref import require_valid_ref_name, require_valid_rev, require_valid_sha
 from .subprocess_runner import RunResult, command_failure_message, run_captured
@@ -51,7 +53,10 @@ from .worktree_archive import (
     _archive_unreachable_tip_if_applicable,
     _is_confirmed_missing_ref,
 )
+from .worktree_closed_reclaim import issue_confirmed_closed, reclaim_closed_issue_worktree
+from .worktree_pr_lanes import pr_lane_verdict
 from .worktree_pr_lookup import WorktreeCleanGH, _pr_number_for_head_branch
+from .salvage_retry import retry_failed_salvage_push
 from .rescue_capture_exclusions import (  # noqa: F401  (deliberate re-export)
     _build_rescue_capture_exclusions,
     _filter_redundant_add_exclusions,
@@ -61,9 +66,18 @@ from .base_branch import resolve_base_branch_name  # noqa: F401  (deliberate re-
 from .non_worker_product import (  # noqa: F401  (deliberate re-export)
     _LAUNCHER_OWNED_PR_BODY_RE,
     _declared_scaffolding_matcher,
+    _dirty_reason_for_paths,
+    _is_adapter_shim_path,
     _launcher_owned_file_matcher,
     _launcher_owned_matcher,
     _non_worker_product_matcher,
+)
+from .worktree_unsafe_kinds import (  # noqa: F401  (deliberate re-export)
+    WORKTREE_UNSAFE_KIND_LOCAL_COMMITS,
+    WORKTREE_UNSAFE_KIND_SHIM_DIRT,
+    WORKTREE_UNSAFE_KIND_UNCOMMITTED_WORK,
+    WORKTREE_UNSAFE_KINDS,
+    _worktree_unsafe_kind_from_reason,
 )
 from .foreign_worktree import (  # noqa: F401  (deliberate re-export)
     OPERATOR_MARKER_KIND,
@@ -125,48 +139,6 @@ def _run_remote_captured(
     if result.timed_out:
         result = _invoke(command, cwd=cwd, timeout_seconds=_REMOTE_TIMEOUT_SECONDS)
     return result
-
-
-# Issue #807: ``worktree_unsafe`` is split at detection time into two
-# discriminable kinds, because the two triggers do not share a correct
-# response. Launch-shim dirt / adapter shim materialization (uncommitted
-# modifications) is genuinely mechanical — auto-clear and redispatch is the
-# right move. Genuine unpushed local commits on the worktree branch are a
-# judgment call — returning the issue to dispatch actively fights the safety
-# system that raised the escalation and risks a second writer on a branch
-# that already has divergent local work. The discriminator is the
-# ``dirty_reason`` string already computed at the raise site; classifying at
-# detection (rather than after the fact) makes the invalid state
-# unrepresentable.
-WORKTREE_UNSAFE_KIND_SHIM_DIRT = "worktree_unsafe_shim_dirt"
-WORKTREE_UNSAFE_KIND_LOCAL_COMMITS = "worktree_unsafe_local_commits"
-WORKTREE_UNSAFE_KINDS: frozenset[str] = frozenset(
-    {WORKTREE_UNSAFE_KIND_SHIM_DIRT, WORKTREE_UNSAFE_KIND_LOCAL_COMMITS}
-)
-
-
-def _worktree_unsafe_kind_from_reason(reason: str) -> str:
-    """Map a ``dirty_reason`` string to its ``worktree_unsafe`` sub-kind.
-
-    The reason strings are produced by ``_worktree_refuse_to_reset_reason``
-    and ``_worktree_dirty_reason``. "uncommitted modifications" denotes
-    shim/adapter dirt (mechanical); "local commit(s)" denotes genuine
-    divergence (judgment). A reason that matches neither known pattern
-    defaults to ``WORKTREE_UNSAFE_KIND_LOCAL_COMMITS`` — the fail-closed
-    classification toward judgment/human-needed — so a future reason
-    string that doesn't match either pattern escalates as a judgment
-    call rather than being silently treated as mechanical and
-    auto-cleared (which would reproduce the #807 bug the split exists to
-    prevent). This mirrors the fail-closed convention already enforced
-    for an unrecognized explicit ``kind`` in ``WorktreeUnsafeError.__init__``
-    and for an unrecognized ``reason_class`` in
-    ``state.escalation_reason_class``.
-    """
-    if "local commit" in reason:
-        return WORKTREE_UNSAFE_KIND_LOCAL_COMMITS
-    if "uncommitted modifications" in reason:
-        return WORKTREE_UNSAFE_KIND_SHIM_DIRT
-    return WORKTREE_UNSAFE_KIND_LOCAL_COMMITS
 
 
 class WorktreeUnsafeError(RuntimeError):
@@ -410,6 +382,10 @@ class WorktreeInfo:
     # removal, janitor sweeps) must leave it on disk. Writer-marker cleanup
     # still applies to markers this session wrote.
     foreign_adopted: bool = False
+    # Issue #2289: set when a fresh redispatch was seeded from the work a
+    # provider-throttle death preserved (see attempt_resume). The adapters append
+    # the "continue, do not restart" notice to the worker prompt.
+    resumed_attempt: ResumedAttempt | None = None
 
 
 class WorktreeState(str, Enum):
@@ -527,7 +503,7 @@ def _own_live_session_pids(sessions_dir: Path) -> dict[str, int]:
         pid = payload.get("pid")
         if not session_id or not isinstance(pid, int) or pid <= 0:
             continue
-        if is_pid_alive(pid, payload.get("process_start_time")):
+        if _host.current().probe.is_alive(pid, payload.get("process_start_time")):
             live[str(session_id)] = pid
     return live
 
@@ -598,11 +574,11 @@ def _check_worktree_writer_marker(
         )
         return
 
-    if not isinstance(pid, int) or pid <= 0 or not is_pid_alive(pid, None):
+    if not isinstance(pid, int) or pid <= 0 or not _host.current().probe.is_alive(pid, None):
         # Marker is stale — clean it and proceed.
         remove_worktree_marker(worktree_path)
         return
-    own = _own_live_session_pids(sessions_dir)
+    own = _host.current().sessions.live_session_pids(sessions_dir)
     if session_id and own.get(session_id) == pid:
         # Marker belongs to a live session we already know about.
         return
@@ -740,7 +716,7 @@ def _reap_idle_foreign_writer(
     # Stale-pid guard: the writer is confirmably gone. Clean the marker and
     # report the path clear so the caller proceeds / resets the counter
     # instead of escalating a writer that is already dead.
-    if not is_pid_alive(pid, None):
+    if not _host.current().probe.is_alive(pid, None):
         remove_worktree_marker(worktree_path)
         return True
 
@@ -753,7 +729,7 @@ def _reap_idle_foreign_writer(
     # that drops or misorders it raises ``TypeError`` instead of silently
     # disabling this guard — the exact bug shape #1443 was filed to fix.
     if isinstance(session_id, str) and session_id:
-        own = _own_live_session_pids(sessions_dir)
+        own = _host.current().sessions.live_session_pids(sessions_dir)
         if own.get(session_id) == pid:
             return False
 
@@ -797,7 +773,7 @@ def _reap_idle_foreign_writer(
     # alive, do NOT remove the marker and do not claim a reap — removing the
     # marker would admit a second writer into a worktree that still holds a
     # live one (the #400 invariant inverted).
-    if pid not in killed_pids and is_pid_alive(pid, process_start_time):
+    if pid not in killed_pids and _host.current().probe.is_alive(pid, process_start_time):
         return False
 
     orphan_pids: list[int] = []
@@ -1963,7 +1939,16 @@ def _worker_authored_dirty(
     materialize_dirs: tuple[str, ...] = (),
 ) -> bool:
     """Return True if the worktree has uncommitted changes that are NOT
-    orchestrator scaffolding.
+    orchestrator scaffolding (see ``_worker_authored_dirty_paths``)."""
+    return bool(_worker_authored_dirty_paths(worktree_path, injected_paths, materialize_dirs))
+
+
+def _worker_authored_dirty_paths(
+    worktree_path: Path,
+    injected_paths: tuple[str, ...] = (),
+    materialize_dirs: tuple[str, ...] = (),
+) -> list[str]:
+    """Return the uncommitted paths that are NOT orchestrator scaffolding.
 
     ``injected_paths`` and ``materialize_dirs`` are worktree-relative paths
     (files or directories) that the orchestrator writes into the worktree
@@ -2010,11 +1995,11 @@ def _worker_authored_dirty(
     is_non_worker_product = _non_worker_product_matcher(
         injected_paths, materialize_dirs, include_launcher_dirs=True
     )
-    for raw_path in _parse_status_v2_paths(status_result.stdout):
-        if is_non_worker_product(raw_path):
-            continue
-        return True
-    return False
+    return [
+        raw_path
+        for raw_path in _parse_status_v2_paths(status_result.stdout)
+        if not is_non_worker_product(raw_path)
+    ]
 
 
 def _capture_worktree_work_to_rescue_ref(
@@ -2099,7 +2084,23 @@ def _capture_worktree_work_to_rescue_ref(
     ref_name = f"{RESCUE_REF_PREFIX}/{issue_part}-{timestamp}"
 
     commit_result = run_captured(
-        ["git", "commit-tree", tree_sha, "-p", head_sha, "-m", f"rescue: {issue_part}"],
+        [
+            "git",
+            # ``commit-tree`` refuses (exit 128) without a committer identity,
+            # and a host with no global ``user.name``/``user.email`` (CI, a
+            # fresh account) has none.  ``-c`` supplies one for this call only
+            # and never writes to any git config.
+            "-c",
+            "user.name=charlie-work rescue",
+            "-c",
+            "user.email=charlie-work-rescue@localhost",
+            "commit-tree",
+            tree_sha,
+            "-p",
+            head_sha,
+            "-m",
+            f"rescue: {issue_part}",
+        ],
         cwd=worktree_path,
         timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
     )
@@ -2107,7 +2108,10 @@ def _capture_worktree_work_to_rescue_ref(
         return RescueCapture(
             ref_name=None,
             commit_sha=None,
-            error=f"capture failed at commit-tree: {commit_result.error or commit_result.stderr}",
+            error="capture failed at commit-tree: "
+            + "; ".join(
+                part.strip() for part in (commit_result.error, commit_result.stderr) if part
+            ),
         )
     commit_sha = commit_result.stdout.strip()
 
@@ -2160,8 +2164,9 @@ def _worktree_refuse_to_reset_reason(
     """
     # Uncommitted modifications are only meaningful when the worktree directory exists.
     if worktree_path is not None and worktree_path.is_dir():
-        if _worker_authored_dirty(worktree_path, injected_paths, materialize_dirs):
-            return "worktree has uncommitted modifications"
+        dirty_paths = _worker_authored_dirty_paths(worktree_path, injected_paths, materialize_dirs)
+        if dirty_paths:
+            return _dirty_reason_for_paths(dirty_paths)
         local_tip_result = run_captured(
             ["git", "rev-parse", "--verify", "-q", "HEAD"],
             cwd=worktree_path,
@@ -2315,8 +2320,9 @@ def _worktree_dirty_reason(
     """
     if not worktree_path.is_dir():
         return None
-    if _worker_authored_dirty(worktree_path, injected_paths, materialize_dirs):
-        return "worktree has uncommitted modifications"
+    dirty_paths = _worker_authored_dirty_paths(worktree_path, injected_paths, materialize_dirs)
+    if dirty_paths:
+        return _dirty_reason_for_paths(dirty_paths)
     return None
 
 
@@ -2633,15 +2639,36 @@ def _robust_rmtree(path: Path) -> bool:
     Unlinks all junctions/symlinks first, then deletes the remaining files and
     directories with ``shutil.rmtree``.  Returns True when the path no longer
     exists.
+
+    Read-only entries (git object files, some wheel contents) make Windows
+    refuse the unlink with ``PermissionError``; :func:`_clear_readonly_and_retry`
+    clears the bit and retries once. Without it every orphan holding a git
+    clone or a copied ``.venv`` failed removal on every reclaim pass.
     """
     if not path.exists() and not is_junction(path):
         return True
     _unlink_worktree_reparse_points(path)
     try:
-        shutil.rmtree(path)
+        shutil.rmtree(path, onexc=_clear_readonly_and_retry)
     except OSError:
         return False
     return not path.exists() and not is_junction(path)
+
+
+def _clear_readonly_and_retry(func: Callable[[str], Any], path: str, exc: BaseException) -> None:
+    """``shutil.rmtree`` ``onexc`` hook: clear read-only, retry *func* once.
+
+    Re-raises the original error for anything that is not a permission
+    failure, and for reparse points -- ``os.chmod`` would follow one into its
+    target, which is exactly what :func:`_robust_rmtree` must never touch.
+    """
+    if not isinstance(exc, PermissionError) or os.path.islink(path) or is_junction(Path(path)):
+        raise exc
+    try:
+        os.chmod(path, stat.S_IWRITE)
+    except OSError:
+        raise exc from None
+    func(path)
 
 
 # Issue #1767 follow-up: relocating worker TMP/TEMP/TMPDIR from the host temp
@@ -2870,7 +2897,7 @@ def _worker_kind_from_recovery(recovery: dict[str, Any], config: OrchestratorCon
             kind = latest.get("kind")
             if isinstance(kind, str) and kind:
                 return kind
-    default = config.worker.harness
+    default = config.worker.harness if len(config.worker.chain) == 1 else None  # #2086
     if isinstance(default, str) and default:
         return default
     return None
@@ -2927,7 +2954,7 @@ def _probe_recovery_liveness(
 
     pid_alive = False
     if worker_pid is not None:
-        pid_alive = is_pid_alive(worker_pid, worker_process_start_time)
+        pid_alive = _host.current().probe.is_alive(worker_pid, worker_process_start_time)
         if pid_alive:
             raise LiveWorkerRedispatchError(
                 issue_number=issue_number,
@@ -3310,12 +3337,14 @@ def create_worktree(
             if sessions_dir is not None and isinstance(marker_session_id, str):
                 # Prefer the recorded session sidecar: it carries the
                 # process-start-time fingerprint, defeating pid recycling.
-                live_pid = _own_live_session_pids(sessions_dir).get(marker_session_id)
+                live_pid = (
+                    _host.current().sessions.live_session_pids(sessions_dir).get(marker_session_id)
+                )
             if (
                 live_pid is None
                 and isinstance(marker_pid, int)
                 and marker_pid > 0
-                and is_pid_alive(marker_pid, None)
+                and _host.current().probe.is_alive(marker_pid, None)
             ):
                 live_pid = marker_pid
             if live_pid is not None:
@@ -3371,6 +3400,11 @@ def create_worktree(
             repo_root=repo_root,
             registered=registered,
             recovery=recovery is not None,
+            operator_worktree_roots=(
+                config.runtime.operator_worktree_roots
+                if config is not None
+                else RuntimeConfig().operator_worktree_roots
+            ),
             marker_guard=(
                 (
                     lambda path: _check_worktree_writer_marker(
@@ -3385,6 +3419,41 @@ def create_worktree(
                 else None
             ),
         )
+
+    # Issue #2847: a dead worker's commit stranded by ONE transient failure of
+    # the sweep's salvage push is re-pushed (bounded, see ``salvage_retry``)
+    # before any guard below can read it as divergent local work
+    # (``worktree_unsafe_local_commits``, a judgment escalation). Once it is on
+    # origin, recovery and rework attach to it instead of resetting. A failed
+    # attempt with budget left defers this launch through the ordinary
+    # redispatch path; anything else (budget spent, rejection, a remote that
+    # moved) falls through to the guards unchanged. The push itself refuses a
+    # live or operator writer marker and only ever fast-forwards.
+    #
+    # The result is handled by cause: work on origin (pushed now, or already
+    # there) attaches; a push timeout or an unanswered probe defers while
+    # attempts remain; everything else -- a refusal, a moved remote, a live or
+    # operator writer -- falls through to the guards unchanged.
+    if config is not None and state_file is not None and issue_number is not None:
+        salvage_retry = retry_failed_salvage_push(
+            state_file,
+            issue_number,
+            branch,
+            limit=config.dispatch.salvage_push_retries,
+            push=lambda: salvage_push_stranded_commits(
+                repo_root, branch, worktree_path, base_ref=base_ref
+            ),
+        )
+        if salvage_retry.on_origin and recovery is None:
+            # Recovery attaches to a branch with commits on its own; a plain
+            # fresh dispatch would reset to base and fork from the pushed work.
+            rework = True
+        elif salvage_retry.defer:
+            raise WorktreeProbeFailedError(
+                f"salvage push retry {salvage_retry.attempt}/{salvage_retry.limit} for "
+                f"{branch!r} did not land ({salvage_retry.reason}); the commits stay in the "
+                f"worktree and are re-pushed on the next redispatch"
+            )
 
     if recovery is not None:
         # Validate that the recovery record matches the requested branch
@@ -4011,6 +4080,27 @@ def create_worktree(
                     f"git worktree add failed for branch {branch!r}: {result.error or result.stderr}"
                 )
 
+    # Issue #2289: a fresh dispatch (not a rework/recovery attach of existing
+    # work) whose previous attempt died of a provider throttle starts from that
+    # death's preserved work instead of the bare base. Runs before the venv
+    # junction and materialized dirs exist so a failed seed restores a pristine
+    # tree. Best-effort: never raises, never blocks the dispatch.
+    resumed_attempt: ResumedAttempt | None = None
+    if not rework and (config is None or config.dispatch.resume_throttled_attempts):
+        try:
+            resumed_attempt = seed_from_throttled_attempt(
+                repo_root,
+                worktree_path,
+                issue_number,
+                state_file=state_file,
+                scaffolding=(*injected_paths, *materialize_dirs),
+            )
+        except ResumeRestoreError:
+            # The tree is not provably the base (conflict markers / wrong HEAD):
+            # never launch on it. Same teardown as the other post-add failures.
+            remove_worktree(repo_root, worktree_path, force=True, branch=branch)
+            raise
+
     venv_junction: Path | None = None
     if venv_source is not None:
         venv_link = worktree_path / ".venv"
@@ -4049,6 +4139,7 @@ def create_worktree(
         materialized_paths=tuple(materialized_paths),
         rework_conflict=rework_conflict,
         rescue_capture=rescue_capture,
+        resumed_attempt=resumed_attempt,
     )
 
 
@@ -5195,7 +5286,7 @@ def _cleanup_live_writer_reason(issue_state: dict[str, Any], worktree_path: Path
         worker_pid = int(worker_pid) if worker_pid is not None else None
     except (TypeError, ValueError):
         worker_pid = None
-    if worker_pid is not None and is_pid_alive(worker_pid, process_start_time):
+    if worker_pid is not None and _host.current().probe.is_alive(worker_pid, process_start_time):
         return f"recorded worker pid {worker_pid} is alive"
 
     marker = read_worktree_marker(worktree_path)
@@ -5210,7 +5301,11 @@ def _cleanup_live_writer_reason(issue_state: dict[str, Any], worktree_path: Path
         if _state.is_operator_claimed(issue_state):
             return "worktree is operator-claimed"
         return None
-    if isinstance(marker_pid, int) and marker_pid > 0 and is_pid_alive(marker_pid, None):
+    if (
+        isinstance(marker_pid, int)
+        and marker_pid > 0
+        and _host.current().probe.is_alive(marker_pid, None)
+    ):
         return f"live writer marker (pid={marker_pid}, session_id={session_id})"
     return None
 
@@ -5248,14 +5343,30 @@ def clean_worktrees(
     *,
     dry_run: bool = False,
 ) -> WorktreeCleanResult:
-    """Junction-safe cleanup of worker worktrees for merged or closed-unmerged PRs.
+    """Junction-safe cleanup of worker worktrees for merged or closed-unmerged PRs and for closed issues.
 
-    Enumerates worktrees under ``worktrees_dir`` whose linked issue/PR resolves
-    to a PR number in ``state.json`` -- or, when state.json has no link, via a
-    ``gh pr list --head <branch> --state all`` fallback that adopts the PR only
-    when exactly one matches the branch (issue #1713; see
-    ``_pr_number_for_head_branch``) -- then applies one of two eligibility
-    checks per worktree, chosen by the PR's *terminal* state:
+    Enumerates worktrees under ``worktrees_dir`` and resolves each
+    candidate's linked issue/PR to a PR number in ``state.json`` -- or,
+    when state.json has no link, via a ``gh pr list --head <branch>
+    --state all`` fallback that adopts the PR only when exactly one
+    matches the branch (issue #1713; see ``_pr_number_for_head_branch``).
+
+    The resolved-PR lanes below always evaluate a candidate FIRST; the
+    closed-issue lane (issue #2487) runs only on a worktree they have
+    declined, and only when no PR resolved or the resolved PR was itself
+    confirmed terminal. Lane order is load-bearing: closing keywords
+    auto-close the issue when its PR merges, so issue-CLOSED + merged-PR
+    is the COMMON merged shape -- letting the closed-issue lane run first
+    would steal the merged lane's normal cases and, with them, its branch
+    deletion (the closed-issue lane keeps the branch on purpose). And a
+    resolved PR that is still open keeps the ordinary wait even on a
+    closed issue: an issue can be closed by hand while its PR is still
+    under review, and reclaiming that checkout is exactly the loss the PR
+    gates exist to prevent.
+
+    With a PR resolved, one of two eligibility checks applies per
+    worktree, chosen by the PR's *terminal* state
+    (``pr_lane_verdict``):
 
     **Merged path** (PR state ``MERGED``):
 
@@ -5284,6 +5395,17 @@ def clean_worktrees(
     (open, unknown, or an erroring/ambiguous ``gh`` call) falls through to the
     fail-closed "PR not merged" skip -- still waiting is the correct default
     for a PR that might yet merge.
+
+    **Closed-issue path** (issue #2487): when every resolved-PR lane has
+    declined a candidate, a live ``gh issue view`` runs; a confirmed
+    ``CLOSED`` makes that decline permanent -- nothing will ever advance
+    the issue again -- so the worktree is reclaimed by
+    ``reclaim_closed_issue_worktree``: same live-session gate, a
+    ``refs/charlie/rescue/`` capture for any uncommitted work, then
+    ``remove_worktree(force=True)`` with the branch KEPT so unpushed
+    commits survive. The lane only sees a candidate when no PR resolved
+    or the resolved PR was confirmed terminal; a PR that is open -- or
+    whose state could not be confirmed -- keeps the ordinary skip.
 
     The order matters and is load-bearing. Checks 2 and 3 together prove the
     tree is byte-identical to what already landed on the base branch, so
@@ -5376,6 +5498,16 @@ def clean_worktrees(
             continue
         issue_state = state_issues.get(str(issue_number), {})
         pr_number = _find_linked_pr_number(issue_number, issue_state, state_prs)
+        # Lane order is load-bearing (issue #2487 rework): the resolved-PR
+        # lanes evaluate every candidate FIRST, and the closed-issue lane
+        # runs only on a worktree they have already declined. Closing
+        # keywords auto-close the issue when its PR merges, so
+        # issue-CLOSED + merged-PR is the COMMON merged shape -- letting
+        # the closed-issue lane run first steals the merged lane's normal
+        # cases and, with them, its branch deletion (the closed-issue
+        # lane keeps the branch on purpose).
+        pr_lane_reason: str | None = None
+        pr_terminal = False
         if not pr_number:
             # Issue #1713: a worktree whose state entry was pruned, or that
             # was created outside the normal dispatch path, has no state.json
@@ -5389,274 +5521,62 @@ def clean_worktrees(
             # only discovery widens, never eligibility.
             pr_number, lookup_detail = _pr_number_for_head_branch(gh, branch)
             if not pr_number:
-                skipped.append(
-                    {
-                        "worktree": str(wt_path),
-                        "branch": branch,
-                        "issue_number": issue_number,
-                        "reason": f"no linked PR in state.json; {lookup_detail}",
-                    }
-                )
-                continue
-        pr_state = state_prs.get(str(pr_number), {})
-        state_merged = bool(pr_state.get("status") == "merged" or pr_state.get("merged") is True)
-
-        # `allow_failure=True` means this never raises (see GitHub.run): errors
-        # come back as GitHubRunResult(ok=False, error=...), not exceptions.
-        gh_result = gh.run(
-            ["pr", "view", str(pr_number), "--json", PR_VIEW_MERGED_FIELDS],
-            json_output=True,
-            allow_failure=True,
-        )
-        gh_ok = isinstance(gh_result, GitHubRunResult) and gh_result.ok
-        gh_merged = False
-        gh_closed_unmerged = False
-        merged_head_sha: str | None = None
-        if gh_ok and isinstance(gh_result.value, dict):
-            gh_pr_state = gh_result.value.get("state")
-            gh_merged = gh_pr_state == "MERGED"
-            merged_head_sha = gh_result.value.get("headRefOid")
-            # Terminal, not pending: CLOSED-and-never-merged is a decision, not
-            # a not-yet-merged state, so it must not collapse into the
-            # "PR not merged" wait-forever branch below (issue #990). This is
-            # still positive proof from the SAME live `gh pr view` call the
-            # merged path already makes -- no extra quota -- and it is exactly
-            # as fail-closed: an erroring/ambiguous `gh` call still falls
-            # through to the generic "not merged" branch, which skips.
-            gh_closed_unmerged = (
-                gh_pr_state == "CLOSED" and gh_result.value.get("mergedAt") is None
+                pr_lane_reason = f"no linked PR in state.json; {lookup_detail}"
+        if pr_number:
+            pr_state = state_prs.get(str(pr_number), {})
+            state_merged = bool(
+                pr_state.get("status") == "merged" or pr_state.get("merged") is True
             )
-
-        if not gh_merged and not gh_closed_unmerged:
-            # Fail-closed: only a live `gh pr view` MERGED or CLOSED-unmerged
-            # confirmation may authorize destructive removal. state.json is
-            # corroboration at best -- never sufficient on its own (state.json
-            # reliability history: #285/#309/#310). An unavailable/erroring
-            # `gh` call falls into this branch too and is DISTINGUISHED from a
-            # confirmed-not-merged PR rather than falling back to trusting
-            # state.json.
-            if not gh_ok:
-                gh_error = gh_result.error if isinstance(gh_result, GitHubRunResult) else "unknown"
-                reason = f"gh pr view unavailable; cannot confirm merge status: {gh_error}"
-            elif state_merged:
-                reason = "state.json says merged but gh pr view did not confirm MERGED"
-            else:
-                reason = "PR not merged"
-            skipped.append(
-                {
-                    "worktree": str(wt_path),
-                    "branch": branch,
-                    "issue_number": issue_number,
-                    "pr_number": pr_number,
-                    "reason": reason,
-                }
+            verdict = pr_lane_verdict(
+                repo_root,
+                wt_path,
+                branch,
+                pr_number,
+                state_merged,
+                config,
+                gh,
             )
-            continue
-
-        if gh_merged:
-            try:
-                dirty_reason = _worktree_dirty_reason(
-                    wt_path,
-                    config.dispatch.injected_paths,
-                    config.dispatch.materialize_dirs,
-                )
-            except WorktreeProbeFailedError as exc:
-                skipped.append(
-                    {
-                        "worktree": str(wt_path),
-                        "branch": branch,
-                        "issue_number": issue_number,
-                        "pr_number": pr_number,
-                        "reason": f"worktree status probe failed: {exc}",
-                    }
-                )
-                continue
-            if dirty_reason:
-                skipped.append(
-                    {
-                        "worktree": str(wt_path),
-                        "branch": branch,
-                        "issue_number": issue_number,
-                        "pr_number": pr_number,
-                        "reason": dirty_reason,
-                    }
-                )
-                continue
-            if not merged_head_sha:
-                skipped.append(
-                    {
-                        "worktree": str(wt_path),
-                        "branch": branch,
-                        "issue_number": issue_number,
-                        "pr_number": pr_number,
-                        "reason": "gh pr view did not return headRefOid for the merged PR",
-                    }
-                )
-                continue
-            head_result = run_captured(
-                ["git", "rev-parse", "--verify", "HEAD"],
-                cwd=wt_path,
-                timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
-            )
-            if not head_result.ok or not head_result.stdout.strip():
-                skipped.append(
-                    {
-                        "worktree": str(wt_path),
-                        "branch": branch,
-                        "issue_number": issue_number,
-                        "pr_number": pr_number,
-                        "reason": "could not resolve worktree HEAD",
-                    }
-                )
-                continue
-            local_head_sha = head_result.stdout.strip()
-            if local_head_sha != merged_head_sha:
-                # Containment, NOT equality. The question this gate exists to ask
-                # is "does the worktree hold commits that did not get merged?",
-                # and an equality test cannot tell the two directions apart:
-                #
-                #   local BEHIND merged  -> everything here is reachable from the
-                #       merged head; nothing to lose. This is the ORDINARY shape,
-                #       because the merge path advances the PR branch after the
-                #       worker's last local commit (Aviator merge-queue rebases,
-                #       merge-train updates, base-into-branch merges). 46 of 47
-                #       mismatching worktrees on this host were this shape and were
-                #       all reported as "stray post-merge commit(s)".
-                #   local AHEAD/DIVERGED -> real unmerged work; refuse.
-                #
-                # This is the same class of error the note above records for
-                # `_worktree_refuse_to_reset_reason`: a check whose shape counts
-                # the expected post-merge topology as danger.
-                #
-                # The containment test needs `merged_head_sha` to still be in
-                # the local object store. For a squash-merged PR whose remote
-                # branch was deleted, nothing references that SHA once the
-                # local branch sits behind it, so a `git gc` can prune it (or
-                # this repo may simply never have fetched a branch that ever
-                # pointed at it), and the object-presence gate below starts
-                # refusing every otherwise-reclaimable worktree, permanently
-                # (37 of 63 candidates in one live sweep; root growing without
-                # bound). GitHub still serves the commit via
-                # `refs/pull/<N>/head` even after the head branch is deleted —
-                # unlike a raw-SHA fetch, which most servers (GitHub included)
-                # refuse to advertise — so attempt one bounded, non-interactive
-                # fetch of that ref and re-check before failing closed. The
-                # fetch only adds objects: it never moves a branch, touches a
-                # worktree, or leaves FETCH_HEAD in a state some other call
-                # site depends on, so it is safe to run unconditionally,
-                # including under `--dry-run` — every other eligibility probe
-                # in this function (gh pr view, rev-parse, the ancestor check
-                # below) already runs regardless of `dry_run`, so withholding
-                # just this fetch would make a dry-run preview under-report
-                # what a real run could actually reclaim.
-                if not _object_exists(repo_root, merged_head_sha) and _has_origin_remote(
-                    repo_root
-                ):
-                    _run_remote_captured(
-                        ["git", "fetch", "origin", f"refs/pull/{pr_number}/head"],
-                        cwd=repo_root,
-                        extra_env={"GIT_TERMINAL_PROMPT": "0"},
-                    )
-                if not _object_exists(repo_root, merged_head_sha):
-                    # Still absent -- no origin remote, no such PR ref on the
-                    # remote, or the fetch itself failed/timed out.
-                    # `_run_remote_captured` never raises, so a network
-                    # failure here degrades to this same fail-closed skip
-                    # rather than aborting the sweep.
-                    skipped.append(
-                        {
-                            "worktree": str(wt_path),
-                            "branch": branch,
-                            "issue_number": issue_number,
-                            "pr_number": pr_number,
-                            "reason": (
-                                f"merged PR head ({merged_head_sha[:8]}) is not present in the "
-                                "local object store; cannot verify the worktree adds nothing "
-                                "beyond it"
-                            ),
-                        }
-                    )
-                    continue
-                if not _is_ancestor(repo_root, local_head_sha, merged_head_sha):
-                    skipped.append(
-                        {
-                            "worktree": str(wt_path),
-                            "branch": branch,
-                            "issue_number": issue_number,
-                            "pr_number": pr_number,
-                            "reason": (
-                                f"worktree HEAD ({local_head_sha[:8]}) is not contained in "
-                                f"merged PR head ({merged_head_sha[:8]}); stray post-merge "
-                                "commit(s)"
-                            ),
-                        }
-                    )
-                    continue
-        elif gh_closed_unmerged:
-            # A closed-and-never-merged PR is a terminal decision (issue
-            # #990), not a pending state -- nothing will ever advance it to
-            # MERGED, so the worktree cannot wait on that. There is no
-            # "merged head" to compare against here (the PR never landed), so
-            # eligibility is the ORDINARY "would removing this lose anything"
-            # question instead of the merged path's special
-            # squash-with-deleted-branch containment check: is the working
-            # tree clean, and does the branch have any commits that are not
-            # also on its remote copy? `_worktree_refuse_to_reset_reason`
-            # already answers exactly that (dirty-tree check + remote-ahead
-            # check, positive-proof throughout) for the redispatch lane, and a
-            # closed-unmerged PR's branch is the ordinary case it was built
-            # for -- closing without merging does not *automatically* delete
-            # the remote branch the way GitHub's merge-time auto-delete does
-            # (an operator or Aviator can still delete it by hand), so this is
-            # not the squash-merge special case documented above; the helper's
-            # remote-ahead check already refuses when the remote branch is
-            # gone and the local tip carries commits beyond base. Reused as-is
-            # rather than re-derived.
-            try:
-                closed_unsafe_reason = _worktree_refuse_to_reset_reason(
+            pr_lane_reason = verdict.decline_reason
+            pr_terminal = verdict.terminal
+        if pr_lane_reason is not None:
+            # The PR lanes declined. A live ``gh issue view`` confirming
+            # CLOSED makes that decline permanent -- nothing will ever
+            # advance the issue again -- so the closed-issue lane
+            # reclaims: same live-session gate, a rescue capture for any
+            # uncommitted work, forced removal, branch kept. It gets the
+            # candidate only when no PR resolved or the resolved PR was
+            # itself confirmed terminal: a PR that is still open -- or
+            # whose state could not be confirmed -- may yet merge or may
+            # still be under review (an issue can be closed by hand
+            # mid-rework), and reclaiming that checkout is exactly the
+            # loss the PR gates exist to prevent.
+            if (pr_number is None or pr_terminal) and issue_confirmed_closed(gh, issue_number):
+                lane = reclaim_closed_issue_worktree(
                     repo_root,
-                    branch,
-                    config.dispatch.base_ref,
                     wt_path,
-                    config.dispatch.injected_paths,
-                    config.dispatch.materialize_dirs,
+                    branch,
+                    issue_number,
+                    issue_state,
+                    pr_number,
+                    config,
+                    dry_run=dry_run,
                 )
-            except (WorktreeProbeFailedError, RuntimeError) as exc:
-                skipped.append(
-                    {
-                        "worktree": str(wt_path),
-                        "branch": branch,
-                        "issue_number": issue_number,
-                        "pr_number": pr_number,
-                        "reason": f"closed-unmerged PR reclaim safety probe failed: {exc}",
-                    }
-                )
+                if lane.bucket == "removed":
+                    removed.append(lane.entry)
+                elif lane.bucket == "planned":
+                    planned.append(lane.entry)
+                elif lane.bucket == "failed":
+                    failed.append(lane.entry)
+                else:
+                    skipped.append(lane.entry)
                 continue
-            if closed_unsafe_reason:
-                skipped.append(
-                    {
-                        "worktree": str(wt_path),
-                        "branch": branch,
-                        "issue_number": issue_number,
-                        "pr_number": pr_number,
-                        "reason": f"closed-unmerged PR: {closed_unsafe_reason}",
-                    }
-                )
-                continue
-        else:
-            # Unreachable today: the `not gh_merged and not gh_closed_unmerged`
-            # guard above already continues for every state that is neither.
-            # Kept as an explicit fail-closed branch rather than relying on
-            # that guard alone, so a future third eligibility state added
-            # above this `if` cannot silently fall through into either
-            # removal path via a bare `else`.
             skipped.append(
                 {
                     "worktree": str(wt_path),
                     "branch": branch,
                     "issue_number": issue_number,
                     "pr_number": pr_number,
-                    "reason": "PR eligibility state not recognized (neither merged nor closed-unmerged)",
+                    "reason": pr_lane_reason,
                 }
             )
             continue
@@ -5798,3 +5718,43 @@ def clean_worktrees(
     if not venv_ok:
         message = f"{message}; {venv_message}"
     return WorktreeCleanResult(ok=ok, message=message, data=data)
+
+
+_CLEAN_LIST_KEYS = ("planned", "removed", "skipped", "failed", "attention_events")
+_ORPHAN_KEYS = ("planned", "removed", "failed")
+
+
+def merge_clean_results(
+    swept: Sequence[tuple[Path, WorktreeCleanResult]],
+) -> WorktreeCleanResult:
+    """Combine one ``clean_worktrees`` result per swept root into one result.
+
+    A single root is returned unchanged. With the host I/O volume active the
+    legacy root is swept too (``ResolvedLayout.sweep_roots``). The roots are
+    disjoint, so ``worktrees_out_of_scope`` is the registered total minus the
+    worktrees in scope under any root; the registered total and the venv check
+    are the same for every root, so the first result's values are kept.
+    """
+    if not swept:
+        raise ValueError("merge_clean_results needs at least one swept root")
+    if len(swept) == 1:
+        return swept[0][1]
+    results = [result for _, result in swept]
+    first = results[0].data
+    registered = int(first.get("worktrees_registered", 0))
+    data: dict[str, Any] = {
+        key: [item for r in results for item in r.data.get(key, [])] for key in _CLEAN_LIST_KEYS
+    }
+    data["orphans"] = {
+        key: [item for r in results for item in r.data.get("orphans", {}).get(key, [])]
+        for key in _ORPHAN_KEYS
+    }
+    data["venv_ok"] = first.get("venv_ok")
+    data["venv_message"] = first.get("venv_message")
+    data["worktrees_registered"] = registered
+    data["worktrees_out_of_scope"] = sum(
+        int(r.data.get("worktrees_out_of_scope", 0)) for r in results
+    ) - registered * (len(results) - 1)
+    data["roots"] = [str(root) for root, _ in swept]
+    message = "; ".join(f"{root}: {result.message}" for root, result in swept)
+    return WorktreeCleanResult(ok=all(r.ok for r in results), message=message, data=data)

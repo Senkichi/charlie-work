@@ -100,7 +100,9 @@ def test_review_started_clears_needs_rework() -> None:
     from charlie_work.labels import transition, TransitionOutcome
 
     fake_gh = FakeGitHub()
-    result = transition(fake_gh, OrchestratorConfig().labels, 123, "review_started")
+    result = transition(
+        fake_gh, OrchestratorConfig().labels, 123, "review_started", state_path=None
+    )
 
     assert result.outcome == TransitionOutcome.APPLIED
     assert (123, "agent:pr-open") in fake_gh.labels_added

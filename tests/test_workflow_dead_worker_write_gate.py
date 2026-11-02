@@ -51,7 +51,9 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 from _fakes_github import FakeGitHub
+from _run_captured_fakes import patch_run_captured
 from _sessions_db_fixtures import make_sessions_db
+from _host_fixtures import host_probe
 from charlie_work.config import (
     AutoMergeConfig,
     DeescalationConfig,
@@ -159,14 +161,18 @@ def test_sweep_orphan_processes_for_dead_sessions_dry_run_true_kills_nothing(
 
     control_runner, control_calls = _run_recorder(real_run)
     with (
-        patch("charlie_work.dead_worker_reap.sweep_orphan_processes", side_effect=_control_sweep),
-        # os.name check lives in dead_worker_reap; patching the os module
+        patch(
+            "charlie_work.dead_worker_sweep.effects_sessions.sweep_orphan_processes",
+            side_effect=_control_sweep,
+        ),
+        # os.name check lives in dead_worker_sweep.effects_sessions; patching the os module
         # directly avoids depending on which module happens to `import os`
         # into its own namespace (workflow.py no longer does, post routing
         # deletion).
         patch("os.name", "nt"),
         patch("charlie_work.worker_fate.is_alive", return_value=False),
         patch("subprocess.run", side_effect=control_runner),
+        patch_run_captured(control_runner),
     ):
         _sweep_orphan_processes_for_dead_sessions(
             control_sessions_dir,
@@ -191,10 +197,14 @@ def test_sweep_orphan_processes_for_dead_sessions_dry_run_true_kills_nothing(
 
     dry_runner, dry_calls = _run_recorder(real_run)
     with (
-        patch("charlie_work.dead_worker_reap.sweep_orphan_processes", side_effect=_dry_sweep),
+        patch(
+            "charlie_work.dead_worker_sweep.effects_sessions.sweep_orphan_processes",
+            side_effect=_dry_sweep,
+        ),
         patch("os.name", "nt"),
         patch("charlie_work.worker_fate.is_alive", return_value=False),
         patch("subprocess.run", side_effect=dry_runner),
+        patch_run_captured(dry_runner),
     ):
         _sweep_orphan_processes_for_dead_sessions(
             sessions_dir, state_file, config, write_gate=_wg(state_file, dry_run=True)
@@ -214,7 +224,9 @@ def test_sweep_orphan_processes_for_dead_sessions_dry_run_true_kills_nothing(
 # ---------------------------------------------------------------------------
 
 
-def test_detect_and_handle_orphaned_workers_dry_run_true_writes_nothing(tmp_path: Path) -> None:
+def test_detect_and_handle_orphaned_workers_dry_run_true_writes_nothing(
+    tmp_path: Path, monkeypatch
+) -> None:
     """C1.2: a dead worker with a ``request_changes`` review decision and an
     unchanged head normally resets the issue to ``rework_requested`` (issue
     #207) via the R5-completed sweep-events batcher plus a final
@@ -282,7 +294,7 @@ def test_detect_and_handle_orphaned_workers_dry_run_true_writes_nothing(tmp_path
     control_state_file = _seed(control_root)
     control_sessions_dir = control_root / "sessions"
     control_sessions_dir.mkdir(parents=True, exist_ok=True)
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(monkeypatch, alive=False):
         _detect_and_handle_orphaned_workers(
             control_sessions_dir,
             control_state_file,
@@ -306,7 +318,7 @@ def test_detect_and_handle_orphaned_workers_dry_run_true_writes_nothing(tmp_path
     save_calls: list[tuple[tuple, dict]] = []
     append_calls: list[tuple[tuple, dict]] = []
     with (
-        patch("charlie_work.workflow._worker_pid_alive", return_value=False),
+        host_probe(monkeypatch, alive=False),
         patch(
             "charlie_work.write_gate.save_state",
             lambda *a, **k: save_calls.append((a, k)) or {"BUG": "raw save_state was called"},

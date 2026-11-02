@@ -39,39 +39,30 @@ def test_find_repo_root_resolves_shared_root_from_linked_worktree(tmp_path: Path
     """Issue #648: with no --repo, find_repo_root() invoked from inside a
     linked git worktree must resolve the *shared* (main) worktree root, not
     the worktree's own toplevel — otherwise runtime state silently targets a
-    phantom, never-populated ``.var/charlie-work/`` directory."""
+    phantom, never-populated ``.var/charlie-work/`` directory.
+
+    The linked worktree is the minimal on-disk structure
+    (``_init_minimal_linked_worktree``) instead of a real ``git worktree
+    add``/--remove pair: spawning those two git processes dominated the
+    call phase on Windows CI (~1.0 s median vs 0.48 s baseline, issue
+    #2895). The resolution under test still goes through real ``git
+    rev-parse`` (``--git-dir`` / ``--git-common-dir``) in the worktree,
+    exactly as it does in production.
+    """
     from charlie_work.paths import find_repo_root, runtime_paths
 
-    repo_root = tmp_path / "repo"
-    _init_git_repo(repo_root)
+    repo_root, wt = _init_minimal_linked_worktree(tmp_path, "wt-shared")
     # Seed a real state dir under the main root so we can distinguish it.
     main_state_dir = repo_root / ".var" / "charlie-work"
     main_state_dir.mkdir(parents=True)
     (main_state_dir / "state.json").write_text("{}", encoding="utf-8")
 
-    branch = "agent/issue-648-linked"
-    subprocess.run(
-        ["git", "worktree", "add", "-b", branch, str(tmp_path / "wt"), "HEAD"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    try:
-        resolved = find_repo_root(tmp_path / "wt")
-        # Must resolve to the main worktree root, not the linked worktree.
-        assert resolved == repo_root.resolve()
-        paths = runtime_paths(resolved, ".var/charlie-work")
-        assert paths.state_file.exists()
-        assert paths.state_file == (repo_root / ".var" / "charlie-work" / "state.json").resolve()
-    finally:
-        subprocess.run(
-            ["git", "worktree", "remove", "--force", str(tmp_path / "wt")],
-            cwd=repo_root,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+    resolved = find_repo_root(wt)
+    # Must resolve to the main worktree root, not the linked worktree.
+    assert resolved == repo_root.resolve()
+    paths = runtime_paths(resolved, ".var/charlie-work")
+    assert paths.state_file.exists()
+    assert paths.state_file == (repo_root / ".var" / "charlie-work" / "state.json").resolve()
 
 
 def test_find_repo_root_explicit_main_worktree_returns_main_root(tmp_path: Path) -> None:
@@ -86,6 +77,37 @@ def test_find_repo_root_explicit_main_worktree_returns_main_root(tmp_path: Path)
     assert resolved == repo_root.resolve()
 
 
+def _init_minimal_linked_worktree(tmp_path: Path, name: str = "wt-explicit") -> tuple[Path, Path]:
+    """Create a minimal valid git repo and linked worktree directly on disk.
+
+    Avoids the subprocess spawn storm (cold template init, git worktree add,
+    and git worktree remove in finally) that the test ledger flagged at
+    ~2.8x baseline on Windows CI (issue #2537).
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    git_dir = repo_root / ".git"
+    git_dir.mkdir()
+    (git_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (git_dir / "config").write_text(
+        "[core]\n\trepositoryformatversion = 0\n\tfilemode = false\n\tbare = false\n",
+        encoding="utf-8",
+    )
+    (git_dir / "objects").mkdir()
+    (git_dir / "refs").mkdir()
+
+    linked_wt = tmp_path / name
+    linked_wt.mkdir()
+    admin = git_dir / "worktrees" / name
+    admin.mkdir(parents=True)
+    (admin / "commondir").write_text("../..\n", encoding="utf-8")
+    (admin / "gitdir").write_text(f"{linked_wt / '.git'}\n", encoding="utf-8")
+    # A real linked worktree never shares the main worktree's branch.
+    (admin / "HEAD").write_text("ref: refs/heads/agent-issue-648-explicit\n", encoding="utf-8")
+    (linked_wt / ".git").write_text(f"gitdir: {admin}\n", encoding="utf-8")
+    return repo_root, linked_wt
+
+
 def test_find_repo_root_explicit_linked_worktree_resolves_main_root(tmp_path: Path) -> None:
     """Issue #648 review: an explicit --repo pointing at a linked worktree must
     also resolve to the shared main root, not the linked worktree's own
@@ -94,28 +116,9 @@ def test_find_repo_root_explicit_linked_worktree_resolves_main_root(tmp_path: Pa
     phantom state dir without this."""
     from charlie_work.paths import find_repo_root
 
-    repo_root = tmp_path / "repo"
-    _init_git_repo(repo_root)
-    branch = "agent/issue-648-explicit"
-    linked_wt = tmp_path / "wt-explicit"
-    subprocess.run(
-        ["git", "worktree", "add", "-b", branch, str(linked_wt), "HEAD"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    try:
-        resolved = find_repo_root(linked_wt, explicit=True)
-        assert resolved == repo_root.resolve()
-    finally:
-        subprocess.run(
-            ["git", "worktree", "remove", "--force", str(linked_wt)],
-            cwd=repo_root,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+    repo_root, linked_wt = _init_minimal_linked_worktree(tmp_path)
+    resolved = find_repo_root(linked_wt, explicit=True)
+    assert resolved == repo_root.resolve()
 
 
 def test_find_repo_root_from_subdirectory_of_linked_worktree(tmp_path: Path) -> None:

@@ -1,0 +1,6 @@
+issue #2739: terminal 'already landed' edge for the local path --
+retires a zero-net-diff record through the gate's merge bookkeeping
+(killing any stray claimed suite) instead of letting the packet phase
+re-enter review. Installed from
+``orchestration/local_landed_finalize.py``. Net-new OrchestratorApp
+member added after the Track 2 Phase B surface baseline was pinned.

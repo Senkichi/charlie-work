@@ -1,0 +1,3 @@
+info
+# Issue #2439: per-pass GitHub request/point accounting (lane pass or reap
+# sweep), measured from x-ratelimit-used deltas. Routine bookkeeping.

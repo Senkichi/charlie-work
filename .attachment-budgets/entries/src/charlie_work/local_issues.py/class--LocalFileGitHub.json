@@ -1,6 +1,13 @@
 {
  "boundary": 8.5,
- "bumps": [],
+ "bumps": [
+  {
+   "to": 52,
+   "reason": "Issue #2540 extends ChecksLike with check_run / workflow_runs_for_check_suite (the GET check-run + GET actions/runs?check_suite_id reads behind the run-id resolution enrichment); LocalFileGitHub is protocol-mechanically required to mirror every ChecksLike member (tests/test_local_issues.py test_local_file_github_defines_every_protocol_member), so its null-object surface grows by those two members.",
+   "actor": "worker",
+   "ack": "https://github.com/Senkichi/charlie-work/issues/2540"
+  }
+ ],
  "file": "src/charlie_work/local_issues.py",
  "identity": "LocalFileGitHub",
  "kind": "class",

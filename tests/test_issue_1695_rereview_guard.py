@@ -275,6 +275,50 @@ def test_cli_rereview_force_regenerates_packet_and_archives_prior_decision(
     )
     assert round_two["decision"] == "approved"
     assert round_two["reviewed_head_sha"] == "sha-carried"
+    # A stale-head void is not a *force* void: verdict_force_voided is
+    # reserved for live-head verdicts that only --force-rereview discards.
+    state = json.loads((repo / _STATE_REL).read_text(encoding="utf-8"))
+    assert not [e for e in state["events"] if e.get("kind") == "verdict_force_voided"]
+
+
+def test_cli_force_rereview_voids_live_head_request_changes_verdict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #2081: a ``request_changes`` verdict pinned to the LIVE head
+    survived ``--force-rereview`` (the flag only skipped the guard, and
+    review() voids stale-head verdicts alone). Forced, it must be archived,
+    replaced by the pending stub, and named in a ``verdict_force_voided``
+    event."""
+    repo, _fake_gh = _cli_repo_app(tmp_path, monkeypatch)
+    pr_dir = repo / ".var" / "charlie-work" / "prs" / f"pr-{_PR_NUMBER}"
+    _seed_decision(
+        repo,
+        {
+            "decision": "request_changes",
+            "summary": "fix the thing",
+            "required_changes": ["fix the thing"],
+            "reviewed_head_sha": _LIVE_HEAD,
+            "verdict_provenance": "carried_forward",
+        },
+    )
+
+    rc = _run_cli(repo, "--force-rereview")
+
+    assert rc == 0
+    flat = json.loads(_decision_path(repo).read_text(encoding="utf-8"))
+    assert flat["decision"] == "pending"
+    archived = json.loads(
+        (pr_dir / "rounds" / "round-1" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert archived["decision"] == "request_changes"
+    assert archived["reviewed_head_sha"] == _LIVE_HEAD
+    state = json.loads((repo / _STATE_REL).read_text(encoding="utf-8"))
+    assert state["prs"][str(_PR_NUMBER)]["decision"] == "pending"
+    voided = [e for e in state["events"] if e.get("kind") == "verdict_force_voided"]
+    assert len(voided) == 1
+    assert voided[0]["payload"]["voided_decision"] == "request_changes"
+    assert voided[0]["payload"]["voided_reviewed_head_sha"] == _LIVE_HEAD
 
 
 def test_cli_rereview_proceeds_when_no_verdict(

@@ -17,7 +17,7 @@ from _orphan_sweep_fixtures import _dead_worker_rework_bed, _run_orphan_sweep
 from _unescalate_fixtures import _events, _stranded_worktree_bed
 from charlie_work.config import WORKER_OUTCOME_FILENAME
 from charlie_work.foreign_worktree import write_worktree_marker
-from charlie_work.live_handoff_finalize import collect_stale_live_handoff_pids
+from charlie_work.dead_worker_sweep.live_handoff import collect_stale_live_handoff_pids
 from charlie_work.process_utils import write_worker_terminal_status
 from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.worktree import worktree_path_for_branch
@@ -61,7 +61,9 @@ def test_n1_live_handoff_does_not_finalize_a_blocked_declaration(tmp_path: Path)
     assert candidates == {}
 
 
-def test_n4_with_pr_blocked_declaration_survives_a_reaped_worktree(tmp_path: Path) -> None:
+def test_n4_with_pr_blocked_declaration_survives_a_reaped_worktree(
+    tmp_path: Path, monkeypatch
+) -> None:
     config, paths, fake_gh, _dispatched_at = _dead_worker_rework_bed(
         tmp_path, decision="request_changes"
     )
@@ -85,7 +87,7 @@ def test_n4_with_pr_blocked_declaration_survives_a_reaped_worktree(tmp_path: Pat
         worker_outcome_written_at=_iso(now - timedelta(minutes=2)),
     )
 
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]

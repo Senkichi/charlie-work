@@ -2,8 +2,11 @@
 
 Hoisted out of ``test_reconcile.py`` (issue #1284): its own minimal
 reconcile-pass ``FakeGitHub`` double, PR/issue payload builders, and a
-bare-remote-plus-clone / completed-worktree pair of git fixture builders,
-all imported by other test modules.
+completed-worktree git fixture builder, all imported by other test
+modules. This module used to carry its own bare-remote-plus-clone
+builder, a stale copy that missed the per-process git template; its
+importers now take ``_worktree_fixtures._init_bare_remote_and_clone``
+directly (issue #2303).
 
 Issue #1559 (Track-1 split of ``test_reconcile.py``) added the shared
 check-run / review-decision / empty-stdout helpers the new sibling modules
@@ -219,25 +222,6 @@ def _issue(number: int, labels: list[str], state: str = "OPEN") -> dict[str, Any
         "labels": [{"name": label} for label in labels],
         "state": state,
     }
-
-
-def _init_bare_remote_and_clone(tmp_path: Path) -> tuple[Path, Path]:
-    """Create a bare remote repo and a local clone, return (remote, clone)."""
-    remote = tmp_path / "remote"
-    remote.mkdir(parents=True, exist_ok=True)
-    _git(remote, "init", "--bare", "--initial-branch=main")
-    clone = tmp_path / "clone"
-    clone.mkdir(parents=True, exist_ok=True)
-    _git(clone, "init", "--initial-branch=main")
-    _git(clone, "config", "user.email", "test@example.test")
-    _git(clone, "config", "user.name", "Test User")
-    _git(clone, "config", "commit.gpgSign", "false")
-    _git(clone, "remote", "add", "origin", str(remote))
-    (clone / "README.md").write_text("hello\n", encoding="utf-8")
-    _git(clone, "add", "README.md")
-    _git(clone, "commit", "-m", "initial commit")
-    _git(clone, "push", "-u", "origin", "main")
-    return remote, clone
 
 
 def _setup_completed_worktree(

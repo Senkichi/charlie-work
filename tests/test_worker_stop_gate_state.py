@@ -135,7 +135,7 @@ def test_write_block_count_is_atomic_tmp_replace(gate, tmp_path):
     gate._write_block_count(target, 2)
 
     assert target.exists()
-    assert not target.with_suffix(target.suffix + ".tmp").exists()
+    assert not list(tmp_path.glob("*.tmp"))
     assert json.loads(target.read_text(encoding="utf-8")) == {"count": 2}
 
 

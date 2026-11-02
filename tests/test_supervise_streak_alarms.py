@@ -227,13 +227,15 @@ def test_self_deploy_streak_survives_a_real_deferral_end_to_end(
 
     monkeypatch.setattr("charlie_work.fleet_registry.count_fleet_live_sessions", _fake_count)
 
-    # Pass 1: dependency-changing pull, 0 runners -> attempts sync, sync fails.
+    # Pass 1: dependency-changing update, 0 runners -> merge lands, sync fails.
     runner1, _ = _make_fake_runner(
         [
             RunResult(0, "abc123\n", ""),  # before HEAD
-            RunResult(0, "", ""),  # pull ok
-            RunResult(0, "def456\n", ""),  # after HEAD
+            RunResult(0, "", ""),  # git fetch origin main
+            RunResult(0, "def456\n", ""),  # git rev-parse origin/main
+            RunResult(1, "", ""),  # merge-base: target not an ancestor of HEAD
             RunResult(0, "pyproject.toml\nuv.lock\n", ""),  # diff
+            RunResult(0, "", ""),  # git merge --ff-only origin/main
             RunResult(1, "", "uv sync failed: resolution error"),  # uv sync fails
         ]
     )
@@ -247,8 +249,8 @@ def test_self_deploy_streak_survives_a_real_deferral_end_to_end(
     runner2, _ = _make_fake_runner(
         [
             RunResult(0, "def456\n", ""),  # before HEAD
-            RunResult(0, "Already up to date.\n", ""),  # pull
-            RunResult(0, "def456\n", ""),  # after HEAD (unchanged)
+            RunResult(0, "", ""),  # git fetch origin main
+            RunResult(0, "def456\n", ""),  # git rev-parse origin/main (unchanged)
             RunResult(1, "", "uv sync failed: resolution error"),  # uv sync fails
         ]
     )
@@ -262,8 +264,8 @@ def test_self_deploy_streak_survives_a_real_deferral_end_to_end(
     runner3, _ = _make_fake_runner(
         [
             RunResult(0, "def456\n", ""),  # before HEAD
-            RunResult(0, "Already up to date.\n", ""),  # pull
-            RunResult(0, "def456\n", ""),  # after HEAD (unchanged)
+            RunResult(0, "", ""),  # git fetch origin main
+            RunResult(0, "def456\n", ""),  # git rev-parse origin/main (unchanged)
         ]
     )
     result3 = self_deploy(tmp_path, run_command=runner3, failure_alarm_threshold=3)
@@ -279,8 +281,8 @@ def test_self_deploy_streak_survives_a_real_deferral_end_to_end(
     runner4, _ = _make_fake_runner(
         [
             RunResult(0, "def456\n", ""),  # before HEAD
-            RunResult(0, "Already up to date.\n", ""),  # pull
-            RunResult(0, "def456\n", ""),  # after HEAD (unchanged)
+            RunResult(0, "", ""),  # git fetch origin main
+            RunResult(0, "def456\n", ""),  # git rev-parse origin/main (unchanged)
             RunResult(1, "", "uv sync failed: resolution error"),  # uv sync fails
         ]
     )

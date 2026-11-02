@@ -24,7 +24,7 @@ from charlie_work import layout
 from charlie_work.config import FleetSupervisorConfig, OrchestratorConfig
 from charlie_work.fleet_dispatch import fleet_loop
 from charlie_work.instrumentation import query_events
-from charlie_work.workflow import CommandResult
+from charlie_work.command_result import CommandResult
 
 
 @patch("charlie_work.fleet_dispatch._load_registry")

@@ -18,6 +18,7 @@ from typing import Any
 from _fakes_github import FakeGitHub
 from _worktree_fixtures import (
     _init_bare_remote_and_clone,
+    _init_repo,
     _setup_completed_worktree,
 )
 from charlie_work.claude_code import ClaudeWorkerRecord
@@ -35,6 +36,20 @@ from charlie_work.worktree import create_worktree
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
 
 
+def _dead_probe(monkeypatch: Any) -> None:
+    """Install an all-dead host probe so liveness reads never hit the host PID table."""
+    import dataclasses
+
+    from charlie_work import host as host_pkg
+    from charlie_work.host.fakes import FakeProcessProbe
+
+    monkeypatch.setattr(
+        host_pkg,
+        "_ACTIVE",
+        dataclasses.replace(host_pkg.current(), probe=FakeProcessProbe()),
+    )
+
+
 def _run_phantom_blocked_dispatch(
     tmp_path: Path,
     monkeypatch: Any,
@@ -47,6 +62,13 @@ def _run_phantom_blocked_dispatch(
     ``outcome_payload``; returns ``(result, sidecar_path, fake_gh, paths)``."""
     from charlie_work.config import WORKER_OUTCOME_FILENAME
 
+    # Issue #2262: the phantom lane's salvage probe runs against the app's
+    # repo_root (``tmp_path`` here -- the worker's worktree lives in the
+    # ``clone`` subdir). A real repo at tmp_path lets the probe reach the
+    # conclusive ``no_commits`` verdict (branch ref provably absent) the
+    # requeue path requires; on a non-git dir the probe is inconclusive and
+    # the lane defers instead.
+    _init_repo(tmp_path)
     remote, repo_root = _init_bare_remote_and_clone(tmp_path)
     if with_commits:
         worktree_path, branch = _setup_completed_worktree(repo_root, 1453)
@@ -76,11 +98,10 @@ def _run_phantom_blocked_dispatch(
         )
 
     monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
-    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
-    # See the sibling completed-worktree test above: the sidecar's PID must
-    # also read as dead through worker_fate.is_alive, not just
-    # workflow's is_pid_alive.
-    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda pid, start: False)
+    # Every liveness read — the post-launch result check and the sidecar's
+    # PID through ``worker_fate.is_alive`` — goes through the one injected
+    # host probe; the all-dead fake keeps the outcome off the host PID table.
+    _dead_probe(monkeypatch)
 
     config = OrchestratorConfig(worker=WorkerRoleConfig(harness="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -288,8 +309,7 @@ def test_dispatch_phantom_stale_outcome_emits_worker_evidence_stale(
         )
 
     monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
-    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
-    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda pid, start: False)
+    _dead_probe(monkeypatch)
 
     config = OrchestratorConfig(worker=WorkerRoleConfig(harness="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)

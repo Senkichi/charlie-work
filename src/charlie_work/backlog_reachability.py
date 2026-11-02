@@ -32,12 +32,16 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+import charlie_work.host_routing as host_routing
 
 from .ci_findings import _parse_iso_ts
 from .config import OrchestratorConfig
 from .fleet_registry import managed_repo_names
+from .github_capabilities.cross_repo_blockers import CrossRepoBlocker, blocker_ref
 from .github import (
     GitHubError,
     GitHubLike,
@@ -158,9 +162,25 @@ def classify_backlog_reachability(
         "consistent": None,
         "open_total": 0,
         "dispatchable": 0,
+        # Issue #2314: the no-ready-label arm splits in two. An open issue
+        # carrying a parked/triage label (``config.heartbeat.
+        # stale_mention_parked_labels`` -- blocked, needs-design,
+        # human-action, question, wontfix, duplicate, invalid, tracker,
+        # umbrella, epic by default) was deliberately parked by a human and
+        # bins as ``parked_unready``; only an issue with neither the ready
+        # label nor a parked label bins as ``missing_ready``, the genuinely
+        # un-triaged pool. Without the split every parked issue inflated
+        # ``missing_ready``, so the payload read as "N issues need triage"
+        # when a triage pass found none.
+        "parked_unready": 0,
         "missing_ready": 0,
         "terminal_label": 0,
         "active_label": 0,
+        # Spec C2: a ready issue another host owns (``host_routing``). Without this
+        # bin a non-default host would count the default host's queue as its own
+        # ``dispatchable`` and raise false dispatch_stale alarms. Read from the
+        # other host, it is that host's queue depth.
+        "other_host": 0,
         "operator_claimed": 0,
         # Issue #1110: an automated-ready issue with no agent: label that is
         # blocked by an open predecessor passes every label-only check above
@@ -226,6 +246,10 @@ def classify_backlog_reachability(
 
     claimed = operator_claimed or set()
     covered = mention_covered or {}
+    # Issue #2314: the parked/triage taxonomy a non-ready issue is checked
+    # against -- the configured heartbeat.stale_mention_parked_labels set,
+    # not a second hard-coded list.
+    parked_labels = frozenset(config.heartbeat.stale_mention_parked_labels)
     covered_prs: dict[int, list[int]] = {}
     ready_seen = 0
     examples: dict[str, list[int]] = {}
@@ -241,13 +265,24 @@ def classify_backlog_reachability(
         number = int(number)
         names = label_names(issue)
         if config.labels.ready not in names:
-            reason = "missing_ready"
+            # Issue #2314: split the un-triaged bin. A parked label (the
+            # configured ``heartbeat.stale_mention_parked_labels`` taxonomy --
+            # the same parked set heartbeat_stale_mentions and the armable
+            # gate use, so this module does not grow a second hard-coded
+            # list) means a human already triaged and parked the issue; it is
+            # not part of the un-triaged pool ``missing_ready`` names.
+            if names & parked_labels:
+                reason = "parked_unready"
+            else:
+                reason = "missing_ready"
         else:
             ready_seen += 1
             if names & config.labels.terminal:
                 reason = "terminal_label"
             elif names & config.labels.active:
                 reason = "active_label"
+            elif not host_routing.owned_here(names, config):
+                reason = "other_host"
             elif number in claimed:
                 reason = "operator_claimed"
             else:
@@ -314,8 +349,15 @@ def classify_backlog_reachability(
     open_by_number = {
         int(issue["number"]): issue for issue in issues if issue.get("number") is not None
     }
+    # Issue #2005: a foreign (CrossRepoBlocker) root is emitted repo-qualified
+    # (``"owner/name#60"``) with no ``updated_at``. Its bare number names a
+    # DIFFERENT local issue, so neither the open-issue lookup nor the
+    # local-state progress scan may key on it; the staleness check treats a
+    # string-numbered root as unadjudicable and keeps the exemption.
     reachability["dependency_root_blockers"] = [
-        {"number": n, "updated_at": open_by_number.get(n, {}).get("updatedAt")}
+        {"number": blocker_ref(n), "updated_at": None}
+        if isinstance(n, CrossRepoBlocker)
+        else {"number": n, "updated_at": open_by_number.get(n, {}).get("updatedAt")}
         for n in sorted(open_blockers_of_blocked - blocked_by_dep)
     ]
     if ready_open_count is not None:
@@ -678,3 +720,10 @@ def resolve_dispatch_mention_coverage(
     except GitHubError:
         return {}, None
     return compute_mention_coverage_map(issues, fetched, app), fetched
+
+
+@dataclass(frozen=True)
+class _MergedPRListOutcome:
+    items: list[dict[str, Any]] = field(default_factory=list)
+    error: GitHubError | None = None
+    called: bool = False

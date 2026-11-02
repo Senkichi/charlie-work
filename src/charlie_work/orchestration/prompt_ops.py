@@ -29,6 +29,7 @@ from charlie_work.prompts import (
 )
 from charlie_work.prompt_skills import active_prompt_variants
 from charlie_work.prompt_test_command import prompt_test_command_values
+from charlie_work.selection_wrapper import worker_selection
 
 
 def _render(
@@ -76,12 +77,24 @@ def _write_worker_prompt(self, issue: dict[str, Any], *, dry_run: bool = False) 
             # The test command, derived from the consumer (dispatch.test_command,
             # else its pyproject.toml). ``prompt_test_command`` is the single point
             # of enforcement: no template hardcodes a runner.
-            **prompt_test_command_values(self.config.dispatch.test_command, self.repo_root),
+            # With ``ci-fleet`` usable it is ``ci-fleet test`` around that runner
+            # (``selection_wrapper``); otherwise the hand-picked form plus an event.
+            **prompt_test_command_values(
+                self.config.dispatch.test_command,
+                self.repo_root,
+                selection=worker_selection(
+                    self.repo_root,
+                    self.config.dispatch.base_ref,
+                    state_file=self.paths.state_file,
+                    payload={"issue_number": issue_number},
+                    probe=self.config.dispatch.worker_selection_probe,
+                ),
+            ),
         },
         # Slash-command skills are named only when the consumer ships them for
         # this harness; otherwise the plain git/gh loop renders. See prompt_skills.
         variants=active_prompt_variants(
-            self.config.worker.harness, self.repo_root, self.prompt_dirs
+            [e.harness for e in self.config.worker.chain], self.repo_root, self.prompt_dirs
         ),
     )
     # Issues #714/#715/#717/#1010/#1780: the rendered-output contract guards

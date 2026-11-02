@@ -10,7 +10,15 @@ from __future__ import annotations
 from typing import Any
 
 from charlie_work.github import GitHubRunResult, label_names
-import charlie_work.workflow as _wf
+
+
+# Sentinel used to distinguish "no base-current signal was supplied" from
+# an explicit ``None`` (compare API unavailable) in _should_update_pr_branch.
+class _BaseCurrentUnset:
+    __slots__ = ()
+
+
+_BASE_CURRENT_UNSET = _BaseCurrentUnset()
 
 
 def _is_base_currency_gated(self, base_ref: str) -> bool:
@@ -155,7 +163,7 @@ def _is_base_freshness_required(self, base_ref: str) -> bool:
 def _should_update_pr_branch(
     self,
     pr: dict[str, Any],
-    base_current: bool | None | _wf._BaseCurrentUnset = _wf._BASE_CURRENT_UNSET,
+    base_current: bool | None | _BaseCurrentUnset = _BASE_CURRENT_UNSET,
 ) -> bool:
     """Return True if the PR branch should be synced against its base.
 
@@ -178,7 +186,7 @@ def _should_update_pr_branch(
     mergequeue_label = self.config.auto_merge.mergequeue_label
     if mergequeue_label and mergequeue_label in label_names(pr):
         return False
-    if isinstance(base_current, _wf._BaseCurrentUnset):
+    if isinstance(base_current, _BaseCurrentUnset):
         status = str(pr.get("mergeStateStatus") or "").upper()
         return status not in {"CLEAN", "UNSTABLE", "HAS_HOOKS"}
     return base_current is False

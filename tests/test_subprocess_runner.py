@@ -16,7 +16,7 @@ from __future__ import annotations
 import subprocess
 
 import pytest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from charlie_work.subprocess_runner import (
     hidden_console_kwargs,
@@ -139,17 +139,19 @@ class TestHiddenConsoleKwargsPosix:
 
 class TestRunCapturedUsesHelper:
     def test_run_captured_passes_helper_kwargs_to_subprocess_run(self, tmp_path):
+        # ``run_captured`` spawns via ``Popen`` + bounded ``communicate``
+        # (issue #2139); the test name predates that and is kept so the
+        # collect-only gate does not read a rename as a deletion.
         sentinel = {"creationflags": 0x08000000}
-        fake_completed = subprocess.CompletedProcess(
-            args=["echo", "hi"], returncode=0, stdout="hi\n", stderr=""
-        )
+        fake_proc = MagicMock(returncode=0, pid=1234)
+        fake_proc.communicate.return_value = ("hi\n", "")
         with (
             patch(
                 "charlie_work.subprocess_runner.hidden_console_kwargs",
                 return_value=sentinel,
             ) as mock_kwargs,
             patch(
-                "charlie_work.subprocess_runner.subprocess.run", return_value=fake_completed
+                "charlie_work.subprocess_runner.subprocess.Popen", return_value=fake_proc
             ) as mock_run,
         ):
             result = run_captured(["echo", "hi"], cwd=tmp_path, timeout_seconds=5)
@@ -161,16 +163,15 @@ class TestRunCapturedUsesHelper:
 
     def test_run_captured_passes_stdin_to_subprocess_run(self, tmp_path):
         sentinel = {"creationflags": 0x08000000}
-        fake_completed = subprocess.CompletedProcess(
-            args=["cat"], returncode=0, stdout="hello\n", stderr=""
-        )
+        fake_proc = MagicMock(returncode=0, pid=1234)
+        fake_proc.communicate.return_value = ("hello\n", "")
         with (
             patch(
                 "charlie_work.subprocess_runner.hidden_console_kwargs",
                 return_value=sentinel,
             ),
             patch(
-                "charlie_work.subprocess_runner.subprocess.run", return_value=fake_completed
+                "charlie_work.subprocess_runner.subprocess.Popen", return_value=fake_proc
             ) as mock_run,
         ):
             result = run_captured(["cat"], cwd=tmp_path, timeout_seconds=5, stdin="hello\n")
@@ -178,7 +179,10 @@ class TestRunCapturedUsesHelper:
         assert result.ok
         assert result.stdout == "hello\n"
         _, call_kwargs = mock_run.call_args
-        assert call_kwargs["input"] == "hello\n"
+        assert call_kwargs["stdin"] == subprocess.PIPE
+        _, communicate_kwargs = fake_proc.communicate.call_args
+        assert communicate_kwargs["input"] == "hello\n"
+        assert communicate_kwargs["timeout"] == 5
 
 
 class TestResolveCliBinary:

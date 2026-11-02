@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _src_ast import parsed, source_files, source_text
 
 from _fakes_github import FakeGitHub
 from _orphan_sweep_fixtures import _dead_worker_rework_bed, _run_orphan_sweep
@@ -86,17 +87,22 @@ _RATE_LIMIT_LOG = (
 def test_set_throttled_until_emits_event_with_full_payload() -> None:
     """A changed window emits exactly one ``throttle_window_set`` whose
     payload is the audit record the issue specifies: previous value, new
-    value, reason, adapter_kind, and the caller's ``source``."""
+    value, reason, adapter_kind, the stamped role ``(harness, model)`` that
+    died (issue #2279), and the caller's ``source``."""
     new_value = _future()
     state = set_throttled_until(
         empty_state(),
         new_value,
         reason="rate_limited",
         adapter_kind="devin",
+        harness="devin-shell",
+        model="swe-2-high",
         source="test_source",
     )
 
     assert state["throttled_until"] == new_value
+    assert state["throttle_harness"] == "devin-shell"
+    assert state["throttle_model"] == "swe-2-high"
     events = _throttle_window_events(state)
     assert len(events) == 1
     assert events[0]["payload"] == {
@@ -104,6 +110,8 @@ def test_set_throttled_until_emits_event_with_full_payload() -> None:
         "throttled_until": new_value,
         "reason": "rate_limited",
         "adapter_kind": "devin",
+        "harness": "devin-shell",
+        "model": "swe-2-high",
         "source": "test_source",
     }
 
@@ -238,8 +246,11 @@ def test_every_src_set_throttled_until_call_site_passes_source_literal() -> None
     writer names itself."""
     src_root = Path(__file__).parents[1] / "src" / "charlie_work"
     violations: list[str] = []
-    for path in sorted(src_root.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for path in source_files(src_root):
+        text = source_text(path)
+        if "set_throttled_until" not in text and "persist_failure" not in text:
+            continue
+        tree = parsed(path)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -350,7 +361,8 @@ def test_stall_lane_rate_limit_defer_emits_throttle_window_set(
 ) -> None:
     """Call site 1: ``_detect_and_handle_stalled_sessions``'s rate-limit
     defer branch writes the window and emits ``throttle_window_set``."""
-    from charlie_work import dead_worker_reap, workflow
+    from charlie_work import workflow
+    from charlie_work.dead_worker_sweep import effects_sessions
 
     issue_number = 2006
     sessions_dir, state_file, _ = _make_stalled_devin_session(
@@ -360,7 +372,7 @@ def test_stall_lane_rate_limit_defer_emits_throttle_window_set(
         "charlie_work.write_gate.kill_process_tree",
         lambda pid, start_time=None: [pid],
     )
-    monkeypatch.setattr(dead_worker_reap, "sweep_orphan_processes", lambda worktree_path: [])
+    monkeypatch.setattr(effects_sessions, "sweep_orphan_processes", lambda worktree_path: [])
     monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
     monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _stale_devin_probe)
 
@@ -403,7 +415,8 @@ def test_stall_lane_reap_emits_throttle_window_set(
     """Call site 2: a deferred worker still silent past its deadline is
     killed, classified ``rate_limited`` from the log tail, and the write of
     the freshly computed window emits ``throttle_window_set``."""
-    from charlie_work import dead_worker_reap, workflow
+    from charlie_work import workflow
+    from charlie_work.dead_worker_sweep import effects_sessions
 
     issue_number = 2007
     frozen_now = datetime.now(UTC)
@@ -415,7 +428,7 @@ def test_stall_lane_reap_emits_throttle_window_set(
         "charlie_work.write_gate.kill_process_tree",
         lambda pid, start_time=None: [pid],
     )
-    monkeypatch.setattr(dead_worker_reap, "sweep_orphan_processes", lambda worktree_path: [])
+    monkeypatch.setattr(effects_sessions, "sweep_orphan_processes", lambda worktree_path: [])
     monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
     monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _stale_devin_probe)
 
@@ -450,7 +463,7 @@ def test_launch_failure_reap_emits_throttle_window_set(tmp_path: Path) -> None:
     """Call site 3: a launch-failure sidecar whose log tail carries a
     throttle signature persists the window via the dead-session lane's
     launch-failure branch, emitting ``throttle_window_set``."""
-    from charlie_work.dead_worker_reap import _classify_dead_sessions_and_update_throttle_state
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     issue_number = 2008
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
@@ -478,7 +491,7 @@ def test_dead_session_reap_emits_throttle_window_set(tmp_path: Path) -> None:
     """Call site 4: a confirmed-dead session (no PID, no launch error)
     classified ``rate_limited`` from the log tail persists the window and
     emits ``throttle_window_set``."""
-    from charlie_work.dead_worker_reap import _classify_dead_sessions_and_update_throttle_state
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     issue_number = 2009
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
@@ -540,7 +553,9 @@ def test_reconcile_apply_fixes_emits_throttle_window_set(tmp_path: Path) -> None
     assert db_events[0]["level"] == "info"
 
 
-def test_orphan_sweep_classification_emits_throttle_window_set(tmp_path: Path) -> None:
+def test_orphan_sweep_classification_emits_throttle_window_set(
+    tmp_path: Path, monkeypatch
+) -> None:
     """Call site 6: the state.json-keyed orphan sweep's classify-at-credit
     seam (``dead_worker_classification``, reached through
     ``orphaned_worker_sweep.handle_dead_worker_with_pr``) arms the cooldown
@@ -558,7 +573,7 @@ def test_orphan_sweep_classification_emits_throttle_window_set(tmp_path: Path) -
         pid=99999,
     )
 
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     # The classification still lands: kind stamped, cooldown armed, the
@@ -584,7 +599,7 @@ def test_orphan_sweep_classification_emits_throttle_window_set(tmp_path: Path) -
 
 
 def test_orphan_sweep_classification_dry_run_suppresses_throttle_window_set(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """The threaded gate's dry-run suppression applies to this lane too:
     under ``dry_run=True`` no ``throttle_window_set`` is emitted and no
@@ -600,7 +615,7 @@ def test_orphan_sweep_classification_dry_run_suppresses_throttle_window_set(
         pid=99999,
     )
 
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh, dry_run=True)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, dry_run=True, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     assert not state.get("throttled_until")

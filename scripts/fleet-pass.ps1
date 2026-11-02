@@ -32,6 +32,21 @@ $logDir = Join-Path $root '.var\charlie-work\logs'
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Force -Path $logDir | Out-Null }
 $log = Join-Path $logDir 'fleet-pass.log'
 
+# Issue #1776: refuse to start a supervisor while the operator pause flag exists,
+# so this scheduled task can stay enabled and a pause survives reboot/logon.
+# Mirrors layout.fleet_pause_path / fleet_paths.fleet_dir (CHARLIE_WORK_FLEET_DIR,
+# else %LOCALAPPDATA%\charlie-work) -- no Python has run yet, so the filename is
+# a literal pinned to layout.FLEET_PAUSE_FILENAME by tests/test_fleet_pause.py.
+# Exit 0: a honored pause is not a launcher failure. `charlie fleet resume`
+# removes the flag and the next tick launches normally.
+$fleetDir = $env:CHARLIE_WORK_FLEET_DIR
+if (-not $fleetDir) { $fleetDir = Join-Path $env:LOCALAPPDATA 'charlie-work' }
+$pauseFlag = Join-Path $fleetDir 'fleet-pause.json'
+if (Test-Path -LiteralPath $pauseFlag) {
+    "--- fleet supervise-loop NOT started: fleet paused ($pauseFlag present); run 'charlie fleet resume' $(Get-Date -Format o) ---" | Out-File -FilePath $log -Append -Encoding utf8
+    exit 0
+}
+
 # Must name the same command as the exit marker below. These two lines bracket one
 # run in the log, and #862 changed the command under the exit marker only, leaving a
 # pass that started as "supervise" and ended as "supervise-loop" -- which reads like
@@ -125,5 +140,37 @@ $env:PYTHONIOENCODING = 'utf-8:surrogateescape'
 #
 # Everything after `--` is forwarded to `fleet supervise` verbatim.
 $cmdLine = "uv run --no-sync --project `"$root`" --directory `"$root`" python -m charlie_work fleet supervise-loop -- --max-runtime 0 >> `"$log`" 2>&1"
-& cmd /c $cmdLine
+
+# Issue #2795: inject the secretenv-stored provider key into the supervisor's
+# env for api-harness launches. The `api` adapter (api_worker.launch_api_worker)
+# resolves the provider key via os.environ.get(provider.api_key_env) in the
+# ORCHESTRATOR process -- the supervisor itself -- then injects it into the
+# worker child env as ANTHROPIC_AUTH_TOKEN. The configured api_key_env for the
+# anthropic provider is EMPERICUS_ANTHROPIC_API_KEY, which lives only in the
+# DPAPI secretenv store, not in User/Machine env. The scheduled task's env
+# therefore does not include the key, and any `harness: api` launch from a
+# task-spawned supervisor fails with a missing-key error record.
+#
+# secretenv injects the secret into the child process env only; the value is
+# never printed, logged, or written here. The guards exist so the supervisor
+# still starts WITHOUT the key when the secret is absent or undecryptable:
+# api launches self-limit with an error record, and a missing secret must
+# never strand the whole fleet.
+$secretenv = Join-Path $env:USERPROFILE '.local\bin\secretenv.exe'
+# All three guards must hold to wrap the launch: the key is absent from the
+# process env (never double-wrap), the per-user secretenv.exe exists, and the
+# secret is stored/decryptable. Note: a native redirect (`*> $null`) cannot
+# appear inside a parenthesized expression under PS 5.1, so the verify run and
+# its exit-code read are separate statements.
+$secretenvOk = $false
+if (-not [Environment]::GetEnvironmentVariable('EMPERICUS_ANTHROPIC_API_KEY') -and
+    (Test-Path -LiteralPath $secretenv)) {
+    & $secretenv verify EMPERICUS_ANTHROPIC_API_KEY *> $null
+    $secretenvOk = ($LASTEXITCODE -eq 0)
+}
+if ($secretenvOk) {
+    & $secretenv run EMPERICUS_ANTHROPIC_API_KEY -- cmd /c $cmdLine
+} else {
+    & cmd /c $cmdLine
+}
 "--- fleet supervise-loop exit=$LASTEXITCODE $(Get-Date -Format o) ---" | Out-File -FilePath $log -Append -Encoding utf8

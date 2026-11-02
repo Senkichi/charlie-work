@@ -21,7 +21,10 @@ output.
 from __future__ import annotations
 
 import json
+import os
 import re
+import tempfile
+import time
 from pathlib import Path
 
 from charlie_work.attachment_contracts.model import (
@@ -274,13 +277,45 @@ def with_kind_stats(
     }
 
 
+def _write_text_atomic(path: Path, text: str) -> None:
+    """Unique temp file + ``replace()`` with a bounded ``PermissionError`` retry.
+
+    Mirrors ``charlie_work.atomic_write.write_text_atomic`` -- which this
+    package cannot import because it is an extractable distribution held to
+    intra-package imports only (issue #1544, same boundary that inlined
+    ``_windows.py``). Unique per-writer name (``<stem>.<rand><suffix>.tmp``)
+    so concurrent writers never share a temp file (issue #2265); the name
+    still ends ``<suffix>.tmp`` so ``*.tmp`` exclusions keep matching, and
+    the tmp file is unlinked on failure.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=path.parent, prefix=path.stem + ".", suffix=path.suffix + ".tmp"
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        for attempt in range(3):
+            try:
+                tmp.replace(path)
+                break
+            except PermissionError:
+                if attempt == 2:
+                    raise
+                time.sleep(0.1)
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 def dump(document: dict[str, object], path: Path) -> None:
-    # Temp-file + replace(): the baseline is read by other processes (the
-    # PreToolUse hook, review-packet builder) and must never be observed
+    # Unique temp file + replace(): the baseline is read by other processes
+    # (the PreToolUse hook, review-packet builder) and must never be observed
     # half-written.
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(dumps(document), encoding="utf-8")
-    tmp.replace(path)
+    _write_text_atomic(path, dumps(document))
 
 
 def loads(text: str) -> dict[str, object]:

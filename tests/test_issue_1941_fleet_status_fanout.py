@@ -31,7 +31,7 @@ import pytest
 from charlie_work import cli, fleet_status
 from charlie_work.config import OrchestratorConfig
 from charlie_work.github import GitHubError
-from charlie_work.workflow import CommandResult
+from charlie_work.command_result import CommandResult
 
 
 def _fleet_env(
@@ -139,8 +139,10 @@ def test_fleet_status_repo_timeout_lands_in_stale_not_errors(
     block the aggregate past the budget.
     """
 
+    release = threading.Event()
+
     def _wedged() -> CommandResult:
-        time.sleep(6)  # bounded: a serial implementation still returns
+        release.wait(6)  # bounded: a serial implementation still returns
         return CommandResult(True, "ok", {"repo": "owner/wedged"})
 
     _fleet_env(
@@ -154,7 +156,10 @@ def test_fleet_status_repo_timeout_lands_in_stale_not_errors(
     monkeypatch.setattr(fleet_status, "FLEET_STATUS_REPO_TIMEOUT_SECONDS", 0.5)
 
     start = time.monotonic()
-    result = cli.run_fleet_status(_args())
+    try:
+        result = cli.run_fleet_status(_args())
+    finally:
+        release.set()  # the abandoned worker thread exits now, not 6 s later
     elapsed = time.monotonic() - start
 
     assert result.ok is True
@@ -179,8 +184,10 @@ def test_fleet_status_timeout_does_not_starve_completed_repo(
     that actually blew its budget.
     """
 
+    release = threading.Event()
+
     def _wedged() -> CommandResult:
-        time.sleep(6)
+        release.wait(6)
         return CommandResult(True, "ok", {"repo": "owner/a-wedged"})
 
     _fleet_env(
@@ -193,7 +200,10 @@ def test_fleet_status_timeout_does_not_starve_completed_repo(
     )
     monkeypatch.setattr(fleet_status, "FLEET_STATUS_REPO_TIMEOUT_SECONDS", 0.5)
 
-    result = cli.run_fleet_status(_args())
+    try:
+        result = cli.run_fleet_status(_args())
+    finally:
+        release.set()
 
     assert result.ok is True
     assert "owner/z-fast" in result.data["repos"]

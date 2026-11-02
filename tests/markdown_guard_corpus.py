@@ -16,6 +16,7 @@ import json
 import re
 from pathlib import Path
 from typing import Any
+from _src_ast import parsed, source_text
 
 APPROVED = json.dumps({"decision": "approved", "summary": "looks fine"})
 REQUEST = json.dumps({"decision": "request_changes", "summary": "fix it"})
@@ -132,11 +133,11 @@ def normalized_function_source(path: Path, name: str) -> str:
     Python minor versions (CI is unpinned above 3.11), which would turn a pure
     interpreter upgrade into a false "legacy path changed" failure.
     """
-    source = path.read_text(encoding="utf-8")
+    source = source_text(path)
     lines = source.splitlines()
     node = next(
         n
-        for n in ast.walk(ast.parse(source))
+        for n in ast.walk(parsed(path))
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name
     )
     drop: set[int] = set()

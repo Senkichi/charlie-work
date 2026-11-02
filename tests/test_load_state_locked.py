@@ -15,6 +15,7 @@ from charlie_work.state import (
     state_lock,
 )
 from charlie_work.workflow import OrchestratorApp
+from _src_ast import parsed, source_files, source_text
 
 
 class FakeGitHub:
@@ -193,10 +194,12 @@ def test_no_unlocked_load_state_in_production_code() -> None:
             self.generic_visit(node)
 
     errors: list[str] = []
-    for source_file in src_root.rglob("*.py"):
+    for source_file in source_files(src_root):
         if source_file.name == "test_load_state_locked.py":
             continue
-        tree = ast.parse(source_file.read_text(encoding="utf-8"))
+        if "load_state" not in source_text(source_file):
+            continue
+        tree = parsed(source_file)
         visitor = LockVisitor()
         visitor.visit(tree)
         errors.extend(visitor.errors)

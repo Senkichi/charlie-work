@@ -46,8 +46,18 @@ from ci_fleet.github import GitHubError
 # rationale (it is shared with ``PullRequests`` members and, until this leaf,
 # with ``GitHub.issue_list``). ``issue_list`` (moved below) references it as a
 # bare global.
+from ..github_transport.json_read import JsonRead
+from ..github_transport.request import RestRequest
 from ._base import CapabilityCollaborator, GitHubRunResult, _LIST_LIMIT
+from ._send import read_json, send_text
+from .issue_list_rest import (
+    emit_fallback,
+    fetch_open_issues,
+    filter_by_labels,
+    rest_issue_list_enabled,
+)
 from .circuit_breaker_transport import circuit_breaker_state_path
+from .cross_repo_blockers import CrossRepoBlocker, make_blocker, repo_from_repository_url
 from ..instrumentation import log_event
 
 if TYPE_CHECKING:
@@ -95,6 +105,20 @@ ISSUE_VIEW_FIELDS = (
 _MAX_ISSUE_STATE_WORKERS = 8
 
 
+def _current_repo_slug(gh: Any) -> str | None:
+    """``owner/name`` of ``gh``'s repo, or None when it cannot be determined.
+
+    Test doubles have no ``_repo_owner_name``; a failed remote lookup is a
+    ``GitHubError``. Either way the caller treats a qualified dependency as
+    foreign (see ``make_blocker``), which is the fail-closed direction.
+    """
+    try:
+        owner, name = gh._repo_owner_name()
+    except (AttributeError, GitHubError, TypeError, ValueError):
+        return None
+    return f"{owner}/{name}"
+
+
 # Moved verbatim from ``github.py`` alongside ``issue_dependencies`` (Track 2,
 # issue #1591; design doc Section 5, L07). ``issue_dependencies``'s fallback
 # body calls it as a bare global, so it must live in this module's globals; it
@@ -115,6 +139,10 @@ def get_github_issue_dependencies(gh: GitHubLike, issue_number: int) -> list[int
     Uses the GitHub API to check for issue dependencies. Tolerates 404/410 errors
     for repos that don't have the feature enabled. Returns an empty list on any
     error (fail-open for compatibility).
+
+    Issue #2005: a dependency that lives in another repository is returned as
+    a ``CrossRepoBlocker`` (an ``int`` qualified by its ``owner/name``); a
+    same-repo dependency stays a plain ``int``.
 
     Successful resolutions (a real dependency list, including a legitimate
     empty one, and the 404/410 "feature not available" case) are cached in
@@ -188,7 +216,21 @@ def get_github_issue_dependencies(gh: GitHubLike, issue_number: int) -> list[int
     elif isinstance(value, list):
         # Extract issue numbers from the dependency list — a real, successful
         # resolution, cached.
-        deps = [int(dep.get("number", 0)) for dep in value if dep.get("number")]
+        # Issue #2005: a dependency in another repo keeps its repo identity
+        # (``CrossRepoBlocker``) instead of collapsing to a bare number.
+        # The current repo is resolved only if some dependency is qualified
+        # (it costs a ``git remote`` call on a cold cache).
+        current_repo: str | None = None
+        current_repo_resolved = False
+        deps: list[int] = []
+        for dep in value:
+            if not isinstance(dep, dict) or not dep.get("number"):
+                continue
+            dep_repo = repo_from_repository_url(dep.get("repository_url"))
+            if dep_repo and not current_repo_resolved:
+                current_repo = _current_repo_slug(gh)
+                current_repo_resolved = True
+            deps.append(make_blocker(int(dep["number"]), dep_repo, current_repo))
         if cache is not None:
             cache[cache_key] = deps
         return deps
@@ -299,53 +341,106 @@ class Issues(CapabilityCollaborator):
         if cached is not None:
             return cached
 
-        args = [
+        label_str = ", ".join(label_tuple) if label_tuple else "all"
+        if effective_state == "open" and rest_issue_list_enabled():
+            # Issue #2443: ONE paged REST read of every open issue per pass
+            # (ETag-cached, so an unchanged repo pays only 304s); every
+            # label-specific query is a local filter over it. A REST failure
+            # falls back to the GraphQL read below, per call, with an event.
+            base_key = ("issue_list", "open", ())
+            failed_key = ("issue_list", "open", "rest_failed")
+            all_open = self._list_cache.get(base_key)
+            if all_open is None and failed_key not in self._list_cache:
+                try:
+                    all_open = fetch_open_issues(self)
+                except GitHubError as exc:
+                    logger.warning("REST open-issue list failed, using GraphQL: %s", exc)
+                    emit_fallback(self, exc)
+                    # Per-pass marker: one REST attempt and one event per pass,
+                    # not one per label query (the cache is cleared each pass).
+                    self._list_cache[failed_key] = True
+                else:
+                    self._list_cache[base_key] = all_open
+            if all_open is not None:
+                result = filter_by_labels(all_open, label_tuple)
+                if label_tuple and len(result) >= _LIST_LIMIT:
+                    logger.warning(
+                        "GitHub returned %d issues (labels=%s), matching the page limit "
+                        "(%d); further items may be truncated",
+                        len(result),
+                        label_str,
+                        _LIST_LIMIT,
+                    )
+                    result = result[:_LIST_LIMIT]
+                self._list_cache[cache_key] = result
+                return result
+        read = JsonRead(
             "issue",
             "list",
-            "--limit",
-            str(_LIST_LIMIT),
-            "--state",
-            effective_state,
-            "--json",
             ISSUE_LIST_FIELDS,
-        ]
-        for label in label_tuple:
-            args.extend(["--label", label])
-
-        label_str = ", ".join(label_tuple) if label_tuple else "all"
-        result = self._list_json(
-            args,
+            state=effective_state,
+            labels=label_tuple,
             limit=_LIST_LIMIT,
+            long_call=True,
+        )
+        result = self._list_json(
+            read,
             kind=f"issues (labels={label_str}, state={effective_state})",
         )
         self._list_cache[cache_key] = result
         return result
 
     def issue_view(self, number: int) -> dict[str, Any]:
-        result = self.run(
-            [
-                "issue",
-                "view",
-                str(number),
-                "--json",
-                ISSUE_VIEW_FIELDS,
-            ],
-            json_output=True,
-        )
+        result = read_json(self, JsonRead("issue", "view", ISSUE_VIEW_FIELDS, number=number))
         return result if isinstance(result, dict) else {}
 
     def close_issue(self, number: int) -> bool:
         """Close an issue. Idempotent — returns True even if already closed.
 
-        Uses `gh issue close`. Returns True on success, False on failure.
+        PATCHes the issue state. Returns True on success, False on failure.
         Never raises — per-issue failures are reported as values and must not
         abort a batch operation.
         """
         try:
-            self.run(["issue", "close", str(number)])
+            send_text(
+                self,
+                RestRequest.of(
+                    "PATCH", f"repos/{{owner}}/{{repo}}/issues/{number}", body={"state": "closed"}
+                ),
+            )
             return True
         except GitHubError:
             return False
+
+    def _foreign_blocker_is_open(self, blocker: CrossRepoBlocker) -> bool:
+        """Open/closed state of a cross-repo blocker, in the blocker's own repo.
+
+        Fail closed (issue #2005): any lookup failure or unrecognised payload
+        counts as open, so an unverifiable prerequisite keeps blocking. Only a
+        definite ``state`` is cached (pass-scoped ``_list_cache``), so a
+        failure is retried on the next lookup rather than locked in.
+        """
+        cache_key = ("issue_open", blocker.repo, int(blocker))
+        cached = self._list_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        try:
+            result = self.run(
+                ["api", f"repos/{blocker.repo}/issues/{int(blocker)}"],
+                json_output=True,
+                allow_failure=True,
+            )
+        except (GitHubError, OSError, ValueError, TypeError):
+            logger.warning("Cross-repo blocker %r lookup raised - treating as open", blocker)
+            return True
+        value = result.value if isinstance(result, GitHubRunResult) else result
+        state = str(value.get("state") or "").upper() if isinstance(value, dict) else ""
+        if state not in ("OPEN", "CLOSED"):
+            logger.warning("Cross-repo blocker %r state unresolved - treating as open", blocker)
+            return True
+        is_open = state == "OPEN"
+        self._list_cache[cache_key] = is_open
+        return is_open
 
     def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
         """Check which of the given issue numbers are currently open.
@@ -375,6 +470,11 @@ class Issues(CapabilityCollaborator):
         open_issues: set[int] = set()
         uncached: list[int] = []
         for number in issue_numbers:
+            if isinstance(number, CrossRepoBlocker):
+                # Issue #2005: resolved in its own repo, never by bare number.
+                if self._foreign_blocker_is_open(number):
+                    open_issues.add(number)
+                continue
             cached = self._list_cache.get(("issue_open", number))
             if cached is None:
                 uncached.append(number)

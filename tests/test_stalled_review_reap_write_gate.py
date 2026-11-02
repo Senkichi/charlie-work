@@ -76,6 +76,7 @@ from pathlib import Path
 
 from charlie_work.claude_code import ClaudeWorkerRecord
 from charlie_work.config import OrchestratorConfig
+from charlie_work.host.fakes import FakeProcessProbe
 from charlie_work.instrumentation import event_counts_by_kind
 from charlie_work.state import empty_state, load_state, save_state
 from charlie_work.stalled_review_reap import (
@@ -300,7 +301,7 @@ def test_detect_and_handle_stalled_reviews_dry_run_true_gates_direct_writes_but_
 
 
 def test_detect_and_handle_stalled_reviews_dry_run_true_now_gates_the_sweep_events_path(
-    monkeypatch, tmp_path: Path
+    monkeypatch, tmp_path: Path, fake_host
 ) -> None:
     """R5 completion regression (issue #1264, W6 PR3): a stale
     ``review_dispatch_dispatched`` claim (a dead reviewer PID past the
@@ -340,7 +341,7 @@ def test_detect_and_handle_stalled_reviews_dry_run_true_now_gates_the_sweep_even
 
     now = datetime(2026, 8, 1, 0, 30, tzinfo=UTC)  # 30 min after dispatch: past the 5-min timeout
 
-    monkeypatch.setattr("charlie_work.stalled_review_reap.is_pid_alive", lambda *a, **k: False)
+    fake_host(probe=FakeProcessProbe())
     monkeypatch.setattr(
         "charlie_work.stalled_review_reap.remove_review_checkout", lambda *a, **k: True
     )

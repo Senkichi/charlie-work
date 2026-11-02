@@ -1,0 +1,10 @@
+1
+# Issue #2600: _build_attention_digest moved verbatim out of workflow.py into
+# the new attention_digest.py domain module (the file-size-ratchet extraction
+# that also carries the dispatch lanes' notify-gated stalled-session digest
+# tails). Its single raw gated-primitive site -- the save_state inside the
+# state_lock baseline write-back -- relocates with it, so workflow.py's entry
+# drops by 1 (37 -> 36, slack held at 5; live count 32 -> 31) and this
+# module's entry equals its relocated live count exactly (slack 0).
+# Total-preserving redistribution per the #1317/#1632 precedent: the
+# baseline-dict sum is unchanged and no ratchet ceiling is loosened.

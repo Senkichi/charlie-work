@@ -56,12 +56,17 @@ class HarnessCapabilities:
     ``.devin/skills`` and ``.claude/skills``, and a skill the consumer does not
     ship comes back as ``Skill "<name>" not found`` -- the harness alone does not
     provide it.
+
+    ``requires_model``: a launch needs an explicit model -- the harness has no
+    pinned default and would otherwise run whatever model its CLI last used.
+    Config load rejects an empty model for such a harness in a role chain.
     """
 
     worker: bool
     review: bool
     adapter_kind: str
     skill_dirs: tuple[str, ...] = ()
+    requires_model: bool = False
 
 
 HARNESS_REGISTRY: dict[str, HarnessCapabilities] = {
@@ -75,6 +80,14 @@ HARNESS_REGISTRY: dict[str, HarnessCapabilities] = {
         skill_dirs=(".devin/skills", ".claude/skills"),
     ),
     "api": HarnessCapabilities(worker=True, review=True, adapter_kind="api"),
+    # opencode CLI (``opencode run``), worker-only: opencode_worker.py.
+    "opencode": HarnessCapabilities(
+        worker=True,
+        review=False,
+        adapter_kind="opencode",
+        skill_dirs=(".opencode/skills", ".claude/skills"),
+        requires_model=True,
+    ),
     "command": HarnessCapabilities(worker=True, review=False, adapter_kind="command"),
     "manual": HarnessCapabilities(worker=True, review=False, adapter_kind="manual"),
 }

@@ -10,8 +10,10 @@ Track 1) -- bodies are verbatim relocations; shared helpers live in
 from __future__ import annotations
 
 import subprocess
-import time
+import threading
 from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 
 from _claude_adapter_fixtures import (
@@ -21,6 +23,7 @@ from _claude_adapter_fixtures import (
 )
 
 from charlie_work import claude_code
+from charlie_work.worktree import WorktreeInfo
 from charlie_work.config import (
     ClaudeCodeConfig,
     OrchestratorConfig,
@@ -300,18 +303,38 @@ def test_launch_claude_worker_review_uses_review_effort_when_set(tmp_path: Path)
 
 
 def test_launch_claude_worker_review_falls_back_to_claude_code_effort_when_unset(
-    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """reviewer.effort empty (the default) must fall back to
     claude_code.effort, same as any other reviewer launch before this config
     knob existed."""
     repo_root = tmp_path / "repo"
-    _init_real_repo(repo_root)
+    repo_root.mkdir()
     sessions_dir = tmp_path / "reviews"
-    head_sha = _repo_head_sha(repo_root)
     config = OrchestratorConfig(
         claude_code=ClaudeCodeConfig(effort="medium"),
         reviewer=ReviewerRoleConfig(effort=""),
+    )
+
+    # Issue #2689: this test asserts only on the rendered --effort argv, so
+    # keep it off the real subprocess spawns a live launch pays -- the ledger
+    # flagged exactly that host-priced drift. The real checkout is ~3 git
+    # spawns on top of _init_real_repo's 6, and on a host with the claude CLI
+    # installed popen_worker resolves the default review template's argv[0]
+    # to the real binary and spawns a live agent session. The real
+    # checkout/Popen coverage stays in the isolation and terminal-status
+    # tests above; test_devin_review_allowlist._patch_launch fakes the same
+    # two seams for the same reason.
+    def fake_create_review_checkout(
+        repo_root: Path, pr_number: int, head_sha: str, *, reviews_dir: Path
+    ) -> WorktreeInfo:
+        checkout_path = reviews_dir / f"pr-{pr_number}"
+        checkout_path.mkdir(parents=True, exist_ok=True)
+        return WorktreeInfo(path=checkout_path, branch=head_sha, venv_junction=None)
+
+    monkeypatch.setattr(claude_code, "create_review_checkout", fake_create_review_checkout)
+    monkeypatch.setattr(
+        claude_code, "popen_worker", lambda *args, **kwargs: SimpleNamespace(pid=4242)
     )
 
     record = launch_claude_worker(
@@ -321,7 +344,7 @@ def test_launch_claude_worker_review_falls_back_to_claude_code_effort_when_unset
         repo_root=repo_root,
         sessions_dir=sessions_dir,
         review=True,
-        head_sha=head_sha,
+        head_sha="a" * 40,
         config=config,
     )
 
@@ -393,7 +416,7 @@ def test_launch_claude_worker_review_experiment_control_falls_back(tmp_path: Pat
 
 
 def test_launch_claude_worker_review_uses_resolved_review_effort_passthrough(
-    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """When the caller (dispatch_reviews) already resolved the review_effort
     experiment arm at claim time and passes it via resolved_review_effort,
@@ -401,15 +424,35 @@ def test_launch_claude_worker_review_uses_resolved_review_effort_passthrough(
     re-resolving from config -- this is the single-computation-site
     invariant: the claim-time resolution is authoritative, not a preview."""
     repo_root = tmp_path / "repo"
-    _init_real_repo(repo_root)
+    repo_root.mkdir()
     sessions_dir = tmp_path / "reviews"
-    head_sha = _repo_head_sha(repo_root)
     # Config alone would resolve to "high" (fraction=1.0, reviewer.effort=high),
     # but the passed-through resolved_review_effort deliberately differs so
     # the test can distinguish "used the passthrough" from "recomputed".
     config = OrchestratorConfig(
         claude_code=ClaudeCodeConfig(effort="low"),
         reviewer=ReviewerRoleConfig(effort="high", effort_experiment_fraction=1.0),
+    )
+
+    # Issue #2714: this test asserts only on the rendered --effort argv, so
+    # keep it off the real subprocess spawns a live launch pays -- the ledger
+    # flagged exactly that host-priced drift (same shape as the #2689 fix two
+    # tests up). The real checkout is ~3 git spawns on top of
+    # _init_real_repo's 6, and on a host with the claude CLI installed
+    # popen_worker resolves the default review template's argv[0] to the real
+    # binary and spawns a live agent session. The real checkout/Popen
+    # coverage stays in the isolation and terminal-status tests in this
+    # module; the passthrough itself is resolved before either seam runs.
+    def fake_create_review_checkout(
+        repo_root: Path, pr_number: int, head_sha: str, *, reviews_dir: Path
+    ) -> WorktreeInfo:
+        checkout_path = reviews_dir / f"pr-{pr_number}"
+        checkout_path.mkdir(parents=True, exist_ok=True)
+        return WorktreeInfo(path=checkout_path, branch=head_sha, venv_junction=None)
+
+    monkeypatch.setattr(claude_code, "create_review_checkout", fake_create_review_checkout)
+    monkeypatch.setattr(
+        claude_code, "popen_worker", lambda *args, **kwargs: SimpleNamespace(pid=4242)
     )
 
     record = launch_claude_worker(
@@ -419,7 +462,7 @@ def test_launch_claude_worker_review_uses_resolved_review_effort_passthrough(
         repo_root=repo_root,
         sessions_dir=sessions_dir,
         review=True,
-        head_sha=head_sha,
+        head_sha="a" * 40,
         config=config,
         resolved_review_effort="medium",
     )
@@ -500,7 +543,7 @@ def test_launch_claude_worker_review_prompt_write_failure_tears_down_checkout(
 
 
 def test_launch_claude_worker_review_writes_terminal_status_record(
-    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A review=True launch must start the terminal-status watcher so a
     ``terminal.json`` appears at
@@ -525,6 +568,22 @@ def test_launch_claude_worker_review_writes_terminal_status_record(
     sessions_dir = tmp_path / "reviews"
     head_sha = _repo_head_sha(repo_root)
 
+    # Capture the watcher thread the launch spawns so the test can wait on
+    # the signal that produces the record -- the watcher thread exits only
+    # after write_worker_terminal_status returns -- instead of polling the
+    # file on a fixed wall-clock deadline. The old 10s deadline flaked under
+    # `-n auto` load: the watcher's own 2s poll interval plus thread and
+    # process scheduling delays can exceed it (issue #2238).
+    watcher_threads: list[threading.Thread] = []
+    real_start_watcher = claude_code.start_terminal_status_watcher
+
+    def _capturing_start_watcher(*args, **kwargs):
+        thread = real_start_watcher(*args, **kwargs)
+        watcher_threads.append(thread)
+        return thread
+
+    monkeypatch.setattr(claude_code, "start_terminal_status_watcher", _capturing_start_watcher)
+
     record = launch_claude_worker(
         1354,
         "agent/issue-1354-fix",
@@ -538,15 +597,22 @@ def test_launch_claude_worker_review_writes_terminal_status_record(
 
     assert record.ok, record.error
     assert record.pid is not None
+    assert len(watcher_threads) == 1, (
+        "review=True launch did not start exactly one terminal-status watcher "
+        "-- the `if not review:` guard may have been reintroduced"
+    )
+
+    watcher = watcher_threads[0]
+    # join() wakes the instant the watcher exits; the 60s argument is only a
+    # hang backstop. On the happy path the fake script exits near-instantly
+    # and the watcher writes the record within one 2s poll interval.
+    watcher.join(timeout=60.0)
+    assert not watcher.is_alive(), "terminal-status watcher thread did not finish within 60s"
 
     expected_path = worker_terminal_status_path(sessions_dir, 1354, "claude")
-    # The watcher polls every _TERMINAL_STATUS_POLL_INTERVAL_SECONDS (2s); the
-    # fake script exits near-instantly, so the record should appear within a
-    # few poll intervals. Poll rather than sleep a fixed duration so the test
-    # is fast on a healthy path and only waits as long as needed.
-    deadline = time.monotonic() + 10.0
-    while time.monotonic() < deadline and not expected_path.exists():
-        time.sleep(0.1)
+    # The record write happens inside the watcher thread before it exits, so
+    # a completed join means the write already ran. A missing file here is a
+    # swallowed write failure (a real bug), not a timing flake.
     assert expected_path.exists(), (
         f"review=True launch did not write a terminal-status record at "
         f"{expected_path} -- the start_terminal_status_watcher guard "

@@ -6,15 +6,38 @@ Track-1 wave 8/8).
 
 from __future__ import annotations
 
-import json
-import subprocess
 from pathlib import Path
 import pytest
+from _fake_transport import (
+    FakeAdapter,
+    check_run,
+    checks_reply,
+    connection_page,
+    failure,
+    graphql_failure,
+    graphql_variables,
+    make_github,
+    ok,
+    sent,
+)
 from charlie_work import github as github_module
+from charlie_work.github_transport.outcome import FailureKind, GraphQLError, Response
+from charlie_work.github_transport.request import RestRequest
 from charlie_work.config import (
     ConfigError,
     RuntimeConfig,
 )
+
+
+def _schema_accepting_reply(request):
+    """What GitHub answers when every probed selection is valid: an empty
+    connection for a list, NOT_FOUND for the ``number: 0`` views, empty REST."""
+    if isinstance(request, RestRequest):
+        return ok({"workflow_runs": []} if "actions/runs" in request.route else [])
+    if "number" in graphql_variables(request):
+        return graphql_failure("Could not resolve to a node with the number of 0.")
+    connection = "issues" if "issues(" in request.document else "pullRequests"
+    return connection_page(connection, [])
 
 
 def test_pr_checks_fields_excludes_database_id() -> None:
@@ -63,125 +86,85 @@ def test_job_id_from_link(link, expected) -> None:
     assert github_module._job_id_from_link(link) == expected
 
 
-def test_pr_checks_injects_database_id_from_link(monkeypatch, tmp_path: Path) -> None:
+def test_pr_checks_injects_database_id_from_link(tmp_path: Path) -> None:
     """pr_checks() derives databaseId from link for Actions checks, None otherwise."""
+    reply = checks_reply(
+        check_run("Tests passed", url="https://github.com/OWNER/REPO/actions/runs/1/job/42"),
+        {
+            "__typename": "StatusContext",
+            "context": "external-status-check",
+            "state": "SUCCESS",
+            "targetUrl": "https://example.com/status",
+        },
+    )
+    gh, _http, _ = make_github(tmp_path, http=FakeAdapter("http", [reply]))
 
-    def fake_run(*args, **kwargs):
-        return subprocess.CompletedProcess(
-            args=args,
-            returncode=0,
-            stdout=json.dumps(
-                [
-                    {
-                        "name": "Tests passed",
-                        "state": "SUCCESS",
-                        "bucket": "pass",
-                        "link": "https://github.com/OWNER/REPO/actions/runs/1/job/42",
-                    },
-                    {
-                        "name": "external-status-check",
-                        "state": "SUCCESS",
-                        "bucket": "pass",
-                        "link": "https://example.com/status",
-                    },
-                ]
-            ),
-            stderr="",
-        )
+    checks = gh.pr_checks(123)
 
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    checks = github_module.GitHub(tmp_path).pr_checks(123)
-
-    assert checks[0]["databaseId"] == 42
-    assert checks[1]["databaseId"] is None
+    assert {c["name"]: c["databaseId"] for c in checks} == {
+        "Tests passed": 42,
+        "external-status-check": None,
+    }
 
 
-def test_pr_checks_returns_empty_list_on_empty_success(monkeypatch, tmp_path: Path) -> None:
-    """Empty successful gh pr checks --json response returns [], not None."""
+def test_pr_checks_returns_empty_list_on_empty_success(tmp_path: Path) -> None:
+    """A PR with no check contexts returns [], not None."""
+    gh, _http, _ = make_github(tmp_path, http=FakeAdapter("http", [checks_reply()]))
 
-    def fake_run(*args, **kwargs):
-        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    checks = github_module.GitHub(tmp_path).pr_checks(123)
-
-    assert checks == []
+    assert gh.pr_checks(123) == []
 
 
-def test_pr_checks_returns_none_on_gh_command_failure(monkeypatch, tmp_path: Path) -> None:
-    """gh pr checks command-level failure (Unknown JSON field) returns None."""
+def test_pr_checks_walks_every_page_of_check_contexts(tmp_path: Path) -> None:
+    """``gh pr checks`` follows the rollup's pageInfo; a snapshot cut at the first
+    100 contexts could omit a failing required check ([gt-fix-r1] B3)."""
+    first = checks_reply(check_run("early"), next_cursor="CUR1")
+    second = checks_reply(check_run("late", "FAILURE"))
+    http = FakeAdapter("http", [first, second])
+    gh, _http, _ = make_github(tmp_path, http=http)
 
-    def fake_run(*args, **kwargs):
-        return subprocess.CompletedProcess(
-            args=args,
-            returncode=1,
-            stdout="",
-            stderr='Unknown JSON field: "databaseId"\nAvailable fields:\n  name\n  state\n  bucket\n  link',
-        )
+    checks = gh.pr_checks(123)
 
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    checks = github_module.GitHub(tmp_path).pr_checks(123)
-
-    assert checks is None
+    assert checks is not None
+    assert {c["name"]: c["state"] for c in checks} == {"early": "SUCCESS", "late": "FAILURE"}
+    after = [graphql_variables(r)["after"] for r in http.api_requests]
+    assert after == [None, "CUR1"]
 
 
-def test_check_run_annotations_returns_parsed_list_on_success(monkeypatch, tmp_path: Path) -> None:
-    def fake_run(*args, **kwargs):
-        return subprocess.CompletedProcess(
-            args=args,
-            returncode=0,
-            stdout=json.dumps(
-                [{"path": "src/foo.py", "start_line": 42, "message": "line too long"}]
-            ),
-            stderr="",
-        )
+def test_pr_checks_returns_none_on_gh_command_failure(tmp_path: Path) -> None:
+    """A read the API rejected (a GraphQL error) returns None."""
+    reply = graphql_failure("Field 'bogus' doesn't exist on type 'CheckRun'", "undefinedField")
+    gh, _http, _ = make_github(tmp_path, http=FakeAdapter("http", [reply]))
 
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    result = github_module.GitHub(tmp_path).check_run_annotations(999)
-
-    assert result == [{"path": "src/foo.py", "start_line": 42, "message": "line too long"}]
+    assert gh.pr_checks(123) is None
 
 
-def test_check_run_annotations_returns_empty_list_on_api_failure(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_check_run_annotations_returns_parsed_list_on_success(tmp_path: Path) -> None:
+    annotations = [{"path": "src/foo.py", "start_line": 42, "message": "line too long"}]
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok(annotations)]))
+
+    result = gh.check_run_annotations(999)
+
+    assert result == annotations
+    assert sent(http) == [("GET", "repos/{owner}/{repo}/check-runs/999/annotations", None)]
+
+
+def test_check_run_annotations_returns_empty_list_on_api_failure(tmp_path: Path) -> None:
     """Issue #771: the annotations accessor must return a value (empty list),
-    never raise, when the gh api call fails -- callers building required_changes
+    never raise, when the API call fails -- callers building required_changes
     from it must never crash the review() codepath on a transient GitHub error."""
+    gh, _, _ = make_github(
+        tmp_path, http=FakeAdapter("http", [ok({"message": "Not Found"}, status=404)])
+    )
 
-    def fake_run(*args, **kwargs):
-        return subprocess.CompletedProcess(
-            args=args,
-            returncode=1,
-            stdout="",
-            stderr="HTTP 404: Not Found",
-        )
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    result = github_module.GitHub(tmp_path).check_run_annotations(999)
-
-    assert result == []
+    assert gh.check_run_annotations(999) == []
 
 
-def test_pr_checks_returns_list_when_checks_fail(monkeypatch, tmp_path: Path) -> None:
-    """gh pr checks exits non-zero but with JSON list (failing checks) -> list."""
+def test_pr_checks_returns_list_when_checks_fail(tmp_path: Path) -> None:
+    """A failing check is a normal row (bucket "fail"), not a command failure."""
+    reply = checks_reply(check_run("Tests", "FAILURE"))
+    gh, _http, _ = make_github(tmp_path, http=FakeAdapter("http", [reply]))
 
-    def fake_run(*args, **kwargs):
-        return subprocess.CompletedProcess(
-            args=args,
-            returncode=2,
-            stdout='[{"name": "Tests", "state": "FAILURE", "bucket": "fail", "link": ""}]',
-            stderr="checks failed",
-        )
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    checks = github_module.GitHub(tmp_path).pr_checks(123)
+    checks = gh.pr_checks(123)
 
     assert checks == [
         {
@@ -195,114 +178,105 @@ def test_pr_checks_returns_list_when_checks_fail(monkeypatch, tmp_path: Path) ->
     ]
 
 
-def test_validate_field_lists_passes_when_gh_lists_all_fields(monkeypatch, tmp_path: Path) -> None:
-    """Startup self-check accepts field lists gh supports."""
-    captured: list[list[str]] = []
+def test_validate_field_lists_passes_when_gh_lists_all_fields(tmp_path: Path) -> None:
+    """Startup self-check accepts field lists the GitHub schema supports (B13)."""
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", handler=_schema_accepting_reply))
 
-    def fake_run(cmd, *args, **kwargs):
-        captured.append(cmd)
-        # Return a generic "all these fields are available" stderr.
-        available_fields = [
-            "number",
-            "title",
-            "name",
-            "state",
-            "bucket",
-            "link",
-            "url",
-            "body",
-            "labels",
-            "headRefName",
-            "baseRefName",
-            "isCrossRepository",
-            "mergeable",
-            "headRefOid",
-            "closedAt",
-            "databaseId",
-            "status",
-            "createdAt",
-            "headBranch",
-            "assignees",
-            "author",
-            "updatedAt",
-            "createdAt",
-            "description",
-            "color",
-            "comments",
-            "isDraft",
-            "reviewDecision",
-            "statusCheckRollup",
-            "mergeStateStatus",
-            "additions",
-            "deletions",
-            "mergedAt",
-        ]
-        stderr = (
-            'Unknown JSON field: "nonexistent"\nAvailable fields:\n  '
-            + "\n  ".join(available_fields)
-            + "\n"
-        )
-        return subprocess.CompletedProcess(
-            args=cmd,
-            returncode=1,
-            stdout="",
-            stderr=stderr,
-        )
+    gh.validate_field_lists()
 
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    github_module.GitHub(tmp_path).validate_field_lists()
-
-    # Should have probed all 10 field-list constants.
-    assert len(captured) == 10
-    assert all(c[0] == "gh" for c in captured)
+    # Should have probed all 10 field-list constants, one request each.
+    assert len(http.api_requests) == 10
 
 
-def test_validate_field_lists_fails_on_unsupported_field(monkeypatch, tmp_path: Path) -> None:
-    """Startup self-check fails fast if a configured field is not supported by gh."""
+def test_validate_field_lists_fails_on_unsupported_field(tmp_path: Path) -> None:
+    """Startup self-check fails fast if a configured field is not in the schema."""
+    reply = Response(
+        200,
+        (),
+        '{"data": null}',
+        "http",
+        graphql_errors=(
+            GraphQLError("Field 'nonexistent' doesn't exist on type 'Issue'", "undefinedField"),
+        ),
+    )
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [reply]))
 
-    def fake_run(cmd, *args, **kwargs):
-        return subprocess.CompletedProcess(
-            args=cmd,
-            returncode=1,
-            stdout="",
-            stderr='Unknown JSON field: "nonexistent"\nAvailable fields:\n  name\n  state\n  bucket',
-        )
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    with pytest.raises(ConfigError):
-        github_module.GitHub(tmp_path).validate_field_lists()
+    with pytest.raises(ConfigError, match="ISSUE_LIST_FIELDS.*nonexistent"):
+        gh.validate_field_lists()
+    assert len(http.api_requests) == 1
 
 
-def test_validate_field_lists_timeout_raises_config_error(monkeypatch, tmp_path: Path) -> None:
-    """A hung `gh` probe during startup field-list validation is
+def test_validate_field_lists_timeout_raises_config_error(tmp_path: Path) -> None:
+    """A hung probe during startup field-list validation is
     transport-class, not a configuration error (issue #1833, follow-up to the
     #1832 outage): it must no longer raise ConfigError -- doing so propagated
     uncaught out of OrchestratorApp.__init__ via fleet_dispatch.py's
     "Error processing repo" path, violating the errors-as-values invariant.
     validate_field_lists() now returns normally, skipping the remaining
-    probes for this pass, and records the failure on the circuit breaker.
-    This probe runs once and is not retried, and it is bound by the
-    configured gh_timeout_seconds."""
-    call_count = 0
-    captured_timeouts: list[float] = []
+    probes for this pass, and the guard records the failure on the circuit
+    breaker. The probe is bound by the configured gh_timeout_seconds."""
+    timed_out = failure(FailureKind.TIMEOUT, "hung")
+    http = FakeAdapter("http", [timed_out])
+    gh, http, _ = make_github(
+        tmp_path,
+        http=http,
+        gh=FakeAdapter("gh", [failure(FailureKind.TIMEOUT, "hung", "gh")], token="tok-1"),
+        runtime=RuntimeConfig(gh_timeout_seconds=45.0, gh_max_retries=0),
+    )
 
-    def fake_run(cmd, *args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        captured_timeouts.append(kwargs.get("timeout"))
-        raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout"))
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    gh = github_module.GitHub(tmp_path, runtime=RuntimeConfig(gh_timeout_seconds=45.0))
     gh.validate_field_lists()  # must not raise
 
     # Fails fast on the first field list probed, not after trying all 10.
-    assert call_count == 1
-    # The timeout= kwarg passed to subprocess.run came from the configured
+    assert len(http.api_requests) == 1
+    # The timeout the adapter was given came from the configured
     # gh_timeout_seconds, not a hardcoded value.
-    assert captured_timeouts == [45.0]
+    assert [call.timeout for call in http.calls if call.request in http.api_requests] == [45.0]
     # The transport-class failure is recorded on the breaker.
     assert gh._transport._circuit_breaker_state.consecutive_failures == 1
+    assert gh._transport.__dict__.get("_list_cache") is None
+
+
+_PRIMARY_LIMIT = Response(
+    403,
+    (("x-ratelimit-remaining", "0"), ("x-ratelimit-limit", "5000")),
+    '{"message":"API rate limit exceeded for user ID 1."}',
+    "http",
+)
+_SECONDARY_LIMIT = Response(
+    403,
+    (("retry-after", "60"),),
+    '{"message":"You have exceeded a secondary rate limit."}',
+    "http",
+)
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        Response(401, (), '{"message":"Bad credentials"}', "http"),
+        _PRIMARY_LIMIT,
+        _SECONDARY_LIMIT,
+        Response(404, (), '{"message":"Not Found"}', "http"),
+        Response(422, (), '{"message":"Validation Failed"}', "http"),
+        Response(502, (), "bad gateway", "http"),
+    ],
+    ids=["401", "403-primary", "403-secondary", "404", "422-inconclusive", "502"],
+)
+def test_validate_field_lists_unavailable_github_is_not_a_config_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, reply
+) -> None:
+    """Startup must not depend on GitHub availability or quota (#1833): only a
+    positive "field rejected" verdict is a ConfigError. A 401/403/404, either
+    kind of rate limit, or an inconclusive reply warns and skips instead."""
+    monkeypatch.setattr("charlie_work.github.time.sleep", lambda _s: None)
+    monkeypatch.setattr("time.sleep", lambda _s: None)
+    gh, _http, _ = make_github(
+        tmp_path,
+        http=FakeAdapter("http", handler=lambda _request: reply),
+        runtime=RuntimeConfig(gh_max_retries=0),
+    )
+
+    with caplog.at_level("WARNING"):
+        gh.validate_field_lists()  # must not raise
+
+    assert "Could not validate field list" in caplog.text

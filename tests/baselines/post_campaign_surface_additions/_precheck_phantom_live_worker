@@ -1,0 +1,9 @@
+issue #2262: pre-lock half of the phantom-live-worker route -- resolves each
+phantom sidecar's fate and runs the shared ``salvage_dead_worker_commits``
+probe (which takes state_lock itself and so cannot run inside the dispatch
+lock). Consumed by ``_route_phantom_live_worker`` in-lock. Installed from
+``orchestration/misc_worker_dispatch.py``. Net-new OrchestratorApp member
+added after the Track 2 Phase B surface baseline was pinned; declared here so
+the member-surface conservation check in
+tests/test_workflow_delegation_l00.py subtracts it before comparing moved
+delegates against the pre-campaign total (133).

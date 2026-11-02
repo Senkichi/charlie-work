@@ -22,13 +22,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
 
 from charlie_work.config import (
     OrchestratorConfig,
     ReviewConfig,
     ReviewDispatchConfig,
 )
+from charlie_work.host.fakes import FakeProcessProbe
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.workflow import OrchestratorApp
@@ -129,9 +129,7 @@ def test_dispatch_reviews_does_not_route_clean_pr(tmp_path: Path) -> None:
     assert result.data["selected_count"] >= 1
 
 
-def test_dispatch_reviews_conflict_skipped_when_reviewer_live(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_dispatch_reviews_conflict_skipped_when_reviewer_live(tmp_path: Path, fake_host) -> None:
     """A CONFLICTING PR with a live in-flight reviewer must NOT be routed to
     rework — the verdict may still clear the conflict (e.g. a request_changes
     that prompts a rebase). Mirrors the attempt-cap path's live-reviewer
@@ -160,21 +158,11 @@ def test_dispatch_reviews_conflict_skipped_when_reviewer_live(
         save_state(paths.state_file, state)
     # issue #1283 Phase A: the merge-conflict routing branch this test
     # exercises lives inside `_select_review_dispatch_candidates`, which
-    # moved to `charlie_work.dispatch_selection`. That function's own
-    # `_reviewer_pid_alive(pr_state)` call resolves the name from
-    # dispatch_selection.py's module globals (where the function is
-    # defined), not workflow.py's -- patching only the workflow-side
-    # attribute rebinds workflow.py's own facade re-export and is a no-op
-    # for this call site (confirmed empirically: patching only the
-    # workflow side leaves this test failing with status ==
-    # "rework_requested"). Dual-patch both module paths: the
-    # dispatch_selection side is what this test's merge-conflict branch
-    # actually calls; the workflow side is kept too since
-    # `OrchestratorApp.dispatch_reviews`'s own attempt-cap-escalation
-    # branch (tests/test_fix_escalation_paths.py) still calls the
-    # facade-reexported bare name in workflow.py's module globals.
-    monkeypatch.setattr("charlie_work.workflow._reviewer_pid_alive", lambda *_: True)
-    monkeypatch.setattr("charlie_work.dispatch_selection._reviewer_pid_alive", lambda *_: True)
+    # moved to `charlie_work.dispatch_selection`. Both the
+    # dispatch_selection-side and workflow-facade-side reviewer-liveness
+    # delegates resolve liveness through the injected host probe, so one
+    # `fake_host` overlay covers both call sites (issue #2227).
+    fake_host(probe=FakeProcessProbe({424242: 1.0}))
 
     result = app.dispatch_reviews()
 

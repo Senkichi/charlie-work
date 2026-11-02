@@ -8,47 +8,35 @@ cross-repo fleet supervisor daemon reads (``charlie fleet supervise`` --
 are separate layers, so the fleet-only knobs now live on
 ``FleetSupervisorConfig`` under the ``fleet_supervisor:`` section.
 
-Precedence during the migration window: ``fleet_supervisor.<key>`` wins,
-then the legacy ``supervisor.<key>`` location (still honored -- every moved
-key is registered in ``config_deprecations.DEPRECATED_CONFIG_KEYS`` so a
-legacy read emits ``config_key_deprecated_read`` and the fleet retirement
-sweep arms removal issue #1979 once the old keys are absent from every
-layer), then the dataclass default. Both locations set to *different*
-values in the *same file* is a ``ConfigError`` naming both.
+Issue #1979 removed the migration window's legacy ``supervisor.<key>``
+fallback (and with it ``resolve_fleet_supervisor_layer``'s per-layer fold):
+a moved key still written under ``supervisor:`` is now an ordinary
+unknown-key ``ConfigError``.
 
 ``fleet_supervisor:`` is a host-wide-only section (same treatment as
 ``runner_allocation``/``runner_capacity_escalation``): every knob on it
 belongs to the one fleet supervisor daemon, so
 ``global_config.load_layered_config`` rejects the section in a per-repo
-config and resolves each layer's new>legacy precedence *before* merging
-(``resolve_fleet_supervisor_layer``). A repo layer's leftover
-``supervisor.<key>`` therefore simply wins its key in the ordinary
-repo-over-global merge -- deterministic, and still visible through the
-deprecation event -- instead of surfacing as a merged-view conflict that
-would discard the entire global layer.
+config.
 
-The dataclass and its parser live here rather than in ``config.py`` so the
-relocation does not grow that over-cap monolith (file-size ratchet, issue
+The dataclass lives here rather than in ``config.py`` so the relocation
+does not grow that over-cap monolith (file-size ratchet, issue
 #1442) -- the same arrangement as ``capacity_starvation_escalation.py`` and
-``deescalation_config.py``. ``config.py`` re-exports the dataclass and calls
-``parse_fleet_supervisor`` from ``build_config_from_data``; this module must
-therefore not import ``config`` at module level (``ConfigError`` is imported
-lazily inside the parser -- the same pattern ``capacity_starvation_escalation``
-documents).
+``deescalation_config.py``. ``config.py`` re-exports the dataclass; the
+generic section loop in ``build_config_from_data`` validates it like every
+other section. This module must therefore not import ``config`` at module
+level.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
-from typing import Any, Mapping
+from dataclasses import dataclass
+from typing import Annotated
 
-#: The top-level YAML section name. Referenced by ``config_deprecations``'s
-#: ``replacement`` strings and the parser below so the name is declared once.
+from .config_validation import BoolTolerant, Typed
+
+#: The top-level YAML section name.
 FLEET_SUPERVISOR_SECTION = "fleet_supervisor"
-
-#: The legacy section the moved keys still parse from during the migration
-#: window (removal tracked by issue #1979).
-LEGACY_SUPERVISOR_SECTION = "supervisor"
 
 
 @dataclass(frozen=True)
@@ -122,161 +110,11 @@ class FleetSupervisorConfig:
     scheduler.
     """
 
-    max_pass_runtime_seconds: int = 1800
-    self_deploy_failure_alarm: int = 3
-    self_deploy_pull_ci_fleet: bool = False
-    zero_pass_alarm: int = 3
-    wedge_kill_loop_alarm: int = 3
-    dependency_sync_starvation_seconds: int = 14400
-    fleet_lane_concurrency: int = 8
-    reap_sweep_interval_seconds: int = 300
-
-
-# Derived from the dataclass, not hand-maintained: every ``fleet_supervisor``
-# key is either a bool or an int, and ``bool`` is an ``int`` subclass, so the
-# bool membership test runs first.
-_BOOL_KEYS: tuple[str, ...] = tuple(
-    f.name for f in fields(FleetSupervisorConfig) if isinstance(f.default, bool)
-)
-_INT_KEYS: tuple[str, ...] = tuple(
-    f.name for f in fields(FleetSupervisorConfig) if f.name not in _BOOL_KEYS
-)
-
-
-def _validate_typed_keys(section: dict[str, Any], section_name: str) -> None:
-    """Type-check the moved keys in one config section.
-
-    Mirrors the checks ``build_config_from_data`` ran inline for the
-    ``supervisor`` section before the move (same semantics: ``bool`` is not
-    rejected for int keys there either), applied per-location so the error
-    names the section the operator actually wrote.
-    """
-    from .config import ConfigError
-
-    for key in _INT_KEYS:
-        value = section.get(key)
-        if value is not None and not isinstance(value, int):
-            raise ConfigError(
-                f"config section '{section_name}' key '{key}' must be an int, "
-                f"got {type(value).__name__}"
-            )
-    for key in _BOOL_KEYS:
-        value = section.get(key)
-        if value is not None and not isinstance(value, bool):
-            raise ConfigError(
-                f"config section '{section_name}' key '{key}' must be a bool, "
-                f"got {type(value).__name__}"
-            )
-
-
-def parse_fleet_supervisor(data: dict[str, Any]) -> FleetSupervisorConfig:
-    """Validate and build the ``fleet_supervisor`` config section.
-
-    Also honors the legacy ``supervisor.<key>`` locations during the
-    migration window: a moved key found under ``supervisor:`` is removed from
-    that section's mapping *in place* (so ``build_config_from_data``'s later
-    ``SupervisorConfig`` build does not reject it as unknown) and adopted
-    here when ``fleet_supervisor`` does not set it. ``data`` is
-    ``build_config_from_data``'s private deepcopy, so the in-place removal
-    never touches the caller's dict.
-
-    A key set in both locations to different values is a ``ConfigError``
-    naming both -- silently picking one would make an operator's real intent
-    unresolvable. A key present but ``null`` counts as unset, matching the
-    validation's own ``is not None`` convention.
-    """
-    from .config import ConfigError
-
-    new_section = data.get(FLEET_SUPERVISOR_SECTION)
-    if not isinstance(new_section, dict):
-        new_section = {}
-    legacy_section = data.get(LEGACY_SUPERVISOR_SECTION)
-    if not isinstance(legacy_section, dict):
-        legacy_section = {}
-
-    _validate_typed_keys(new_section, FLEET_SUPERVISOR_SECTION)
-    _validate_typed_keys(legacy_section, LEGACY_SUPERVISOR_SECTION)
-
-    valid = {f.name for f in fields(FleetSupervisorConfig)}
-    unknown = sorted(set(new_section) - valid)
-    if unknown:
-        raise ConfigError(
-            f"unknown key(s) in config section '{FLEET_SUPERVISOR_SECTION}': "
-            f"{', '.join(unknown)} (valid: {', '.join(sorted(valid))})"
-        )
-
-    merged = _adopt_legacy_keys(new_section, legacy_section)
-    return FleetSupervisorConfig(**merged)
-
-
-def _adopt_legacy_keys(
-    new_section: Mapping[str, Any], legacy_section: dict[str, Any]
-) -> dict[str, Any]:
-    """Resolve one source's ``fleet_supervisor``/``supervisor`` pair.
-
-    Moved keys found in ``legacy_section`` are popped out of it *in place*
-    (so a later ``SupervisorConfig`` build never sees them as unknown) and
-    adopted into the returned mapping when ``new_section`` does not set the
-    key. A key in both locations with different values is a ``ConfigError``
-    naming both; ``null`` counts as unset on either side. The conflict
-    wording is shared verbatim by ``parse_fleet_supervisor`` (single file)
-    and ``resolve_fleet_supervisor_layer`` (one merge layer) so the two
-    paths cannot drift on what "both locations disagree" means.
-    """
-    from .config import ConfigError
-
-    merged = dict(new_section)
-    for f in fields(FleetSupervisorConfig):
-        key = f.name
-        if key not in legacy_section:
-            continue
-        legacy_value = legacy_section.pop(key)
-        if legacy_value is None:
-            continue
-        new_value = merged.get(key)
-        if new_value is not None and new_value != legacy_value:
-            raise ConfigError(
-                f"config key '{key}' is set in both "
-                f"'{FLEET_SUPERVISOR_SECTION}' ({new_value!r}) and legacy "
-                f"'{LEGACY_SUPERVISOR_SECTION}' ({legacy_value!r}) with "
-                "different values; the legacy location is deprecated "
-                "(removal tracked by #1979) -- delete "
-                f"'{LEGACY_SUPERVISOR_SECTION}.{key}'"
-            )
-        if new_value is None:
-            merged[key] = legacy_value
-    return merged
-
-
-def resolve_fleet_supervisor_layer(data: Mapping[str, Any]) -> dict[str, Any]:
-    """Return one raw config-*layer* dict with legacy keys folded in.
-
-    ``global_config.load_layered_config`` runs this on each layer BEFORE the
-    repo-over-global merge so the moved-key adoption sees one file at a
-    time: a ``fleet_supervisor.<key>``/``supervisor.<key>`` disagreement
-    within one file still raises the ``ConfigError`` above, while a
-    repo-layer ``supervisor.<key>`` that disagrees with the global layer's
-    ``fleet_supervisor.<key>`` is just an ordinary per-key override -- the
-    repo layer wins it, like every other repo-layer key. Without this, the
-    cross-layer disagreement only surfaced post-merge as a conflict that
-    triggered ``load_layered_config``'s #665 rescue and discarded the
-    *entire* global layer over one disputed key.
-
-    The input mapping is never mutated: the layer dict and both section
-    dicts are copied, so callers keep the raw layer for deprecation-event
-    attribution (``emit_deprecated_key_reads`` must still see the legacy
-    spelling in the file it was read from). No type validation happens here
-    -- ``parse_fleet_supervisor`` re-checks the merged ``fleet_supervisor``
-    values, and a bad legacy value in a repo layer resurfaces with its own
-    section name when the #665 rescue re-parses that file standalone.
-    """
-    out = dict(data)
-    new_section = data.get(FLEET_SUPERVISOR_SECTION)
-    new = dict(new_section) if isinstance(new_section, dict) else {}
-    legacy_section = data.get(LEGACY_SUPERVISOR_SECTION)
-    legacy = dict(legacy_section) if isinstance(legacy_section, dict) else {}
-
-    effective = _adopt_legacy_keys(new, legacy)
-    out[FLEET_SUPERVISOR_SECTION] = effective
-    out[LEGACY_SUPERVISOR_SECTION] = legacy
-    return out
+    max_pass_runtime_seconds: Annotated[int, Typed, BoolTolerant] = 1800
+    self_deploy_failure_alarm: Annotated[int, Typed, BoolTolerant] = 3
+    self_deploy_pull_ci_fleet: Annotated[bool, Typed] = False
+    zero_pass_alarm: Annotated[int, Typed, BoolTolerant] = 3
+    wedge_kill_loop_alarm: Annotated[int, Typed, BoolTolerant] = 3
+    dependency_sync_starvation_seconds: Annotated[int, Typed, BoolTolerant] = 14400
+    fleet_lane_concurrency: Annotated[int, Typed, BoolTolerant] = 8
+    reap_sweep_interval_seconds: Annotated[int, Typed, BoolTolerant] = 300

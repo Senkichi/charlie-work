@@ -4,8 +4,8 @@ cw#1273 binding design (issue comment, phase-0-recon corrections):
 
 ``GitHub.run()`` already retries mutating commands (``pr create`` included)
 on *pre-connection* failures only (TLS handshake timeout, connection
-refused, could-not-connect, error-connecting-to) -- see ``github.py``'s
-``_is_pre_connection_error``/``_should_retry``. That retry is deliberately
+refused, could-not-connect, error-connecting-to) -- see ``github_transport.guarded``'s
+``is_retryable``. That retry is deliberately
 narrow: a mutation whose response is lost *after* it reached GitHub (a
 post-send ambiguous timeout, a 5xx after headers) is never retried there,
 because retrying an already-applied mutation risks a duplicate. Its total

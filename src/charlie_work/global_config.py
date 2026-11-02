@@ -3,7 +3,8 @@ from __future__ import annotations
 import logging
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 import yaml
 
@@ -17,13 +18,14 @@ from .config import (
 )
 from . import layout
 from .config_deprecations import emit_deprecated_key_reads, repo_state_path
+from .config_validation import ConstructionError, host_wide_error, host_wide_sections
 from .fleet_paths import fleet_dir
-from .fleet_supervisor_config import (
-    FLEET_SUPERVISOR_SECTION,
-    resolve_fleet_supervisor_layer,
-)
+
+from .paths import RepoNotFoundError
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 
 def config_layer_paths(
@@ -94,7 +96,87 @@ def _deep_merge(base: Any, override: Any) -> Any:
     return override
 
 
+def peek_runtime_state_dir(
+    repo_root: Path,
+    explicit: Path | None = None,
+    *,
+    fleet_dir_override: str | None = None,
+) -> str:
+    """Best-effort read of ``runtime.state_dir`` from the config layers.
+
+    Exists for one caller: the boot-time pending-sync repair (issue #2312)
+    must locate the marker *before* ``load_fleet_global_config`` runs -- the
+    dependency skew it repairs is exactly what can crash that load. Reads the
+    same two layer slots ``load_layered_config`` uses and applies the same
+    repo-wins-per-key precedence, but only for ``runtime.state_dir``, and
+    tolerates every failure the real loader would surface: absent files,
+    malformed YAML, non-mapping documents, and non-mapping ``runtime``
+    sections all contribute nothing.
+
+    A layer that declares ``state_dir`` wins even when the value is unusable:
+    the real loader would raise ``ConfigError`` on it and the fleet entry
+    points fall back to defaults, so the peek's own default matches where
+    that fallback puts the marker. The string comes back unresolved --
+    resolution belongs to ``runtime_paths``/``supervisor_runtime_paths``.
+    """
+    state_dir: Any = None
+    for _layer, path in config_layer_paths(
+        repo_root, explicit, fleet_dir_override=fleet_dir_override
+    ):
+        try:
+            raw = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else None
+        except (OSError, yaml.YAMLError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        runtime = raw.get("runtime")
+        if isinstance(runtime, dict) and "state_dir" in runtime:
+            state_dir = runtime["state_dir"]
+    return state_dir if isinstance(state_dir, str) else layout.DEFAULT_STATE_DIR
+
+
+_AVIATOR_CONFIG = Path(".aviator") / "config.yml"
+_AVIATOR_WARNED: set[Path] = set()
+
+
+def warn_if_aviator_config_missing(config: OrchestratorConfig, repo_root: Path) -> bool:
+    """Warn (once per repo per process) when ``mergequeue_label`` is set but the repo has no
+    ``.aviator/config.yml`` (#2441): the hand-off labels PRs for a queue that has no rules
+    to merge them, so they sit labelled forever. Returns True when it warned.
+    """
+    label = config.auto_merge.mergequeue_label
+    if not label or (repo_root / _AVIATOR_CONFIG).is_file():
+        return False
+    key = repo_root.resolve()
+    if key in _AVIATOR_WARNED:
+        return False
+    _AVIATOR_WARNED.add(key)
+    logger.warning(
+        "auto_merge.mergequeue_label=%r is set but %s has no %s; PRs handed to the merge "
+        "queue will not be merged until that file exists",
+        label,
+        repo_root,
+        _AVIATOR_CONFIG.as_posix(),
+    )
+    return True
+
+
 def load_layered_config(
+    repo_root: Path,
+    explicit: Path | None = None,
+    *,
+    fleet_dir_override: str | None = None,
+    require_global: bool = False,
+) -> OrchestratorConfig:
+    """``_load_layered_config`` plus the missing-``.aviator/config.yml`` warning (#2441)."""
+    config = _load_layered_config(
+        repo_root, explicit, fleet_dir_override=fleet_dir_override, require_global=require_global
+    )
+    warn_if_aviator_config_missing(config, repo_root)
+    return config
+
+
+def _load_layered_config(
     repo_root: Path,
     explicit: Path | None = None,
     *,
@@ -227,69 +309,31 @@ def load_layered_config(
         str(p) for p in (global_config_path if global_exists else None, repo_source) if p
     )
 
-    # ``runner_allocation`` is host-wide only (see RunnerAllocationConfig's
-    # docstring): three repos must not hold three opinions about how many jobs
-    # one machine can run. The merge below is section-by-section with the
-    # per-repo file winning per key, so without this rejection a per-repo
-    # ``orchestrator.config.yaml`` could silently override a host-wide knob --
-    # the exact confusion that made #590 expensive to diagnose. Reject the key
-    # outright so the invalid state is unrepresentable rather than merely
-    # unused (issue #600).
-    if "runner_allocation" in repo_data:
-        raise ConfigError(
-            "config section 'runner_allocation' is host-wide only and must not "
-            f"appear in a per-repo config ({repo_config_path}); declare it in "
-            "the global fleet layer (<fleet_dir>/config.yaml) instead"
-        )
-    # ``runner_capacity_escalation`` is the same shape of host-wide concern as
-    # ``runner_allocation``: it escalates a starvation condition measured across
-    # the whole host's budget, so a per-repo override would be three repos
-    # holding three opinions about one machine's capacity signal. Reject it for
-    # the same reason and with the same remedy (issue #763).
-    if "runner_capacity_escalation" in repo_data:
-        raise ConfigError(
-            "config section 'runner_capacity_escalation' is host-wide only and "
-            f"must not appear in a per-repo config ({repo_config_path}); declare "
-            "it in the global fleet layer (<fleet_dir>/config.yaml) instead"
-        )
-    # ``fleet_supervisor`` is the same shape of host-wide concern as
-    # ``runner_allocation`` (issue #1978): every knob on it belongs to the one
-    # cross-repo fleet supervisor daemon, so a per-repo
-    # ``orchestrator.config.yaml`` declaring the section would shadow the
-    # operator's global values -- reject it outright, same remedy. The legacy
-    # ``supervisor.<key>`` spellings stay legal here during the #1979
-    # migration window: the fold below lifts them into the repo layer's
-    # effective ``fleet_supervisor`` mapping, where they keep the ordinary
-    # repo-wins-per-key merge semantics.
-    if FLEET_SUPERVISOR_SECTION in repo_data:
-        raise ConfigError(
-            f"config section '{FLEET_SUPERVISOR_SECTION}' is host-wide only and "
-            f"must not appear in a per-repo config ({repo_config_path}); declare "
-            "it in the global fleet layer (<fleet_dir>/config.yaml) instead"
-        )
-
-    # Issue #1978: resolve each layer's fleet_supervisor/supervisor pair
-    # *before* merging. Adoption on the post-merge view cannot tell a
-    # same-file disagreement (a hard ConfigError -- the operator wrote both
-    # spellings) from a cross-layer one (the global file's new-style key vs a
-    # repo's still-deprecated legacy key, which is just the ordinary
-    # repo-wins merge). Conflicting spellings surfacing only after the merge
-    # made the merged build raise, which the #665 rescue below treated like
-    # any broken global layer -- discarding the entire global config over
-    # one disputed key. The fold works on copies; ``global_data`` /
-    # ``repo_data`` keep the legacy spellings for the deprecation-event
-    # emits above and below.
-    global_layer = resolve_fleet_supervisor_layer(global_data)
-    repo_layer = resolve_fleet_supervisor_layer(repo_data)
+    # Host-wide sections (declared with ``HostWideOnly`` on the ``OrchestratorConfig``
+    # field, never listed here): one physical machine / one fleet supervisor daemon, so
+    # three repos must not hold three opinions about it. The merge below is
+    # section-by-section with the per-repo file winning per key, so without this
+    # rejection a per-repo ``orchestrator.config.yaml`` could silently override a
+    # host-wide knob -- the exact confusion that made #590 expensive to diagnose. Reject
+    # the key outright so the invalid state is unrepresentable rather than merely unused
+    # (issues #600, #763, #1978). A legacy ``supervisor.<key>`` spelling of a
+    # moved fleet-supervisor knob needs no carve-out here: since #1979 it is
+    # just an unknown key, and the ordinary validation below rejects it like
+    # any other.
+    for host_wide in sorted(host_wide_sections()):
+        if host_wide in repo_data:
+            raise host_wide_error(
+                host_wide, fleet_dir=global_config_path.parent, repo_path=repo_config_path
+            )
 
     # Merge: global as base, per-repo as override (section-by-section, deep)
     merged_data: dict[str, Any] = {}
-    all_sections = set(global_layer.keys()) | set(repo_layer.keys())
+    all_sections = set(global_data.keys()) | set(repo_data.keys())
     known_sections = known_config_sections()
 
     for section in all_sections:
-        global_section = global_layer.get(section, {})
-        repo_section = repo_layer.get(section, {})
+        global_section = global_data.get(section, {})
+        repo_section = repo_data.get(section, {})
 
         # Both should be dicts for a proper merge
         global_section = global_section if isinstance(global_section, dict) else {}
@@ -358,7 +402,7 @@ def load_layered_config(
             except Exception:  # noqa: BLE001 — deprecation telemetry must never break config load
                 logger.debug("config_key_deprecated_read emit failed for %s", repo_source)
         return merged
-    except ConfigError:
+    except ConfigError as exc:
         # A present-but-invalid global layer (e.g. an unknown key) makes
         # the merged load raise, and callers (fleet_dispatch) catch
         # ConfigError and skip the repo -- silently discarding a *valid*
@@ -370,15 +414,68 @@ def load_layered_config(
         # silently defaulting would itself reproduce the #623 shape.
         if not global_exists or not repo_data:
             raise
+        # A section constructor's own rejection (ci_fleet's host-wide
+        # ``__post_init__`` rules, ``rescue.worker``) is the global layer's
+        # *host-wide* breakage. Discarding that layer would silently default
+        # every host-wide knob -- the #623 shape -- so it stays loud.
+        if isinstance(exc, ConstructionError):
+            raise
         # Provenance is the per-repo file alone, deliberately: the global
         # layer was *discarded*, so listing it would claim a contribution
         # that was rolled back. This is the case the field earns its keep
         # on -- the warning below scrolls away, the value does not.
         repo_only = replace(load_config(repo_config_path), sources=(str(repo_config_path),))
+        # ``exc`` is the validation error that triggered the discard and names the
+        # section and key (``claude_code: expected known keys ..., got unknown
+        # key(s) ...``); without it the warning and the wrong effective values
+        # are the only symptoms (issue #2850).
         logger.warning(
             "Layered config: merged load failed validation; the global "
             "layer was discarded and the per-repo config used alone. "
-            "global path=%s",
+            "global path=%s: %s",
             global_config_path,
+            exc,
         )
         return repo_only
+
+
+def load_fleet_global_config(
+    load: Callable[..., OrchestratorConfig],
+    cwd: Path,
+    *,
+    fleet_dir_override: str | None,
+    fallback: _T,
+    report: Callable[[Exception], None],
+) -> OrchestratorConfig | _T:
+    """Load the fleet entry points' global config: require the global layer, degrade softly.
+
+    The one place ``fleet supervise`` / ``fleet work`` / ``fleet bash-rats`` decide what a
+    failed global load means. A missing or invalid global layer is reported through
+    *report*, then the per-repo config is reloaded without the global requirement so it
+    survives (the #623 silent-disable shape); only if that also fails does the caller's
+    *fallback* apply.
+
+    A :class:`ConstructionError` is never degraded. It is a *host-wide* section's own
+    constructor rejecting the global layer (ci_fleet's ``__post_init__`` rules, design F1),
+    which main surfaced as a raw ``ValueError`` that these handlers did not catch, so the
+    process refused to start. Continuing on defaults would silently turn runner allocation
+    and the fleet caps off (#623 / #590). ``ConstructionError`` subclasses ``ConfigError``,
+    so it must be re-raised explicitly ahead of that catch.
+
+    *load* is the caller's own ``load_layered_config`` binding (injected, not imported here,
+    so the caller module remains the seam its tests patch). The per-repo call sites that
+    skip a repo on ``ConfigError`` (autoscale prologue, fleet status) stay as they are: they
+    are non-fatal per repo, and skipping one repo is not a host-wide fail-open.
+    """
+    try:
+        return load(cwd, None, fleet_dir_override=fleet_dir_override, require_global=True)
+    except ConstructionError:
+        raise
+    except (ConfigError, RepoNotFoundError) as exc:
+        report(exc)
+        try:
+            return load(cwd, None, fleet_dir_override=fleet_dir_override)
+        except ConstructionError:
+            raise
+        except (ConfigError, RepoNotFoundError):
+            return fallback

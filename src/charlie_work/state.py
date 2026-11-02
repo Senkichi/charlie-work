@@ -12,6 +12,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Mapping
 
+from . import atomic_write
+from . import host as _host
 from .dead_dispatched_timer import LOCAL_PARK_DEFER_FIELDS
 
 # Issue #1769 review follow-up / file-size ratchet (#1442): dispatch-cadence
@@ -26,6 +28,7 @@ from .dispatch_cadence import (  # noqa: F401 (deliberate re-export)
     mark_dispatch_baseline_backfill_attempted,
     record_non_empty_dispatch,
 )
+from .host.clock import format_utc
 from .iso_timestamp import parse_iso_timestamp  # noqa: F401 (deliberate re-export)
 
 # File-size ratchet (#1442): periodic-pass scheduling helpers moved to their own
@@ -62,9 +65,10 @@ _LOAD_RETRY_DELAY_SECONDS = 0.1
 # (a lock-free ``load_state`` reader, ``charlie doctor``, a dashboard render)
 # raises ``PermissionError`` [WinError 5]. The failure is transient and
 # non-destructive -- the previous valid file is intact -- so retry with backoff
-# before surfacing, mirroring the reader-side knobs above.
-_SAVE_RETRY_ATTEMPTS = 3
-_SAVE_RETRY_DELAY_SECONDS = 0.1
+# before surfacing, mirroring the reader-side knobs above. The retry loop itself
+# now lives in ``atomic_write`` (issue #2265); this alias only feeds the
+# operator-facing error message below and must not drift from it.
+_SAVE_RETRY_ATTEMPTS = atomic_write.REPLACE_ATTEMPTS
 
 # Stale claim timeout (minutes) — claims older than this are re-dispatchable
 # to prevent crashed phase-2 from wedging issues
@@ -450,7 +454,7 @@ def _thread_lock_for(path: Path) -> threading.Lock:
 
 
 def utc_now() -> str:
-    return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return format_utc(_host.current().clock.now())
 
 
 def age_days_since(timestamp: str | None, *, now: datetime | None = None) -> float | None:
@@ -469,7 +473,7 @@ def age_days_since(timestamp: str | None, *, now: datetime | None = None) -> flo
         since_dt = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
     except (ValueError, TypeError):
         return None
-    resolved_now = now if now is not None else datetime.now(UTC)
+    resolved_now = now if now is not None else _host.current().clock.now()
     return round((resolved_now - since_dt).total_seconds() / 86400.0, 2)
 
 
@@ -569,7 +573,7 @@ def is_claim_stale(
         return False
     try:
         claim_time = datetime.fromisoformat(claim_timestamp.replace("Z", "+00:00"))
-        resolved_now = now if now is not None else datetime.now(UTC)
+        resolved_now = now if now is not None else _host.current().clock.now()
         age = resolved_now - claim_time
         return age > timedelta(minutes=timeout_minutes)
     except (ValueError, TypeError):
@@ -613,7 +617,7 @@ def stale_operator_claims(
 
     Used for digest warnings; stale claims still block dispatch until released.
     """
-    now = datetime.now(UTC)
+    now = _host.current().clock.now()
     stale: set[int] = set()
     for issue_number_str, entry in data.get("issues", {}).items():
         timestamp = _operator_claim_timestamp(entry)
@@ -709,8 +713,8 @@ def advisory_file_lock(path: Path):
             # We use a retry loop with timeout for bounded waiting
             import time
 
-            start = time.time()
-            while time.time() - start < _LOCK_TIMEOUT_SECONDS:
+            start = time.monotonic()
+            while time.monotonic() - start < _LOCK_TIMEOUT_SECONDS:
                 try:
                     # Try non-blocking lock first
                     msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
@@ -733,8 +737,8 @@ def advisory_file_lock(path: Path):
             import time
 
             lock_file = lock_path.open("r+b", encoding=None)
-            start = time.time()
-            while time.time() - start < _LOCK_TIMEOUT_SECONDS:
+            start = time.monotonic()
+            while time.monotonic() - start < _LOCK_TIMEOUT_SECONDS:
                 try:
                     fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                     acquired = True
@@ -871,33 +875,20 @@ def load_state(path: Path) -> dict[str, Any]:
 def save_state(path: Path, data: dict[str, Any]) -> dict[str, Any]:
     """Persist a fresh copy of ``data`` without mutating the caller's dict."""
     to_save = {**data, "generated_at": utc_now()}
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(to_save, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    # On Windows, ``replace()`` onto a target another process currently holds
-    # open (a lock-free ``load_state`` reader, ``charlie doctor``, a dashboard
-    # render) raises ``PermissionError`` [WinError 5]. The failure is transient
-    # and non-destructive -- the previous valid file is intact -- so retry with
-    # backoff before surfacing, mirroring ``load_state``'s reader-side retry.
-    # ``PermissionError`` is caught specifically so the final message can name
-    # the condition; a bare "Access is denied" sends an operator hunting for an
-    # admin shell (issue #1062).
-    for attempt in range(_SAVE_RETRY_ATTEMPTS):
-        try:
-            tmp_path.replace(path)
-            break
-        except PermissionError as exc:
-            if attempt < _SAVE_RETRY_ATTEMPTS - 1:
-                time.sleep(_SAVE_RETRY_DELAY_SECONDS)
-                continue
-            raise PermissionError(
-                f"atomic replace of {path} failed after {_SAVE_RETRY_ATTEMPTS} "
-                f"attempts: {exc}. This is usually a transient Windows sharing "
-                f"violation (another process holds the file open); the previous "
-                f"state file is intact."
-            ) from exc
+    # The write goes through ``atomic_write.write_json_atomic`` (unique temp
+    # name + bounded ``PermissionError`` retry + orphan cleanup -- issue
+    # #2265). ``PermissionError`` is caught specifically so the final message
+    # can name the condition; a bare "Access is denied" sends an operator
+    # hunting for an admin shell (issue #1062).
+    try:
+        atomic_write.write_json_atomic(path, to_save)
+    except PermissionError as exc:
+        raise PermissionError(
+            f"atomic replace of {path} failed after {_SAVE_RETRY_ATTEMPTS} "
+            f"attempts: {exc}. This is usually a transient Windows sharing "
+            f"violation (another process holds the file open); the previous "
+            f"state file is intact."
+        ) from exc
     return to_save
 
 
@@ -962,7 +953,7 @@ def is_throttled(data: dict[str, Any]) -> bool:
         return False
     try:
         throttle_time = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
-        return datetime.now(UTC) < throttle_time
+        return _host.current().clock.now() < throttle_time
     except (ValueError, TypeError):
         # Malformed timestamp — treat as not throttled to be safe
         return False
@@ -975,6 +966,8 @@ def set_throttled_until(
     source: str,
     reason: str | None = None,
     adapter_kind: str | None = None,
+    harness: str | None = None,
+    model: str | None = None,
     write_gate: WriteGate | None = None,
     state_path: Path | None = None,
     repo: str | None = None,
@@ -984,13 +977,13 @@ def set_throttled_until(
     ``source`` is a required keyword naming the caller (issue #2006).
     Whenever the value changes -- extended or shortened -- this function
     appends a ``throttle_window_set`` event carrying
-    ``{previous, throttled_until, reason, adapter_kind, source}`` so a moved
-    window is never invisible to the audit trail; a no-op write emits
-    nothing. Emission goes through ``write_gate`` when given (so gated lanes
-    get the gate's dry-run suppression and its bound ``state_path``/``repo``
-    dual-write), else through ``append_event`` with the optional
-    ``state_path``/``repo`` dual-write bindings; with neither, the event
-    lands only in the in-memory ``events`` ring.
+    ``{previous, throttled_until, reason, adapter_kind, harness, model,
+    source}`` so a moved window is never invisible to the audit trail; a
+    no-op write emits nothing. Emission goes through ``write_gate`` when
+    given (so gated lanes get the gate's dry-run suppression and its bound
+    ``state_path``/``repo`` dual-write), else through ``append_event`` with
+    the optional ``state_path``/``repo`` dual-write bindings; with neither,
+    the event lands only in the in-memory ``events`` ring.
 
     ``reason`` (a ``worker_fate.classify_for`` failure_kind -- e.g.
     "quota_exhausted", "provider_auth", "rate_limited") and ``adapter_kind``
@@ -1002,6 +995,14 @@ def set_throttled_until(
     call sites that have not been updated to pass them keep working; a
     throttle with an unset reason/adapter_kind is treated as
     claude-code-shaped (the common case) by ``clear_quota_throttles``.
+
+    ``harness``/``model`` -- persisted as ``throttle_harness`` /
+    ``throttle_model`` -- name the dead session's stamped role-chain entry
+    (issue #2279): the quota ledger already scopes restrictions per
+    ``(harness, model)``, so a window stamped with the entry that produced it
+    lets ``role_selection.window_covered`` tell a fallback's quota window
+    from an operator hold or the selected entry's own death. They default to
+    None; a window with no stamp keeps the pre-#2279 blocking semantics.
 
     Monotonic (issue #2042): a new window never shortens a still-active one.
     When the stored ``throttled_until`` parses, is still in the future, and
@@ -1032,6 +1033,8 @@ def set_throttled_until(
         "throttled_until": throttled_until,
         "throttle_reason": reason,
         "throttle_adapter_kind": adapter_kind,
+        "throttle_harness": harness,
+        "throttle_model": model,
     }
     if previous == throttled_until:
         return new_data
@@ -1040,6 +1043,8 @@ def set_throttled_until(
         "throttled_until": throttled_until,
         "reason": reason,
         "adapter_kind": adapter_kind,
+        "harness": harness,
+        "model": model,
         "source": source,
     }
     if write_gate is not None:
@@ -1153,7 +1158,7 @@ def is_reviewer_quota_exhausted(data: dict[str, Any]) -> bool:
         return False
     try:
         throttle_time = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
-        return datetime.now(UTC) < throttle_time
+        return _host.current().clock.now() < throttle_time
     except (ValueError, TypeError):
         return False
 
@@ -1169,7 +1174,7 @@ def is_reviewer_probe_ready(data: dict[str, Any]) -> bool:
         return True
     try:
         probe_time = datetime.fromisoformat(probe_after.replace("Z", "+00:00"))
-        return datetime.now(UTC) >= probe_time
+        return _host.current().clock.now() >= probe_time
     except (ValueError, TypeError):
         return True
 
@@ -1321,7 +1326,7 @@ def is_quota_probe_due(data: dict[str, Any]) -> bool:
         return False
     try:
         next_time = datetime.fromisoformat(next_at.replace("Z", "+00:00"))
-        return datetime.now(UTC) >= next_time
+        return _host.current().clock.now() >= next_time
     except (ValueError, TypeError):
         return True
 
@@ -1364,7 +1369,7 @@ def is_operator_queue_review_due(data: dict[str, Any]) -> bool:
         return True
     try:
         next_time = datetime.fromisoformat(next_at.replace("Z", "+00:00"))
-        return datetime.now(UTC) >= next_time
+        return _host.current().clock.now() >= next_time
     except (ValueError, TypeError):
         return True
 
@@ -1513,6 +1518,8 @@ def clear_quota_throttles(data: dict[str, Any]) -> dict[str, Any]:
             "throttled_until": None,
             "throttle_reason": None,
             "throttle_adapter_kind": None,
+            "throttle_harness": None,
+            "throttle_model": None,
         }
     cleared = clear_reviewer_quota(cleared)
     reviewer_quota = cleared.get("reviewer_quota") or {}
@@ -1530,7 +1537,10 @@ def clear_quota_throttles(data: dict[str, Any]) -> dict[str, Any]:
         reviewer_quota = {
             **reviewer_quota,
             "consecutive_probe_failures": 0,
-            "last_probe_cleared_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "last_probe_cleared_at": _host.current()
+            .clock.now()
+            .isoformat()
+            .replace("+00:00", "Z"),
         }
         cleared = {**cleared, "reviewer_quota": reviewer_quota}
     return cleared

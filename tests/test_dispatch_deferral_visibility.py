@@ -19,7 +19,8 @@ from charlie_work.github import GitHubError, GraphQLBudgetError
 from charlie_work.instrumentation import query_events
 from charlie_work.paths import runtime_paths
 from charlie_work.state import StateLockBusy
-from charlie_work.workflow import CommandResult, OrchestratorApp
+from charlie_work.command_result import CommandResult
+from charlie_work.workflow import OrchestratorApp
 
 _DISPATCH_MOD = "charlie_work.orchestration.reap_dispatch"
 _REWORK_MOD = "charlie_work.orchestration.misc_worker_dispatch"

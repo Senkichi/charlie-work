@@ -20,9 +20,11 @@ from pathlib import Path
 from _fakes_github import FakeGitHub
 from _worktree_fixtures import (
     _init_bare_remote_and_clone,
+    _init_repo,
     _setup_completed_worktree,
 )
 from charlie_work.claude_code import ClaudeWorkerRecord
+from charlie_work.host.fakes import FakeProcessProbe
 from charlie_work.config import (
     OrchestratorConfig,
     WorkerRoleConfig,
@@ -37,12 +39,16 @@ from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # no
 
 
 def test_dispatch_phantom_live_worker_frees_slot_and_reaps_sidecar(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, fake_host
 ) -> None:
     """Issue #523: a live_worker_redispatch_averted result whose recorded PID is
     dead must not count as a live worker slot. The phantom slot is freed, the
     stale sidecar is reaped, active labels are stripped, ready is restored, and
     the issue is re-dispatchable on the next pass."""
+
+    # Issue #2262: the dead-worker salvage probe needs a real git repo to
+    # prove the branch carries no commits (the verdict that permits requeue).
+    _init_repo(tmp_path)
 
     def _fake_launch(issue_number, branch, prompt_text, **kwargs):
         return ClaudeWorkerRecord(
@@ -61,17 +67,14 @@ def test_dispatch_phantom_live_worker_frees_slot_and_reaps_sidecar(
 
     monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
     # Issue #523: the recorded PID is dead, so the result must not count as a
-    # live worker slot. This also makes _worker_pid_alive return False so the
-    # issue is selectable despite state.json recording a worker_pid.
-    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
-    # The sidecar-driven live-worker census (_issues_with_live_workers ->
-    # worker.iter_workers().is_alive() -> worker_fate.is_alive) reads a
-    # SEPARATE liveness reference from workflow.is_pid_alive. Patch it too: whether the
-    # fixture's PID reads as alive there depends on the host's current PID
-    # table (process_utils.is_pid_alive treats OpenProcess/ERROR_ACCESS_DENIED
-    # as indeterminate-so-alive by design), so leaving it unpatched makes the
-    # test's outcome depend on host state, not the code under test.
-    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda pid, start: False)
+    # live worker slot. Worker liveness everywhere reads the injected host
+    # probe (state-entry check, post-launch result check, and the
+    # sidecar-driven live-worker census); fake it all-dead so the outcome
+    # never depends on the host's real PID table — leaving it unfaked made
+    # the test's outcome depend on host state, not the code under test
+    # (process_utils.is_pid_alive treats OpenProcess/ERROR_ACCESS_DENIED as
+    # indeterminate-so-alive by design).
+    fake_host(probe=FakeProcessProbe())
 
     config = OrchestratorConfig(worker=WorkerRoleConfig(harness="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -162,7 +165,7 @@ def test_dispatch_phantom_live_worker_frees_slot_and_reaps_sidecar(
 
 
 def test_dispatch_phantom_live_worker_no_active_labels_skips_relabel(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, fake_host
 ) -> None:
     """Issue #523: a phantom live worker whose issue carries only a terminal
     label (no active labels) must still free the slot and reap the sidecar,
@@ -170,6 +173,10 @@ def test_dispatch_phantom_live_worker_no_active_labels_skips_relabel(
     terminal-only and spurious relabeling would resurrect it. A
     ``session_failed_relabeled`` event with empty ``removed_labels`` and
     ``added_ready=False`` is still recorded so the slot-free is observable."""
+
+    # Issue #2262: the dead-worker salvage probe needs a real git repo to
+    # prove the branch carries no commits (the verdict that permits requeue).
+    _init_repo(tmp_path)
 
     def _fake_launch(issue_number, branch, prompt_text, **kwargs):
         return ClaudeWorkerRecord(
@@ -187,15 +194,11 @@ def test_dispatch_phantom_live_worker_no_active_labels_skips_relabel(
         )
 
     monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
-    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
-    # The sidecar-driven live-worker census (_issues_with_live_workers ->
-    # worker.iter_workers().is_alive() -> worker_fate.is_alive) reads a
-    # SEPARATE liveness reference from workflow.is_pid_alive. Patch it too: whether the
-    # fixture's PID reads as alive there depends on the host's current PID
-    # table (process_utils.is_pid_alive treats OpenProcess/ERROR_ACCESS_DENIED
-    # as indeterminate-so-alive by design), so leaving it unpatched makes the
-    # test's outcome depend on host state, not the code under test.
-    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda pid, start: False)
+    # Worker liveness everywhere reads the injected host probe; fake it
+    # all-dead so the outcome never depends on the host's real PID table
+    # (process_utils.is_pid_alive treats OpenProcess/ERROR_ACCESS_DENIED as
+    # indeterminate-so-alive by design).
+    fake_host(probe=FakeProcessProbe())
 
     config = OrchestratorConfig(worker=WorkerRoleConfig(harness="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -286,7 +289,7 @@ def test_dispatch_phantom_live_worker_no_active_labels_skips_relabel(
 
 
 def test_dispatch_phantom_live_worker_preserves_sidecar_for_completed_worktree(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, fake_host
 ) -> None:
     """Issue #1122: a phantom live worker whose worktree is COMPLETED (clean,
     ahead of base) must NOT have its sidecar reaped or labels stripped. The
@@ -304,7 +307,7 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_completed_worktree(
     # fixture. It is NOT what fixes this test -- the phantom-live routing
     # under test does not gate on started_at at all. The actual gate that
     # made this test flip green/red across days is PID-liveness, not a time
-    # window (see the worker_fate.is_alive patch below).
+    # window (see the all-dead probe fake below).
     recent_started_at = (datetime.now(UTC) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     def _fake_launch(issue_number, branch, prompt_text, **kwargs):
@@ -323,24 +326,23 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_completed_worktree(
         )
 
     monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
-    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
-    # Issue #1122 fixture note: the sidecar's PID must also read as dead via
-    # ``_issues_with_live_workers`` -> ``worker.iter_workers().is_alive()`` ->
-    # ``worker_fate.is_alive`` -- a
-    # SEPARATE liveness reference from ``charlie_work.workflow.is_pid_alive``
-    # patched above. Without this, this fixture's specific PID (6262) can
-    # spuriously read as "alive": ``process_utils.is_pid_alive`` treats
-    # ``OpenProcess`` failing with ``ERROR_ACCESS_DENIED`` as indeterminate-so-
-    # alive by design (process_utils.py:293-301), and on this host PID 6262
-    # currently returns that error while sibling fixture PIDs (4242, 5353,
-    # 7373) return ``ERROR_INVALID_PARAMETER`` (correctly read as dead) --
-    # confirmed by direct ``OpenProcess`` probe, not assumed. That makes the
-    # unpatched read host-PID-table-state dependent rather than deterministic,
-    # which is what made this test pass on 2026-08-19 and fail on 2026-08-21
-    # with no code change: it marks the issue live-dispatched and drops it out
-    # of the dispatch candidate set before the phantom-live-worker routing
-    # under test ever runs.
-    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda pid, start: False)
+    # Issue #1122 fixture note: every liveness read — the state-entry check,
+    # the post-launch result check, and the sidecar-driven live-worker census
+    # (``_issues_with_live_workers`` -> ``worker.iter_workers().is_alive()``)
+    # — now reads the one injected host probe. Without the all-dead fake this
+    # fixture's specific PID (6262) can spuriously read as "alive":
+    # ``process_utils.is_pid_alive`` treats ``OpenProcess`` failing with
+    # ``ERROR_ACCESS_DENIED`` as indeterminate-so-alive by design
+    # (process_utils.py:293-301), and on this host PID 6262 currently returns
+    # that error while sibling fixture PIDs (4242, 5353, 7373) return
+    # ``ERROR_INVALID_PARAMETER`` (correctly read as dead) -- confirmed by
+    # direct ``OpenProcess`` probe, not assumed. That makes the unfaked read
+    # host-PID-table-state dependent rather than deterministic, which is what
+    # made this test pass on 2026-08-19 and fail on 2026-08-21 with no code
+    # change: it marks the issue live-dispatched and drops it out of the
+    # dispatch candidate set before the phantom-live-worker routing under
+    # test ever runs.
+    fake_host(probe=FakeProcessProbe())
 
     config = OrchestratorConfig(worker=WorkerRoleConfig(harness="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -425,7 +427,7 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_completed_worktree(
 
 
 def test_dispatch_phantom_live_worker_preserves_sidecar_for_push_succeeded_outcome(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, fake_host
 ) -> None:
     """Issue #1122: a phantom live worker whose ``.worker-outcome.json`` reports
     ``push_succeeded=true, pr_created=false`` must NOT have its sidecar reaped,
@@ -460,14 +462,12 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_push_succeeded_outco
         )
 
     monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
-    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
-    # See the sibling completed-worktree test above: the sidecar's PID must
-    # also read as dead through worker_fate.is_alive, not just
-    # workflow's is_pid_alive, or the test's
-    # outcome depends on the host's current PID table (ERROR_ACCESS_DENIED
-    # from OpenProcess is treated as indeterminate-so-alive by design) instead
-    # of the code under test.
-    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda pid, start: False)
+    # See the sibling completed-worktree test above: every liveness read —
+    # including the sidecar's PID — goes through the injected host probe, so
+    # the all-dead fake keeps the outcome off the host's real PID table
+    # (ERROR_ACCESS_DENIED from OpenProcess is treated as
+    # indeterminate-so-alive by design).
+    fake_host(probe=FakeProcessProbe())
 
     config = OrchestratorConfig(worker=WorkerRoleConfig(harness="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -545,7 +545,7 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_push_succeeded_outco
 
 
 def test_dispatch_phantom_live_worker_reaps_sidecar_when_pr_created_omitted(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, fake_host
 ) -> None:
     """B9 (wf-review-opus.md): an outcome that OMITS ``pr_created`` entirely
     must NOT get the same preservation treatment as one that explicitly
@@ -563,6 +563,10 @@ def test_dispatch_phantom_live_worker_reaps_sidecar_when_pr_created_omitted(
     opposite of the sibling test's outcome.
     """
     from charlie_work.config import WORKER_OUTCOME_FILENAME
+
+    # Issue #2262: the dead-worker salvage probe needs a real git repo to
+    # prove the branch carries no commits (the verdict that permits requeue).
+    _init_repo(tmp_path)
 
     worktree_path = tmp_path / "wt"
     worktree_path.mkdir(parents=True, exist_ok=True)
@@ -587,8 +591,9 @@ def test_dispatch_phantom_live_worker_reaps_sidecar_when_pr_created_omitted(
         )
 
     monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
-    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
-    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda pid, start: False)
+    # Worker liveness reads the injected host probe; fake it all-dead so the
+    # outcome never depends on the host's real PID table.
+    fake_host(probe=FakeProcessProbe())
 
     config = OrchestratorConfig(worker=WorkerRoleConfig(harness="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)

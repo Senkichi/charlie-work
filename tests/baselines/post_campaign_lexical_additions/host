@@ -1,0 +1,1 @@
+Wave D (host ports): OrchestratorApp.host property returning the HostPorts bundle; a net-new lexical member, not a moved body.

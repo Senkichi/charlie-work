@@ -353,6 +353,21 @@ def check_dispatch_staleness(
             result["reason"] = "empty_backlog"
         return result
 
+    # Spec C2 (host_routing): the repo-wide stall alarm belongs to the default
+    # host. A host that is not the default owns only its ``host:<name>``
+    # issues, so a pass with none of them dispatchable is idle by design --
+    # but a wedged dependency chain is not idle-by-design: when the ready
+    # issues are dependency-blocked, leave the decision to the #1110/#1682
+    # arm below so ``dependency_root_blocker_idle`` still raises for the
+    # non-default host's own backlog (issue #2821 review, following #1682).
+    if config.host is not None and not config.default_host:
+        if (
+            result["backlog_dispatchable"] == 0
+            and result["backlog_blocked_by_open_dependency"] == 0
+        ):
+            result["reason"] = "not_default_host"
+            return result
+
     # Issue #1110: when every ready issue is blocked by an open dependency,
     # dispatch is permanently (and correctly) idle -- there is nothing to
     # dispatch and nothing wrong with the dispatcher. Firing a cadence alarm
@@ -378,7 +393,14 @@ def check_dispatch_staleness(
         # the ``backlog_not_observed``/``no_baseline`` precedent.
         stall_minutes = config.dependency_stall_minutes
         roots = backlog_reachability.get("dependency_root_blockers")
-        if stall_minutes > 0 and isinstance(roots, list) and roots:
+        # Issue #2005: a repo-qualified (string-numbered) root is a foreign
+        # blocker whose progress local state cannot see. One such root makes
+        # "every root is idle" unprovable, so keep the unconditional
+        # exemption rather than alarm on evidence we can never have.
+        has_foreign_root = isinstance(roots, list) and any(
+            isinstance(r, dict) and isinstance(r.get("number"), str) for r in roots
+        )
+        if stall_minutes > 0 and isinstance(roots, list) and roots and not has_foreign_root:
             stall_seconds = stall_minutes * 60
             details = _dependency_root_blocker_progress(state, roots, now)
             result["dependency_root_blockers"] = details

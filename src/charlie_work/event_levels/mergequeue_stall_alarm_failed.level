@@ -1,0 +1,4 @@
+warning
+# Issue #2441: the merge-queue stall alarm itself failed (state-lock timeout or a
+# write error). Warning: the alarm is advisory and retried next pass; the PR scan
+# continues. Audit-only: the exception is also logged.
