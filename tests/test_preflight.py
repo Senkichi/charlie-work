@@ -10,6 +10,7 @@ module stays under the 800-line file-size cap.
 
 from __future__ import annotations
 
+import ast
 import io
 from dataclasses import FrozenInstanceError, fields
 from datetime import datetime, timedelta, timezone
@@ -28,6 +29,7 @@ from charlie_work.preflight import (
     emit_preflight_refusal,
     run_preflight,
 )
+from _src_ast import parsed
 
 UTC = timezone.utc
 
@@ -350,6 +352,55 @@ def test_venv_identity_fails_on_wrong_checkout(tmp_path: Path) -> None:
     assert str(paths.repo_root.resolve()) in venv_check.detail
 
 
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    link.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        link.symlink_to(target)
+    except OSError:
+        pytest.skip("symlinks are unavailable on this host")
+
+
+def test_venv_identity_ok_when_venv_python_symlinks_to_base_interpreter(tmp_path: Path) -> None:
+    # A POSIX venv (uv or ``python -m venv``) makes bin/python a symlink to
+    # the base interpreter, so resolving the executable itself lands outside
+    # the venv. The Mac LaunchDaemon was refused on every pass by exactly this.
+    paths = _paths(tmp_path)
+    base_python = tmp_path / "uv-python" / "cpython-3.14" / "bin" / "python3.14"
+    base_python.parent.mkdir(parents=True)
+    base_python.write_text("", encoding="utf-8")
+    venv_python = paths.venv_dir / "bin" / "python"
+    _symlink_or_skip(venv_python, base_python)
+    result = run_preflight(
+        paths,
+        PreflightConfig(),
+        disk_usage=_disk_usage_free(50 * 1024**3),
+        sys_executable=str(venv_python),
+        package_file=str(paths.repo_root / "src" / "charlie_work" / "preflight.py"),
+    )
+    venv_check = next(c for c in result.checks if c.name == "venv_identity")
+    assert venv_check.ok is True, venv_check.detail
+
+
+def test_venv_identity_fails_on_outside_symlink_to_venv_python(tmp_path: Path) -> None:
+    # Only the executable's own name is left unresolved: a link elsewhere that
+    # points into the expected venv is still a different install.
+    paths = _paths(tmp_path)
+    venv_python = paths.venv_dir / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.write_text("", encoding="utf-8")
+    outside_link = tmp_path / "other-repo" / ".venv" / "bin" / "python"
+    _symlink_or_skip(outside_link, venv_python)
+    result = run_preflight(
+        paths,
+        PreflightConfig(),
+        disk_usage=_disk_usage_free(50 * 1024**3),
+        sys_executable=str(outside_link),
+        package_file=str(paths.repo_root / "src" / "charlie_work" / "preflight.py"),
+    )
+    venv_check = next(c for c in result.checks if c.name == "venv_identity")
+    assert venv_check.ok is False
+
+
 def test_venv_identity_respects_config_fatal_override(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
     result = run_preflight(
@@ -562,3 +613,32 @@ def test_preflight_config_field_names_match_defaults_in_issue() -> None:
         "config_freshness_fatal",
         "git_identity_fatal",
     }
+
+
+# ---------------------------------------------------------------------------
+# conftest's autouse preflight stub must not lazy-import its patch targets
+# (issue #2864)
+# ---------------------------------------------------------------------------
+
+
+def test_default_healthy_preflight_imports_are_at_collection_time() -> None:
+    """``_default_healthy_preflight`` (tests/conftest.py) patches
+    ``charlie_work.workflow.run_preflight`` and
+    ``charlie_work.fleet_dispatch.run_preflight`` on every test. Its imports of
+    both modules must sit at conftest module level -- collection time -- not be
+    resolved lazily from the fixture body: a lazy import charges the modules'
+    ~1 s module import to the first test that runs in the process. In small
+    selected runs ``tests/test_attempt_resume.py`` is often the
+    alphabetically-first selected file, so
+    ``test_non_throttle_death_starts_clean[stalled]`` absorbed the whole cost
+    in its setup phase (2.3x ledger regression, issue #2864)."""
+    conftest = Path(__file__).parent / "conftest.py"
+    tree = parsed(conftest)
+    imported: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.update(f"{node.module}.{alias.name}" for alias in node.names)
+    assert "charlie_work.workflow" in imported
+    assert "charlie_work.fleet_dispatch" in imported

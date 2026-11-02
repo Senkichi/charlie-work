@@ -846,6 +846,63 @@ console — Ctrl+C there is handled cleanly: the wrapper logs one line and
 exits without a traceback, leaving its supervisor child (and any workers)
 running; follow with `charlie fleet stop` to stop the child too.
 
+## Main sync: local mains follow origin
+
+Once per full supervisor pass (after `self_deploy`, skipped while draining), the
+supervisor brings every `fleet.json` repo's **primary checkout** up to
+`origin/<default>`, except its own checkout (`orchestrator_root()`, owned by
+`self_deploy`). Design: `docs/specs/main-sync.md`.
+
+- **What it does:** a working-tree `merge --ff-only` when the default branch is
+  checked out, or a compare-and-swap `update-ref` when another branch is. Anything
+  unsafe is skipped with a reason in that repo's `events.db` (`main_sync_skipped`:
+  `blocked`, `diverged`, `unrelated_history`, `shallow_history` (dry run only),
+  `checked_out_elsewhere`, `rebase_in_progress`, `index_locked`, `detached_head`,
+  ...), logged once per sha pair.
+  A shallow clone is unshallowed by main-sync's fetch, once.
+- **Kill switch:** `main_sync: {enabled: false}` in `<fleet_dir>/config.yaml`
+  (everywhere) or in one repo's `orchestrator.config.yaml`.
+- **Dependencies:** never touched unless the repo opts in:
+
+  ```yaml
+  main_sync:
+    post_sync_command: ["uv", "sync", "--locked"]
+    post_sync_when_paths: ["uv.lock", "pyproject.toml"]
+    post_sync_timeout_seconds: 300
+  ```
+
+  The command must exit 0 for the advance to stand. It should exit 75 to mean "not
+  now", for example while its venv is in use. Any other exit rolls back with
+  `git reset --keep` and backs off up to 60 minutes.
+- **Alarms** (`main_sync_alarm`, also an `ERROR` fleet attention entry
+  `main-sync <repo>`):
+  - `unrelated_history`: origin was re-rooted (full clone only; a shallow graft is
+    unshallowed instead); reset the checkout by hand after checking nothing local
+    is lost;
+  - `post_sync_failing`: 3 consecutive failures;
+  - `deferred_4h`: 4h of deferral;
+  - `rollback_refused`: the tree was left at the new sha with a failed post_sync.
+- **Counters:** `<fleet_dir>/main-sync/<owner>__<repo>.json`; deleting one resets it.
+
+### Marker contract (schema 1)
+
+After a working-tree advance stands, main-sync writes
+`<git-common-dir>/charlie-main-sync.json` atomically:
+
+```json
+{"schema": 1, "from": "<sha>", "to": "<sha>", "commits": 4,
+ "instruction_paths": ["CLAUDE.md", ".claude/settings.json"],
+ "ts": "2026-10-25T17:00:00+00:00"}
+```
+
+- `instruction_paths` lists the changed paths that a live agent session loaded as
+  instructions: `CLAUDE.md`/`AGENTS.md` at any depth, or anything under a `.claude/`
+  directory.
+- The file is overwritten on each advance and never deleted. A ref-only update never
+  writes it.
+- Consumers (for example a prompt-submit hook) must treat unknown `schema` values as
+  absent. Adding keys keeps `schema: 1`; renaming or removing a key bumps it.
+
 ## Supervisor: worker health & escalation
 
 The supervisor layer runs as a sweep nested inside each pass (it generalizes
@@ -1133,18 +1190,41 @@ applies the same config-derived pop to any env built by copying the
 supervisor's ambient environment; it runs in `sanitize_env()` and in the local
 merge gate's suite launch (`orchestration.local_merge_gate` ->
 `local_suite_runner.launch_suite_gate`), which executes the PR branch's
-worker-authored test suite, so that child no longer inherits the key. The
-remaining surfaces, documented here as **accepted** for this repo, are:
+worker-authored test suite, so that child no longer inherits the key.
 
-- **ci_runner listeners and CI job steps** (owned by `ci_fleet`, not here):
-  `ci_fleet.runners._sanitize_env` strips only `UV_`/`VIRTUAL_ENV`/`PYTHON`/
-  `PIP_`/`CLAUDE` prefixes, so the runner listeners the allocator starts — and,
-  transitively, every self-hosted CI job step — still inherit the configured
-  provider key. Mitigation belongs at the allocator's env boundary in
-  `ci_fleet`, stripping the same config-derived provider-key names. That fix
-  is tracked in `ci_fleet`'s own issue tracker: it adds the strip behind a seam,
-  which charlie-work then installs with
-  `env_sanitize.provider_api_key_env_vars`.
+Runner listeners, and so every self-hosted CI job step, are covered too:
+`ci_fleet_env_strip.fleet_provider_key_names` hands `ci_fleet` the configured
+names from every registered repo and the global layer, and `ci_fleet` removes
+them when it launches a listener (issue #2902). `CI_FLEET_ENV_STRIP=off` turns
+that off.
+
+A running listener keeps the environment it started with. After adding a
+provider key to the supervisor's environment, or after the first deploy of this
+strip, restart listeners with a timed drain. `charlie runners allocate` alone
+leaves a running listener alone while demand holds, and starting or stopping
+one by hand is a second controller:
+
+```powershell
+ci-fleet drain --start --reason manual --for 15m   # idle listeners park; busy ones finish
+Get-Process Runner.Listener | Select-Object Id, StartTime, Path   # wait for the old ones to go
+ci-fleet drain --clear                             # the allocator starts them again
+Get-Process Runner.Listener | Select-Object Id, StartTime, Path   # later than the drain?
+```
+
+Only listeners under `runner_allocation.managed_root` count. The drain doesn't
+touch any others, and a blank row is a process this user can't read.
+
+A listener that stays busy for the whole drain never parks, so it keeps its
+environment, and `ci-fleet drain --status` doesn't show listeners. If a managed
+listener's start time is still older than the drain, run the drain again.
+
+A new start time proves a restart, not a strip. The strip needs `ci-fleet`
+>=0.8.3 in the process that starts the listener, and a supervisor without it logs
+`no env_strip module` when it starts. That warning stays true after a sync until
+the supervisor restarts.
+
+The remaining surface, documented here as **accepted** for this repo, is:
+
 - **Raw `run_captured` children**: `charlie_work.subprocess_runner.run_captured`
   builds its env as `{**os.environ, ...}`, so every child the supervisor or
   orchestrator spawns through it also sees the key. That includes

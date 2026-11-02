@@ -263,7 +263,11 @@ def _check_venv_identity(
     name = "venv_identity"
     expected_venv = paths.venv_dir.resolve()
     expected_repo_root = paths.package_root.resolve()
-    exec_path = Path(sys_executable).resolve()
+    # Resolve the executable's directory, never the executable: a POSIX venv's
+    # bin/python is a symlink to the base interpreter, so resolving the file
+    # itself always lands outside the venv and refuses every startup.
+    raw_exec = Path(sys_executable)
+    exec_path = raw_exec.parent.resolve() / raw_exec.name
     pkg_path = Path(package_file).resolve()
 
     exec_ok = _is_relative_to(exec_path, expected_venv)
