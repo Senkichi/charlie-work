@@ -212,6 +212,13 @@ claude_code:
   # "Local host saturation ceiling (claude-code adapter)".
   worker_env:
     PYTEST_XDIST_AUTO_NUM_WORKERS: "2"
+  # Ship ON (issue #2814): the stream-json tee is enabled by default, so every
+  # claude-code session writes --output-format stream-json --verbose into both
+  # its .claude.log and an issue-<n>.events.jsonl sidecar. This gives the
+  # watchdog a live activity signal while the session reads and plans (a 0-byte
+  # log used to make a healthy worker look stalled 20 minutes in). Set false
+  # only to restore the pre-#2814 plain-text-log behaviour.
+  # tee_stream_json: true
 
 # No cross-model review in this profile: worker and reviewer both use
 # claude-code with no model override, so worker.model == reviewer.model.

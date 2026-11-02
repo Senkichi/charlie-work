@@ -13,10 +13,10 @@ Design notes that are easy to get wrong:
 
 * A field with NO rule-bearing marker is not checked at all (its current
   laxness is preserved); any rule-bearing marker turns on the base-type check.
-* ``key: null`` is preserved as ``None`` (design P2): no marker runs on it and the
-  default does NOT apply, because a falsy ``None`` differs from a default ``True``.
-  ``NullIsDefault`` opts a key into the default instead (where main normalized it),
-  ``NotNull`` rejects it, and a required key still reports ``missing``.
+* ``key: null`` handling is derived from the annotation (issue #2116): a non-Optional
+  scalar knob never builds ``None`` — an explicit null is omitted the ``NullIsDefault``
+  way (the dataclass default applies, derived from ``kind`` + ``Optional``) unless
+  ``NotNull`` rejects it; Optional scalars and non-scalar kinds keep design P2.
 * ``bool`` is an ``int`` in Python; ``int``/``number`` fields reject it unless
   the field carries ``BoolTolerant`` (a legacy tolerance, preserved per key).
 * ``ConfigError`` lives here so section modules can raise it without the
@@ -401,6 +401,7 @@ class FieldSpec:
     markers: tuple[Marker, ...]
     required: bool
     mapping_factory: str  # "dict" or "proxy" for map kinds
+    optional: bool  # annotation includes ``None``; drives the #2116 class-level null rule
 
 
 _SCALARS: dict[Any, str] = {int: "int", float: "number", bool: "bool", str: "str"}
@@ -460,10 +461,12 @@ def field_specs(cls: type) -> tuple[FieldSpec, ...]:
     for f in fields(cls):
         if not f.init:
             continue
+        base, markers = _markers_of(hints[f.name])
         kind, item, scalars, factory = _classify(hints[f.name])
-        _, markers = _markers_of(hints[f.name])
+        is_union = typing.get_origin(base) in (typing.Union, types.UnionType)
+        optional = is_union and type(None) in typing.get_args(base)
         required = f.default is MISSING and f.default_factory is MISSING
-        specs.append(FieldSpec(f.name, kind, item, scalars, markers, required, factory))
+        specs.append(FieldSpec(f.name, kind, item, scalars, markers, required, factory, optional))
     return tuple(specs)
 
 
@@ -702,9 +705,12 @@ def validate_section(
             if spec.name in raw:
                 if NotNull in markers:
                     raise FieldError(f"{path}.{spec.name}", "a value", "null", "raw")
-                # ``key: null`` is preserved, never checked and never replaced by the
-                # default (design P2): a falsy None differs from a default True.
-                if NullIsDefault not in markers:
+                omitted = NullIsDefault in markers or (
+                    spec.kind in ("int", "number", "bool", "str", "union") and not spec.optional
+                )
+                if not omitted:  # else: omitted -- derived/explicit NullIsDefault (issue #2116)
+                    # ``key: null`` is preserved, never checked and never replaced by the
+                    # default (design P2): a falsy None differs from a default True.
                     built[spec.name] = None
             continue
         _check_compat(spec, markers, cls)

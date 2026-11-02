@@ -140,6 +140,9 @@ def _process_rescue_review(self, candidate: dict[str, Any]) -> CommandResult:
         # subdirectory of that instead, which run_cross_family_review
         # reclaims once the subprocess finishes.
         tmp_dir=pr_dir / layout.WORKER_TMP_DIRNAME,
+        # Issue #2795: give sanitize_env the config so the api provider-key
+        # variable names are stripped from the rescue reviewer's env too.
+        config=self.config,
     )
 
     verdict: dict[str, Any] | None = None

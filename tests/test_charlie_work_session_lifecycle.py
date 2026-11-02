@@ -467,11 +467,9 @@ def test_sweep_orphan_processes_for_dead_sessions_unit(tmp_path: Path) -> None:
             "charlie_work.dead_worker_sweep.effects_sessions.sweep_orphan_processes",
             side_effect=mock_sweep_orphan,
         ),
-        patch(
-            "os.name", "nt"
-        ),  # Force Windows path (os.name check lives in dead_worker_sweep.effects_sessions;
-        # patching the os module directly avoids depending on which module happens to
-        # `import os` into its own namespace)
+        # Force the Windows kill path (process_utils.kill_orphan_pid runs taskkill
+        # under os.name == "nt"), which the taskkill assertions below rely on.
+        patch("os.name", "nt"),
         patch("subprocess.run", side_effect=mock_subprocess_run),
         patch_run_captured(mock_subprocess_run),
     ):

@@ -19,9 +19,9 @@ class SessionCounter(Protocol):
 
     def fleet_live_workers(self, fleet_dir_override: str | None) -> tuple[int, list[str]]: ...
 
-    def fleet_live_workers_by_adapter_kind(
+    def fleet_live_workers_with_adapter_kinds(
         self, fleet_dir_override: str | None
-    ) -> tuple[dict[str, int], list[str]]: ...
+    ) -> tuple[int, dict[str, int], list[str]]: ...
 
     def live_reviews(self, reviews_dir: Path, state_file: Path | None = None) -> int: ...
 
@@ -45,12 +45,12 @@ class RealSessionCounter:
 
         return fleet_registry.count_fleet_live_sessions(fleet_dir_override)
 
-    def fleet_live_workers_by_adapter_kind(
+    def fleet_live_workers_with_adapter_kinds(
         self, fleet_dir_override: str | None
-    ) -> tuple[dict[str, int], list[str]]:
+    ) -> tuple[int, dict[str, int], list[str]]:
         from .. import fleet_registry
 
-        return fleet_registry.count_fleet_live_sessions_by_adapter_kind(fleet_dir_override)
+        return fleet_registry.count_fleet_live_sessions_with_adapter_kinds(fleet_dir_override)
 
     def live_reviews(self, reviews_dir: Path, state_file: Path | None = None) -> int:
         from .. import live_session_count

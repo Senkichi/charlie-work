@@ -1,2 +1,4 @@
 scripts/hook-python.sh text eol=lf
 .claude/hooks/*.sh text eol=lf
+
+scripts/fleet-pass.sh text eol=lf

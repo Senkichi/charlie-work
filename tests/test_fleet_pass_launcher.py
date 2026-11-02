@@ -124,3 +124,99 @@ def test_module_entry_point_exists() -> None:
     assert main_module.is_file(), "src/charlie_work/__main__.py is required by the launcher"
     source = main_module.read_text(encoding="utf-8")
     assert "main" in source, "__main__.py must dispatch to the CLI entry point"
+
+
+# Structural invariant for the issue #2795 secretenv injection, matched as ONE
+# multi-line regex over the script's non-comment lines so the individual
+# fragments cannot drift apart. It ties the whole guarded launch together:
+#   1. `$secretenv` resolves to the per-user secretenv.exe (not PATH),
+#   2. `$secretenvOk` is initialised to $false,
+#   3. the if-condition carries BOTH guards joined by `-and` — the key-absence
+#      (no double-wrap) test AND `Test-Path -LiteralPath $secretenv`. The `-and`
+#      is required literally between them: without it a `-and`-to-`-or` mutant
+#      still matched (the round-1 pattern's `[^{}]*?` tail spanned the
+#      operator), and `-or` would wrap whenever EITHER guard holds instead of
+#      requiring both.
+#   4. inside that same guard block, `secretenv verify ... *> $null` runs and
+#      `$secretenvOk` is assigned from ($LASTEXITCODE -eq 0) right after it,
+#   5. the launch is `if ($secretenvOk) { & $secretenv run ... -- cmd /c $cmdLine
+#      } else { & cmd /c $cmdLine }` — wrap in the if-branch, plain launch
+#      (a missing secret never strands the fleet) in the else-branch.
+# Each of these can only be checked together: the substring form previously in
+# this module passed even when the gate was inverted (`if (-not $secretenvOk)`)
+# or the branches swapped, because every fragment still existed individually.
+_SECRETENV_LAUNCH_RE = re.compile(
+    r"\$secretenv\s*=\s*Join-Path\s+\$env:USERPROFILE\s+'\.local\\bin\\secretenv\.exe'"
+    r"[^{}]*?\$secretenvOk\s*=\s*\$false\b"
+    r"[^{}]*?if\s*\([^\n\(]*-not\s+\[Environment\]::GetEnvironmentVariable\('EMPERICUS_ANTHROPIC_API_KEY'\)"
+    r"[^{}]*-and[^{}]*?Test-Path\s+-LiteralPath\s+\$secretenv"
+    r"[^{}]*?\)[^\n{]*\{\s*\n\s*"
+    r"&\s*\$secretenv\s+verify\s+EMPERICUS_ANTHROPIC_API_KEY\s+\*>\s*\$null\s*\n\s*"
+    r"\$secretenvOk\s*=\s*\(\s*\n?\s*\$LASTEXITCODE\s+-eq\s+0\s*\)\s*\n"
+    r"\}\s*\n"
+    r"if\s*\(\s*\$secretenvOk\s*\)\s*\{\s*\n\s*"
+    r"&\s*\$secretenv\s+run\s+EMPERICUS_ANTHROPIC_API_KEY\s+--\s+cmd\s+/c\s+\$cmdLine\s*\n"
+    r"\}\s*else\s*\{\s*\n\s*"
+    r"&\s*cmd\s+/c\s+\$cmdLine\s*\n?"
+    r"\}",
+)
+
+
+def test_fleet_pass_launch_structure_ties_secretenv_wrap_to_its_guards() -> None:
+    """Issue #2795: the secretenv wrap and its guards are one invariant.
+
+    The `api` adapter resolves the provider key from the supervisor's own env
+    (`os.environ.get(provider.api_key_env)`), and the key lives only in the
+    DPAPI secretenv store -- so the scheduled-task-spawned supervisor cannot
+    run `harness: api` launches unless the launcher wraps the supervisor in
+    `secretenv run`. The wrap must be guarded (never double-wrap an env that
+    already has the key, never trust a secretenv.exe that disappears between
+    the exists-check and the spawn, never allow a missing/undecryptable secret
+    to strand the whole fleet) and must never emit the secret value.
+
+    The single structural match is mutation-hard: applied by textual edit to
+    `scripts/fleet-pass.ps1`, each of these mutants makes the regex stop
+    matching, i.e. this test fails —
+    - `-and` between the key-absence test and `Test-Path` rewritten to `-or`,
+    - the `-not` key-absence test dropped from the gate condition,
+    - the `Test-Path -LiteralPath $secretenv` operand dropped,
+    - the gate inverted (`if (-not $secretenvOk)`),
+    - the gate condition replaced with `if ($true)`,
+    - `$secretenvOk = $false` initialized to `$true`,
+    - `$secretenvOk` assigned `$true` instead of `($LASTEXITCODE -eq 0)`,
+    - the exit-code comparison `-eq` flipped to `-ne`,
+    - the if/else wrap-or-plain branches swapped,
+    - the `else` plain-launch fallback branch dropped,
+    - `*> $null` dropped from the verify call (unredirected verify),
+    - the `& $secretenv verify` line dropped, and
+    - the key name `EMPERICUS_ANTHROPIC_API_KEY` replaced with a different
+      key's name.
+
+    Every fragment of the guarded structure is required together: operations
+    like a substring check catch only some of these, because mutated
+    fragments can still exist individually.
+    """
+    script = SCRIPTS_DIR / "fleet-pass.ps1"
+    code = _command_lines(script)
+    assert _SECRETENV_LAUNCH_RE.search(code), (
+        "fleet-pass.ps1's secretenv launch must keep the full guarded structure: "
+        "$secretenv per-user path, $secretenvOk=$false, an if-condition with BOTH "
+        "the key-absence and Test-Path guards, $secretenvOk=($LASTEXITCODE -eq 0) "
+        "right after the verify call, and the wrap/`& cmd /c $cmdLine` split as "
+        "if/else (issue #2795)"
+    )
+
+
+def test_fleet_pass_keeps_plain_launch_fallback() -> None:
+    """Issue #2795: a missing secret must never strand the whole fleet.
+
+    The structural regex above pins the if/else split itself; this test keeps
+    the trailing `exit=$LASTEXITCODE` log marker, which must stay OUTSIDE both
+    branches so the marker records the same child exit code regardless of
+    whether the launch was wrapped.
+    """
+    script = SCRIPTS_DIR / "fleet-pass.ps1"
+    assert "exit=$LASTEXITCODE" in script.read_text(encoding="utf-8"), (
+        "fleet-pass.ps1 must keep the trailing `exit=$LASTEXITCODE` log marker "
+        "(secretenv propagates the child exit code)"
+    )

@@ -158,6 +158,11 @@ claude_code:
   # ceiling (claude-code adapter)".
   worker_env:
     PYTEST_XDIST_AUTO_NUM_WORKERS: "2"
+  # Ship ON (issue #2814): the stream-json tee is enabled by default, so every
+  # claude-code session writes --output-format stream-json --verbose into both
+  # its .claude.log and an issue-<n>.events.jsonl sidecar. Set false only to
+  # restore the pre-#2814 plain-text-log behaviour.
+  # tee_stream_json: true
 
 supervisor:
   # Foreground poll/sleep loop used by `charlie bash-rats` (per-repo) and

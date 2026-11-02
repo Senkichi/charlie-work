@@ -233,6 +233,7 @@ _DISPATCH_STALE_RESOLVED_REASONS = frozenset(
         "within_threshold",
         "empty_backlog",
         "all_ready_blocked_by_dependencies",
+        "not_default_host",
     }
 )
 

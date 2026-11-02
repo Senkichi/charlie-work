@@ -7,8 +7,6 @@ the orphan-process sweep for dead sessions and the worker census.
 
 from __future__ import annotations
 
-
-import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -339,9 +337,8 @@ def _sweep_orphan_processes_for_dead_sessions(
     processes that survived session kills (e.g., detached/daemonized processes
     like nohup-style background processes). This addresses issue #139.
 
-    On Windows: Uses PowerShell Get-CimInstance Win32_Process to find processes
-    whose CommandLine references the worktree path of dead sessions.
-    On POSIX: Not implemented (returns empty list).
+    ``sweep_orphan_processes`` finds processes whose command line references the
+    worktree path of dead sessions: CIM on Windows, ``ps`` on POSIX (spec C2).
 
     Detected orphans are killed automatically and logged to state.json.
 
@@ -356,10 +353,6 @@ def _sweep_orphan_processes_for_dead_sessions(
     from .. import worker_fate
     from ..devin_shell import read_session_records
     from ..claude_code import read_worker_records
-
-    # Only run on Windows where the issue occurs
-    if os.name != "nt":
-        return
 
     # Collect worktree paths of dead sessions
     dead_worktree_paths: set[str] = set()

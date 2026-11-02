@@ -200,8 +200,12 @@ def test_a_restricted_tier_falls_back_to_the_normal_chain(tmp_path: Path, fake_h
 
 
 def test_a_mixed_batch_launches_each_tier_on_its_entry_and_keeps_one_manifest(
-    tmp_path: Path, fake_host
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_host
 ) -> None:
+    """The boundary launch stays paced at the configured stagger -- recorded,
+    never slept out (the pacing test asserts the number; this test only records)."""
+    sleeps: list[float] = []
+    monkeypatch.setattr("charlie_work.worker_launch_gate.time.sleep", sleeps.append)
     calls = _spy(fake_host)
     app = _app(tmp_path, FRESH)
     plain = copy.deepcopy(app.gh.issues[0])
@@ -209,6 +213,7 @@ def test_a_mixed_batch_launches_each_tier_on_its_entry_and_keeps_one_manifest(
     plain["labels"] = [{"name": "automated-ready"}]
     app.gh.issues.append(plain)
     _run(app, FRESH)
+    assert sleeps == [app.config.dispatch.launch_stagger_seconds]
     assert _launched(calls) == {123: OPUS.key, 124: PRIMARY.key}
     manifest = json.loads(app._layout.session_manifest.read_text(encoding="utf-8"))
     assert sorted(s["issue_number"] for s in manifest["sessions"]) == [123, 124]

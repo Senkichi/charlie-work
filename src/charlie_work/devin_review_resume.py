@@ -251,7 +251,10 @@ def resume_exec_rejected_review(app: Any, worker: Any, pr_number: int, reviews_d
     try:
         write_text_atomic(nudge_path, review_exec_nudge_text())
         worker_env = app._adapter_settings(adapter="devin-shell").worker_env
-        env = {**sanitize_env(checkout), **{str(k): str(v) for k, v in worker_env.items()}}
+        env = {
+            **sanitize_env(checkout, config=app.config),
+            **{str(k): str(v) for k, v in worker_env.items()},
+        }
     except OSError as exc:
         return _fail(f"prepare_failed: {exc}", error_class=launch_events.LAUNCH_ERR_ENV)
 

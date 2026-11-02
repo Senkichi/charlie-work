@@ -87,6 +87,7 @@ def _write_worker_prompt(self, issue: dict[str, Any], *, dry_run: bool = False) 
                     self.config.dispatch.base_ref,
                     state_file=self.paths.state_file,
                     payload={"issue_number": issue_number},
+                    probe=self.config.dispatch.worker_selection_probe,
                 ),
             ),
         },

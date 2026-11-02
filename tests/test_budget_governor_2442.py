@@ -7,6 +7,7 @@ no retries at a primary rate limit, and the one event per window. Driven at the
 
 from __future__ import annotations
 
+import sys
 import ast
 import json
 from dataclasses import dataclass
@@ -47,9 +48,45 @@ from charlie_work.orchestration.misc_review_verdicts import _run_review_reap_swe
 from charlie_work.pass_deadline import PassDeadline
 
 from _fake_transport import FakeAdapter, Runtime, Sleeps, ok
-from _src_ast import parsed, source_files
+from _src_ast import parsed, source_files, source_text
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "charlie_work"
+# The derivation in ``_lane_names_in_source`` only matches AST shapes whose
+# source text carries one of three fixed textual forms (`X.phase(`, a `lane=`
+# call keyword, or a `budget_deferral(` call), so ``_carries_gate_call`` prunes
+# every file it cannot reach instead of scanning the whole tree. This test is
+# often the first src-scanner a small selected run or a fresh xdist worker
+# reaches, and a full-tree regex pass costs ~0.3 s here while the predicate
+# costs ~0.02 s (issues #2861, #2865): nine of ~490 package files carry every
+# gate call.
+
+
+def _carries_gate_call(text: str) -> bool:
+    """Does this source text carry a gate-call shape the AST pass can match?
+
+    Each of the three shapes has one fixed textual form: ``<expr>.phase(...)``
+    contains ``.phase``, a ``lane=`` call keyword contains ``lane`` followed by
+    whitespace and ``=``, and ``budget_deferral(...)`` contains
+    ``budget_deferral``. The predicate checks exactly those forms with
+    ``str.find`` scans, so it cannot miss a file the derivation would match;
+    it may reach a file whose text merely mentions a lane, which then parses
+    and contributes nothing. The whitespace run is ``str.isspace()`` so a
+    keyword wrapped across lines inside a call's parentheses is still reached.
+    """
+    if ".phase" in text or "budget_deferral" in text:
+        return True
+    i = text.find("lane")
+    end = len(text)
+    while i != -1:
+        j = i + 4
+        while j < end and text[j].isspace():
+            j += 1
+        if j < end and text[j] == "=":
+            return True
+        i = text.find("lane", i + 1)
+    return False
+
+
 NOW = 1000.0
 RESET = 4600
 GET_PR = RestRequest.of("GET", "repos/{owner}/{repo}/pulls/7")
@@ -165,9 +202,17 @@ def test_a_disabled_governor_never_defers() -> None:
 
 
 def _lane_names_in_source() -> set[str]:
-    """Every lane name a source file hands the gate, derived from the AST."""
+    """Every lane name a source file hands the gate, derived from the AST.
+
+    The walk starts from the ``_carries_gate_call`` source-text match, not
+    from the whole tree: every call shape the AST pass below matches is
+    written in one of the predicate's textual forms, so parsing a file the
+    predicate cannot reach cannot add a lane name.
+    """
     names: set[str] = set()
     for path in source_files(SRC):
+        if not _carries_gate_call(source_text(path)):
+            continue
         for node in ast.walk(parsed(path)):
             if not isinstance(node, ast.Call):
                 continue
@@ -189,11 +234,44 @@ def _lane_names_in_source() -> set[str]:
     return names
 
 
-def test_every_gated_lane_in_the_source_is_mapped_and_none_is_essential() -> None:
-    gated = _lane_names_in_source()
+def test_every_gated_lane_in_the_source_is_mapped_and_none_is_essential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Count every `parsed()` call the derivation makes (issue #2861): the scan
+    # must parse only the files the candidate regex reaches, not the whole tree.
+    visited: list[Path] = []
+    tree_parsed = parsed
+
+    def counted(path: Path) -> ast.Module:
+        visited.append(Path(path))
+        return tree_parsed(path)
+
+    here = sys.modules[__name__]
+    monkeypatch.setattr(here, "parsed", counted)
+    try:
+        gated = _lane_names_in_source()
+    finally:
+        monkeypatch.undo()
+
     assert {"intake", "dispatch", "review_reap", "quota_probe", "ci_reclaim"} <= gated
     assert gated <= set(LANE_TIERS), gated - set(LANE_TIERS)
     assert not {n for n in gated if tier_of(n) is Tier.ESSENTIAL}
+    # Every AST shape the derivation matches must be reachable by the candidate
+    # predicate (spaced, multi-spaced and wrapped forms alike), so pruning
+    # cannot miss a gate.
+    for shape in (
+        "deadline.phase('merge', lambda: None)",
+        "deadline.phase ('merge', lambda: None)",
+        "gate.check(1, lane='quota_probe')",
+        "gate.check(1, lane = 'review_reap')",
+        "gate.check(1, lane  = 'review_reap')",
+        "deadline.call(\n            lambda: ran.append('x'), None, lane\n            = 'ci_reclaim',\n        )",
+        "budget_deferral(app, 'ci_reclaim')",
+    ):
+        assert _carries_gate_call(shape), shape
+    candidates = [p for p in source_files(SRC) if _carries_gate_call(source_text(p))]
+    assert visited == candidates
+    assert candidates and len(candidates) <= len(source_files(SRC)) // 4
 
 
 def test_the_loop_body_arms_the_gate_on_its_pass_deadline() -> None:

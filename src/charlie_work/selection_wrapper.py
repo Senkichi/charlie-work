@@ -15,10 +15,20 @@ Everything fails soft. When the wrapper cannot be used -- no executable,
 ``enabled = false`` in the repo's ``ci-fleet.toml``, no slug or no base --
 ``resolve_selection`` says why, the callers keep today's commands, and the
 reason is recorded as an event.
+
+A usable wrapper can still be useless: when the repo's selection map is stale
+(or missing) ``ci-fleet test`` runs the whole suite, which for a worker is a serial
+run that outlasts its foreground limit. ``probe_selection`` asks the selector
+itself, once per rendered worker or rework prompt, whether it can narrow anything;
+when it can only answer ``full`` the prompt keeps the hand-picked targeted
+command (reason ``selection-full``) and returns to the wrapper by itself once the
+map is fresh again. The merge gate is not probed: a full run there is the correct
+fail-open.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
@@ -36,12 +46,17 @@ GIT_TIMEOUT_SECONDS = 30
 # ``shadow-status`` is one ledger read; the bound only stops a wedged process
 # from holding the merge gate. A timeout reads as "window not met" (shadow).
 SHADOW_STATUS_TIMEOUT_SECONDS = 60
+# ``select`` reads the selection map and diffs two refs (about 2 seconds live); the
+# bound only stops a wedged process from holding up a prompt render.
+SELECT_PROBE_TIMEOUT_SECONDS = 60
 
 # Why the wrapper is not used. ``disabled`` is the repo's own choice; the rest are faults.
+# ``selection-full`` is a usable wrapper that can only run everything (see ``probe_selection``).
 NO_EXECUTABLE = "no-executable"
 DISABLED = "disabled"
 NO_REPO = "no-repo"
 NO_BASE = "no-base"
+SELECTION_FULL = "selection-full"
 
 # The gate's two wrapped modes. ``shadow`` records the selection and runs everything.
 SHADOW = "shadow"
@@ -164,14 +179,62 @@ def resolve_selection(
     return SelectionTarget(exe=exe, repo=repo, base=resolved)
 
 
+def probe_selection(target: SelectionTarget, repo_root: Path) -> SelectionUnavailable | None:
+    """Ask ``ci-fleet select`` whether it can narrow anything; unavailable when it can only say full.
+
+    The probe diffs the base against itself. An empty diff cannot trigger any
+    diff-dependent reason, so a ``full`` verdict there (``map-stale``, ``no-map``,
+    ``map-project-dir``) holds for every change the worker will make. Every other
+    outcome -- ``selected``, a non-zero exit, a timeout, output that is not one JSON
+    object, a missing ``mode`` -- returns None, so the prompt keeps ``ci-fleet test``
+    exactly as it did before the probe existed.
+    """
+    result = run_captured(
+        [
+            str(target.exe),
+            "select",
+            "--repo",
+            target.repo,
+            "--base",
+            target.base,
+            "--head",
+            target.base,
+            "--format",
+            "json",
+        ],
+        cwd=repo_root,
+        timeout_seconds=SELECT_PROBE_TIMEOUT_SECONDS,
+    )
+    if not result.ok or result.timed_out:
+        return None
+    try:
+        verdict = json.loads(result.stdout)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(verdict, dict) or verdict.get("mode") != "full":
+        return None
+    reason = verdict.get("reason")
+    return SelectionUnavailable(
+        SELECTION_FULL,
+        f"ci-fleet select answers full for an empty diff against {target.base} "
+        f"(reason: {reason if isinstance(reason, str) and reason else 'none given'}), "
+        "so that verdict holds for every change",
+    )
+
+
 def worker_selection(
     repo_root: Path | None,
     configured_base_ref: str,
     *,
     state_file: Path,
     payload: Mapping[str, object],
+    probe: bool = True,
 ) -> SelectionTarget | None:
     """``resolve_selection`` for a worker or rework prompt, recording why it fell back.
+
+    With ``probe`` (``dispatch.worker_selection_probe``) a usable target is also
+    checked by ``probe_selection``; a selector that can only answer ``full`` falls
+    back like any other unavailable wrapper, through the same event.
 
     ``log_event`` (not ``_record_event``): prompts are rendered outside the state
     lock, like ``_build_module_map_value``. With no repo root (test callers only)
@@ -183,7 +246,10 @@ def worker_selection(
         return None
     selection = resolve_selection(repo_root, configured_base_ref=configured_base_ref)
     if isinstance(selection, SelectionTarget):
-        return selection
+        unavailable = probe_selection(selection, repo_root) if probe else None
+        if unavailable is None:
+            return selection
+        selection = unavailable
     fields = {**payload, "reason": selection.reason, "detail": selection.detail}
     if selection.reason == DISABLED:
         log_event(

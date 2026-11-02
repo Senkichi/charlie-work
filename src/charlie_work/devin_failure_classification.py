@@ -109,21 +109,23 @@ def get_rate_limit_defer_until(
         return None
 
     minutes = reset_minutes if reset_minutes is not None else _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES
+    cooldown = timedelta(minutes=minutes + slack_minutes, seconds=resume_margin_seconds)
+    if reset_minutes is None:
+        # No stated countdown: the default cooldown is a synthetic
+        # post-detection window, not a countdown that started at emission.
+        defer_until = now + cooldown
+    else:
+        # Issue #1997: same emission-time anchor as worker_fate.classify_for —
+        # the provider's countdown started when the log line was written, not
+        # now. max(now, ...) keeps a born-expired window a zero-length deferral
+        # rather than a negative one. Lazy import: the anchor helper now lives
+        # in worker_fate (design doc §7), and a top-level import here would
+        # cycle (worker_fate -> worker -> claude_code/devin_shell already
+        # imports this module's sibling functions).
+        from .failure_classifier import _throttle_emission_anchor
 
-    # Issue #1997: same emission-time anchor as worker_fate.classify_for —
-    # the provider's countdown started when the log line was written, not
-    # now. max(now, ...) keeps a born-expired window a zero-length deferral
-    # rather than a negative one. Lazy import: the anchor helper now lives
-    # in worker_fate (design doc §7), and a top-level import here would
-    # cycle (worker_fate -> worker -> claude_code/devin_shell already
-    # imports this module's sibling functions).
-    from .failure_classifier import _throttle_emission_anchor
-
-    emitted_at = _throttle_emission_anchor(log_path, tail, now=now, throttle_markers=markers)
-    defer_until = max(
-        now,
-        emitted_at + timedelta(minutes=minutes + slack_minutes, seconds=resume_margin_seconds),
-    )
+        emitted_at = _throttle_emission_anchor(log_path, tail, now=now, throttle_markers=markers)
+        defer_until = max(now, emitted_at + cooldown)
     return defer_until.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 

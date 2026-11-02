@@ -36,6 +36,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import charlie_work.host_routing as host_routing
+
 from .ci_findings import _parse_iso_ts
 from .config import OrchestratorConfig
 from .fleet_registry import managed_repo_names
@@ -174,6 +176,11 @@ def classify_backlog_reachability(
         "missing_ready": 0,
         "terminal_label": 0,
         "active_label": 0,
+        # Spec C2: a ready issue another host owns (``host_routing``). Without this
+        # bin a non-default host would count the default host's queue as its own
+        # ``dispatchable`` and raise false dispatch_stale alarms. Read from the
+        # other host, it is that host's queue depth.
+        "other_host": 0,
         "operator_claimed": 0,
         # Issue #1110: an automated-ready issue with no agent: label that is
         # blocked by an open predecessor passes every label-only check above
@@ -274,6 +281,8 @@ def classify_backlog_reachability(
                 reason = "terminal_label"
             elif names & config.labels.active:
                 reason = "active_label"
+            elif not host_routing.owned_here(names, config):
+                reason = "other_host"
             elif number in claimed:
                 reason = "operator_claimed"
             else:
