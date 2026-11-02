@@ -31,7 +31,9 @@ uv run --project ..\charlie-work --directory ..\your-repo charlie --repo ..\your
 Most consumers wrap this in a one-line script so daily use is just
 `charlie <command>`. The console script is `charlie` (with a `charlie-work`
 alias), defined by `[project.scripts]` in this repo's `pyproject.toml`
-(`charlie = "charlie_work.cli:main"`). The `uv run charlie …` examples below are
+(`charlie = "charlie_work._entry:main"`, which checks the declared
+dependencies before importing `charlie_work.cli` — see `_entry`). The
+`uv run charlie …` examples below are
 shorthand for that wrapped invocation.
 
 ## 2. Add a config file
