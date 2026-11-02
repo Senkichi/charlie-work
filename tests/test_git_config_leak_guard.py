@@ -347,11 +347,15 @@ def test_ceiling_directories_lists_root_and_ancestors(tmp_path: Path) -> None:
 # The helpers that rebuild a subprocess env by dropping every GIT_* key.
 # Behavior under test: the env each one actually hands subprocess.run keeps
 # the session isolation variables while dropping the redirect hazard.
+#
+# Two entries moved with origin/main (#2425, #2127): the loop-gates
+# ``_init_repo`` now copies a per-process git template and builds no env at
+# all (it inherits the session's isolation vars), so it left this list; the
+# async-gate ``_git`` lives in the shared ``_local_gate_async_fixtures``.
 _GIT_ENV_SCRUBBING_HELPERS = (
-    ("test_local_issues_loop_gates", "_init_repo"),
+    ("_local_gate_async_fixtures", "_git"),
     ("test_local_issues_merge_gate", "_git"),
     ("test_local_issues_patch_equiv", "_git"),
-    ("test_local_merge_gate_async", "_git"),
 )
 
 
@@ -390,11 +394,7 @@ def test_git_env_scrubbing_helpers_preserve_isolation_vars(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    repo_root = tmp_path / "repo"
-    if helper_name == "_init_repo":
-        helper(repo_root)
-    else:
-        helper(repo_root, "rev-parse", "--git-dir")
+    helper(tmp_path / "repo", "rev-parse", "--git-dir")
 
     env = captured[0]
     assert env is not None, f"{module_name}.{helper_name} ran git without an explicit env"
