@@ -3252,6 +3252,14 @@ def create_worktree(
         (issue #849 rework finding).
         """
         nonlocal rescue_capture
+        # Issue #2904: a worktree directory that no longer exists has no dirty
+        # content to capture — the local commits the refusal names are already
+        # on the branch ref it names, and every git call below would fail with
+        # [WinError 267] / ENOENT, re-escalating the issue on every requeue.
+        # The reset may proceed: the branch-delete path snapshots the tip to an
+        # attempt ref first, which the next dispatch re-applies onto the base.
+        if not check_path.is_dir():
+            return
         capture = _capture_worktree_work_to_rescue_ref(
             repo_root,
             check_path,
