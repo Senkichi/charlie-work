@@ -33,6 +33,8 @@ from _rework_dispatch_fixtures import _wg
 from charlie_work.claude_code import ClaudeWorkerRecord
 from charlie_work.instrumentation import query_events
 from charlie_work.state import (
+    clear_escalation,
+    clear_escalation_on_issue_prs,
     load_state,
     save_state,
     state_lock,
@@ -375,10 +377,18 @@ def test_dispatch_reviews_recorded_verdict_suppresses_later_stalled_throttle(
 
 
 def test_dispatch_reviews_skips_empty_diff_pr(monkeypatch, tmp_path: Path) -> None:
-    """Issue #1251: a PR whose diff.patch is empty (zero-file diff vs base)
-    must not burn a paid reviewer session. The pre-flight gate skips dispatch,
-    emits review_dispatch_skipped_empty_diff, and does NOT increment
-    review_dispatch_attempt_count (an empty diff is not a review attempt)."""
+    """Issue #2899 (replacing #1251's per-pass warning): a PR whose diff.patch
+    is empty (zero-file diff vs base) must not burn a paid reviewer session.
+    The pre-flight gate still skips dispatch and still does NOT increment
+    review_dispatch_attempt_count (an empty diff is not a review attempt, and
+    none of the attempts are spent on the route either), but the first pass
+    that observes the empty diff routes the linked issue to the operator
+    queue once through review_dispatch_escalated with a reason naming the
+    empty diff -- the no-exit shape of one warning per pass forever is gone.
+    The PR binds issue #10 through its closing-keyword body (the branch
+    validator finds no such open issue, so the binding falls through to the
+    keyword path), so the route carries the full mechanical escalation:
+    operator_queue label edge, issue+PR escalation records."""
     prs = [
         {
             "number": 100,
@@ -419,14 +429,36 @@ def test_dispatch_reviews_skips_empty_diff_pr(monkeypatch, tmp_path: Path) -> No
     assert result.data["launched_count"] == 0
     # The PR must appear in the skipped_empty_diff payload.
     assert 100 in result.data["skipped_empty_diff"]
-    # review_dispatch_skipped_empty_diff event must have been emitted.
-    skip_events = query_events(app.paths.state_file, kind="review_dispatch_skipped_empty_diff")
-    assert len(skip_events) == 1
-    assert skip_events[0]["pr_number"] == 100
+    # The operator-queue route fired exactly once this pass.
+    assert result.data["empty_diff_operator_queued"] == [100]
+    # Exactly one escalation event naming the empty diff; the retired
+    # per-pass warning kind (#1251) is no longer emitted.
+    escalated = query_events(app.paths.state_file, kind="review_dispatch_escalated")
+    assert len(escalated) == 1
+    payload = escalated[0]["payload"]
+    assert payload["pr_number"] == 100
+    assert payload["issue_number"] == 10
+    assert payload["reason"] == "empty_diff_zero_file"
+    assert payload["attempt_count"] == 0
+    assert payload["packet_head_sha"] == "sha-100"
+    assert query_events(app.paths.state_file, kind="review_dispatch_skipped_empty_diff") == []
+    # Exactly one label transition, and it lands the operator-queue label,
+    # never human-needed: this is a mechanical escalation.
+    assert app.gh.labels_added.count((10, app.config.labels.operator_queue)) == 1
+    assert (10, app.config.labels.human_needed) not in app.gh.labels_added
     # review_dispatch_attempt_count must NOT have been incremented.
     state = load_state(app.paths.state_file)
     pr_state = state["prs"].get("100", {})
     assert int(pr_state.get("review_dispatch_attempt_count", 0)) == 0
+    # The issue and PR records escalated with reason_class mechanical and the
+    # PR recorded the head-scoped dedup marker.
+    issue_state = state["issues"].get("10", {})
+    assert issue_state.get("status") == "escalated"
+    assert issue_state.get("escalation_reason") == "empty_diff_zero_file"
+    assert issue_state.get("reason_class") == "mechanical"
+    assert pr_state.get("status") == "escalated"
+    assert pr_state.get("escalation_reason") == "empty_diff_zero_file"
+    assert pr_state.get("empty_diff_operator_queued_head_sha") == "sha-100"
     # No dispatch claim must have been written.
     assert pr_state.get("review_dispatch_status") != "review_dispatch_pending"
 
@@ -502,22 +534,20 @@ def test_dispatch_reviews_empty_diff_mixed_with_nonempty(monkeypatch, tmp_path: 
 def test_dispatch_reviews_empty_diff_skip_is_registered_and_never_launches(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Issue #1258 (AC5): the #1251 empty-diff pre-flight guard already
-    landed on this clone's main (commit 7de2fa9, PR #1278) before this item
-    started -- per the task's "integrate with it instead of duplicating"
-    instruction, this item does not reimplement it. This test pins the two
-    concrete AC5 guarantees against the ALREADY-MERGED gate as an explicit
-    W1 regression (not just #1251's own suite): zero reviewer-launch calls
-    for a zero-file PR, and its dedicated event kind is genuinely registered
-    in instrumentation.py's exhaustive registry (not just a bare string).
+    """Issue #1258 (AC5), updated by #2899: the #1251 empty-diff pre-flight
+    guard landed on main (commit 7de2fa9, PR #1278); #2899 replaced its
+    per-pass warning emission with the single operator-queue route. This test
+    still pins both concrete AC5 guarantees against the gate as a W1
+    regression: zero reviewer-launch calls for a zero-file PR, and the
+    escalation event kind it now emits being genuinely registered in
+    instrumentation.py's exhaustive registry (not just a bare string).
 
-    Naming note: the event kind was originally ``review_skipped_empty_diff``
-    (#1251, PR #1278) and has been renamed to ``review_dispatch_skipped_empty_diff``
-    for issue #1258 (AC5) so it shares the ``review_dispatch_*`` family AC4
-    pins for the new CI-red kind. The rename touches only the
-    ``_LEVEL_BY_KIND`` registry key, its single emitter call site, and this
-    suite's assertions -- the emission site, payload shape, and warning
-    level are unchanged, so this is not a behavior change.
+    Naming note: the #1251 event kind ``review_skipped_empty_diff`` (renamed
+    ``review_dispatch_skipped_empty_diff`` for #1258, AC5) is retired by
+    #2899 -- the route reuses the registered ``review_dispatch_escalated``
+    kind with a reason naming the empty diff instead. The kind registry pin
+    moves with it; the retired key stays registered for historical events
+    but is no longer emitted.
 
     ``_dispatch_reviews_app`` defaults ``review_dispatch.enabled=True``, so
     ``launched == []`` here is a real launch-avoidance assertion, not a
@@ -528,7 +558,7 @@ def test_dispatch_reviews_empty_diff_skip_is_registered_and_never_launches(
     """
     from charlie_work.instrumentation import _LEVEL_BY_KIND
 
-    assert "review_dispatch_skipped_empty_diff" in _LEVEL_BY_KIND
+    assert "review_dispatch_escalated" in _LEVEL_BY_KIND
 
     prs = [
         {
@@ -556,9 +586,10 @@ def test_dispatch_reviews_empty_diff_skip_is_registered_and_never_launches(
     assert result.ok is True
     assert launched == []
     assert result.data["launched_count"] == 0
-    skip_events = query_events(app.paths.state_file, kind="review_dispatch_skipped_empty_diff")
-    assert len(skip_events) == 1
-    assert skip_events[0]["pr_number"] == 100
+    escalated = query_events(app.paths.state_file, kind="review_dispatch_escalated")
+    assert len(escalated) == 1
+    assert escalated[0]["payload"]["pr_number"] == 100
+    assert escalated[0]["payload"]["reason"] == "empty_diff_zero_file"
 
 
 def test_dispatch_reviews_dry_run_empty_diff_preview_is_read_only(
@@ -696,3 +727,209 @@ def test_dispatch_reviews_proceeds_with_nonempty_diff(monkeypatch, tmp_path: Pat
     # Dispatch must have proceeded — claim upgraded to dispatched.
     state = load_state(app.paths.state_file)
     assert state["prs"]["100"]["review_dispatch_status"] == "review_dispatch_dispatched"
+
+
+# --- Issue #2899: the zero-diff skip's operator-queue exit route -------------
+
+
+def _empty_diff_issue_linked_app(tmp_path: Path) -> Any:
+    """An app whose PR 100 is linked to open issue 10 and whose packet diff is
+    empty at head ``sha-100`` -- the #2899 fixture shape."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    app.gh.issues = [
+        {
+            "number": 10,
+            "title": "Fix search",
+            "url": "https://example.test/issues/10",
+            "body": "Search is broken",
+            "labels": [],
+            "state": "OPEN",
+        }
+    ]
+    _write_review_packet(tmp_path, 100, "sha-100")
+    (app.paths.prs / "pr-100" / "diff.patch").write_text("", encoding="utf-8")
+    return app
+
+
+def _clear_empty_diff_escalation(app: Any) -> None:
+    """Reset the #2899 escalation fields the way a clear does (the mechanical
+    de-escalation sweep's per-issue clear shape, mirrored on the PR record),
+    leaving the head-scoped dedup marker in place."""
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        issue_entry = state["issues"]["10"]
+        issue_entry["status"] = "open_passive"
+        clear_escalation(issue_entry)
+        clear_escalation_on_issue_prs(state, 10)
+        state["issues"]["10"] = issue_entry
+        pr_entry = state["prs"]["100"]
+        pr_entry["status"] = "open_passive"
+        clear_escalation(pr_entry)
+        state["prs"]["100"] = pr_entry
+        save_state(app.paths.state_file, state)
+
+
+def test_dispatch_reviews_empty_diff_route_is_once_per_head(monkeypatch, tmp_path: Path) -> None:
+    """Issue #2899 ACs 1-3: repeated passes over one zero-diff head produce
+    exactly one transition and one event (first pass: escalated-skipped;
+    later same-head passes: silent even after the escalation is cleared --
+    the head-scoped marker deduplicates) while a new empty head re-routes
+    once."""
+    app = _empty_diff_issue_linked_app(tmp_path)
+
+    _fail_if_launched(monkeypatch)
+
+    # Pass 1: the route fires.
+    result1 = app.dispatch_reviews()
+    assert result1.data["empty_diff_operator_queued"] == [100]
+    escalated_after_pass1 = query_events(app.paths.state_file, kind="review_dispatch_escalated")
+    assert len(escalated_after_pass1) == 1
+    assert app.gh.labels_added.count((10, app.config.labels.operator_queue)) == 1
+
+    # Pass 2: escalated status blinds selection -- nothing new fires.
+    result2 = app.dispatch_reviews()
+    assert 100 in result2.data["escalated_skipped"]
+    assert result2.data["empty_diff_operator_queued"] == []
+    assert len(query_events(app.paths.state_file, kind="review_dispatch_escalated")) == 1
+    assert app.gh.labels_added.count((10, app.config.labels.operator_queue)) == 1
+
+    # Simulate the escalation being cleared while the head is STILL empty
+    # (the mechanical de-escalation sweep's clear shape; the marker stays).
+    _clear_empty_diff_escalation(app)
+
+    # Pass 3: same head, still empty -- the marker keeps it silent, no
+    # re-escalation ping-pong.
+    result3 = app.dispatch_reviews()
+    assert result3.data["empty_diff_operator_queued"] == []
+    assert result3.data["skipped_empty_diff"] == [100]
+    assert len(query_events(app.paths.state_file, kind="review_dispatch_escalated")) == 1
+    assert app.gh.labels_added.count((10, app.config.labels.operator_queue)) == 1
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["100"]["status"] != "escalated"
+    assert state["prs"]["100"]["empty_diff_operator_queued_head_sha"] == "sha-100"
+    assert int(state["prs"]["100"].get("review_dispatch_attempt_count", 0)) == 0
+
+    # A NEW head with an empty diff re-routes (once per head). Move the real
+    # PR head (pr_list's headRefOid) -- review_queue reads pr_list, not
+    # pr_view's pr_head_shas override.
+    app.gh.prs[0]["headRefOid"] = "sha-200"
+    _write_review_packet(tmp_path, 100, "sha-200")
+    (app.paths.prs / "pr-100" / "diff.patch").write_text("", encoding="utf-8")
+
+    result4 = app.dispatch_reviews()
+    assert result4.data["empty_diff_operator_queued"] == [100]
+    escalated_after_pass4 = query_events(app.paths.state_file, kind="review_dispatch_escalated")
+    assert len(escalated_after_pass4) == 2
+    assert escalated_after_pass4[1]["payload"]["reason"] == "empty_diff_zero_file"
+    assert escalated_after_pass4[1]["payload"]["packet_head_sha"] == "sha-200"
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["100"]["empty_diff_operator_queued_head_sha"] == "sha-200"
+    assert int(state["prs"]["100"].get("review_dispatch_attempt_count", 0)) == 0
+    assert state["issues"]["10"]["status"] == "escalated"
+
+
+def test_dispatch_reviews_missing_diff_patch_is_not_empty(monkeypatch, tmp_path: Path) -> None:
+    """Issue #2899 AC4 (the #1807 behaviour): a MISSING diff.patch is never
+    read as empty -- no operator-queue route, no skipped_empty_diff entry,
+    no escalation event -- so a packet whose diff file is absent (a missing
+    packet, a different problem from a zero-delta PR) still goes through the
+    pre-existing normal gate chain instead of being escalated for a zero
+    diff it does not have."""
+    app = _empty_diff_issue_linked_app(tmp_path)
+    (app.paths.prs / "pr-100" / "diff.patch").unlink()
+
+    recorded: list[int] = []
+
+    def recording_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        recorded.append(kwargs.get("issue_number") or args[0])
+        return _fake_claude_worker_record(
+            kwargs.get("issue_number") or args[0],
+            kwargs.get("branch") or args[1],
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", recording_launch)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    assert result.data["skipped_empty_diff"] == []
+    assert result.data["empty_diff_operator_queued"] == []
+    assert query_events(app.paths.state_file, kind="review_dispatch_escalated") == []
+    # The missing packet is not a zero-delta PR: the dispatch proceeds under
+    # the normal gate chain (claim + launch), exactly as before #2899.
+    assert result.data["launched_count"] == 1
+    assert recorded == [100]
+
+
+def test_dispatch_reviews_empty_diff_new_head_regained_diff_is_dispatched(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #2899 AC3: a PR that gains a non-empty diff on a new head is
+    dispatched for review as usual once the escalation is cleared -- the
+    head-scoped marker must never stand between a plus-diff head and the
+    reviewer."""
+    app = _empty_diff_issue_linked_app(tmp_path)
+
+    _fail_if_launched(monkeypatch)
+
+    # Pass 1: route to the operator queue.
+    result1 = app.dispatch_reviews()
+    assert result1.data["empty_diff_operator_queued"] == [100]
+
+    # Simulate the escalation being cleared (the mechanical de-escalation
+    # sweep's clear shape) while the head is still empty.
+    _clear_empty_diff_escalation(app)
+
+    # Pass 2: same head, still empty -- the marker keeps it silent and no
+    # reviewer is claimed.
+    result2 = app.dispatch_reviews()
+    assert result2.data["skipped_empty_diff"] == [100]
+    assert result2.data["empty_diff_operator_queued"] == []
+    assert len(query_events(app.paths.state_file, kind="review_dispatch_escalated")) == 1
+
+    # Now the PR regains a diff on the new head: normal dispatch. Move the
+    # real PR head (pr_list's headRefOid) -- review_queue reads pr_list.
+    app.gh.prs[0]["headRefOid"] = "sha-200"
+    _write_review_packet(tmp_path, 100, "sha-200")
+    (app.paths.prs / "pr-100" / "diff.patch").write_text(
+        "diff --git a/foo.py b/foo.py\n+print('hello')\n", encoding="utf-8"
+    )
+
+    recorded: list[int] = []
+
+    def recording_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        recorded.append(kwargs.get("issue_number") or args[0])
+        return _fake_claude_worker_record(
+            kwargs.get("issue_number") or args[0],
+            kwargs.get("branch") or args[1],
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", recording_launch)
+
+    result3 = app.dispatch_reviews()
+
+    assert result3.ok is True
+    assert recorded == [100]
+    assert result3.data["launched_count"] == 1
+    assert result3.data["empty_diff_operator_queued"] == []
+    # Still exactly one escalation event -- the regained-diff pass raised
+    # no new one.
+    assert len(query_events(app.paths.state_file, kind="review_dispatch_escalated")) == 1
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["100"]["review_dispatch_status"] == "review_dispatch_dispatched"
+    assert int(state["prs"]["100"].get("review_dispatch_attempt_count", 0)) == 1

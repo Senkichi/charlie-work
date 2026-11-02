@@ -4495,37 +4495,118 @@ class OrchestratorApp:
         # empty (zero-file diff vs base) must not burn a paid reviewer
         # session reviewing nothing. The packet build (review()) already
         # fetches and writes diff.patch; an empty patch is the signal. Skip
-        # dispatch for these PRs and emit review_dispatch_skipped_empty_diff
-        # instead of claiming. review_dispatch_attempt_count is NOT incremented --
-        # an empty diff is not a review attempt and must not walk toward
-        # escalation. Do not auto-close the PR from this path; closing is a
-        # separate judgment (the #1221 fix owns the duplicate-PR lifecycle).
-        # A missing diff.patch is NOT treated as empty -- that is a missing
-        # packet (a different problem), not a zero-delta PR.
+        # dispatch for these PRs. review_dispatch_attempt_count is NOT
+        # incremented -- an empty diff is not a review attempt and must not
+        # walk toward escalation. Do not auto-close the PR from this path;
+        # closing is a separate judgment (the #1221 fix owns the
+        # duplicate-PR lifecycle). A missing diff.patch is NOT treated as
+        # empty -- that is a missing packet (a different problem), not a
+        # zero-delta PR.
+        #
+        # Issue #2899: the original per-pass warning had no exit -- a
+        # zero-file PR whose issue stayed ``agent:pr-open`` produced one
+        # review_dispatch_skipped_empty_diff warning EVERY pass forever (491
+        # in 48h on one fleet), with no review, no merge, and no terminal
+        # state. The first pass that observes an empty diff for a given
+        # packet head now routes the issue to the operator queue through the
+        # standard mechanical escalation (escalation.py's _escalate_issue;
+        # the label edge below resolves to the operator_queued edge), with a
+        # reason naming the empty diff. This lives inside the same
+        # skipped-from-dispatch contract: the escalation makes the PR land
+        # in escalated_skipped in selection, so later passes are blinded;
+        # when the escalation is later cleared (operator re-arm or the
+        # mechanical de-escalation sweep) while the head is still empty, the
+        # ``empty_diff_operator_queued_head_sha`` marker below keeps that
+        # head silent. The marker is head-scoped on purpose: a new packet
+        # head re-routes (once per head), and a head whose diff regained
+        # content is dispatched for review as usual once the escalation is
+        # cleared. The marker is deliberately NOT in
+        # UNESCALATE_PR_RESET_FIELDS: an operator re-arm of a still-empty
+        # head must not re-fire the escalation they just cleared for the
+        # same bytes.
         skipped_empty_diff: list[int] = []
         skipped_empty_diff_issues: dict[int, int | None] = {}
+        skipped_empty_diff_heads: dict[int, str | None] = {}
         selected_with_diff: list[dict[str, Any]] = []
         for c in selected:
             diff_text = self._read_packet_diff(c["pr"])
             if diff_text is not None and not diff_text.strip():
                 skipped_empty_diff.append(c["pr"])
                 skipped_empty_diff_issues[c["pr"]] = c.get("issue")
+                skipped_empty_diff_heads[c["pr"]] = c.get("packet_head_sha") or (
+                    self._read_packet_head_oid(c["pr"])
+                )
             else:
                 selected_with_diff.append(c)
         selected = selected_with_diff
+        # (pr_number, issue_number) pairs whose operator-queue route is fresh
+        # this pass and still owes the label edge; consumed alongside
+        # escalated_for_labels by the label-edge pass below. Same mechanical
+        # class, same operator_queued edge. PRs escalated without a resolvable
+        # linked issue appear in ``empty_diff_routed_prs`` only (no label edge
+        # exists for them, matching the attempt-cap escalation).
+        empty_diff_routed: list[tuple[int, int | None]] = []
+        empty_diff_routed_prs: list[int] = []
         if skipped_empty_diff:
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
                 for pr_number in skipped_empty_diff:
-                    state = self.write_gate.record_event(
+                    pr_state = state["prs"].get(str(pr_number), {})
+                    packet_head = skipped_empty_diff_heads.get(pr_number)
+                    issue_num = pr_state.get("issue_number") or skipped_empty_diff_issues.get(
+                        pr_number
+                    )
+                    if (
+                        pr_state.get("status") in SINK_STATUSES
+                        or state["issues"].get(str(issue_num), {}).get("status") in SINK_STATUSES
+                    ):
+                        # Escalated/blocked concurrently since the selection
+                        # snapshot (another lane won the race): stay silent
+                        # rather than clobbering its escalation reason with
+                        # ours (escalation.py's #1461 dedup contract).
+                        continue
+                    if (
+                        "empty_diff_operator_queued_head_sha" in pr_state
+                        and pr_state["empty_diff_operator_queued_head_sha"] == packet_head
+                    ):
+                        # Already routed for this exact head (e.g. the
+                        # escalation was auto-cleared by the de-escalation
+                        # sweep or cleared by an operator re-arm): later
+                        # passes on the same head emit nothing -- no event,
+                        # no transition, no state mutation.
+                        continue
+                    state = _escalate_issue(
                         state,
-                        "review_dispatch_skipped_empty_diff",
+                        issue_num,
+                        reason="empty_diff_zero_file",
+                        reason_class="mechanical",
+                        pr_number=pr_number,
+                    )
+                    state["prs"][str(pr_number)] = {
+                        **state["prs"].get(str(pr_number), {}),
+                        "number": pr_number,
+                        "empty_diff_operator_queued_head_sha": packet_head,
+                    }
+                    state = self.write_gate.append_event(
+                        state,
+                        "review_dispatch_escalated",
                         {
                             "pr_number": pr_number,
-                            "issue_number": skipped_empty_diff_issues.get(pr_number),
+                            "issue_number": issue_num,
+                            # The attempt count did not move (an empty diff is
+                            # not a review attempt, issue #1251); report it
+                            # so the "escalation without attempts" shape is
+                            # queryable.
+                            "attempt_count": int(pr_state.get("review_dispatch_attempt_count", 0)),
+                            # Names the empty diff: the zero-diff skip's exit
+                            # route (#2899).
+                            "reason": "empty_diff_zero_file",
+                            "packet_head_sha": packet_head,
                         },
-                        level="warning",
                     )
+                    if issue_num is not None:
+                        empty_diff_routed.append((int(pr_number), int(issue_num)))
+                    empty_diff_routed_prs.append(int(pr_number))
                 self.write_gate.save_state(state)
 
         # Issue #1131: re-check the decision file at claim time. review_queue's
@@ -4682,9 +4763,11 @@ class OrchestratorApp:
             # escalates with reason_class="mechanical" (max_review_dispatch_
             # attempts_exceeded is a process-attempt-cap limit, never a
             # judgment call), so the edge is resolved once for the batch.
+            # Issue #2899: the empty-diff gate's operator-queue routes land
+            # through the same mechanical edge, so they ride this batch too.
             escalated_edge = _escalation_edge("escalated", "mechanical")
             escalated_label_outcomes: list[tuple[int, dict[str, Any] | None]] = []
-            for _pr_num, issue_num in escalated_for_labels:
+            for _pr_num, issue_num in (*empty_diff_routed, *escalated_for_labels):
                 if issue_num is None:
                     continue
                 result = self.write_gate.transition(
@@ -5195,6 +5278,11 @@ class OrchestratorApp:
             "deferred_count": len(candidates) - len(dispatchable),
             "escalated_skipped": escalated_skipped,
             "skipped_empty_diff": skipped_empty_diff,
+            # Issue #2899: the zero-diff PRs whose operator-queue route fired
+            # THIS pass (fresh routes only; already-routed heads and
+            # escalated-skipped PRs carry no data). Empty on every pass
+            # after the first for a given head.
+            "empty_diff_operator_queued": empty_diff_routed_prs,
             "skipped_already_approved": skipped_already_approved,
             "merge_conflict_results": merge_conflict_results,
             "recorded_verdicts": recorded_verdicts,
