@@ -2586,7 +2586,7 @@ def _take_fleet_snapshot(
 
     repo_snapshots: set[tuple[str, LocalSnapshot]] = set()
     for repo_key, entry in repos.items():
-        if bool(entry.get("retired")) or entry_is_retired(entry):
+        if entry_is_retired(entry):
             continue
         state_dir_str = entry.get("state_dir")
         if not state_dir_str:

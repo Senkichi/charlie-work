@@ -338,6 +338,45 @@ def test_fleet_enumerations_ignore_retired_repos(
     assert _take_fleet_snapshot(fleet_dir_override=None).repo_snapshots == frozenset()
 
 
+@pytest.mark.parametrize(
+    ("persisted", "config_retired", "counted"),
+    [
+        # Positive control: nothing retired anywhere -> the repo is counted, so
+        # the three exclusions below are the retirement check, not an empty fixture.
+        (False, False, True),
+        # The round-4 defect: a stale persisted ``retired: true`` must not
+        # override a readable ``fleet.retired: false`` config.
+        (True, False, True),
+        # The config is the source of truth in the other direction too.
+        (False, True, False),
+        # Unreadable config preserves the last recorded flag (never clears it).
+        (True, None, False),
+    ],
+    ids=["active", "stale-persisted-true", "persisted-false-config-true", "unreadable-config"],
+)
+def test_take_fleet_snapshot_derives_retirement_from_config_not_the_persisted_flag(
+    tmp_path: Path, persisted: bool, config_retired: bool | None, counted: bool
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    if config_retired is None:
+        config_path = repo / "orchestrator.config.yaml"  # never written: unreadable
+    else:
+        config_path = _write_config(repo, retired=config_retired)
+    entry = {**_repo_entry(repo, config_path), "retired": persisted}
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir()
+    (fleet_dir / "fleet.json").write_text(
+        json.dumps({"version": 1, "repos": {"local/localrepo": entry}}), encoding="utf-8"
+    )
+
+    snapshot = _take_fleet_snapshot(fleet_dir_override=str(fleet_dir))
+
+    assert {key for key, _snap in snapshot.repo_snapshots} == (
+        {"local/localrepo"} if counted else set()
+    )
+
+
 def test_fleet_status_reports_retired_not_stale(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
