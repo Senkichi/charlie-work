@@ -1112,7 +1112,13 @@ def close_db(state_path: Path) -> None:
 # The env-strip source is the fourth, and its absence is silent in the worst
 # way: listeners keep launching, each with a copy of the supervisor's provider
 # keys. See ci_fleet_env_strip (issue #2902).
-from ci_fleet.env_strip import set_env_strip_source  # noqa: E402
+#
+# It is the one seam whose import is optional, because this source can run on
+# an older ci-fleet: the daemon after a failed deferred sync, or a tool or dev
+# environment that moved with the checkout and never synced. A hard import kills
+# every one of those at startup, and nothing relaunches a daemon that dies
+# there. An older ci-fleet has no strip to configure, so listeners launched from
+# it are no worse off than before, and the warning says so.
 from ci_fleet.observability import set_event_query, set_event_sink  # noqa: E402
 from ci_fleet.provenance import set_provenance_anchor  # noqa: E402
 
@@ -1122,4 +1128,13 @@ from charlie_work.ci_fleet_env_strip import fleet_provider_key_names  # noqa: E4
 set_event_sink(log_event)
 set_event_query(query_events)
 set_provenance_anchor(declared_ci_fleet_root)
-set_env_strip_source(fleet_provider_key_names)
+
+try:
+    from ci_fleet.env_strip import set_env_strip_source
+except ImportError:
+    logger.warning(
+        "the installed ci-fleet has no env_strip module (it needs >=0.8.3): listeners "
+        "launched from this process keep provider API keys until it is synced"
+    )
+else:
+    set_env_strip_source(fleet_provider_key_names)

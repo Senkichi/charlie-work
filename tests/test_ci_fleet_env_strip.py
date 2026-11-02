@@ -1,8 +1,9 @@
 """Configured provider-key names reach ci_fleet's listener env strip (issue #2902).
 
-These tests go through ``ci_fleet.runners._sanitize_env``, the function that
-builds every listener's environment, rather than asserting on the list of names.
-A name the list holds but the launch keeps would otherwise pass.
+The ``leaves_the_listener_env`` tests go through
+``ci_fleet.runners._sanitize_env``, the function that builds every listener's
+environment, because a name the list holds but the launch keeps would otherwise
+pass. The rest are about which names the source finds.
 """
 
 from __future__ import annotations
@@ -13,10 +14,14 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from ci_fleet import env_strip, runners
+from ci_fleet import runners
 
 from charlie_work import layout
 from charlie_work.ci_fleet_env_strip import fleet_provider_key_names
+
+# An install older than ci-fleet 0.8.3 has no strip to test. The import seam test
+# in test_ci_fleet_seams.py covers what happens on one.
+env_strip = pytest.importorskip("ci_fleet.env_strip")
 
 
 def _provider_yaml(key_name: str) -> str:
@@ -83,6 +88,22 @@ def test_every_repos_key_name_leaves_the_listener_env(
     assert env["charlie_work_test_control"] == "kept"
 
 
+def test_the_zero_argument_call_leaves_the_listener_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, restore_source: None
+) -> None:
+    """``ci_fleet`` passes no arguments, so the source has to find the fleet itself."""
+    fleet = _fleet(tmp_path, _repo(tmp_path, "alpha", _provider_yaml("ALPHA_PROVIDER_KEY")))
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", fleet)
+    monkeypatch.setenv("ALPHA_PROVIDER_KEY", "alpha-value")
+    monkeypatch.setenv("CHARLIE_WORK_TEST_CONTROL", "kept")
+
+    env_strip.set_env_strip_source(fleet_provider_key_names)
+    env = {name.casefold(): value for name, value in runners._sanitize_env().items()}
+
+    assert "alpha_provider_key" not in env
+    assert env["charlie_work_test_control"] == "kept"
+
+
 def test_a_config_that_fails_to_load_keeps_the_others(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -94,7 +115,7 @@ def test_a_config_that_fails_to_load_keeps_the_others(
         names = fleet_provider_key_names(fleet)
 
     assert names == {"GOOD_PROVIDER_KEY"}
-    assert str(broken) in caplog.text
+    assert "owner/broken" in caplog.text
 
 
 def test_the_global_layer_counts_when_no_repo_can_be_read(tmp_path: Path) -> None:
@@ -102,6 +123,45 @@ def test_the_global_layer_counts_when_no_repo_can_be_read(tmp_path: Path) -> Non
     fleet = _fleet(tmp_path, global_config=_provider_yaml("FLEET_PROVIDER_KEY"))
 
     assert fleet_provider_key_names(fleet) == {"FLEET_PROVIDER_KEY"}
+
+
+@pytest.mark.parametrize(
+    "registry",
+    [
+        pytest.param(b'{"repos": []}', id="repos-is-a-list"),
+        pytest.param(b'{"repos": 5}', id="repos-is-a-number"),
+        pytest.param(b'{"repos": {"owner/x": {"repo_root": 5}}}', id="root-is-not-a-path"),
+        pytest.param(b'{"repos": {"owner/x": "text"}}', id="entry-is-not-a-mapping"),
+        pytest.param(b"\xff\xfe not text", id="not-utf8"),
+        pytest.param(b'{"repos": {', id="truncated"),
+    ],
+)
+def test_a_bad_registry_keeps_the_global_names_and_says_so(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, registry: bytes
+) -> None:
+    """A raising source strips nothing at all, so a bad registry must not raise."""
+    fleet = _fleet(tmp_path, global_config=_provider_yaml("FLEET_PROVIDER_KEY"))
+    (Path(fleet) / layout.FLEET_REGISTRY_FILENAME).write_bytes(registry)
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.ci_fleet_env_strip"):
+        names = fleet_provider_key_names(fleet)
+
+    assert names == {"FLEET_PROVIDER_KEY"}
+    assert "env strip:" in caplog.text
+
+
+def test_an_explicit_config_path_is_the_one_read(tmp_path: Path) -> None:
+    """The registry can point a repo at a config outside its root."""
+    root = _repo(tmp_path, "alpha", _provider_yaml("DEFAULT_PATH_KEY"))
+    explicit = tmp_path / "elsewhere.yaml"
+    explicit.write_text(_provider_yaml("EXPLICIT_PATH_KEY"), encoding="utf-8")
+    fleet = _fleet(tmp_path)
+    registry = {"repos": {"owner/alpha": {"repo_root": str(root), "config_path": str(explicit)}}}
+    (Path(fleet) / layout.FLEET_REGISTRY_FILENAME).write_text(
+        json.dumps(registry), encoding="utf-8"
+    )
+
+    assert fleet_provider_key_names(fleet) == {"EXPLICIT_PATH_KEY"}
 
 
 def test_a_missing_fleet_dir_names_nothing_and_does_not_raise(tmp_path: Path) -> None:

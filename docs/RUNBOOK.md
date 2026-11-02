@@ -1206,9 +1206,15 @@ one by hand is a second controller:
 
 ```powershell
 ci-fleet drain --start --reason manual --for 15m   # idle listeners park; busy ones finish
-ci-fleet drain --status
+Get-Process Runner.Listener | Select-Object Id, StartTime   # wait for the old ones to go
 ci-fleet drain --clear                             # the allocator starts them again
+Get-Process Runner.Listener | Select-Object Id, StartTime   # all later than the drain?
 ```
+
+A listener that stays busy for the whole drain never parks, so it keeps its
+environment, and `ci-fleet drain --status` doesn't show listeners. Any start time
+still older than the drain means that listener wasn't restarted: run the drain
+again.
 
 The remaining surface, documented here as **accepted** for this repo, is:
 
