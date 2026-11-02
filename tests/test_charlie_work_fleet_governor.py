@@ -376,24 +376,16 @@ def test_fleet_dir_env_var() -> None:
             os.environ["CHARLIE_WORK_FLEET_DIR"] = original
 
 
-def test_fleet_dir_platform_defaults() -> None:
-    """Test that fleet_dir uses platform-specific defaults."""
+def test_fleet_dir_platform_defaults(tmp_path: Path, monkeypatch) -> None:
+    """Test that fleet_dir uses platform-specific defaults.
+
+    The platform base points at a fresh temp dir: the host's real fleet dir may hold
+    MSIX-virtualized files, which reroute the result to a UNC path (issue #2806).
+    """
     from charlie_work.fleet_paths import fleet_dir
 
-    # Clear env var to test platform defaults
-    original = os.environ.get("CHARLIE_WORK_FLEET_DIR")
-    try:
-        os.environ.pop("CHARLIE_WORK_FLEET_DIR", None)
-        result = fleet_dir()
+    monkeypatch.delenv("CHARLIE_WORK_FLEET_DIR", raising=False)
+    base_var = "LOCALAPPDATA" if sys.platform == "win32" else "XDG_STATE_HOME"
+    monkeypatch.setenv(base_var, str(tmp_path))
 
-        if sys.platform == "win32":
-            expected_base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
-        else:
-            expected_base = Path(
-                os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")
-            )
-
-        assert result == expected_base / "charlie-work"
-    finally:
-        if original is not None:
-            os.environ["CHARLIE_WORK_FLEET_DIR"] = original
+    assert fleet_dir() == tmp_path / "charlie-work"

@@ -39,6 +39,7 @@ from .config_validation import (
     Coerced,
     CoercedLenient,
     CommandTemplate,
+    Entries,
     FieldError,
     Check,
     FieldRules,
@@ -114,6 +115,7 @@ from .fleet_supervisor_config import (  # noqa: F401  (deliberate re-export)
 from . import layout
 from .fleet_harness_caps import freeze_harness_caps
 from .harnesses import REVIEWER_HARNESSES, WORKER_HARNESSES
+from .main_sync_config import MainSyncConfig
 from .opencode_config import OpenCodeConfig
 from .role_chain import (
     RoleEntry,
@@ -587,6 +589,17 @@ class DispatchConfig:
     # default; set to false to restore the always-clean-base behavior. Any
     # conflict or error falls back to the clean base either way.
     resume_throttled_attempts: Annotated[bool, Typed] = True
+    # Issue #2847: a dead worker's committed work can be stranded by ONE
+    # transient failure of the sweep's salvage push (e.g. ``push_failed:
+    # command timed out after 60s`` through a pre-push gate on a loaded host).
+    # Left alone, the next redispatch reads that commit as divergent local work
+    # and escalates ``worktree_unsafe_local_commits`` to a human. This many
+    # attempts per issue re-push it first (``salvage_retry``); an attempt is
+    # spent when it starts and is visible at
+    # ``state["issues"][n]["salvage_push_retries"]``. A rejected push, or a
+    # remote that moved, still escalates at once -- the retry only ever
+    # fast-forwards. 0 restores the escalate-on-first-sight behavior.
+    salvage_push_retries: Annotated[int, Typed, NonNeg] = 3
 
     def __post_init__(self) -> None:
         # Normalize to a tuple of forward-slash strings. The writer marker is
@@ -2102,6 +2115,18 @@ class WatchdogConfig:
     # to exit leaves the pushed branch and its drafted PR stranded for as long
     # as the PID lingers (the swole #163 incident: PR unopened ~2h).
     worker_outcome_finalize_minutes: Annotated[int, Typed, NonNeg] = 15
+    # Issue #2826: the rework brief promises "the orchestrator applies your
+    # ``pr_body``/``pr_comment`` for you", but the dead-worker sweep only queued
+    # that apply on the completed-outcome route (reviewed head == live head). The
+    # head-changed route, the unreviewed ``pr-open`` advance and the drift
+    # fall-through never read the outcome, so the edit was dropped with no event
+    # and the reviewer kept asking for a body fix no worker could make. True
+    # (default) resolves the completed outcome once, ahead of the route fan-out,
+    # queues the apply for every with-PR route, holds a head-changed review route
+    # until the head is recorded as applied, and rebuilds a verdictless packet
+    # that predates an applied body. False restores the routing-conditional
+    # behaviour exactly (kill switch).
+    apply_rework_outcome_on_every_route: Annotated[bool, Typed] = True
 
 
 @dataclass(frozen=True)
@@ -2636,6 +2661,7 @@ class OrchestratorConfig:
     claude_code: ClaudeCodeConfig = field(default_factory=ClaudeCodeConfig)
     api_worker: ApiWorkerConfig = field(default_factory=ApiWorkerConfig)
     opencode: OpenCodeConfig = field(default_factory=OpenCodeConfig)
+    main_sync: MainSyncConfig = field(default_factory=MainSyncConfig)
     rescue: RescueConfig = field(default_factory=RescueConfig)
     worker: Annotated[
         WorkerRoleConfig,
@@ -2694,6 +2720,13 @@ class OrchestratorConfig:
     # ``max_running_per_repo``) still raises -- construction errors stay loud, and a
     # use-site ``NotNull`` on this section would make the failure a rescuable
     # ``FieldError`` silently discarding the global layer (cfg review R2-B1).
+    # ``deferred_demand`` is the deliberate exception: its use-site ``Entries`` rule makes a
+    # bad ``after_seconds`` (non-int, <= 0) a rescuable ``FieldError``, so with a per-repo
+    # config present the #665 rescue discards the global layer (the warning names the key)
+    # and ``deferred_demand`` falls back to ``()`` -- the same outcome as the bounded
+    # scalars above (``NonNeg``). A bad ``labels`` has no use-site rule, so ``ci_fleet``'s
+    # ``DeferredDemand.__post_init__`` rejects it as a loud ``ConstructionError``. Both
+    # outcomes are pinned in tests/test_runner_allocation_deferred_demand.py.
     runner_allocation: Annotated[
         RunnerAllocationConfig,
         HostWideOnly,
@@ -2710,6 +2743,7 @@ class OrchestratorConfig:
             leak_drain=Typed,
             leak_probe_path=Typed,
             host_io_auto_exclusions=Typed,
+            deferred_demand=Entries(after_seconds=(Typed, Positive)),
         ),
         Check(_runner_floors_agree),
     ] = field(default_factory=RunnerAllocationConfig)
