@@ -159,6 +159,81 @@ def test_real_wind_down_reaps_a_dead_worker_and_leaves_no_live_work(
     assert retired_pass_disposition("owner/retired", repo, app.config, app.paths.root, {}) is True
 
 
+# Every OrchestratorApp entry point a launch, rework, rescue, reviewer, merge-gate
+# suite or tracker commit flows through. ``monkeypatch.setattr`` is strict, so a
+# rename fails this test loudly instead of silently shrinking the checked set.
+_LAUNCH_ENTRY_POINTS = (
+    "dispatch",
+    "_dispatch_impl",
+    "dispatch_rework",
+    "_dispatch_rework_impl",
+    "dispatch_reviews",
+    "_local_lane",
+    "_local_dispatch_reviewers",
+    "_local_dispatch_rework",
+    "_local_gate_launch",
+    "_launch_local_rework",
+    "_flush_pass_tracker_writes",
+    "merge_ready",
+    "loop",
+)
+# The process-launch / commit primitives underneath those entry points.
+_LAUNCH_PRIMITIVES = (
+    "charlie_work.workflow.launch_claude_worker",
+    "charlie_work.workflow.launch_devin_session",
+    "charlie_work.workflow.launch_api_worker",
+    "charlie_work.adapters.dispatch_sessions",
+    "charlie_work.local_suite_runner.launch_suite_gate",
+    "charlie_work.orchestration.local_tracker_flush.flush_tracker_writes",
+)
+
+
+def test_run_wind_down_reaches_no_launch_entry_point(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wind-down reaps and ingests verdicts; it must never launch anything.
+
+    Round-4 review of #2791: the full-loop test's reviewer/suite assertions were
+    vacuous, so adding a launch to ``run_wind_down`` could not fail any test.
+    Here every launch entry point and primitive is a tripwire. Each records the
+    call *before* raising, because a broad ``except`` inside wind-down would
+    swallow the raise and leave a green run. The same call also does real reap
+    work, so the tripwires sit on a live path rather than an empty one.
+    """
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    issues_dir = repo / "docs" / "issues"
+    _write_repo_config(repo, retired=True)
+    config = build_config_from_data(_retirement_data(retired=True))
+    app = _app(repo, issues_dir, config)
+    number = 1
+    branch = f"agent/issue-{number}"
+    _write_local_issue(issues_dir, number, labels=(config.labels.in_progress,))
+    _seed_dispatched_issue(app, number, branch)
+    sidecar = _write_dead_session(app, repo, number, branch)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
+
+    reached: list[str] = []
+
+    def _tripwire(name: str) -> Any:
+        def _trip(*_args: object, **_kwargs: object) -> None:
+            reached.append(name)
+            raise AssertionError(f"wind-down reached launch entry point {name}")
+
+        return _trip
+
+    for name in _LAUNCH_ENTRY_POINTS:
+        monkeypatch.setattr(OrchestratorApp, name, _tripwire(f"OrchestratorApp.{name}"))
+    for target in _LAUNCH_PRIMITIVES:
+        monkeypatch.setattr(target, _tripwire(target))
+
+    summary = run_wind_down(app)
+
+    assert reached == []
+    assert summary["reaped"] == 1
+    assert not sidecar.exists(), "wind-down still did its real reap work"
+
+
 def _write_review_sidecar(reviews: Path, *, pr: int, pid: int) -> Path:
     """A claude-code review sidecar whose claim is well past the stale timeout."""
     reviews.mkdir(parents=True, exist_ok=True)
@@ -189,6 +264,16 @@ def _write_review_sidecar(reviews: Path, *, pr: int, pid: int) -> Path:
         encoding="utf-8",
     )
     return sidecar
+
+
+# The launch hooks the active positive control PROVES can fire for this fixture
+# (``test_active_worker_eligible_repo_launches_work`` asserts each one). The
+# retired run's ``== []`` is only able to fail for these. ``reviewers`` and
+# ``suites`` are recorded below purely as hermetic stubs: this fixture has no
+# review-ready branch, so they never fire even when active, and asserting
+# ``== []`` for them here would be vacuous. They are covered where they can
+# genuinely fail -- ``test_run_wind_down_reaches_no_launch_entry_point``.
+_CONTROLLED_LAUNCH_HOOKS = ("workers", "tracker_commits")
 
 
 def _run_worker_eligible_passes(
@@ -306,13 +391,13 @@ def test_retired_worker_eligible_repo_launches_nothing(
     assert first.data["retired"] == ["owner/retired"]
     assert first.data["repos"]["owner/retired"]["wind_down"] is True
     assert not run["sidecar"].exists()
-    for hook in ("workers", "reviewers", "suites", "tracker_commits"):
+    for hook in _CONTROLLED_LAUNCH_HOOKS:
         assert launches[hook] == [], hook
     assert query_events(run["app"].paths.state_file, kind="local_lane_kill_switch_stalled") == []
 
     assert second.data["retired_quiescent"] == ["owner/retired"]
     assert "owner/retired" not in second.data["repos"]
-    for hook in ("workers", "reviewers", "suites", "tracker_commits"):
+    for hook in _CONTROLLED_LAUNCH_HOOKS:
         assert launches[hook] == [], hook
     assert query_events(run["app"].paths.state_file, kind="local_lane_kill_switch_stalled") == []
 
@@ -329,7 +414,8 @@ def test_active_worker_eligible_repo_launches_work(
     launches = run["launches"]
 
     assert "owner/active" in run["first"].data["repos"]
-    assert launches["workers"], "the active fixture must dispatch a worker"
+    for hook in _CONTROLLED_LAUNCH_HOOKS:
+        assert launches[hook], f"the active fixture must fire the {hook} hook"
     assert run["first"].data["retired"] == []
 
 
