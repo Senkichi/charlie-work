@@ -89,9 +89,12 @@ def test_console_script_and_module_form_agree() -> None:
     """Control: the two entry points are the same artifact.
 
     ``[project.scripts]`` maps both ``charlie`` and ``charlie-work`` to
-    ``charlie_work.cli:main``. If this test ever fails while the two above pass,
-    the module form is running *something*, just not the same thing operators
-    get -- which would be a worse bug than the original silence.
+    ``charlie_work._entry:main`` (issue #2808: a dependency guard that lazily
+    imports ``charlie_work.cli``), so the ``python -m`` form here runs the
+    same underlying CLI as the console scripts. If this test ever fails while
+    the two above pass, the module form is running *something*, just not the
+    same thing operators get -- which would be a worse bug than the original
+    silence.
     """
     module_help = _run("--help")
     direct = subprocess.run(
