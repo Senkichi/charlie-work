@@ -23,15 +23,16 @@ The fix has three seams, each covered below:
   the result.
 * ``Issues.are_issues_open`` runs its per-issue ``issue_view`` fallback only
   over numbers absent from the batched result, and emits
-  ``github_issue_state_partial_fallback`` once per newly-unresolved number
-  per GitHub-instance lifetime: a number leaves the tracked set only when a
-  later batch positively resolves it, so an unrelated clean batch cannot
-  reset the baseline and whole-batch failures neither emit nor disturb it.
-  Instance lifetime is caller-dependent -- the single-repo supervisor keeps
-  one GitHub for the whole process, while ``fleet_loop`` builds a fresh
-  GitHub per repo per pass -- so the kind is registered ``info``, not
-  ``warning`` (the last test below covers the fleet lifecycle end-to-end
-  through the real ``log_event``/events.db path).
+  ``github_issue_state_partial_fallback`` once per newly-unresolved number:
+  a number leaves the tracked set only when a later batch positively
+  resolves it, so an unrelated clean batch cannot reset the baseline and
+  whole-batch failures neither emit nor disturb it. Since issue #2901 the
+  tracked set is a per-repo sidecar rather than a GitHub-instance attribute
+  (``fleet_loop`` builds a fresh GitHub per repo per pass, which made the
+  instance-local set report a persistent stale blocker every pass); the
+  last test below covers the fleet lifecycle end-to-end through the real
+  ``log_event``/events.db path, and ``test_issue_2901_unresolved_issue_baseline``
+  covers the sidecar itself. The kind stays registered ``info``.
 
 No live network anywhere: both adapters are scripted fakes
 (``tests/_fake_transport.py``) and no ``gh`` subprocess is ever spawned.
@@ -221,26 +222,22 @@ def test_are_issues_open_emits_telemetry_for_partial_batch_fallback(
     path) keep their existing log-line-only behavior.
 
     Edge-triggered per number (rework): the event fires once per
-    *newly-unresolved* issue number per GitHub-instance lifetime, not once
-    per batch observation. The emitter tracks numbers already reported; a
-    reported number leaves the tracked set only when a later batch
-    positively resolves it -- an unrelated clean batch must NOT reset the
-    baseline (the multi-call-per-pass flood the round-2 review caught). A
-    newly-stale number joining an already-reported set is a new edge and
-    still fires.
+    *newly-unresolved* issue number, not once per batch observation. The
+    emitter tracks numbers already reported; a reported number leaves the
+    tracked set only when a later batch positively resolves it -- an
+    unrelated clean batch must NOT reset the baseline (the multi-call-per-pass
+    flood the round-2 review caught). A newly-stale number joining an
+    already-reported set is a new edge and still fires.
 
-    Lifetime caveat (round-3 review): instance lifetime is
-    caller-dependent. This test models the single-repo supervisor
-    (``supervise.run_supervised``), which keeps one GitHub/Issues pair
-    across passes -- there the set does suppress a persistent stale
-    blocker's repeat. The fleet supervisor builds a fresh GitHub per repo
-    per pass, so there the same blocker emits once per pass per repo;
-    that expected repeat is why the kind is registered ``info``, not
-    ``warning`` -- covered end-to-end by
-    ``test_fleet_lifecycle_persistent_blocker_never_emits_warning``.
-    Short-lived processes such as ``fleet status --json`` still emit once
-    per invocation: their GitHub instance does not outlive the run, so
-    there is nothing to dedupe against.
+    Lifecycle (round-3 review, revised by issue #2901): this test models the
+    single-repo supervisor (``supervise.run_supervised``), which keeps one
+    GitHub/Issues pair across passes. The fleet supervisor builds a fresh
+    GitHub per repo per pass, and ``fleet status --json`` a fresh one per
+    invocation; neither used to share a baseline, so the same blocker
+    re-emitted every time. The baseline is now durable (a per-repo
+    sidecar), so those lifecycles dedupe too -- covered end-to-end by
+    ``test_fleet_lifecycle_persistent_blocker_never_emits_warning`` and
+    ``test_issue_2901_unresolved_issue_baseline``.
     """
     from charlie_work.github_capabilities import issues as issues_module
 
@@ -468,21 +465,21 @@ def test_fleet_lifecycle_persistent_blocker_never_emits_warning(
 ) -> None:
     """The fleet supervisor lifecycle (round-3 review): ``fleet_loop``
     builds a NEW ``GitHub`` per repo on every pass
-    (``fleet_dispatch.fleet_loop``), so the instance-scoped
-    ``_partial_fallback_reported`` baseline resets each pass and a
-    persistent stale blocker re-emits
-    ``github_issue_state_partial_fallback`` every pass. The earlier tests
-    model the other lifecycle (``run_supervised`` reusing one GitHub) via
+    (``fleet_dispatch.fleet_loop``). The earlier tests model the other
+    lifecycle (``run_supervised`` reusing one GitHub) via
     ``_list_cache.clear()``; this one constructs a fresh instance per
     pass exactly as fleet_loop does.
 
-    Because the per-pass repeat is expected, the flood is closed by the
-    kind's ``info`` registration, not by dedupe: at ``warning`` the same
-    blocker would write one row per pass into ``check_warning_events``
-    (the #1271/#1768 flood shape). The real ``log_event`` is left
-    unpatched so the persisted ``level`` column itself is asserted --
-    zero warning rows across all passes, while the info rows still land
-    once per pass.
+    Issue #2901: this test used to assert the *opposite* of report-once --
+    that the fresh instance's empty baseline made a persistent stale
+    blocker emit ``github_issue_state_partial_fallback`` on every pass, and
+    that only the kind's ``info`` registration kept that flood out of
+    ``check_warning_events``. That was the bug (2,081 rows in a week in one
+    consumer repo, one per ``loop_completed``). The baseline is now a
+    per-repo sidecar, so the same blocker emits exactly ONE row across all
+    passes. The real ``log_event`` is left unpatched so the persisted
+    ``level`` column itself is asserted -- the row is ``info`` and there are
+    zero warning rows, as before.
     """
     from charlie_work.github_capabilities.circuit_breaker_transport import (
         circuit_breaker_state_path,
@@ -512,11 +509,13 @@ def test_fleet_lifecycle_persistent_blocker_never_emits_warning(
         assert gh.are_issues_open([1, 361]) == {1}
 
     emitted = query_events(state_path, kind="github_issue_state_partial_fallback")
-    # The telemetry still lands every pass (the degradation is not
-    # hidden) ...
-    assert len(emitted) == passes
+    # The degradation is reported once -- on the first pass that sees it --
+    # not once per pass (issue #2901) ...
+    assert passes > 1
+    assert len(emitted) == 1
+    assert emitted[0]["payload"] == {"unresolved": [361], "requested": 2}
     assert all(e["level"] == "info" for e in emitted)
-    # ... but never at warning level, so check_warning_events sees nothing.
+    # ... and never at warning level, so check_warning_events sees nothing.
     assert not query_events(
         state_path, kind="github_issue_state_partial_fallback", level="warning"
     )

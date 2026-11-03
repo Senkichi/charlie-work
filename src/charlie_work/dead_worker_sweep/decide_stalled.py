@@ -14,7 +14,7 @@ The history the original function carried (issues #246, #247, #261, #338, #484,
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from ..worker import WorkerHealth
@@ -33,6 +33,7 @@ from .stalled_model import (
     RecordFailure,
     RecordPostMortem,
     RecordRoleQuota,
+    ReleaseBlockedTool,
     StalledFacts,
     StalledPlan,
     StampSidecar,
@@ -42,6 +43,12 @@ from .stalled_model import (
 
 REAP_SOURCE = "stalled_sessions_reap"
 DEFER_SOURCE = "stalled_sessions_rate_limit_defer"
+
+# Issue #2794: how long a released worker is left alone to resume before a
+# still-STALLED verdict is believed. A freed tool call completes immediately and
+# the next model turn emits events within seconds, so one lane pass is plenty;
+# this only has to outlast the gap between two passes.
+RELEASE_RESUME_GRACE = timedelta(minutes=10)
 
 
 def _parse_defer_until(value: str | None) -> datetime | None:
@@ -93,6 +100,50 @@ def _budget_flow(facts: StalledFacts) -> Flow:
             provider=w.provider,
         ),
     )
+
+
+def _release_flow(facts: StalledFacts) -> Flow:
+    """#2794: free a tool call blocked on an orphaned pipe holder instead of reaping.
+
+    An opencode session whose ``bash`` call left a background process holding the
+    call's pipe is silent, alive and STALLED, yet healthy: killing just the
+    holders lets the call complete and the model carry on. One release per
+    dispatch (the marker lives on the dispatch's sidecar). Returns True when the
+    worker should be left running -- either just released, or still inside the
+    resume grace of an earlier release; False to fall through to the reap
+    (nothing held the pipe, the release did not get the worker moving, or this
+    is a dry run).
+
+    Dry run: finding the holders is the kill primitive's first half and nothing
+    may be killed, so a dry-run pass cannot know whether a live pass would find
+    any. It never asks for a release and previews the ordinary reap, exactly as
+    it did for every stalled worker before #2794. An earlier release's grace
+    window is still honoured -- that is a read of the stamp, not an effect.
+    """
+    w = facts.worker
+    issue = w.issue_number
+    released_at = _parse_defer_until(w.tool_released_at)
+    if released_at is not None:
+        return facts.now < released_at + RELEASE_RESUME_GRACE
+    if facts.dry_run:
+        return False
+    released = yield ReleaseBlockedTool(issue)
+    if not released:
+        return False
+    yield StampSidecar(issue, _pairs(tool_released_at=facts.now.isoformat()))
+    tail = yield ReadLogTail(issue)
+    yield StateTxn(
+        event_kind="session_tool_released",
+        event_payload=_pairs(
+            issue_number=issue,
+            pid=w.pid,
+            process_start_time=w.process_start_time,
+            released_pids=list(released),
+            log_mtime=tail.mtime,
+            last_log_line=tail.last_line,
+        ),
+    )
+    return True
 
 
 def _reap_flow(facts: StalledFacts, health: WorkerHealth, probe: Any, adapter: Any) -> Flow:
@@ -201,6 +252,14 @@ def stalled_flow(facts: StalledFacts) -> Flow:
                 event_payload=_pairs(issue_number=issue, pid=w.pid, defer_until=defer_until),
             )
             return None
+
+    if (
+        health == WorkerHealth.STALLED
+        and adapter.can_release_blocked_tool
+        and facts.config.opencode.release_blocked_tool
+        and (yield from _release_flow(facts))
+    ):
+        return None
 
     yield from _reap_flow(facts, health, observed_health.probe, adapter)
     return entry

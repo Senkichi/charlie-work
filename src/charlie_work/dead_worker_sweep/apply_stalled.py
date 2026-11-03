@@ -30,6 +30,7 @@ from .. import devin_shell, no_pr_orphan_fate, post_mortem, role_quota_ledger, w
 from . import effects_sessions
 from ..config import OrchestratorConfig
 from ..host import current as _host_current
+from ..pipe_holder_release import release_pipe_holders
 from ..process_utils import find_worker_terminal_status
 from ..worktree import read_worker_outcome
 from ..state import load_state, load_state_locked, set_throttled_until, state_lock
@@ -51,6 +52,7 @@ from .stalled_model import (
     RecordFailure,
     RecordPostMortem,
     RecordRoleQuota,
+    ReleaseBlockedTool,
     StalledFacts,
     StampSidecar,
     StateTxn,
@@ -112,6 +114,7 @@ def _serve(
                 and profile.over_budget(w, config)
             ),
             can_record_failure=profile is not None and profile.record_failure is not None,
+            can_release_blocked_tool=profile is not None and profile.releases_blocked_tool,
         )
     if isinstance(request, ProbeHealth):
         # Issues #280/#301: corroborate sidecar mtime against real-session
@@ -137,6 +140,15 @@ def _serve(
     if isinstance(request, KillTree):
         # Start-time verification (inside the primitive) prevents PID recycling kills.
         return tuple(write_gate.kill_process_tree(w.pid, w.process_start_time))
+    if isinstance(request, ReleaseBlockedTool):
+        # Issue #2794: the worker is spared; only the orphans holding its tool
+        # call's pipe die (identity-anchored inside the primitive). ``decide_stalled``
+        # never asks for a release under dry-run; this guard is the effect
+        # boundary's own backstop, honoured here rather than by a ``WriteGate``
+        # method (that class is attachment-saturated, and this is the only caller).
+        if write_gate.dry_run:
+            return ()
+        return release_pipe_holders(Path(w.worktree_path), w.pid, w.process_start_time)
     if isinstance(request, KillOrphans):
         # Catches detached/daemonized processes that survived the tree kill.
         orphans = effects_sessions.sweep_orphan_processes(w.worktree_path)

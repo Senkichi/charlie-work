@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _fakes_github import FakeGitHub
 
 from charlie_work import cli
 from charlie_work.config import (
@@ -23,8 +24,9 @@ from charlie_work.config import (
     build_config_from_data,
 )
 from charlie_work.host_routing import issue_hosts, owned_here
+from charlie_work.instrumentation import query_events
 from charlie_work.paths import runtime_paths
-from charlie_work.state import record_non_empty_dispatch
+from charlie_work.state import load_state, record_non_empty_dispatch
 from charlie_work.workflow import (
     OrchestratorApp,
     check_dispatch_staleness,
@@ -255,3 +257,118 @@ def test_non_default_host_wedged_dependency_chain_still_alarms() -> None:
     assert result["stale"] is True
     assert result["reason"] == "dependency_root_blocker_idle"
     assert [r["issue"] for r in result["dependency_root_blockers"]] == [2]
+
+
+# ---------------------------------------------------------------------------
+# Intake (issue #2906): another host intakes the issues it owns.
+# ---------------------------------------------------------------------------
+
+
+class _ViewRecordingGitHub(FakeGitHub):
+    """FakeGitHub over a given issue list that records every ``issue_view``."""
+
+    def __init__(self, issues: list[dict[str, Any]]) -> None:
+        super().__init__()
+        self.issues = issues
+        self.viewed: list[int] = []
+
+    def issue_view(self, number: int) -> dict[str, Any]:
+        self.viewed.append(number)
+        return super().issue_view(number)
+
+
+def _intake_issue(number: int, names: set[str]) -> dict[str, Any]:
+    return {
+        "number": number,
+        "title": f"Issue {number}",
+        "url": f"https://example.test/issues/{number}",
+        "body": "A plain body with no dependencies.",
+        "labels": [{"name": name} for name in sorted(names)],
+        "state": "OPEN",
+    }
+
+
+def _intake_ready_observed(paths: Any, number: int) -> list[dict[str, Any]]:
+    return query_events(paths.state_file, kind="ready_observed", issue_number=number)
+
+
+@pytest.mark.parametrize(
+    ("host", "default_host", "local_extra", "foreign_extra"),
+    [
+        # A labelled issue for another host, seen from the default host.
+        ("workstation", True, set(), {"host:macbook"}),
+        # An unlabelled issue belongs to the default host, so a non-default host skips it.
+        ("macbook", False, {"host:macbook"}, set()),
+    ],
+)
+def test_intake_skips_a_ready_issue_another_host_owns(
+    tmp_path: Path,
+    host: str,
+    default_host: bool,
+    local_extra: set[str],
+    foreign_extra: set[str],
+) -> None:
+    config = _config(host, default_host=default_host)
+    ready = config.labels.ready
+    local, foreign = 1, 2
+    gh = _ViewRecordingGitHub(
+        [
+            _intake_issue(local, {ready, *local_extra}),
+            _intake_issue(foreign, {ready, *foreign_extra}),
+        ]
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, gh)
+
+    result = app.intake()
+
+    assert result.ok is True
+    # Positive control: the issue this host owns is taken in end to end...
+    assert gh.viewed == [local]
+    assert [entry["issue"] for entry in result.data["issues"]] == [local]
+    assert (paths.issues / f"issue-{local}" / "issue.json").is_file()
+    assert (paths.issues / f"issue-{local}" / "worker-prompt.md").is_file()
+    assert len(_intake_ready_observed(paths, local)) == 1
+    # ...while the foreign one costs no read, no folder, no prompt, no episode.
+    assert not (paths.issues / f"issue-{foreign}").exists()
+    assert _intake_ready_observed(paths, foreign) == []
+    state = load_state(paths.state_file)
+    assert str(local) in state["issues"]
+    assert str(foreign) not in state["issues"]
+    intake_events = [e for e in state["events"] if e.get("kind") == "intake"]
+    assert [e["payload"]["issue_count"] for e in intake_events] == [1]
+
+
+def test_intake_skips_every_issue_when_this_host_owns_none(tmp_path: Path) -> None:
+    config = _config("macbook", default_host=False)
+    gh = _ViewRecordingGitHub([_intake_issue(7, {config.labels.ready})])
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, gh)
+
+    result = app.intake()
+
+    assert result.ok is True
+    assert gh.viewed == []
+    assert result.data["issues"] == []
+    assert not (paths.issues / "issue-7").exists()
+    assert _intake_ready_observed(paths, 7) == []
+    assert "7" not in load_state(paths.state_file)["issues"]
+
+
+def test_intake_takes_in_the_same_issue_when_dispatch_host_is_unset(tmp_path: Path) -> None:
+    """The kill switch: with ``dispatch.host`` unset a ``host:<name>`` label is inert."""
+    config = _config(None, default_host=False)
+    ready = config.labels.ready
+    gh = _ViewRecordingGitHub([_intake_issue(2, {ready, "host:macbook"})])
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, gh)
+
+    result = app.intake()
+
+    assert result.ok is True
+    assert gh.viewed == [2]
+    assert [entry["issue"] for entry in result.data["issues"]] == [2]
+    assert (paths.issues / "issue-2" / "issue.json").is_file()
+    assert (paths.issues / "issue-2" / "worker-prompt.md").is_file()
+    assert len(_intake_ready_observed(paths, 2)) == 1
+    assert "2" in load_state(paths.state_file)["issues"]
