@@ -15,10 +15,12 @@ it publishes the tip to ``refs/heads/salvage/<branch>`` -- or, when the remote
 already holds the tip, reports where instead of pushing again.
 
 Extracted from ``worktree.py`` under the file-size ratchet (issue #1442): new
-code must not land in the over-cap monolith. The network runner is injected
-(``run_remote``) rather than imported, because ``worktree.py`` imports this
-module at top level and a back-import would close the cycle -- the same reason
-``worktree_archive`` declares its own timeout constant.
+code must not land in the over-cap monolith. The read-only network runner is
+injected (``run_remote``) rather than imported, because ``worktree.py`` imports
+this module at top level and a back-import would close the cycle -- the same
+reason ``worktree_archive`` declares its own timeout constant. ``run_remote`` is
+used for ``ls-remote`` only; the one remote-mutating call, the salvage push, is
+deliberately not routed through it (see ``preserve_stranded_branch_tip``).
 """
 
 from __future__ import annotations
@@ -47,7 +49,9 @@ _REMOTE_REF_PATTERNS = ("refs/heads/*", "refs/pull/*/head")
 
 _TRACKING_PREFIX = "refs/remotes/origin/"
 
-# ``(command, cwd) -> RunResult`` -- ``worktree._run_remote_captured``.
+# ``(command, cwd) -> RunResult`` -- ``worktree._run_remote_captured``. Retrying
+# and 20s-bounded, so it is for read-only ``ls-remote`` probes and nothing that
+# mutates the remote.
 RunRemote = Callable[[list[str], Path], RunResult]
 
 
@@ -88,7 +92,10 @@ def preserve_stranded_branch_tip(
     3. Otherwise push ``<tip>:refs/heads/salvage/<branch>`` -- a plain push,
        never forced, so an existing salvage ref at a different tip is rejected
        rather than overwritten -- and read the ref back from the remote. The
-       work counts as durable only when the remote advertises the tip.
+       work counts as durable only when the remote advertises the tip. The
+       push runs once through ``run_captured`` (never ``run_remote``: a
+       remote-mutating command must not sit behind a retry loop); only the
+       read-only ``ls-remote`` probes use ``run_remote``.
 
     Every failure comes back as ``error`` so the caller keeps its
     ``WorktreeUnsafeError``: a failed rescue must not weaken the refusal.
@@ -120,7 +127,16 @@ def preserve_stranded_branch_tip(
 
     salvage_ref = salvage_ref_for_branch(branch)
     push_command = ["git", "push", "origin", f"{tip}:{salvage_ref}"]
-    push_result = run_remote(push_command, repo_root)
+    # The push mutates the remote, so it must NOT go through ``run_remote``:
+    # that is ``worktree._run_remote_captured``, whose retry loop
+    # (``git_retry.run_git_with_retry``) is for read-only/idempotent commands
+    # only and whose 20s read timeout is sized for ``ls-remote``. A plain
+    # ``run_captured`` is one attempt with the module's normal budget. A push
+    # that timed out after landing is still safe: the next call's probe finds
+    # the tip on the salvage ref and reports it without pushing again.
+    push_result = run_captured(
+        push_command, cwd=repo_root, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS
+    )
     if not push_result.ok:
         detail = command_failure_message(push_command, push_result, "git push failed")
         return StrandedTipOutcome(
