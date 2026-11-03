@@ -55,7 +55,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 from .checks import _is_failing_run, summarize_checks
 from .ci_findings import _required_changes_from_checks
-from .labels import TransitionOutcome
+from .escalation import _record_issue_label_error
 from .markdown_fence import fenced_block
 from . import worker_fate
 from .rework_attempt_exemption import exempt_provider_throttle_rework_death
@@ -362,10 +362,11 @@ def _rearm_after_throttle_death(
     throttle death does after it: reset the entry to ``rework_requested`` (clearing
     the drift markers that would otherwise suppress or anchor a later pass), then the
     ``rework_requested`` label edge. An edge that returns a non-``APPLIED`` result is
-    recorded as ``label_error`` on the entry, as the sweep's other ``rework_requested``
-    edges do, so the failed write stays diagnosable; an exception out of the edge
-    itself is not handled here and reaches ``drain_no_op_rework_routes``' per-route
-    handler, which logs it (the entry is already ``rework_requested`` by then).
+    recorded as ``label_error`` on the entry through the shared
+    ``escalation._record_issue_label_error`` (not a local copy), so the failed write
+    stays diagnosable; an exception out of the edge itself is not handled here and
+    reaches ``drain_no_op_rework_routes``' per-route handler, which logs it (the
+    entry is already ``rework_requested`` by then).
     """
     import charlie_work.workflow as _wf
 
@@ -414,21 +415,7 @@ def _rearm_after_throttle_death(
         write_gate.save_state(state)
 
     result = write_gate.transition(gh, config.labels, issue_number, "rework_requested")
-    if result.outcome != TransitionOutcome.APPLIED:
-        with _wf.state_lock(state_file):
-            state = _wf.load_state(state_file)
-            latest = state["issues"].get(str(issue_number), {})
-            if isinstance(latest, dict):
-                state["issues"][str(issue_number)] = {
-                    **latest,
-                    "label_error": {
-                        "edge": "rework_requested",
-                        "outcome": result.outcome.value,
-                        "add_failures": result.add_failures,
-                        "remove_failures": result.remove_failures,
-                    },
-                }
-                write_gate.save_state(state)
+    _record_issue_label_error(state_file, write_gate, issue_number, "rework_requested", result)
     return True
 
 

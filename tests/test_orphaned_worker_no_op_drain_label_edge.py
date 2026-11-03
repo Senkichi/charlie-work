@@ -17,6 +17,7 @@ import pytest
 from _fakes_github import FakeGitHub
 from _rework_dispatch_fixtures import _wg
 
+from charlie_work import orphaned_worker_no_op_drain as drain_module
 from charlie_work.config import OrchestratorConfig
 from charlie_work.labels import TransitionOutcome, TransitionResult
 from charlie_work.orphaned_worker_no_op_drain import NoOpReworkRoute, drain_no_op_rework_routes
@@ -83,3 +84,28 @@ def test_non_applied_edge_is_recorded_as_label_error(
     assert entry["label_error"]["edge"] == "rework_requested"
     assert entry["label_error"]["outcome"] == outcome.value
     assert entry["label_error"]["add_failures"] == [[207, "agent:needs-rework"]]
+
+
+def test_non_applied_edge_goes_through_the_shared_label_error_helper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ``label_error`` write is ``escalation._record_issue_label_error``, not a local copy.
+
+    The helper is the single point of enforcement for persisting a failed edge. The spy
+    replaces it, so ``label_error`` is absent from the entry unless some *other* code
+    path (a re-introduced inline block) wrote it -- which is what this asserts against.
+    """
+    failed = TransitionResult(TransitionOutcome.PARTIAL_FAILURE, [(207, "agent:needs-rework")], [])
+    monkeypatch.setattr(WriteGate, "transition", lambda self, *a, **k: failed)
+    calls: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(drain_module, "_record_issue_label_error", lambda *a: calls.append(a))
+
+    entry, _gh, _config = _drain_throttle_death(tmp_path)
+
+    assert len(calls) == 1
+    state_file, write_gate, issue_number, edge, result = calls[0]
+    assert Path(state_file) == tmp_path / "state.json"
+    assert isinstance(write_gate, WriteGate)
+    assert (issue_number, edge, result) == (207, "rework_requested", failed)
+    assert entry["status"] == "rework_requested"
+    assert "label_error" not in entry  # only the (stubbed) helper may write it
