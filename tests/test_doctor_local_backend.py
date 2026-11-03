@@ -10,8 +10,12 @@ real client, and the positive controls use ``FakeDoctorGitHub`` doubles that
 keep the default ``publishes_pull_requests=True``.
 
 Sibling doctor-test seam: fixtures come from ``tests/_doctor_fixtures.py``;
-the small git/issue-file helpers are inlined here per this repo's convention
-of keeping each new test file self-contained (see test_local_review_ready.py).
+the repo is a copy of the per-process ``plain`` git template
+(``_worktree_fixtures._init_repo`` -> ``tests/_git_templates.py``) rather than
+a fresh ``git init`` + ``git commit`` per test -- two fewer process spawns in
+every test's ``call`` phase (issue #2966, the same remedy as #2387). The small
+issue-file helpers stay inlined here per this repo's convention of keeping each
+new test file self-contained (see test_local_review_ready.py).
 """
 
 from __future__ import annotations
@@ -31,34 +35,7 @@ from charlie_work.local_issues import LocalFileGitHub
 from charlie_work.paths import runtime_paths
 from charlie_work.state import empty_state, save_state
 from _doctor_fixtures import FakeDoctorGitHub, _config, _write_workflow
-
-
-def _init_repo(repo_root: Path) -> None:
-    """A fresh git repo with one commit and NO origin remote."""
-    subprocess.run(
-        ["git", "init", "--initial-branch=main"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    subprocess.run(
-        [
-            "git",
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "--allow-empty",
-            "-m",
-            "chore: seed",
-        ],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+from _worktree_fixtures import _init_repo  # one-commit ``main`` repo, NO origin remote
 
 
 def _write_issue(issues_dir: Path, number: int, *, slug: str = "issue") -> Path:
