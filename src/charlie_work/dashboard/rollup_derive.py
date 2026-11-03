@@ -145,6 +145,8 @@ KNOWN_IGNORED: dict[str, str] = {
     "infra_rerun_failed": "infra-rerun bookkeeping",
     "infra_rerun_backlog_deferred": "infra-rerun deferral bookkeeping",
     "infra_rerun_escalated": "infra-rerun escalation record",
+    "aggregate_job_rerun_triggered": "wedged-aggregate self-heal bookkeeping",
+    "aggregate_job_rerun_failed": "wedged-aggregate self-heal bookkeeping",
     # -- Config / host housekeeping.
     "config_key_deprecated_read": "deprecated-config diagnostic (issue #1976)",
     "config_key_retirement_armed": "config-retirement bookkeeping",

@@ -1,0 +1,5 @@
+info
+# Issue #2666: the self-heal lane re-ran the failed jobs of a required aggregate job that
+# GitHub killed at its timeout-minutes (a wedged runner) on a merge-queue PR or a queue-bot
+# draft. One event per workflow run, ever: the lane caps itself at one rerun per run id so a
+# real hang surfaces. Audit trail of an automated remedy, not a fault.

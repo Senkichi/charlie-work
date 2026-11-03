@@ -372,6 +372,7 @@ def run_deadline_guarded_maintenance(
     workflow -> github.
     """
     import charlie_work.workflow as _wf
+    from charlie_work.aggregate_job_heal import heal_best_effort
     from charlie_work.test_slots import drain_wait_timeouts, slot_dir
 
     sessions_dir = app._layout.sessions_dir
@@ -427,6 +428,13 @@ def run_deadline_guarded_maintenance(
     # reaper this cannot lose the race for the capacity it exists to
     # free. See _maybe_reclaim_superseded_main_ci's docstring.
     deadline.call(lambda: app._maybe_reclaim_superseded_main_ci(), None, lane="ci_reclaim")
+
+    # Issue #2666: re-run a required aggregate job that a wedged runner timed
+    # out on a merge-queue PR or a queue-bot draft -- nothing else looks at
+    # either (see aggregate_job_heal's docstring). REST only, so deliberately
+    # no budget-governor ``lane``: the GraphQL governor has nothing to defer.
+    # Its own ``aggregate_heal_interval_minutes`` cadence bounds the cost.
+    deadline.call(lambda: heal_best_effort(app, now=now), None)
 
     # Issue #1717: post-merge outcome attribution for the reviewer-effort
     # experiment (#1701) -- turn the two previously not-derivable outcome
