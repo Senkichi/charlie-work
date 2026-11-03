@@ -30,6 +30,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from _src_ast import parsed
 from charlie_work import cli, layout
 from charlie_work import supervise as supervise_module
 from charlie_work.command_result import CommandResult
@@ -64,7 +65,9 @@ SELF_GUARDED = {("fleet", "supervise"): ("fleet_dispatch", "run_fleet_supervise"
 
 
 def _parse(module_stem: str) -> ast.Module:
-    return ast.parse((PACKAGE_DIR / f"{module_stem}.py").read_text(encoding="utf-8"))
+    # Shared, read-only tree from the per-process cache (HS-CW-3, #2541). Every
+    # walker below only inspects it; none may mutate (the session guard fails if so).
+    return parsed(PACKAGE_DIR / f"{module_stem}.py")
 
 
 def _functions(tree: ast.Module) -> dict[str, ast.FunctionDef]:
