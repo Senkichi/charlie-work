@@ -339,6 +339,19 @@ def _load_layered_config(
         global_section = global_section if isinstance(global_section, dict) else {}
         repo_section = repo_section if isinstance(repo_section, dict) else {}
 
+        # Issue #2754: retirement is a per-repo key. A global-layer value
+        # must not be able to retire the whole fleet, so drop it from the
+        # fleet-wide layer before the merge. The per-repo layer still wins.
+        if section == "fleet" and "retired" in global_section:
+            global_section = {
+                key: value for key, value in global_section.items() if key != "retired"
+            }
+            logger.warning(
+                "Layered config: ignoring user-global fleet.retired in %s -- "
+                "retirement is per-repo (issue #2754)",
+                global_config_path,
+            )
+
         # Merge: repo values override global values. The api_worker section is
         # deep-merged so partial per-repo overrides (e.g. budget caps or provider
         # additions) do not drop global defaults. All other sections keep the
