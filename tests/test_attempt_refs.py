@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from unittest import mock
 
 from _worktree_fixtures import _init_repo as _init_repo_templated
 from charlie_work.attempt_refs import (
@@ -64,11 +65,77 @@ def _commit(repo_root: Path, name: str, content: str) -> str:
     return _git(repo_root, "rev-parse", "HEAD").stdout.strip()
 
 
+def _seed_branch_commit(repo_root: Path, branch: str, name: str, content: str) -> str:
+    """Create ``branch`` one commit ahead of ``main`` in one ``git fast-import``
+    spawn and return the new tip SHA.
+
+    Replaces the ``checkout -b`` + ``add`` + ``commit`` + ``rev-parse`` quartet
+    (four spawns, plus an index rewrite and a working-tree write) for a test that
+    only needs the branch *ref* to exist: ``snapshot_attempt_ref`` resolves the
+    branch by name and never reads HEAD, the index or the working tree. HEAD
+    therefore stays on ``main``. ``--export-marks`` hands back the SHA without a
+    ``rev-parse`` (same shape as ``_backfill_gate_fixtures._make_repo_with_fix``,
+    issue #2605; ledger precedent #2569). Issue #2936.
+    """
+    marks_path = repo_root.parent / f"{repo_root.name}.marks"
+    subprocess.run(
+        ["git", "fast-import", "--quiet", f"--export-marks={marks_path}"],
+        cwd=repo_root,
+        # input as bytes: text=True would translate \n to \r\n on Windows
+        # stdin, and git parses the \r as part of each command line.
+        input=(
+            f"commit refs/heads/{branch}\n"
+            "mark :1\n"
+            "committer Test User <test@example.test> 0 +0000\n"
+            "data <<MSG\n"
+            f"add {name}\n"
+            "MSG\n"
+            "from refs/heads/main\n"
+            f"M 100644 inline {name}\n"
+            "data <<EOT\n"
+            f"{content}"
+            "EOT\n"
+        ).encode(),
+        check=True,
+        capture_output=True,
+    )
+    return marks_path.read_text(encoding="utf-8").split()[1]  # ":1 <sha>"
+
+
+def test_seed_branch_commit_is_one_spawn_one_commit_ahead_of_main(tmp_path: Path) -> None:
+    """Issue #2936 regression pin: the preserves-tip fixture must build its branch
+    in a single child process, as a real commit whose only parent is ``main``.
+
+    The ledger flagged ``test_snapshot_attempt_ref_preserves_tip`` at 2.3x
+    baseline (0.583 s -> 1.313 s median on CI) with no change to this code path:
+    the first slow SHA touches only ``aggregate_job_heal``/``infra_rerun_refusal``.
+    The repo's documented mechanism for that shape is a loaded runner inflating
+    per-spawn and per-file cost (#2577, #2605), so the fix is fewer call-phase
+    spawns -- nine became six. Counting ``Popen`` (which ``subprocess.run``
+    goes through) catches a regression back to ``_git``/``run_captured`` calls
+    as well as a second ``fast-import``.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    main_tip = _git(repo_root, "rev-parse", "main").stdout.strip()
+
+    with mock.patch.object(subprocess, "Popen", wraps=subprocess.Popen) as popen:
+        tip = _seed_branch_commit(repo_root, "agent/issue-1", "work.txt", "some work\n")
+
+    assert popen.call_count == 1
+    assert _git(repo_root, "rev-parse", "agent/issue-1").stdout.strip() == tip
+    # `--parents -n1` prints "<commit> <parent>..."; a single parent that is main's tip.
+    assert _git(repo_root, "rev-list", "--parents", "-n1", tip).stdout.split() == [tip, main_tip]
+    assert _git(repo_root, "show", f"{tip}:work.txt").stdout == "some work\n"
+    # The seed must not move HEAD or dirty the tree the other tests in this module rely on.
+    assert _git(repo_root, "symbolic-ref", "--short", "HEAD").stdout.strip() == "main"
+    assert _git(repo_root, "status", "--porcelain").stdout == ""
+
+
 def test_snapshot_attempt_ref_preserves_tip(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
-    _git(repo_root, "checkout", "-b", "agent/issue-1")
-    tip = _commit(repo_root, "work.txt", "some work\n")
+    tip = _seed_branch_commit(repo_root, "agent/issue-1", "work.txt", "some work\n")
 
     snapshot = snapshot_attempt_ref(repo_root, "agent/issue-1", issue_number=1, base_ref="main")
 
