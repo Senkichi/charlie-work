@@ -9,7 +9,8 @@ attachment-point member ceiling, and ``transport.py`` sits at the edge of the
 800-line file-size ratchet (issue #1442).
 
 Why this exists: one unresolvable issue number in the batched query
-(``s_361: issue(number: 361)`` on a deleted/renumbered/hiccuping issue) makes
+(``s_361: issueOrPullRequest(number: 361)`` on a deleted/renumbered/hiccuping
+issue) makes
 ``gh api graphql`` exit non-zero for the WHOLE query -- but GitHub still
 answers HTTP 200 with partial ``data``: every other alias resolves normally
 and the bad alias is ``null``, alongside a per-node ``errors`` entry. Both
@@ -39,7 +40,24 @@ logger = logging.getLogger(__name__)
 
 
 def _issue_state_fields(chunk: list[int]) -> str:
-    return " ".join(f"s_{n}: issue(number: {n}) {{ number state }}" for n in chunk)
+    """One aliased ``issueOrPullRequest`` lookup per number (issue #2901).
+
+    ``repository.issue(number:)`` resolves issues ONLY: a pull request number
+    -- a blocker declared as ``Blocked by #<PR>`` -- came back ``null`` with a
+    per-node ``errors`` entry on every pass, forcing a per-issue fallback for
+    it each time. ``issueOrPullRequest`` is the lookup the per-issue fallback
+    (``issue view``, ``gh_json_fields.document_for``) already uses, so the
+    batch now answers for exactly the numbers the fallback could: a PR is
+    open iff its ``state`` is ``OPEN`` (``MERGED``/``CLOSED`` are not), the
+    same reading ``Issues.are_issues_open`` applies to an issue. ``number`` and
+    ``state`` are selected through both inline fragments because a union has
+    no fields of its own.
+    """
+    return " ".join(
+        f"s_{n}: issueOrPullRequest(number: {n}) "
+        f"{{ ... on Issue {{ number state }} ... on PullRequest {{ number state }} }}"
+        for n in chunk
+    )
 
 
 def graphql_issue_states(
