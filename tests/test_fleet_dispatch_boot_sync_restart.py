@@ -3,10 +3,11 @@
 ``heal_pending_sync_at_boot`` runs after the supervisor has imported everything,
 so a sync that replaces installed packages leaves this process on the old
 modules. These tests drive the *real* repair (only the ``git``/``uv`` subprocess
-seam is faked) through the real ``run_fleet_supervise`` and pin the three
-acceptance cases: a repair that synced requests a restart, a repair with nothing
-to do does not, and a repair that failed does not (so a persistent sync failure
-cannot become a restart loop).
+seam is faked) through the real ``run_fleet_supervise`` and pin the acceptance
+cases: a repair that synced *and converged* requests a restart; a repair with
+nothing to do, a repair that failed, and a sync that exited 0 but left the drift
+probe at exit 1 do not (so neither a persistent sync failure nor a persistent
+non-convergence can become a restart loop).
 
 Kept apart from ``test_fleet_dispatch_boot_sync_repair.py``, which pins the
 ordering of the repair against the lock and the config load (issue #2312).
@@ -50,8 +51,15 @@ _WATCHDOG_DISARMED = WatchdogProbe(armed=False, detail="task 'charlie-fleet-pass
 
 _PROBE_DRIFT = RunResult(1, "", "")  # ``uv sync --locked --check --inexact``: "would change"
 _PROBE_CLEAN = RunResult(0, "", "")
+_PROBE_UV_ERROR = RunResult(2, "", "error: Failed to parse `uv.lock`", error="command exited 2")
+_PROBE_TIMED_OUT = RunResult(
+    None, "", "", timed_out=True, error="command timed out after 30s"
+)  # no exit code: neither clean nor drift
 _SYNC_OK = RunResult(0, "", "")
 _SYNC_FAILED = RunResult(1, "", "error: failed to build a wheel")
+
+_CHECK_ARGV = ["uv", "sync", "--locked", "--check", "--inexact"]
+_SYNC_ARGV = ["uv", "sync", "--locked", "--inexact"]
 
 
 class _Run:
@@ -134,6 +142,12 @@ def _real_repair(
     return heal, calls
 
 
+def _boot_sync_events(tmp_path: Path) -> list[dict]:
+    """The ``self_deploy_boot_sync`` events the real repair wrote under ``tmp_path``."""
+    state_path = layout.state_file_path(layout.default_state_root(tmp_path))
+    return query_events(state_path, kind="self_deploy_boot_sync")
+
+
 def _exit_code(result: CommandResult, monkeypatch: pytest.MonkeyPatch) -> int:
     """The process exit code ``cli.main`` derives from a ``fleet supervise`` result."""
     monkeypatch.setattr(cli, "run_fleet_supervise", lambda **_kwargs: result)
@@ -156,14 +170,12 @@ def test_synced_repair_requests_restart_before_config_load(
     relaunched process can acquire it. The exit code is the one the
     ``supervise-loop`` wrapper relaunches on.
     """
-    heal, calls = _real_repair(tmp_path, [_PROBE_DRIFT, _SYNC_OK])
+    heal, calls = _real_repair(tmp_path, [_PROBE_DRIFT, _SYNC_OK, _PROBE_CLEAN])
 
     result, run = _supervise(tmp_path, monkeypatch, heal)
 
-    assert [c[0] for c in calls] == [
-        ["uv", "sync", "--locked", "--check", "--inexact"],
-        ["uv", "sync", "--locked", "--inexact"],
-    ]
+    # detect drift -> sync -> confirm the sync converged (the restart's precondition)
+    assert [c[0] for c in calls] == [_CHECK_ARGV, _SYNC_ARGV, _CHECK_ARGV]
     assert result.ok is True
     assert result.data["exit_reason"] == BOOT_SYNC_EXIT_REASON
     assert result.data["restart_requested"] is True
@@ -171,6 +183,65 @@ def test_synced_repair_requests_restart_before_config_load(
     run.fleet_loop.assert_not_called()
     run.lock.release.assert_called_once_with()
     assert _exit_code(result, monkeypatch) == cli.EXIT_RESTART_REQUESTED
+
+
+def test_sync_that_leaves_drift_does_not_request_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sync that exits 0 but leaves the drift probe at exit 1 must not restart.
+
+    Restarting on ``uv sync`` exiting 0 alone would relaunch into the identical
+    sync on every boot when the probe keeps reporting drift (the wrapper's
+    relaunch cap retires one wrapper; the scheduled tick starts another), and the
+    fleet would never reach a pass. The supervisor must carry on into its pass
+    instead, and the non-convergence must be on the ``self_deploy_boot_sync`` event.
+    """
+    heal, calls = _real_repair(tmp_path, [_PROBE_DRIFT, _SYNC_OK, _PROBE_DRIFT])
+
+    result, run = _supervise(tmp_path, monkeypatch, heal)
+
+    # The behaviour first: it is what must hold, whatever commands got us here.
+    assert result.data["restart_requested"] is False
+    assert result.data["exit_reason"] == "max_passes"
+    run.load_config.assert_called_once()
+    run.fleet_loop.assert_called_once()
+    assert _exit_code(result, monkeypatch) == 0
+
+    assert [c[0] for c in calls] == [_CHECK_ARGV, _SYNC_ARGV, _CHECK_ARGV]
+    (event,) = _boot_sync_events(tmp_path)
+    assert event["payload"]["synced"] is False
+    assert event["payload"]["post_sync_check"] == "drift"
+    assert "did not converge" in event["payload"]["error"]
+
+
+@pytest.mark.parametrize(
+    "post_probe",
+    [
+        pytest.param(_PROBE_UV_ERROR, id="uv-error"),
+        pytest.param(_PROBE_TIMED_OUT, id="timeout"),
+    ],
+)
+def test_inconclusive_post_sync_probe_still_requests_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, post_probe: RunResult
+) -> None:
+    """Only exit 1 is drift: a post-sync probe that proves nothing keeps the restart.
+
+    The sync did succeed and replaced packages this process already imported, so
+    suppressing the restart on a probe timeout or a uv error would leave stale
+    modules in place for no reason.
+    """
+    heal, calls = _real_repair(tmp_path, [_PROBE_DRIFT, _SYNC_OK, post_probe])
+
+    result, run = _supervise(tmp_path, monkeypatch, heal)
+
+    assert [c[0] for c in calls] == [_CHECK_ARGV, _SYNC_ARGV, _CHECK_ARGV]
+    assert result.data["restart_requested"] is True
+    assert result.data["exit_reason"] == BOOT_SYNC_EXIT_REASON
+    run.load_config.assert_not_called()
+
+    (event,) = _boot_sync_events(tmp_path)
+    assert event["payload"]["synced"] is True
+    assert event["payload"]["post_sync_check"] == "inconclusive"
 
 
 @pytest.mark.parametrize(
