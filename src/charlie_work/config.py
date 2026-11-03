@@ -2305,6 +2305,14 @@ class FleetConfig:
     ``max_concurrent_sessions_by_harness`` (issue #2757): per-harness ceilings; see
     :mod:`charlie_work.fleet_harness_caps` for the shape and semantics.
 
+    ``harness_auth_block_enabled`` (issue #2810) is the kill switch for the
+    harness-auth fault response (:mod:`charlie_work.harness_auth_block`): a
+    worker death whose log shows the harness CLI could not authenticate
+    blocks that harness fleet-wide until a probe proves the credential is
+    back. ON by default; ``false`` restores the pre-#2810 behaviour exactly
+    (no classification, no block, no probe, no alert), and an already-recorded
+    block stops being honored the moment it is flipped.
+
     ``retired`` (issue #2754) is read from the repo's own config file only.
     ``global_config.load_layered_config`` strips it from the fleet-wide
     layer, so a global value cannot retire every repo in the fleet.
@@ -2316,6 +2324,7 @@ class FleetConfig:
     global_max_concurrent_reviews: Annotated[int, Typed, NonNeg] = 0
     launch_lock_wait_seconds: Annotated[float, Typed, NonNeg, Finite] = 10.0
     max_concurrent_sessions_by_harness: Mapping[str, int] = field(default_factory=dict)
+    harness_auth_block_enabled: Annotated[bool, Typed] = True
     # Issue #2754: per-repo retirement. The layered loader removes this key
     # from the user-global layer; see repo_retirement.
     retired: Annotated[bool, Typed] = False
