@@ -14,6 +14,7 @@ import pytest
 from _claude_adapter_fixtures import (
     _init_real_repo,
     _install_fake_create_worktree,
+    _install_fake_popen_worker,
 )
 
 from charlie_work import claude_code
@@ -38,6 +39,7 @@ def test_launch_claude_worker_pins_configured_model_by_default(
     repo_root.mkdir()
     sessions_dir = tmp_path / "sessions"
     _install_fake_create_worktree(monkeypatch, tmp_path)
+    _install_fake_popen_worker(monkeypatch)
 
     record = launch_claude_worker(
         42,
@@ -47,6 +49,7 @@ def test_launch_claude_worker_pins_configured_model_by_default(
         sessions_dir=sessions_dir,
     )
 
+    assert record.ok, record.error
     assert "--model" in record.command
     idx = record.command.index("--model")
     assert record.command[idx + 1] == claude_code._DEFAULT_CLAUDE_MODEL
@@ -59,6 +62,7 @@ def test_launch_claude_worker_honors_configured_model_override(
     repo_root.mkdir()
     sessions_dir = tmp_path / "sessions"
     _install_fake_create_worktree(monkeypatch, tmp_path)
+    _install_fake_popen_worker(monkeypatch)
     # Role-config Phase 1.5: the model-pin fallback (no model_override passed)
     # reads worker.model, not claude_code.model -- see claude_code.py's single
     # enforcement point in launch_claude_worker.
@@ -73,6 +77,7 @@ def test_launch_claude_worker_honors_configured_model_override(
         config=config,
     )
 
+    assert record.ok, record.error
     assert record.command.count("--model") == 1
     idx = record.command.index("--model")
     assert record.command[idx + 1] == "claude-opus-4-8"
@@ -91,6 +96,7 @@ def test_launch_claude_worker_model_override_wins_over_worker_model(
     repo_root.mkdir()
     sessions_dir = tmp_path / "sessions"
     _install_fake_create_worktree(monkeypatch, tmp_path)
+    _install_fake_popen_worker(monkeypatch)
     config = OrchestratorConfig(worker=WorkerRoleConfig(model="claude-sonnet-5"))
 
     record = launch_claude_worker(
@@ -103,6 +109,7 @@ def test_launch_claude_worker_model_override_wins_over_worker_model(
         model_override="kimi-k3",
     )
 
+    assert record.ok, record.error
     assert record.command.count("--model") == 1
     idx = record.command.index("--model")
     assert record.command[idx + 1] == "kimi-k3"
@@ -129,6 +136,7 @@ def test_launch_claude_worker_empty_worker_model_falls_back_to_claude_default(
     repo_root.mkdir()
     sessions_dir = tmp_path / "sessions"
     _install_fake_create_worktree(monkeypatch, tmp_path)
+    _install_fake_popen_worker(monkeypatch)
     config = OrchestratorConfig(
         worker=WorkerRoleConfig(harness="claude-code", model=""),
     )
@@ -142,6 +150,7 @@ def test_launch_claude_worker_empty_worker_model_falls_back_to_claude_default(
         config=config,
     )
 
+    assert record.ok, record.error
     assert record.command.count("--model") == 1
     idx = record.command.index("--model")
     assert record.command[idx + 1] == claude_code._DEFAULT_CLAUDE_MODEL
@@ -163,6 +172,7 @@ def test_launch_claude_worker_empty_reviewer_model_override_falls_back_to_claude
     repo_root.mkdir()
     sessions_dir = tmp_path / "sessions"
     _install_fake_create_worktree(monkeypatch, tmp_path)
+    _install_fake_popen_worker(monkeypatch)
     config = OrchestratorConfig(
         worker=WorkerRoleConfig(model="claude-should-not-be-read-either"),
         reviewer=ReviewerRoleConfig(model=""),
@@ -178,6 +188,7 @@ def test_launch_claude_worker_empty_reviewer_model_override_falls_back_to_claude
         model_override=config.reviewer.model,
     )
 
+    assert record.ok, record.error
     assert record.command.count("--model") == 1
     idx = record.command.index("--model")
     assert record.command[idx + 1] == claude_code._DEFAULT_CLAUDE_MODEL
@@ -193,6 +204,7 @@ def test_launch_claude_worker_worker_never_uses_review_effort(
     repo_root.mkdir()
     sessions_dir = tmp_path / "sessions"
     _install_fake_create_worktree(monkeypatch, tmp_path)
+    _install_fake_popen_worker(monkeypatch)
     config = OrchestratorConfig(
         claude_code=ClaudeCodeConfig(effort="low"),
         reviewer=ReviewerRoleConfig(effort="high"),
@@ -207,6 +219,7 @@ def test_launch_claude_worker_worker_never_uses_review_effort(
         config=config,
     )
 
+    assert record.ok, record.error
     assert record.command.count("--effort") == 1
     idx = record.command.index("--effort")
     assert record.command[idx + 1] == "low"
