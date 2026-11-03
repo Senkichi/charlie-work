@@ -64,6 +64,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -231,6 +232,45 @@ EOT
         capture_output=True,
     )
     return _TRACKED_VENV_BRANCH
+
+
+def _seed_diverged_branch(repo_root: Path, branch: str, filename: str = "work.txt") -> str:
+    """Make ``branch`` one commit ahead of ``main`` with no worktree; return its tip.
+
+    The state an abandoned worker leaves behind once its worktree is removed: a
+    diverged agent branch and no checkout (the #1944 shape). Built in one
+    ``git fast-import`` spawn plus one ``rev-parse`` instead of
+    ``create_worktree`` + ``git add`` + ``git commit`` + ``remove_worktree``,
+    which is about ten git processes -- process count is what the test ledger's
+    call-phase time tracks on the Windows runners (issue #3008; same lever as
+    #2569).
+
+    The commit parents on ``main`` with a current timestamp, like a real worker
+    commit would. Callers must not depend on the worktree-side effects of the
+    longer route (a registered-then-pruned worktree entry, the ``.var`` scaffold
+    dirs): the branch ref is the only thing a later ``create_worktree`` reads.
+    """
+    subprocess.run(
+        ["git", "fast-import", "--quiet"],
+        cwd=repo_root,
+        # input as bytes: text=True would translate \n to \r\n on Windows
+        # stdin, and git parses the \r as part of each command line.
+        input=f"""\
+commit refs/heads/{branch}
+committer Test User <test@example.test> {int(time.time())} +0000
+data <<MSG
+worker commit on agent branch
+MSG
+from refs/heads/main
+M 100644 inline {filename}
+data <<EOT
+local work
+EOT
+""".encode(),
+        check=True,
+        capture_output=True,
+    )
+    return _git(repo_root, "rev-parse", f"refs/heads/{branch}").stdout.strip()
 
 
 def _clone_repo(remote_repo: Path, repo_root: Path, *, fresh: bool = False) -> None:
