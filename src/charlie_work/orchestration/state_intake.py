@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import charlie_work.host_routing as host_routing
 import charlie_work.workflow as _wf
 from charlie_work.command_result import CommandResult
 from charlie_work import labels as _labels
@@ -21,7 +22,12 @@ from charlie_work import labels as _labels
 
 @_wf._guard_state_lock
 def intake(self) -> CommandResult:
-    issues = self.gh.issue_list(self.config.labels.ready)
+    # Issue #2906 / spec C2: another host intakes the issues it owns. Filtering
+    # here, before any per-issue read, keeps a foreign issue from costing an
+    # ``issue_view``, an issue folder, a worker-prompt render, a ``state.json``
+    # entry or a ``ready_observed`` episode on this host. A no-op while
+    # ``dispatch.host`` is unset.
+    issues = host_routing.local_issues(self.gh.issue_list(self.config.labels.ready), self.config)
     written: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
     prose_only_deps_issues: list[int] = []
