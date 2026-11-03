@@ -405,10 +405,11 @@ class DispatchConfig:
     test_command: Annotated[str, Typed, NullIsDefault] = ""
     # Kill switch for the selector probe. On (default), a worker or rework prompt asks
     # ``ci-fleet select`` whether it can narrow anything before it tells the worker to
-    # run ``ci-fleet test``; a selector that can only answer ``full`` (stale or missing
-    # selection map) leaves the hand-picked targeted command in place, so the worker is
-    # not handed a serial run of the whole suite. Off skips the probe: the prompt trusts
-    # the static preconditions alone. See selection_wrapper.probe_selection.
+    # run ``ci-fleet test`` (once per pass per repo, not once per prompt); a selector
+    # that can only answer ``full`` (stale or missing selection map) leaves the
+    # hand-picked targeted command in place, so the worker is not handed a serial run
+    # of the whole suite. Off skips the probe: the prompt trusts the static
+    # preconditions alone. See selection_wrapper.probe_selection.
     worker_selection_probe: Annotated[bool, Typed, NullIsDefault] = True
     # Global concurrency governor: cap total live worker sessions across fresh,
     # rework, and recovery dispatch. Unset/0 preserves current unlimited behavior.
