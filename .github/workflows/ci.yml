@@ -241,7 +241,7 @@ jobs:
         # The nightly's map pass does NOT store durations: its per-test
         # timings do not predict a plain run's. Measured on the test ledger
         # (#2924): in-process tests (no git, no subprocess) take 2-3x longer
-        # under the tracer, while git-driven tests come out at 0.55-0.7x of
+        # under the tracer, while git-driven tests come out at 0.63-0.68x of
         # their pull-request duration. Splitting pull requests on those
         # timings loaded shard 4/6 with ~1.4x the mean shard's cost.
         # "Refresh test durations" below is the one writer.
