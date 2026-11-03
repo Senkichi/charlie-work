@@ -132,22 +132,19 @@ def test_redispatch_over_a_present_clean_worktree_reaches_the_same_push(
     a PRESENT worktree that is clean but holds unpushed commits removes the
     directory itself, then re-checks the branch -- so the missing-directory
     rescue runs there too. Before the fix that second check failed with
-    ``[WinError 267]`` for exactly the same reason.
-
-    Deliberately dispatched without ``config``: with one, the #2847 salvage-push
-    retry publishes the branch itself and the worktree is reused (rework), which
-    is a different, already-handled path.
-    """
+    ``[WinError 267]`` for exactly the same reason."""
     remote, repo, branch, tip = _stranded_branch(wt_scratch, delete_dir=False)
     salvage_ref = salvage_ref_for_branch(branch)
+    config = OrchestratorConfig()
 
-    info = create_worktree(repo, branch, base_ref="HEAD", issue_number=ISSUE)
+    info = create_worktree(repo, branch, base_ref="HEAD", issue_number=ISSUE, config=config)
 
     assert _remote_ref_sha(remote, salvage_ref) == tip
     assert info.rescue_capture is not None
     assert info.rescue_capture.ref_name == salvage_ref
     assert info.path.exists()
     assert not (info.path / "work.txt").exists()
+    assert salvage_ref in [e["payload"]["rescue_ref"] for e in _events(repo, config)]
 
 
 def test_push_failure_keeps_worktree_unsafe_error_with_push_error(wt_scratch: Path) -> None:
