@@ -180,15 +180,12 @@ def provider_api_key_env_vars(config: "OrchestratorConfig | None") -> tuple[str,
     merge-gate suite launch (``orchestration.local_merge_gate`` ->
     ``local_suite_runner.launch_suite_gate``), which runs the PR branch's
     worker-authored test suite. Other children of the orchestrator or
-    supervisor process inherit ``os.environ`` raw —
+    supervisor process inherit ``os.environ`` raw, such as
     ``subprocess_runner.run_captured`` children
-    (``env = {**os.environ, ...}``) and, via ci_fleet's own
-    ``runners._sanitize_env`` (which strips only ``UV_/VIRTUAL_ENV/PYTHON/
-    PIP_/CLAUDE`` prefixes), every runner listener the allocator starts and
-    every self-hosted CI job step. That residual ambient exposure is
-    documented as accepted in docs/RUNBOOK.md's API-worker section; stripping
-    those surfaces is a ci_fleet-side or future charlie-work change keyed on
-    the same config-derived names this function returns.
+    (``env = {**os.environ, ...}``). That residual ambient exposure is
+    documented as accepted in docs/RUNBOOK.md's API-worker section. Runner
+    listeners, and so CI job steps, get the same names stripped through
+    :mod:`charlie_work.ci_fleet_env_strip` (issue #2902).
     """
     if config is None:
         return ()
