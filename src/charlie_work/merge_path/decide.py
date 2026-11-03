@@ -54,12 +54,13 @@ from .mergequeue import (
     requeue_accounting,
     requeue_gate,
 )
+from .alarm_text import alarm_warning
+from .human_block import human_block_gate
 from .readiness_gates import decide_revert, deescalates
 from .rules import (
     CHECK_ROUTE_EXCLUDED_STATUSES,
     CONFLICT_REWORK_IN_FLIGHT_STATUSES,
     CONFLICT_ROUTE_EXCLUDED_STATUSES,
-    format_merge_attempt_alarm_message,
     is_pending_only,
     readiness_no_ci_stall,
 )
@@ -453,6 +454,9 @@ def decide_merge(readiness: Readiness, holds: HoldFacts) -> MergePlan:
         raise FactNotGathered("merge_hold is needed: a mergequeue hand-off is possible")
     merge_hold = read_merge_hold and holds.merge_hold is True
     merge_hold_unavailable = read_merge_hold and holds.merge_hold_unavailable
+    # Issue #2763: a human's outstanding request-changes holds a merge AND a
+    # hand-off -- unlike ``merge_hold`` it is not gated on the queue label.
+    human_block = human_block_gate(enter, holds)
 
     # Issue #2743: the projected same-head queue-revert count and cap verdict,
     # counted only when this pass would attempt the re-add (a held pass is a
@@ -465,7 +469,7 @@ def decide_merge(readiness: Readiness, holds: HoldFacts) -> MergePlan:
     requeue_rework = requeue.rework
 
     action_hand_off = re_add_pending and not requeue_capped
-    action_merge = enter and not label
+    action_merge = enter and not label and not human_block.held
     action_human_merge = human_hold and can_merge and should_merge and not escalated_merge_hold
 
     # ``int()``: legacy coerced the persisted counter (a hand-edited state file).
@@ -523,6 +527,7 @@ def decide_merge(readiness: Readiness, holds: HoldFacts) -> MergePlan:
         held.add(Hold.CHECKS_UNAVAILABLE)
     if requeue_capped:
         held.add(Hold.REQUEUE_CAPPED)
+    held |= human_block.holds
 
     kind: PlanKind
     if readiness.kind is not StageKind.PROCEED:
@@ -551,6 +556,10 @@ def decide_merge(readiness: Readiness, holds: HoldFacts) -> MergePlan:
         read_merge_hold=read_merge_hold,
         merge_hold=merge_hold,
         merge_hold_unavailable=merge_hold_unavailable,
+        read_human_block=human_block.read_needed,
+        human_block=human_block.blocked,
+        human_block_unavailable=human_block.unavailable,
+        human_block_source=human_block.source,
         # A re-apply while the label is still reverted must not reset the
         # counter (ADR-0003): the revert is what keeps it climbing.
         reset_failed_attempts_on_hand_off=not adm.mergequeue_label_reverted,
@@ -566,28 +575,6 @@ def decide_merge(readiness: Readiness, holds: HoldFacts) -> MergePlan:
 # --------------------------------------------------------------------------- #
 # Stage 5: accounting
 # --------------------------------------------------------------------------- #
-
-
-def _route_detail(
-    issue_number: int | None,
-    *,
-    routed: bool,
-    escalated: bool,
-    label_error: Mapping[str, Any] | None,
-    issue_status_after: str | None,
-) -> str:
-    if issue_number is None:
-        return "no linked issue, cannot route to rework"
-    if escalated:
-        return "conflict-rework cap exhausted; escalated to a human"
-    if routed:
-        if label_error:
-            outcome = label_error.get("outcome", label_error)
-            return f"rework dispatch attempted (label update failed: {outcome})"
-        return "rework dispatched"
-    if issue_status_after == "rework_requested":
-        return "rework already requested"
-    return "rework not routed"
 
 
 def _frozen(data: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -632,7 +619,7 @@ def decide_accounting(
             attempts = min(attempts, threshold + 1)
         alarm = threshold > 0 and attempts == threshold
         if alarm:
-            warning = _alarm_warning(readiness, results, facts, attempts, handoff_failed)
+            warning = alarm_warning(readiness, results, facts, attempts, handoff_failed)
             events.append(
                 EventSpec(
                     "merge_failed_attempt_alarm",
@@ -659,6 +646,7 @@ def decide_accounting(
         and results.merge_output is None
         and not handoff_failed
         and not plan.merge_hold_unavailable
+        and not plan.human_block_unavailable
         and not readiness.human_merge_hold
         and not readiness.human_merge_check_unavailable
     )
@@ -699,6 +687,9 @@ def decide_accounting(
                     "merged": merged,
                     "merge_hold": plan.merge_hold,
                     "merge_hold_check_unavailable": plan.merge_hold_unavailable,
+                    "human_block": plan.human_block,
+                    "human_block_check_unavailable": plan.human_block_unavailable,
+                    "human_block_source": plan.human_block_source,
                     "human_merge_hold": readiness.human_merge_hold,
                     "human_merge_check_unavailable": readiness.human_merge_check_unavailable,
                     "cancel_superseded_runs_results": results.cancel_results,
@@ -738,61 +729,4 @@ def decide_accounting(
         mergequeue_requeues=requeues,
         mergequeue_requeues_head_sha=requeues_head,
         events=tuple(events),
-    )
-
-
-def _alarm_warning(
-    readiness: Readiness,
-    results: EffectResults,
-    facts: AccountingFacts,
-    attempts: int,
-    handoff_failed: bool,
-) -> str:
-    """Alarm text; priority: conflict > cross-PR revert > hand-off > failed checks > generic."""
-    summary = readiness.summary
-    pr_number = facts.pr_number
-    issue_number = facts.issue_number
-    pass_str = "pass" if attempts == 1 else "passes"
-    lead = f"PR #{pr_number} approved but unmergeable for {attempts} {pass_str}: "
-    if readiness.branch.merge_conflict:
-        detail = _route_detail(
-            issue_number,
-            routed=results.conflict_routed,
-            escalated=results.conflict_escalated,
-            label_error=results.rework_label_error,
-            issue_status_after=results.issue_status_after,
-        )
-        return f"{lead}merge conflict — {detail}"
-    if readiness.cross_pr_revert_detected:
-        detail = _route_detail(
-            issue_number,
-            routed=results.cross_pr_revert_routed,
-            escalated=False,
-            label_error=results.rework_label_error,
-            issue_status_after=results.issue_status_after,
-        )
-        return f"{lead}cross-PR revert — {detail}"
-    if handoff_failed:
-        return (
-            f"PR #{pr_number} approved and checks green but the mergequeue "
-            f"label {facts.config.mergequeue_label!r} failed to "
-            f"apply for {attempts} {pass_str} — never handed off to "
-            "Aviator"
-        )
-    if summary.failed:
-        detail = _route_detail(
-            issue_number,
-            routed=results.check_failure_routed,
-            escalated=False,
-            label_error=results.rework_label_error,
-            issue_status_after=results.issue_status_after,
-        )
-        failed_str = ", ".join(summary.failed)
-        return f"{lead}required check(s) failed ({failed_str}) — {detail}"
-    return format_merge_attempt_alarm_message(
-        pr_number,
-        attempts,
-        summary,
-        mergeable=facts.mergeable,
-        merge_state_status=facts.merge_state_status,
     )

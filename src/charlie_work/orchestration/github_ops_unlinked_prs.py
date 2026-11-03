@@ -53,11 +53,13 @@ in ``entries``.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 
 import charlie_work.workflow as _wf
 from charlie_work.pr_unlinked_visibility import (
+    NO_LINKED_ISSUE_REASON,
     UNLINKED_PR_NOTICE_KEY,
     UNLINKED_PR_RESOLVED_EVENT_KIND,
     UNLINKED_PR_SKIPPED_EVENT_KIND,
@@ -75,13 +77,20 @@ def _record_unlinked_pr_skips(
     *,
     now: datetime,
     linked_prs: dict[int, int],
+    reasons: Mapping[int, str] | None = None,
 ) -> None:
     """Batch edge-triggered notice for every PR the merge lane skipped this pass.
 
     ``entries`` is collected by the per-PR loop in ``reap_loop._loop_body``
     at the exact site that used to ``continue`` with zero instrumentation --
     one ``(pr, pr_number)`` pair per PR whose linked issue could not be
-    resolved -- and this is called once, after that loop finishes. For each
+    resolved, or (issue #2763) that binds to an issue the fleet does not own --
+    and this is called once, after that loop finishes. ``reasons`` maps a PR
+    number to why it was skipped when that is not the original "no linked
+    issue" case (``fleet_ownership.NOT_FLEET_OWNED_REASON``); it is stamped on
+    the event as ``reason`` and is part of the edge comparison, so a PR that
+    flips from one classification to the other is announced even though its
+    fingerprint is unchanged. For each
     entry, emits ``pr_unlinked_skipped`` when the PR is first seen, and again
     only when its persisted fingerprint (``mergeable``/``mergeStateStatus``/
     head SHA -- already in hand from this pass's ``pr_list()`` call, so this
@@ -115,8 +124,9 @@ def _record_unlinked_pr_skips(
                 fingerprint = unlinked_pr_fingerprint(pr)
                 pr_state = dict(state["prs"].get(str(pr_number)) or {})
                 marker = pr_state.get(UNLINKED_PR_NOTICE_KEY)
+                reason = (reasons or {}).get(pr_number)
                 new_marker, event_extra = compute_unlinked_pr_transition(
-                    marker, fingerprint, now=now
+                    marker, fingerprint, now=now, reason=reason
                 )
                 if event_extra is None:
                     continue
@@ -130,6 +140,7 @@ def _record_unlinked_pr_skips(
                         "pr_number": pr_number,
                         "author": author,
                         "is_bot": is_bot,
+                        "reason": reason or NO_LINKED_ISSUE_REASON,
                         **fingerprint.as_dict(),
                         **event_extra,
                     },

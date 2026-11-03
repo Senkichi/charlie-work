@@ -772,6 +772,18 @@ class ReviewConfig:
         "not automated rework",
         "confirm explicitly",
     )
+    # Issue #2763: the review/merge lane only drives a PR the fleet OWNS (see
+    # ``issue_linking.fleet_owns_pr``): one on the ``dispatch.branch_prefix``
+    # namespace, whose linked issue carries ``labels.ready``, or whose issue
+    # has dispatch provenance in ``state.issues``. A same-repo PR that merely
+    # names an issue with a closing keyword binds to that issue (intended --
+    # ``linked_issue_number``), but is NOT enough to adopt it: an operator's
+    # own session PR for an issue the fleet never dispatched was reviewed and
+    # handed to the merge queue over an outstanding human request-changes.
+    # An un-owned PR is routed to the existing ``pr_unlinked_skipped`` path
+    # (``reason: not_fleet_owned``) and is never reviewed or enqueued. Ships ON;
+    # False is the kill switch and restores the old "any bound PR" behavior.
+    require_fleet_ownership: bool = True
 
     def __post_init__(self) -> None:
         # Mirror DispatchConfig.__post_init__: ``load_config`` validates and
@@ -1275,6 +1287,29 @@ class AutoMergeConfig:
     # honours the same bound so it cannot re-add behind the cap's back. A new
     # head SHA gets a fresh budget. 0 disables the gate (counting continues).
     mergequeue_requeue_cap: Annotated[int, Typed, NonNeg] = 3
+    # Issue #2763: respect an outstanding human block. The merge lane approves
+    # on the fleet's own verdict only; a human "request changes" (a formal
+    # ``reviewDecision == CHANGES_REQUESTED`` review, or -- for the single-
+    # account case, where a PR author cannot formally request changes on their
+    # own PR -- a verdict comment) used to be invisible to it. When True, the
+    # merge-path hold (evaluated lazily, only when a hand-off/merge is about to
+    # happen, so a normal pass adds no GitHub call) holds the PR: no
+    # ``mergequeue`` label, no merge, no escalation, and it self-clears when the
+    # signal clears. Comments carrying the orchestrator-generated marker are
+    # the fleet's own, and comments by GitHub App/bot accounts are not a
+    # human's; neither is ever read as a human verdict. Unreadable
+    # comments fail closed (hold). Ships ON; False is the kill switch.
+    honor_human_block: bool = True
+    # Case-insensitive patterns deciding the newest non-fleet, non-bot verdict comment.
+    # The defaults match the marker form (``<!-- review-verdict: request-changes -->``
+    # / ``<!-- review-verdict: approved -->``) and the plain ``**Verdict: request
+    # changes.**`` / ``Verdict: approved`` text sessions already post.
+    human_block_request_changes_pattern: Annotated[str, Typed, NonEmptyRaw, Regex] = (
+        r"<!--\s*review-verdict:\s*request-changes\s*-->|\bverdict:\**\s*request[ -]changes\b"
+    )
+    human_block_approved_pattern: Annotated[str, Typed, NonEmptyRaw, Regex] = (
+        r"<!--\s*review-verdict:\s*approved\s*-->|\bverdict:\**\s*approved\b"
+    )
     # Issue #2666: cadence (minutes) of the wedged-aggregate self-heal lane. A
     # required check (``required_checks``) on a ``mergequeue``-labelled PR or a
     # queue-bot draft that GitHub killed at its ``timeout-minutes`` (a wedged

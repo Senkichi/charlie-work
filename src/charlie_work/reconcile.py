@@ -52,7 +52,7 @@ from .github import (
     build_branch_issue_validator_from_issues,
     label_names,
 )
-from .issue_linking import linked_issue_number
+from .issue_linking import fleet_owns_pr, linked_issue_number
 from .instrumentation import query_events
 from .labels import TransitionOutcome, apply_issue_labels, transition
 from .local_lane import synthesize_open_pr
@@ -1365,8 +1365,20 @@ def detect_drift(
         if issue_number in foreign_issues:
             continue
         if issue_number is not None:
+            # An un-owned PR (issue #2763: a closing keyword for an issue the fleet
+            # never dispatched, off the agent branch namespace) stays in
+            # ``prs_linking_issue`` so the active-label guards still see it, but
+            # is withheld from ``open_prs_by_issue``: that map feeds the
+            # ``issue_active_label_with_open_pr`` / ``stale_issue_pr_number``
+            # self-heals, which would otherwise ADOPT it (``agent:pr-open`` plus an
+            # ``open_passive`` state entry) and hand it to the review/merge lane.
             prs_linking_issue.setdefault(issue_number, []).append(pr)
-            if gh_state == "OPEN":
+            if gh_state == "OPEN" and fleet_owns_pr(
+                pr,
+                label_names(issues_by_number.get(issue_number) or {}),
+                state.get("issues", {}).get(str(issue_number)),
+                config,
+            ):
                 open_prs_by_issue.setdefault(issue_number, []).append(pr)
 
         state_entry = state_prs.get(str(pr_number))
