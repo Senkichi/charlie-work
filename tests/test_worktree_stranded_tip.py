@@ -66,8 +66,9 @@ def _remote_ref_sha(remote: Path, ref: str) -> str | None:
 def _stranded_branch(wt_scratch: Path, *, delete_dir: bool = True) -> tuple[Path, Path, str, str]:
     """A repo with a remote and an agent branch ahead of it, worktree dir gone.
 
-    Returns ``(remote, repo, branch, tip)``. The directory is deleted from
-    under git (the registration is left stale, as after a crashed cleanup).
+    Returns ``(remote, repo, branch, tip)``. By default the directory is deleted
+    from under git (the registration is left stale, as after a crashed
+    cleanup); ``delete_dir=False`` leaves the clean worktree in place.
     """
     remote = wt_scratch / "remote"
     _init_repo(remote)
@@ -78,7 +79,7 @@ def _stranded_branch(wt_scratch: Path, *, delete_dir: bool = True) -> tuple[Path
     tip = _commit_in(info.path)
     if delete_dir:
         shutil.rmtree(info.path)
-    assert not info.path.exists()
+    assert info.path.exists() is not delete_dir
     return remote, repo, branch, tip
 
 
@@ -122,6 +123,31 @@ def test_missing_worktree_dir_pushes_tip_to_salvage_ref_and_dispatch_proceeds(
     assert payload["issue_number"] == ISSUE
     assert "not on remote branch" in payload["reason"]
     assert not any(marker in str(payload) for marker in WORKING_TREE_CAPTURE_FAILURES)
+
+
+def test_redispatch_over_a_present_clean_worktree_reaches_the_same_push(
+    wt_scratch: Path,
+) -> None:
+    """The directory need not be gone when dispatch starts. A fresh dispatch over
+    a PRESENT worktree that is clean but holds unpushed commits removes the
+    directory itself, then re-checks the branch -- so the missing-directory
+    rescue runs there too. Before the fix that second check failed with
+    ``[WinError 267]`` for exactly the same reason.
+
+    Deliberately dispatched without ``config``: with one, the #2847 salvage-push
+    retry publishes the branch itself and the worktree is reused (rework), which
+    is a different, already-handled path.
+    """
+    remote, repo, branch, tip = _stranded_branch(wt_scratch, delete_dir=False)
+    salvage_ref = salvage_ref_for_branch(branch)
+
+    info = create_worktree(repo, branch, base_ref="HEAD", issue_number=ISSUE)
+
+    assert _remote_ref_sha(remote, salvage_ref) == tip
+    assert info.rescue_capture is not None
+    assert info.rescue_capture.ref_name == salvage_ref
+    assert info.path.exists()
+    assert not (info.path / "work.txt").exists()
 
 
 def test_push_failure_keeps_worktree_unsafe_error_with_push_error(wt_scratch: Path) -> None:
