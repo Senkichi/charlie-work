@@ -195,6 +195,7 @@ from .throttle_signatures import (
     match_throttle_tail,
     parse_reset_clock_time,
 )
+from . import infra_rerun_refusal as _refusal
 from . import markdown_guard
 from .write_gate import WriteGate
 
@@ -1908,14 +1909,10 @@ def _format_stale_base_alarm_message(pr_number: int, attempts: int, reason: str)
 def _is_rerun_already_running_error(error: str) -> bool:
     """Return True if a ``gh run rerun`` error means the run is still in progress.
 
-    GitHub refuses to rerun a workflow while any job in the run is still
-    running. The CLI surfaces this with the phrase ``already running`` in the
-    error, e.g. ``run <id> cannot be rerun; This workflow is already running``
-    or ``The workflow run containing this job is already running``. Other
-    refusal reasons (expired run, broken workflow file, missing permissions,
-    ...) do not contain this phrase and should not be treated as retryable.
+    Kept as the ``_wf.`` seam its callers use; the classifier itself lives in
+    ``infra_rerun_refusal.is_rerun_already_running`` (shared with the aggregate heal lane).
     """
-    return "already running" in error.lower()
+    return _refusal.is_rerun_already_running(error)
 
 
 def _try_reap_blocked_foreign_writer(
@@ -2016,9 +2013,13 @@ class OrchestratorApp:
         dry_run: bool = False,
         fleet_dir_override: str | None = None,
         host: HostPorts | None = None,
+        ignore_pause: bool = False,
     ):
         # Production composition only; tests use the ``fake_host`` fixture.
         self._host = host
+        # Issue #2766: ``--ignore-pause`` for this process -- the worker launch
+        # gate (fleet_pause.launch_pause_fields) stands down for a deliberate one-shot.
+        self.ignore_pause = ignore_pause
         self.repo_root = repo_root
         self.paths = paths
         self.config = config

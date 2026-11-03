@@ -17,6 +17,14 @@ chain by PID without a tree kill, prove it stayed down):
   ``bash-rats``) are gated once, in ``cli.main``, before ``self_deploy()`` or
   any dispatch (issue #2660): they exit ``EXIT_FLEET_PAUSED`` unless given
   ``--ignore-pause``. A command opts in via ``mark_pass_running``.
+- A pause also stops *new worker launches* inside a fleet pass already
+  running (issue #2766): a fleet pass walks the registry for minutes, so the
+  loop-boundary read above would otherwise let every repo it has not reached
+  launch a full cap of workers after the operator paused. The one gate every
+  worker launch goes through (``worker_launch_gate.issue_worker_launch_permit``)
+  reads the flag fresh via :func:`launch_pause_fields` and defers with
+  ``fleet_paused``. ``--ignore-pause`` rides on the app
+  (:func:`ignore_pause_requested`) so a deliberate one-shot still launches.
 
 Unlike the one-shot stop marker (``fleet_stop``) the flag is never consumed by
 the supervisor; only ``resume`` removes it. The flag is read from disk every
@@ -32,7 +40,7 @@ import logging
 import os
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from . import host as _host
 from . import layout
@@ -98,14 +106,18 @@ def read_fleet_pause(fleet_dir_override: str | None) -> dict[str, Any] | None:
 
     Existence is the signal: a present-but-unreadable/malformed flag still
     means *paused* (payload ``{}``) -- failing open would silently resume a
-    fleet the operator paused. Only an absent file is ``None``.
+    fleet the operator paused. Only an absent file is ``None``. "Malformed"
+    includes bytes that are not UTF-8: Windows PowerShell 5.1 writes UTF-16
+    for ``... > fleet-pause.json``, and since issue #2766 this read sits on
+    every worker launch, where raising would crash the lane instead of
+    deferring it.
     """
     path = layout.fleet_pause_path(fleet_dir_override)
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         logger.warning("unreadable fleet pause flag %s; treating as paused", path)
         return {}
     try:
@@ -171,6 +183,49 @@ def mark_pass_running(parser: argparse.ArgumentParser) -> None:
     parser.set_defaults(**{PASS_RUNNING_DEST: True})
 
 
+def ignore_pause_requested(args: argparse.Namespace) -> bool:
+    """Whether ``--ignore-pause`` was given (``False`` for a command without the flag).
+
+    The one reader of the flag's dest, so ``refuse_pass_while_paused`` (which
+    lets the command start) and the app constructors (which let it launch) cannot
+    disagree about what the override means.
+    """
+    return bool(getattr(args, "ignore_pause", False))
+
+
+class PauseAwareApp(Protocol):
+    """What the launch gate reads off an ``OrchestratorApp``."""
+
+    fleet_dir_override: str | None
+    ignore_pause: bool
+
+
+def launch_pause_fields(app: PauseAwareApp) -> dict[str, Any] | None:
+    """Deferral fields while the pause flag blocks new worker launches, else ``None``.
+
+    Issue #2766: a fleet pass walks every registered repo for minutes, but the
+    supervisor reads the flag only between fleet passes, so a pause written
+    part-way through one left every repo it had not reached free to launch a
+    full cap of workers. ``worker_launch_gate.issue_worker_launch_permit`` calls
+    this at its top -- lock-free, before the fleet lock -- so each lane's
+    launch decision reads the flag fresh from disk (never a copy cached at
+    pass start) and a paused fleet never contends for the lock.
+
+    Only *starting* work is gated: running workers, in-flight reviews,
+    reconcile and salvage do not pass through the permit and are untouched.
+    ``--ignore-pause`` (``app.ignore_pause``) bypasses it. Existence is the
+    signal (:func:`read_fleet_pause`), so an unreadable flag still blocks.
+    """
+    if app.ignore_pause:
+        return None
+    flag = read_fleet_pause(app.fleet_dir_override)
+    if flag is None:
+        return None
+    # ``pause_reason``, not ``reason``: ``fleet_dispatch._add_skip_reasons``
+    # reads ``data["reason"]`` as a skip reason ahead of ``deferred_reason``.
+    return {"paused_at": flag.get("paused_at"), "pause_reason": flag.get("reason")}
+
+
 def _command_label(args: argparse.Namespace) -> str:
     fleet_command = getattr(args, "fleet_command", None)
     parts = [str(args.command)] + ([str(fleet_command)] if fleet_command else [])
@@ -201,7 +256,7 @@ def refuse_pass_while_paused(args: argparse.Namespace) -> CommandResult | None:
     command = _command_label(args)
     flag_path = layout.fleet_pause_path(fleet_dir_override)
     reason = flag.get("reason")
-    if getattr(args, "ignore_pause", False):
+    if ignore_pause_requested(args):
         logger.warning(
             "--ignore-pause: running `charlie %s` although the fleet is paused (%s present, "
             "paused_at=%s, reason=%s)",

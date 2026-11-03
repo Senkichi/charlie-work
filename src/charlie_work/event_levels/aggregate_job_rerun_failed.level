@@ -1,0 +1,6 @@
+warning
+# Issue #2666: the wedged-aggregate self-heal lane could not re-run a timed-out required job
+# (GitHub refused the rerun call; stage "rerun") or a whole tick failed (stage "pass", e.g. an
+# unreadable open-PR list). Warning, not error: a refused rerun is retried a bounded number of
+# times and a failed tick re-arms its cadence; the stuck PR still surfaces through
+# mergequeue_stalled.

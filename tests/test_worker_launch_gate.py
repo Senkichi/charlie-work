@@ -1,8 +1,9 @@
 """Issue #2041: every worker lane launches through one permit-gated point.
 
 App-level lane tests (fresh ``dispatch`` and remote ``dispatch_rework``): an
-active provider throttle, a held fleet lock, or a governor clamped to zero each
-mean zero launches, and an ungated control launches. The local rework lane's
+active provider throttle, a held fleet lock, a fleet pause (issue #2766), or a
+governor clamped to zero each mean zero launches, and an ungated control
+launches. The local rework lane's
 equivalents live in ``tests/test_local_rework_launch_gates.py`` (issue #2039),
 which now exercises the same shared gate. The unit tests at the bottom pin
 ``_launch_workers``' refusals: a forged / absent / released permit, and a batch
@@ -24,8 +25,11 @@ from charlie_work.config import (
     OrchestratorConfig,
     WorkerRoleConfig,
 )
+from charlie_work import layout
+from charlie_work.fleet_pause import clear_fleet_pause, fleet_pause_pending, write_fleet_pause
 from charlie_work.fleet_registry import try_acquire_fleet_lock
 from charlie_work.host.fakes import FakeWorkerLauncher
+from charlie_work.instrumentation import query_events
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state, set_throttled_until, state_lock
 from charlie_work.worker_launch_gate import (
@@ -56,7 +60,14 @@ def _config(
     )
 
 
-def _app(tmp_path: Path, lane: str, **config_kw: Any) -> OrchestratorApp:
+def _app(
+    tmp_path: Path,
+    lane: str,
+    *,
+    fleet_dir: Path | None = None,
+    ignore_pause: bool = False,
+    **config_kw: Any,
+) -> OrchestratorApp:
     config = _config(**config_kw)
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     paths.root.mkdir(parents=True, exist_ok=True)
@@ -72,7 +83,12 @@ def _app(tmp_path: Path, lane: str, **config_kw: Any) -> OrchestratorApp:
         # No open PR covers the ready issue, so fresh dispatch selects it.
         fake_gh.prs[0]["state"] = "CLOSED"
     app = OrchestratorApp(
-        tmp_path, paths, config, fake_gh, fleet_dir_override=str(tmp_path / "fleet")
+        tmp_path,
+        paths,
+        config,
+        fake_gh,
+        fleet_dir_override=str(fleet_dir or tmp_path / "fleet"),
+        ignore_pause=ignore_pause,
     )
     if lane == REWORK:
         pr_dir = paths.prs / "pr-456"
@@ -191,6 +207,134 @@ def test_lane_releases_fleet_lock_after_launch(tmp_path: Path, fake_host, lane: 
     lock = try_acquire_fleet_lock(app.fleet_dir_override)
     assert lock is not None
     lock.release()
+
+
+# --- fleet pause (issue #2766) -----------------------------------------------
+#
+# The supervisor reads fleet-pause.json only between fleet passes; the permit
+# reads it at every launch decision, so a pause written part-way through a fleet
+# pass stops the repos that pass has not reached yet.
+
+
+def _pause(app: OrchestratorApp, reason: str = "shed host load") -> None:
+    write_fleet_pause(app.fleet_dir_override, reason=reason)
+
+
+def _deferrals(app: OrchestratorApp) -> list[dict[str, Any]]:
+    return query_events(app.paths.state_file, kind="dispatch_deferred")
+
+
+@LANES
+def test_pause_blocks_launch(tmp_path: Path, fake_host, lane: str) -> None:
+    app = _app(tmp_path, lane)
+    calls = _spy_dispatch_sessions(fake_host)
+    _pause(app)
+
+    result = _run(app, lane)
+
+    assert calls == []
+    assert result.ok  # the operator's own act is a deferral, not a failure
+    assert result.data["deferred_reason"] == "fleet_paused"
+    assert result.data["pause_reason"] == "shed host load"
+    assert result.data["paused_at"]
+    assert "reason" not in result.data  # fleet_dispatch reads data["reason"] as a skip reason
+    (event,) = _deferrals(app)
+    assert event["payload"]["deferred_reason"] == "fleet_paused"
+    assert event["payload"]["pause_reason"] == "shed host load"
+
+
+@LANES
+def test_pause_written_between_two_repos_blocks_the_second(
+    tmp_path: Path, fake_host, lane: str
+) -> None:
+    """The reported failure: a fleet pass is walking the registry when the operator pauses."""
+    fleet = tmp_path / "shared-fleet"
+    first = _app(tmp_path / "repo-a", lane, fleet_dir=fleet)
+    second = _app(tmp_path / "repo-b", lane, fleet_dir=fleet)
+    calls = _spy_dispatch_sessions(fake_host)
+
+    _run(first, lane)
+    assert [r.issue_number for r in calls] == [123]  # control: launches while unpaused
+
+    _pause(second)  # written after the first repo's dispatch step, before the second's
+    result = _run(second, lane)
+
+    assert [r.issue_number for r in calls] == [123], "a worker launched after the pause"
+    assert result.data["deferred_reason"] == "fleet_paused"
+    assert [e["payload"]["deferred_reason"] for e in _deferrals(second)] == ["fleet_paused"]
+    assert _deferrals(first) == []  # the repo that launched before the pause is untouched
+
+
+@LANES
+def test_resume_restores_launches(tmp_path: Path, fake_host, lane: str) -> None:
+    """With no flag present, dispatch behaves as before: the same app launches after resume."""
+    app = _app(tmp_path, lane)
+    calls = _spy_dispatch_sessions(fake_host)
+    _pause(app)
+    assert _run(app, lane).data["deferred_reason"] == "fleet_paused"
+    assert calls == []
+
+    assert clear_fleet_pause(app.fleet_dir_override)
+    result = _run(app, lane)
+
+    assert [r.issue_number for r in calls] == [123], result.message
+    assert "deferred_reason" not in result.data
+
+
+@LANES
+def test_ignore_pause_launches_through_the_flag(tmp_path: Path, fake_host, lane: str) -> None:
+    """``--ignore-pause`` (#2660) is a deliberate one-shot: it must still launch."""
+    app = _app(tmp_path, lane, ignore_pause=True)
+    calls = _spy_dispatch_sessions(fake_host)
+    _pause(app)
+
+    result = _run(app, lane)
+
+    assert [r.issue_number for r in calls] == [123], result.message
+    assert "deferred_reason" not in result.data
+    assert fleet_pause_pending(app.fleet_dir_override)  # the override does not resume the fleet
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(b"{torn", id="torn-json"),
+        pytest.param('{"reason": "x"}'.encode("utf-16"), id="utf16-powershell-5.1-redirect"),
+    ],
+)
+def test_unreadable_pause_flag_still_blocks_launch(
+    tmp_path: Path, fake_host, payload: bytes
+) -> None:
+    """Fail closed, like every other reader of the flag (``read_fleet_pause``)."""
+    app = _app(tmp_path, FRESH)
+    calls = _spy_dispatch_sessions(fake_host)
+    flag = layout.fleet_pause_path(app.fleet_dir_override)
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.write_bytes(payload)
+
+    result = app.dispatch()
+
+    assert calls == []
+    assert result.data["deferred_reason"] == "fleet_paused"
+    assert result.data["paused_at"] is None
+
+
+def test_pause_defers_before_the_fleet_lock_is_touched(tmp_path: Path) -> None:
+    """A paused fleet must not contend for the lock (the #2055 starvation shape)."""
+    app = _app(tmp_path, FRESH, fleet_cap=4)
+    _pause(app)
+    attempts: list[Any] = []
+
+    def _acquire(override: Any) -> Any:
+        attempts.append(override)
+        return try_acquire_fleet_lock(override)
+
+    decision = issue_worker_launch_permit(app, 3, acquire=_acquire)
+
+    assert isinstance(decision, WorkerLaunchDeferral)
+    assert (decision.reason, decision.ok) == ("fleet_paused", True)
+    assert decision.governor is None  # the governor never ran
+    assert attempts == []
 
 
 # --- _launch_workers refusals ------------------------------------------------

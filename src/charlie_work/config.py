@@ -1275,6 +1275,14 @@ class AutoMergeConfig:
     # honours the same bound so it cannot re-add behind the cap's back. A new
     # head SHA gets a fresh budget. 0 disables the gate (counting continues).
     mergequeue_requeue_cap: Annotated[int, Typed, NonNeg] = 3
+    # Issue #2666: cadence (minutes) of the wedged-aggregate self-heal lane. A
+    # required check (``required_checks``) on a ``mergequeue``-labelled PR or a
+    # queue-bot draft that GitHub killed at its ``timeout-minutes`` (a wedged
+    # runner) is re-run once per workflow run with ``gh run rerun --failed``;
+    # see ``aggregate_job_heal``. Ships ON; ``0`` is the kill switch. The lane
+    # reads REST only (one open-PR list plus one check-run read per candidate per
+    # tick), so the cadence, not the GraphQL budget, bounds its cost.
+    aggregate_heal_interval_minutes: Annotated[int, Typed, NonNeg] = 3
 
     def __post_init__(self) -> None:
         legacy_to_strategy = {
