@@ -22,11 +22,12 @@ from _devin_shell_fixtures import (
     _FAKE_DEVIN_SLEEP,
     _init_repo,
     _install_fake_create_worktree,
+    _install_fake_popen_worker,
     _write_fake_devin,
 )
 from _worker_marker_wait import read_worker_marker
 
-from charlie_work import devin_shell, worker_fate
+from charlie_work import worker_fate
 from charlie_work.config import DevinConfig, OrchestratorConfig
 from charlie_work.devin_shell import launch_devin_session
 from charlie_work.worktree import (
@@ -272,43 +273,46 @@ def test_launch_writes_sidecar_json_with_expected_fields(
 def test_launch_devin_session_passes_rework_flag(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The rework flag should be passed through to create_worktree."""
+    """The rework flag should be passed through to create_worktree.
+
+    Issue #2950: the spawn seam is faked. Left real, this test spawned the real
+    ``devin`` CLI on a host that has it, and on a host without it (CI) paid for
+    the launch-failure teardown's ``git`` subprocesses -- neither is what it
+    asserts on. ``record.error is None`` proves each launch reached the seam.
+    """
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     sessions_dir = tmp_path / "sessions"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("do the thing", encoding="utf-8")
 
-    rework_calls = []
-
-    def tracking_create_worktree(*args, **kwargs):
-        rework_calls.append(kwargs.get("rework", False))
-        # Return a fake WorktreeInfo to avoid actual git operations
-        from charlie_work.worktree import WorktreeInfo
-
-        return WorktreeInfo(path=tmp_path / "fake-wt", branch="test", venv_junction=None)
-
-    monkeypatch.setattr(devin_shell, "create_worktree", tracking_create_worktree)
+    worktree_calls: list[dict] = []
+    _install_fake_create_worktree(monkeypatch, tmp_path, calls=worktree_calls)
+    _install_fake_popen_worker(monkeypatch)
 
     # Test with rework=False (default)
-    launch_devin_session(
+    plain = launch_devin_session(
         1,
         "agent/issue-1",
-        tmp_path / "prompt.md",
+        prompt_path,
         repo_root=repo_root,
         sessions_dir=sessions_dir,
         rework=False,
     )
 
     # Test with rework=True
-    launch_devin_session(
+    rework = launch_devin_session(
         2,
         "agent/issue-2",
-        tmp_path / "prompt.md",
+        prompt_path,
         repo_root=repo_root,
         sessions_dir=sessions_dir,
         rework=True,
     )
 
-    assert rework_calls == [False, True]
+    assert plain.error is None, plain.error
+    assert rework.error is None, rework.error
+    assert [call["rework"] for call in worktree_calls] == [False, True]
 
 
 def test_launch_captures_process_start_time(
