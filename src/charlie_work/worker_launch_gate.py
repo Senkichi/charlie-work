@@ -128,7 +128,7 @@ logger = logging.getLogger(__name__)
 _MINT = object()
 
 REASON_FLEET_LOCK_HELD = "fleet_lock_held"
-REASON_PROVIDER_THROTTLED = "provider_throttled"
+REASON_PROVIDER_THROTTLED = role_selection.REASON_PROVIDER_THROTTLED
 REASON_CONCURRENCY_CAP = "concurrency_cap"
 REASON_LAUNCH_LOCK_INVALID = "launch_lock_invalid"
 
@@ -300,7 +300,7 @@ class WorkerLaunchDeferral:
     def report_fields(self) -> dict[str, Any]:
         """Payload fields for this deferral (excludes ``deferred_reason``)."""
         fields: dict[str, Any] = dict(self.extra)
-        if self.reason == REASON_PROVIDER_THROTTLED:
+        if self.reason in (REASON_PROVIDER_THROTTLED, role_selection.REASON_HARNESS_AUTH_BLOCKED):
             fields["throttled_until"] = self.throttled_until
         if self.governor is not None and self.governor.any_term_enabled:
             fields.update(self.governor.report_fields())
@@ -486,10 +486,10 @@ def issue_worker_launch_permit(
     # Issue #2086: resolve the worker role chain against the fleet quota
     # ledger first. Every entry restricted is the chained form of "provider
     # throttled"; a per-repo window the ledger explains is covered below.
-    selection = role_selection.select_for_launch(app.config.worker.chain)
+    selection = role_selection.select_for_config(app.config.worker.chain, app.config)
     if selection.exhausted:
         return WorkerLaunchDeferral(
-            REASON_PROVIDER_THROTTLED,
+            selection.exhausted_reason,
             throttled_until=selection.report_fields().get("chain_retry_at"),
             extra=selection.report_fields(),
         )
@@ -676,7 +676,7 @@ def _tier_groups(
         default.append(request)
     served: list[tuple[Any, str | None, list[SessionRequest]]] = []
     for tier, members in sorted(by_tier.items()):
-        tier_selection, reason = model_tier.select_tier_for_launch(selection.chain, tier)
+        tier_selection, reason = model_tier.select_for_config(selection.chain, tier, app.config)
         if tier_selection is None:
             model_tier.emit_tier_fallback(
                 app.write_gate,

@@ -44,7 +44,10 @@ from charlie_work.rework_attempt_exemption import (
 )
 from charlie_work.role_quota_ledger import RESTRICTING_FAILURE_KINDS, session_stamp
 from charlie_work.state import load_state, save_state, state_lock
-from charlie_work.throttle_signatures import PROVIDER_THROTTLE_FAILURE_KINDS
+from charlie_work.throttle_signatures import (
+    HARNESS_AUTH_FAILED_KIND,
+    PROVIDER_THROTTLE_FAILURE_KINDS,
+)
 from charlie_work.worker_fate import profile_for
 from charlie_work.workflow import OrchestratorApp
 
@@ -234,7 +237,9 @@ def test_exempt_kinds_derive_from_the_restricting_ledger_kinds() -> None:
     assert PROVIDER_THROTTLE_FAILURE_KINDS <= PROVIDER_THROTTLE_EXEMPT_KINDS
 
 
-@pytest.mark.parametrize("kind", sorted(RESTRICTING_FAILURE_KINDS))
+# Issue #2810: ``harness_auth_failed`` is exempt from every cap in this lane too (restore,
+# no-op rework cap, ``worker_death_loop``) -- it rides ``PROVIDER_THROTTLE_FAILURE_KINDS``.
+@pytest.mark.parametrize("kind", sorted(RESTRICTING_FAILURE_KINDS | {HARNESS_AUTH_FAILED_KIND}))
 def test_three_consecutive_throttle_rework_deaths_do_not_escalate(
     tmp_path: Path, kind: str, monkeypatch
 ) -> None:

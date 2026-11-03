@@ -4367,20 +4367,33 @@ class OrchestratorApp:
             _deferred_normal, deferred_rescue_results = self._partition_rescue_candidates(
                 deferred_candidates
             )
+            # Issue #2810: a chain exhausted by a dead harness credential is its
+            # own deferral, not a quota backoff -- the operator reads the cause.
+            reviewer_auth_blocked = role_sel.harness_auth_blocked
             return _CommandResult(
                 True,
-                "review dispatch deferred: reviewer quota exhausted, probe not ready",
+                "review dispatch deferred: reviewer harness auth blocked"
+                if reviewer_auth_blocked
+                else "review dispatch deferred: reviewer quota exhausted, probe not ready",
                 {
                     "selected_count": 0,
                     "attempted_count": 0,
                     "failed_count": 0,
                     "launched_count": 0,
-                    "deferred_reason": "reviewer_quota_probe_backoff",
+                    "deferred_reason": role_selection.REASON_HARNESS_AUTH_BLOCKED
+                    if reviewer_auth_blocked
+                    else "reviewer_quota_probe_backoff",
                     "recorded_verdicts": recorded_verdicts,
                     "missed_verdicts": missed_verdicts,
                     "reconciled_verdicts": reconciled_verdicts,
                     "rescue_review_results": deferred_rescue_results,
-                    **role_sel.chain_report_fields(),
+                    # A length-1 chain reports nothing by default; a dead credential
+                    # still needs its retry time (``chain_retry_at``).
+                    **(
+                        role_sel.report_fields()
+                        if reviewer_auth_blocked
+                        else role_sel.chain_report_fields()
+                    ),
                 },
             )
 

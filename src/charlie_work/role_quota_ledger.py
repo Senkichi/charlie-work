@@ -29,6 +29,16 @@ platform default). It deliberately ignores the per-invocation ``--fleet-dir``
 override: the classification sites that write it run deep inside reap lanes
 that never receive that override, and reader and writer must agree.
 
+Harness-wide records (issue #2810): the same file also holds a
+``"<harness>|*"`` record -- ``model`` is the :data:`HARNESS_WIDE_MODEL`
+sentinel -- written when a harness CLI itself cannot authenticate (every launch
+on that harness fails, whatever the model). It restricts every chain entry on
+the harness (:func:`effective_restriction`) and carries the episode fields the
+alert-once and resume logic need (:class:`HarnessBlock`). Unlike a quota
+window it is cleared by proof, not by the clock alone:
+:func:`mark_harness_resumed` is stamped when a probe launch outlives the
+survival period.
+
 Every function here is best-effort and never raises: a ledger I/O problem
 degrades to "no restriction recorded", which is the pre-#2086 behavior.
 """
@@ -39,7 +49,8 @@ import json
 import logging
 import random
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -49,6 +60,7 @@ from .file_lock import try_acquire_byte_range_lock
 from .fleet_paths import fleet_dir
 from .harnesses import HARNESS_REGISTRY
 from .iso_timestamp import parse_iso_timestamp
+from .throttle_signatures import HARNESS_AUTH_FAILED_KIND
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +89,15 @@ _ESCALATABLE_BASE_MAX = timedelta(hours=2)
 
 _LOCK_WAIT_SECONDS = 2.0
 
+# Issue #2810: the ``model`` of a harness-wide record. Not a real model name, so
+# a ``(harness, "*")`` key can never collide with a chain entry's own key.
+HARNESS_WIDE_MODEL = "*"
+HARNESS_AUTH_REASON = HARNESS_AUTH_FAILED_KIND
+# Base window of a harness-wide block. Short on purpose: the resume check
+# (``harness_auth_block``) is a cheap credential probe, so a short window keeps
+# resume latency low; consecutive launch deaths escalate it by the #2767 backoff.
+HARNESS_AUTH_BASE_WINDOW = timedelta(minutes=15)
+
 
 def ledger_path() -> Path:
     return fleet_dir() / LEDGER_FILENAME
@@ -101,17 +122,69 @@ def _read_raw(path: Path) -> dict[str, Any]:
     return raw
 
 
-def load_restrictions() -> dict[tuple[str, str], datetime]:
-    """Every recorded ``(harness, model) -> until``, expired or not. Never raises."""
+def _iter_restrictions(*, wide: bool | None) -> dict[tuple[str, str], datetime]:
+    """Parsed ledger records; ``wide`` True = harness-wide only, False = per-model only."""
     result: dict[tuple[str, str], datetime] = {}
     for record in _read_raw(ledger_path()).get("restrictions", {}).values():
         if not isinstance(record, dict):
             continue
         harness, model = record.get("harness"), record.get("model")
+        if wide is not None and (model == HARNESS_WIDE_MODEL) != wide:
+            continue
         until = parse_iso_timestamp(record.get("until"))
         if isinstance(harness, str) and isinstance(model, str) and until is not None:
             result[(harness, model)] = until
     return result
+
+
+def load_restrictions(*, harness_auth: bool = True) -> dict[tuple[str, str], datetime]:
+    """Every recorded ``(harness, model) -> until``, expired or not. Never raises.
+
+    ``harness_auth=False`` (the ``fleet.harness_auth_block_enabled`` kill switch,
+    issue #2810) drops the harness-wide records, so a disabled feature reads the
+    ledger exactly as it did before they existed -- even a block recorded
+    earlier stops being honored the moment the switch flips.
+    """
+    return _iter_restrictions(wide=None if harness_auth else False)
+
+
+def load_harness_restrictions() -> dict[tuple[str, str], datetime]:
+    """Only the harness-wide ``(harness, "*") -> until`` records. Never raises.
+
+    What a length-1 role chain reads: with no ``fallbacks:`` it has no per-model
+    routing to do, but a dead harness credential still has to stop the launch.
+    """
+    return _iter_restrictions(wide=True)
+
+
+def list_harness_blocks() -> list[HarnessBlock]:
+    """Every harness-wide block in the ledger (any episode state). Never raises."""
+    blocks = [
+        _parse_block(record)
+        for record in _read_raw(ledger_path()).get("restrictions", {}).values()
+        if isinstance(record, dict) and record.get("model") == HARNESS_WIDE_MODEL
+    ]
+    return [block for block in blocks if block is not None]
+
+
+def effective_restriction(
+    ledger: Mapping[tuple[str, str], datetime], harness: str, model: str, now: datetime
+) -> tuple[datetime | None, bool]:
+    """``(until, harness_wide)``: how long ``(harness, model)`` is restricted at ``now``.
+
+    The later of the entry's own window and its harness's wide block (issue
+    #2810), counting only windows still live at ``now``; ``(None, False)`` when
+    neither is. ``harness_wide`` is True when the harness block is what binds
+    (it ends at or after the entry's own window), so callers can tell a dead
+    credential from a quota wall. Pure.
+    """
+    own = ledger.get((harness, model))
+    wide = ledger.get((harness, HARNESS_WIDE_MODEL))
+    own = own if own is not None and own > now else None
+    wide = wide if wide is not None and wide > now else None
+    if wide is not None and (own is None or wide >= own):
+        return wide, True
+    return own, False
 
 
 def _acquire_lock(path: Path) -> Any:
@@ -202,6 +275,252 @@ def record_restriction(
     finally:
         if lock is not None:
             lock.release()
+
+
+@dataclass(frozen=True)
+class HarnessBlock:
+    """A harness-wide block (issue #2810): the harness CLI cannot authenticate.
+
+    One *episode* runs from the first death that arms the block to the probe
+    that proves the harness healthy again (``resumed_at``). ``alerted_at`` is
+    stamped once per episode (the alert-once claim); ``stage_a_green_at`` says
+    the cheap credential check passed for the current window, so one real probe
+    launch may be admitted. ``affected`` is every ``(repo, issue)`` whose death
+    armed or re-armed the block this episode.
+    """
+
+    harness: str
+    until: datetime
+    evidence: str
+    consecutive_hits: int
+    episode_started_at: datetime | None
+    alerted_at: datetime | None
+    stage_a_green_at: datetime | None
+    resumed_at: datetime | None
+    affected: tuple[tuple[str, int], ...] = ()
+
+    @property
+    def episode_open(self) -> bool:
+        return self.resumed_at is None
+
+
+@dataclass(frozen=True)
+class ArmOutcome:
+    """Result of :func:`arm_harness_block`: the stored block and whether it began an episode."""
+
+    block: HarnessBlock | None
+    new_episode: bool = False
+
+
+def _backoff_window(base: timedelta, hits: int) -> timedelta:
+    """The #2767 escalation: the base doubles per consecutive hit, capped at 4h."""
+    return min(base * (2 ** min(max(hits, 1) - 1, 3)), MAX_ESCALATED_BACKOFF)
+
+
+def _parse_block(record: Any) -> HarnessBlock | None:
+    if not isinstance(record, dict):
+        return None
+    harness = record.get("harness")
+    until = parse_iso_timestamp(record.get("until"))
+    if not isinstance(harness, str) or until is None:
+        return None
+    hits = record.get("consecutive_hits", 1)
+    affected: list[tuple[str, int]] = []
+    raw_affected = record.get("affected")
+    if isinstance(raw_affected, dict):
+        for repo, issues in raw_affected.items():
+            if isinstance(repo, str) and isinstance(issues, list):
+                affected.extend((repo, n) for n in issues if isinstance(n, int))
+    return HarnessBlock(
+        harness=harness,
+        until=until,
+        evidence=str(record.get("evidence") or ""),
+        consecutive_hits=hits if isinstance(hits, int) and hits >= 1 else 1,
+        episode_started_at=parse_iso_timestamp(record.get("episode_started_at")),
+        alerted_at=parse_iso_timestamp(record.get("alerted_at")),
+        stage_a_green_at=parse_iso_timestamp(record.get("stage_a_green_at")),
+        resumed_at=parse_iso_timestamp(record.get("resumed_at")),
+        affected=tuple(sorted(set(affected))),
+    )
+
+
+def read_harness_block(harness: str) -> HarnessBlock | None:
+    """The harness-wide record for ``harness`` (live, lapsed or resumed), else ``None``."""
+    record = (
+        _read_raw(ledger_path()).get("restrictions", {}).get(_key(harness, HARNESS_WIDE_MODEL))
+    )
+    return _parse_block(record)
+
+
+def _update_harness_record(
+    harness: str, mutate: Callable[[dict[str, Any] | None], dict[str, Any] | None]
+) -> HarnessBlock | None:
+    """Locked read-modify-write of the harness-wide record; returns the stored block.
+
+    ``mutate`` gets the current record (``None`` when absent) and returns the
+    record to store, or ``None`` for "no change" -- in which case the current
+    record is returned unparsed-as-is. Never raises (an I/O problem is "no
+    change").
+    """
+    path = ledger_path()
+    lock = _acquire_lock(path.with_name(LEDGER_LOCK_FILENAME))
+    if lock is None:
+        logger.warning("role quota ledger lock busy; writing without it")
+    try:
+        raw = _read_raw(path)
+        restrictions = dict(raw.get("restrictions", {}))
+        key = _key(harness, HARNESS_WIDE_MODEL)
+        existing = restrictions.get(key)
+        updated = mutate(existing if isinstance(existing, dict) else None)
+        if updated is None:
+            return _parse_block(existing)
+        restrictions[key] = updated
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(path, {"version": LEDGER_VERSION, "restrictions": restrictions})
+        return _parse_block(updated)
+    except OSError as exc:
+        logger.warning("role quota ledger write failed: %s", exc)
+        return None
+    finally:
+        if lock is not None:
+            lock.release()
+
+
+def arm_harness_block(
+    harness: str,
+    *,
+    base_window: timedelta,
+    evidence: str | None,
+    source: str,
+    now: datetime | None = None,
+    escalate: bool = True,
+    affected: tuple[str, int] | None = None,
+) -> ArmOutcome:
+    """Arm (or re-arm) the harness-wide block for ``harness``. Never raises.
+
+    * No record, or one whose episode has ended (``resumed_at``): a NEW episode
+      -- ``base_window`` from ``now``, one hit, alert not yet sent.
+    * A record whose window is still live: the same batch dying; ``until`` and
+      the hit count are untouched (only evidence and ``affected`` merge).
+    * A lapsed record: ``escalate=True`` (a launch died of the signature) is
+      another consecutive hit and the window grows by the #2767 backoff;
+      ``escalate=False`` (the cheap credential check was still red -- no launch
+      happened) just re-arms ``base_window`` so resume latency stays low.
+
+    Re-arming clears ``stage_a_green_at``. Arming never touches ``alerted_at``:
+    the once-per-episode alert is claimed separately by :func:`claim_harness_alert`.
+    """
+    resolved_now = (now if now is not None else datetime.now(UTC)).replace(microsecond=0)
+    state: dict[str, bool] = {"new_episode": False}
+
+    def mutate(existing: dict[str, Any] | None) -> dict[str, Any] | None:
+        block = _parse_block(existing)
+        new_episode = block is None or not block.episode_open
+        if block is None or new_episode:
+            hits, until = 1, resolved_now + base_window
+            started, alerted = resolved_now, None
+            issues_by_repo: dict[str, list[int]] = {}
+            stage_a = None
+        else:
+            hits, until = block.consecutive_hits, block.until
+            started, alerted = block.episode_started_at or resolved_now, block.alerted_at
+            issues_by_repo = {}
+            for repo, issue in block.affected:
+                issues_by_repo.setdefault(repo, []).append(issue)
+            stage_a = block.stage_a_green_at
+            if block.until <= resolved_now:
+                stage_a = None
+                if escalate:
+                    hits += 1
+                    until = resolved_now + _backoff_window(base_window, hits)
+                else:
+                    until = resolved_now + base_window
+        if affected is not None:
+            repo, issue = affected
+            bucket = issues_by_repo.setdefault(repo, [])
+            if issue not in bucket:
+                bucket.append(issue)
+        state["new_episode"] = new_episode
+        record: dict[str, Any] = {
+            "harness": harness,
+            "model": HARNESS_WIDE_MODEL,
+            "until": _format_z(until),
+            "reason": HARNESS_AUTH_REASON,
+            "source": source,
+            "role": "",
+            "updated_at": _format_z(resolved_now),
+            "consecutive_hits": hits,
+            "evidence": evidence or (block.evidence if block is not None else ""),
+            "episode_started_at": _format_z(started),
+            "alerted_at": _format_z(alerted) if alerted is not None else None,
+            "stage_a_green_at": _format_z(stage_a) if stage_a is not None else None,
+            "resumed_at": None,
+            "affected": {repo: sorted(issues) for repo, issues in sorted(issues_by_repo.items())},
+        }
+        return record
+
+    block = _update_harness_record(harness, mutate)
+    if block is None:
+        return ArmOutcome(None)
+    return ArmOutcome(block, new_episode=state["new_episode"])
+
+
+def claim_harness_alert(harness: str, *, now: datetime | None = None) -> HarnessBlock | None:
+    """Take the once-per-episode alert claim. Never raises.
+
+    Returns the block for exactly ONE caller per open episode -- the claim is a
+    locked read-modify-write, so racing processes cannot both win -- and
+    ``None`` for everyone else (already alerted, no block, episode over).
+    """
+    resolved_now = (now if now is not None else datetime.now(UTC)).replace(microsecond=0)
+    state = {"claimed": False}
+
+    def mutate(existing: dict[str, Any] | None) -> dict[str, Any] | None:
+        block = _parse_block(existing)
+        if existing is None or block is None or not block.episode_open or block.alerted_at:
+            return None
+        state["claimed"] = True
+        return {**existing, "alerted_at": _format_z(resolved_now)}
+
+    block = _update_harness_record(harness, mutate)
+    return block if state["claimed"] else None
+
+
+def mark_stage_a_green(harness: str, *, now: datetime | None = None) -> bool:
+    """Record that the cheap credential check passed for the current window.
+
+    True when the stamp landed on an open episode. Never raises.
+    """
+    resolved_now = (now if now is not None else datetime.now(UTC)).replace(microsecond=0)
+
+    def mutate(existing: dict[str, Any] | None) -> dict[str, Any] | None:
+        block = _parse_block(existing)
+        if existing is None or block is None or not block.episode_open:
+            return None
+        return {**existing, "stage_a_green_at": _format_z(resolved_now)}
+
+    block = _update_harness_record(harness, mutate)
+    return block is not None and block.episode_open and block.stage_a_green_at is not None
+
+
+def mark_harness_resumed(harness: str, *, now: datetime | None = None) -> HarnessBlock | None:
+    """End the episode: a probe outlived the survival period. Never raises.
+
+    Returns the final block when THIS call ended an open episode (the caller
+    emits ``harness_auth_resumed`` exactly once), else ``None``.
+    """
+    resolved_now = (now if now is not None else datetime.now(UTC)).replace(microsecond=0)
+    state = {"ended": False}
+
+    def mutate(existing: dict[str, Any] | None) -> dict[str, Any] | None:
+        block = _parse_block(existing)
+        if existing is None or block is None or not block.episode_open:
+            return None
+        state["ended"] = True
+        return {**existing, "resumed_at": _format_z(resolved_now)}
+
+    block = _update_harness_record(harness, mutate)
+    return block if state["ended"] else None
 
 
 def session_stamp(role: str, harness: str, model: str, chain_index: int) -> dict[str, Any]:
@@ -299,9 +618,45 @@ def record_from_sidecar_payload(
 
 
 def record_classified_death(
-    payload: Mapping[str, Any], failure_kind: str | None, until: str | None, *, source: str
+    payload: Mapping[str, Any],
+    failure_kind: str | None,
+    until: str | None,
+    *,
+    source: str,
+    harness: str | None = None,
+    evidence: str | None = None,
+    repo: str | None = None,
 ) -> bool:
-    """The classification-site hook: record only a quota/rate-limit death."""
+    """The classification-site hook: record a quota/rate-limit or harness-auth death.
+
+    A ``rate_limited`` / ``quota_exhausted`` death restricts the session's
+    stamped ``(harness, model)`` until ``until``. A ``harness_auth_failed``
+    death (issue #2810) instead arms the harness-wide block for ``harness``
+    (default: the session stamp's harness) -- the stamp's *model* is irrelevant
+    because every launch on a harness with a dead credential fails alike, and an
+    unstamped (pre-#2086) sidecar still blocks when the caller names the
+    ``harness``. ``evidence`` is the log line the classification fired on;
+    ``repo`` and the payload's ``issue_number`` record who was affected. Any
+    other kind records nothing.
+    """
+    if failure_kind == HARNESS_AUTH_REASON:
+        stamp = payload.get(SESSION_ROLE_KEY) if isinstance(payload, Mapping) else None
+        resolved = harness or (stamp.get("harness") if isinstance(stamp, Mapping) else None)
+        if not isinstance(resolved, str) or not resolved:
+            return False
+        issue = payload.get("issue_number") if isinstance(payload, Mapping) else None
+        return (
+            arm_harness_block(
+                resolved,
+                base_window=HARNESS_AUTH_BASE_WINDOW,
+                evidence=evidence,
+                source=source,
+                affected=(repo, issue)
+                if isinstance(repo, str) and isinstance(issue, int)
+                else None,
+            ).block
+            is not None
+        )
     if failure_kind not in RESTRICTING_FAILURE_KINDS:
         return False
     return record_from_sidecar_payload(payload, until, reason=failure_kind, source=source)

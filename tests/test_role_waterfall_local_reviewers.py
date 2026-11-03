@@ -266,3 +266,62 @@ def test_launch_quota_hit_writes_the_launched_entry_to_the_ledger(
     restrictions = role_quota_ledger.load_restrictions()
     assert set(restrictions) == {PRIMARY.key}
     assert restrictions[PRIMARY.key] > datetime.now(UTC)
+
+
+def _arm_harness_auth_block(harness: str) -> None:
+    """Issue #2810: a dead harness credential, as the classifier records it."""
+    outcome = role_quota_ledger.arm_harness_block(
+        harness,
+        base_window=role_quota_ledger.HARNESS_AUTH_BASE_WINDOW,
+        evidence="Error: Not logged in",
+        source="test",
+    )
+    assert outcome.block is not None
+
+
+def test_harness_auth_block_moves_the_local_reviewer_on_to_its_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _recorder(monkeypatch)
+    _arm_harness_auth_block(PRIMARY.harness)
+    app = _local_app(tmp_path)
+
+    result = app._local_dispatch_reviewers()
+
+    assert len(result["launched"]) == 2
+    assert {c["harness"] for c in calls} == {FALLBACK.harness}
+    [event] = query_events(app.paths.state_file, kind="role_fallback_selected")
+    assert [item["harness"] for item in event["payload"]["skipped"]] == [PRIMARY.harness]
+
+
+def test_exhausted_local_reviewer_chain_names_the_dead_credential_not_a_quota_wall(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _recorder(monkeypatch)
+    _arm_harness_auth_block(PRIMARY.harness)
+    _restrict(FALLBACK, datetime.now(UTC) + timedelta(hours=1))
+    app = _local_app(tmp_path)
+
+    result = app._local_dispatch_reviewers()
+
+    assert calls == []
+    assert result["deferred_reason"] == role_selection.REASON_HARNESS_AUTH_BLOCKED
+    assert result["launched"] == []
+    assert len(result["skipped"]) == 2
+    assert result["chain_retry_at"] is not None
+
+
+def test_a_quota_only_exhausted_local_reviewer_chain_keeps_its_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Control for the test above: the same chain exhausted by quota walls alone."""
+    calls = _recorder(monkeypatch)
+    later = datetime.now(UTC) + timedelta(hours=1)
+    _restrict(PRIMARY, later)
+    _restrict(FALLBACK, later)
+    app = _local_app(tmp_path)
+
+    result = app._local_dispatch_reviewers()
+
+    assert calls == []
+    assert result["deferred_reason"] == "reviewer_chain_exhausted"
