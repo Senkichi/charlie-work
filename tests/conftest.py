@@ -104,6 +104,11 @@ def pytest_configure(config: pytest.Config) -> None:
         basetemp=Path(basetemp) if basetemp else None
     )
     _ENCLOSING_REPO_CONFIG_PATH = enclosing_repo_config_path()
+    # Issue #3010: no test may leave a foreign os.name live across a phase boundary.
+    import _os_name_guard
+
+    if not config.pluginmanager.has_plugin(_os_name_guard.PLUGIN_NAME):
+        config.pluginmanager.register(_os_name_guard, _os_name_guard.PLUGIN_NAME)
 
 
 def pytest_sessionfinish(session: pytest.Session) -> None:

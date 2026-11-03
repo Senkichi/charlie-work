@@ -8,8 +8,10 @@ under test on any host.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import signal
+from collections.abc import Iterator
 from typing import Any
 
 import pytest
@@ -23,15 +25,15 @@ def _stub_reap_env(
     *,
     alive: dict[int, bool],
     queries: dict[int, Any],
-    os_name: str = "posix",
 ) -> dict[str, list[Any]]:
     """Install the seams ``_reap_enumerated_children`` touches.
 
     Unlike ``_stub_kill_env`` (which drives ``kill_process_tree`` end-to-end
     on a forced-Windows model), this stubs only what the reaper calls --
     ``is_pid_alive`` / ``get_process_start_time`` / ``run_captured`` on
-    ``process_utils`` plus ``os.kill``/``os.name`` -- so the platform branch
-    under test is selectable per case. ``alive`` is the liveness oracle;
+    ``process_utils`` plus ``os.kill`` -- the platform branch under test is
+    selected per case with :func:`_platform` around the one call under test,
+    never here (issue #3010). ``alive`` is the liveness oracle;
     ``queries`` is what ``get_process_start_time`` returns per pid, and a
     list value is consumed one entry per call (modeling a start-time read
     that changes between the pinned liveness probe and the identity
@@ -89,8 +91,23 @@ def _stub_reap_env(
     monkeypatch.setattr(_pu, "run_captured", fake_run_captured)
     monkeypatch.setattr(os, "kill", fake_os_kill)
     monkeypatch.setattr(signal, "SIGKILL", 9, raising=False)
-    monkeypatch.setattr(os, "name", os_name)
     return {"sigkill": sigkill_calls, "taskkill": taskkill_calls, "start_queries": start_queries}
+
+
+@contextlib.contextmanager
+def _platform(monkeypatch: pytest.MonkeyPatch, os_name: str) -> Iterator[None]:
+    """Make ``os.name`` read ``os_name`` for the body only (issue #3010).
+
+    ``os.name`` is process-global. A patch that lives until fixture teardown is
+    still in force when pytest-cov switches the coverage context for the
+    teardown phase, and on Windows a ``"posix"`` value makes ``pathlib`` build
+    a ``PosixPath`` that cannot express a drive-letter path -- coverage 7.17.1
+    raised ``ValueError`` there and the nightly died with an ``INTERNALERROR``.
+    Bound to the call under test, the patch is undone before any phase boundary.
+    """
+    with monkeypatch.context() as patched:
+        patched.setattr(os, "name", os_name)
+        yield
 
 
 def test_reap_enumerated_children_posix_sigkill_reaps_pinned_survivor(
@@ -110,7 +127,8 @@ def test_reap_enumerated_children_posix_sigkill_reaps_pinned_survivor(
     queries: dict[int, Any] = {root: 1000.0, child: 2000.0}
     calls = _stub_reap_env(monkeypatch, alive=alive, queries=queries)
 
-    dead = _osweep._reap_enumerated_children(root, {child: 2000.0}, frozenset(), 1000.0)
+    with _platform(monkeypatch, "posix"):
+        dead = _osweep._reap_enumerated_children(root, {child: 2000.0}, frozenset(), 1000.0)
 
     assert dead == [child]
     assert calls["sigkill"] == [(child, 9)]
@@ -134,7 +152,8 @@ def test_reap_enumerated_children_posix_tolerates_start_jitter(
     queries: dict[int, Any] = {root: 1000.0, child: child_start}
     calls = _stub_reap_env(monkeypatch, alive=alive, queries=queries)
 
-    dead = _osweep._reap_enumerated_children(root, {child: child_start}, frozenset(), 1000.0)
+    with _platform(monkeypatch, "posix"):
+        dead = _osweep._reap_enumerated_children(root, {child: child_start}, frozenset(), 1000.0)
 
     assert dead == [child]
     assert calls["sigkill"] == [(child, 9)]
@@ -160,7 +179,10 @@ def test_reap_enumerated_children_survivor_of_direct_kill_not_recorded(
     # (e.g. an immune/protected holder).
     monkeypatch.setattr(os, "kill", lambda pid, sig: calls["sigkill"].append((pid, sig)))
 
-    with caplog.at_level(logging.WARNING, logger="charlie_work"):
+    with (
+        _platform(monkeypatch, "posix"),
+        caplog.at_level(logging.WARNING, logger="charlie_work"),
+    ):
         dead = _osweep._reap_enumerated_children(root, {child: 2000.0}, frozenset(), 1000.0)
 
     assert dead == []
@@ -184,7 +206,7 @@ def test_reap_enumerated_children_survivor_warning_reports_taskkill_failure(
     root, child = 60131, 60132
     alive = {root: False, child: True}
     queries: dict[int, Any] = {root: 1000.0, child: 2000.0}
-    calls = _stub_reap_env(monkeypatch, alive=alive, queries=queries, os_name="nt")
+    calls = _stub_reap_env(monkeypatch, alive=alive, queries=queries)
     monkeypatch.setattr(_osweep, "_CHILD_KILL_CONFIRM_SECONDS", 0.0)
 
     def failed_taskkill(command: list[str], **_kwargs: Any) -> RunResult:
@@ -198,7 +220,7 @@ def test_reap_enumerated_children_survivor_warning_reports_taskkill_failure(
 
     monkeypatch.setattr(_pu, "run_captured", failed_taskkill)
 
-    with caplog.at_level(logging.WARNING, logger="charlie_work"):
+    with _platform(monkeypatch, "nt"), caplog.at_level(logging.WARNING, logger="charlie_work"):
         dead = _osweep._reap_enumerated_children(root, {child: 2000.0}, frozenset(), 1000.0)
 
     assert dead == []
@@ -231,7 +253,10 @@ def test_reap_enumerated_children_refuses_when_recheck_unverifiable(
     queries: dict[int, Any] = {root: 1000.0, child: child_queries}
     calls = _stub_reap_env(monkeypatch, alive=alive, queries=queries)
 
-    with caplog.at_level(logging.WARNING, logger="charlie_work"):
+    with (
+        _platform(monkeypatch, "posix"),
+        caplog.at_level(logging.WARNING, logger="charlie_work"),
+    ):
         dead = _osweep._reap_enumerated_children(root, {child: 2000.0}, frozenset(), 1000.0)
 
     assert dead == []
@@ -253,7 +278,8 @@ def test_reap_enumerated_children_recycled_pid_recorded_dead(
     queries: dict[int, Any] = {root: 1000.0, child: 3000.0}  # != the 2000.0 fingerprint
     calls = _stub_reap_env(monkeypatch, alive=alive, queries=queries)
 
-    dead = _osweep._reap_enumerated_children(root, {child: 2000.0}, frozenset(), 1000.0)
+    with _platform(monkeypatch, "posix"):
+        dead = _osweep._reap_enumerated_children(root, {child: 2000.0}, frozenset(), 1000.0)
 
     assert dead == [child]
     assert calls["sigkill"] == []
@@ -276,9 +302,9 @@ def test_reap_enumerated_children_uses_caller_supplied_root_start(
     # No root entry: any re-read would return None and show up in
     # start_queries. The phantom predates the supplied root start.
     queries: dict[int, Any] = {phantom: 500.0}
-    calls = _stub_reap_env(monkeypatch, alive=alive, queries=queries, os_name="nt")
+    calls = _stub_reap_env(monkeypatch, alive=alive, queries=queries)
 
-    with caplog.at_level(logging.WARNING, logger="charlie_work"):
+    with _platform(monkeypatch, "nt"), caplog.at_level(logging.WARNING, logger="charlie_work"):
         dead = _osweep._reap_enumerated_children(root, {phantom: 500.0}, frozenset(), 1000.0)
 
     assert dead == []
@@ -315,7 +341,8 @@ def test_kill_process_tree_posix_reaps_survivor_killpg_missed(
 
     monkeypatch.setattr(os, "killpg", fake_killpg, raising=False)
 
-    killed = kill_process_tree(root, expected_start_time=None)
+    with _platform(monkeypatch, "posix"):
+        killed = kill_process_tree(root, expected_start_time=None)
 
     assert killed == [root, child]
     assert calls["sigkill"] == [(child, 9)]
