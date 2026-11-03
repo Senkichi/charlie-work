@@ -12,7 +12,6 @@ from pathlib import Path
 import pytest
 
 from _claude_adapter_fixtures import (
-    _init_real_repo,
     _install_fake_create_worktree,
     _install_fake_popen_worker,
 )
@@ -226,12 +225,25 @@ def test_launch_claude_worker_worker_never_uses_review_effort(
 
 
 def test_launch_claude_worker_worker_defaults_to_accept_edits_permission_mode(
-    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Issue #2010: a headless worker must never default to a prompting mode."""
+    """Issue #2010: a headless worker must never default to a prompting mode.
+
+    Issue #2982: this asserts only on the rendered argv, which is fixed by
+    ``claude_code._WORKER_COMMAND_TEMPLATE`` before any worktree or process
+    exists, so both seams are faked. With a real repo and a real spawn the
+    test's cost and meaning depended on the host: where the ``claude`` CLI is
+    installed a live interpreter started; where it is not (every CI runner)
+    ``Popen`` failed and the failure teardown ran real ``git worktree``/
+    ``git branch`` subprocesses, while the test still passed because the
+    error record carries the unresolved template. ``assert record.ok`` keeps
+    a launch that never reached the spawn seam from passing.
+    """
     repo_root = tmp_path / "repo"
-    _init_real_repo(repo_root)
+    repo_root.mkdir()
     sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+    _install_fake_popen_worker(monkeypatch)
 
     record = launch_claude_worker(
         502,
@@ -241,6 +253,7 @@ def test_launch_claude_worker_worker_defaults_to_accept_edits_permission_mode(
         sessions_dir=sessions_dir,
     )
 
+    assert record.ok, record.error
     assert "--permission-mode" in record.command
     mode_index = record.command.index("--permission-mode")
     assert record.command[mode_index + 1] == "bypassPermissions"
