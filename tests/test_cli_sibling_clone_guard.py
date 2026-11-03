@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -103,11 +104,28 @@ def test_init_git_repo_with_origin_goes_through_git_template(
     assert main_ref.is_file() and main_ref.read_text(encoding="utf-8").strip()
 
 
-def test_sibling_clone_verdict_refused(tmp_path: Path) -> None:
-    """Issue #1376 acceptance criterion #5: a state-affecting command run
-    from a sibling clone (separate git repo, same GitHub remote) must refuse
-    with a three-path error, never silently write to the clone's phantom
-    ``.var`` tree."""
+@dataclass(frozen=True)
+class _SiblingCloneVerdictScenario:
+    """A ``verdict`` invocation from a sibling clone, arranged but not yet run."""
+
+    canonical: Path
+    ctx: cli.CommandContext
+    args: argparse.Namespace
+
+
+@pytest.fixture
+def _sibling_clone_verdict_scenario(tmp_path: Path) -> _SiblingCloneVerdictScenario:
+    """Arrange the canonical repo, its sibling clone, the fleet registry naming
+    the canonical root, the sibling's ``CommandContext`` and the parsed
+    ``verdict`` args, so the measured ``call`` phase holds only the guard and
+    the assertions (issue #2983, the #2976 pattern).
+
+    The two ``_init_git_repo_with_origin`` template copies (~54 file creates)
+    are the host-sensitive part of the scaffold; the ledger alerts on ``call``
+    time only (issue #2570), and this cost still shows up under
+    ``ci-fleet ledger report --section slow-fixtures``. The guard's own
+    ``git remote get-url origin`` read is product behavior and deliberately
+    stays inside the call."""
     remote_url = "https://github.com/test/canonical.git"
     canonical = _init_git_repo_with_origin(tmp_path / "canonical", remote_url)
     sibling = _init_git_repo_with_origin(tmp_path / "sibling", remote_url)
@@ -116,19 +134,32 @@ def test_sibling_clone_verdict_refused(tmp_path: Path) -> None:
     canonical_state = canonical / ".var" / "charlie-work"
     _write_fleet_registry(fleet_dir, "test/canonical", canonical, canonical_state)
 
-    config = OrchestratorConfig()
-    ctx = _make_sibling_clone_ctx(sibling, config)
+    ctx = _make_sibling_clone_ctx(sibling, OrchestratorConfig())
     args = cli.build_parser().parse_args(
         ["--fleet-dir", str(fleet_dir), "verdict", "--pr", "1", "--decision", "approved"]
     )
+    return _SiblingCloneVerdictScenario(canonical=canonical, ctx=ctx, args=args)
+
+
+def test_sibling_clone_verdict_refused(
+    _sibling_clone_verdict_scenario: _SiblingCloneVerdictScenario,
+) -> None:
+    """Issue #1376 acceptance criterion #5: a state-affecting command run
+    from a sibling clone (separate git repo, same GitHub remote) must refuse
+    with a three-path error, never silently write to the clone's phantom
+    ``.var`` tree.
+
+    Scenario acquisition lives in ``_sibling_clone_verdict_scenario`` so the
+    measured ``call`` phase is the guard's own work (issue #2983)."""
+    scenario = _sibling_clone_verdict_scenario
 
     with pytest.raises(ConfigError) as excinfo:
-        cli._assert_not_sibling_clone(ctx, args)
+        cli._assert_not_sibling_clone(scenario.ctx, scenario.args)
 
     message = str(excinfo.value)
     # The three required paths: cwd, would-be state root, canonical root.
-    assert str(ctx.paths.root) in message
-    assert str(canonical.resolve()) in message
+    assert str(scenario.ctx.paths.root) in message
+    assert str(scenario.canonical.resolve()) in message
     # The corrective invocation.
     assert "--repo" in message
 
