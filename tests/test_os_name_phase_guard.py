@@ -17,7 +17,9 @@ import pytest
 
 import _os_name_guard as guard
 
-pytestmark = pytest.mark.skipif(
+# Applied per test, not module-wide: the wiring test below must run on every host, because
+# the conftest registration it pins is unconditional (only the guard's *effect* is Windows-only).
+_windows_only = pytest.mark.skipif(
     not guard.ENFORCED, reason="the guard is enforced on a Windows host only"
 )
 
@@ -78,13 +80,27 @@ _LEAKS_INTO_A_FAILING_HOOK = textwrap.dedent(
 )
 
 
+# One failure in each wrapped phase, each raised while a foreign ``os.name`` is live:
+# the call phase (the test body) and the setup phase (a fixture after the leaking one).
 _LEAKS_THEN_FAILS = textwrap.dedent(
     f"""
     import os
+    import pytest
+
+    @pytest.fixture
+    def leaky_fixture(monkeypatch):
+        monkeypatch.setattr(os, "name", {_FOREIGN!r})
+
+    @pytest.fixture
+    def failing_fixture(leaky_fixture):
+        raise RuntimeError("the fixture's own failure")
 
     def test_leaks_then_fails_its_own_assertion(monkeypatch):
         monkeypatch.setattr(os, "name", {_FOREIGN!r})
         raise AssertionError("the test's own failure")
+
+    def test_leaks_then_a_later_fixture_fails(failing_fixture):
+        pass
     """
 )
 
@@ -121,6 +137,21 @@ def _run_inner(tmp_path: Path, body: str, *, guarded: bool, conftest: str = "") 
     return done.returncode, done.stdout + done.stderr
 
 
+def test_the_guard_is_registered_in_the_live_pytest_session(
+    request: pytest.FixtureRequest,
+) -> None:
+    """Wiring: every other test here runs a *separate* inner session with the guard passed
+    explicitly (``-p``), so none of them notices if ``tests/conftest.py::pytest_configure``
+    stops registering it. This asks the session that is running the suite right now."""
+    pluginmanager = request.config.pluginmanager
+
+    assert pluginmanager.has_plugin(guard.PLUGIN_NAME)
+    assert pluginmanager.get_plugin(guard.PLUGIN_NAME) is guard
+    for hook in (pluginmanager.hook.pytest_runtest_setup, pluginmanager.hook.pytest_runtest_call):
+        owners = {impl.plugin_name for impl in hook.get_hookimpls()}
+        assert guard.PLUGIN_NAME in owners, f"{guard.PLUGIN_NAME} has no live {hook.name} impl"
+
+
 def test_restore_host_os_name_is_a_no_op_on_the_host_value() -> None:
     assert os.name == guard.HOST_OS_NAME
     assert guard.restore_host_os_name() is None
@@ -137,6 +168,7 @@ def test_restore_host_os_name_returns_the_foreign_value_and_puts_the_host_back(
     assert (live, restored) == (_FOREIGN, guard.HOST_OS_NAME)
 
 
+@_windows_only
 def test_a_patch_that_outlives_the_test_body_fails_that_test_with_the_remedy(
     tmp_path: Path,
 ) -> None:
@@ -153,6 +185,10 @@ def test_a_patch_that_outlives_the_test_body_fails_that_test_with_the_remedy(
     assert "monkeypatch.context()" in out, out
 
 
+# The two "without the guard" controls pin pytest/CPython internals (what pytest tolerates and
+# how it fails with a foreign os.name). If one goes red after an upgrade, delete or rewrite the
+# control -- it does not mean the guard broke.
+@_windows_only
 def test_without_the_guard_the_same_leak_passes_silently(tmp_path: Path) -> None:
     """Control: the guard is what flags the leak -- nothing else in pytest does."""
     code, out = _run_inner(tmp_path, _LEAKS, guarded=False)
@@ -161,12 +197,14 @@ def test_without_the_guard_the_same_leak_passes_silently(tmp_path: Path) -> None
     assert "3 passed" in out, out
 
 
+@_windows_only
 def test_without_the_guard_a_teardown_hook_failure_in_the_window_is_an_internal_error(
     tmp_path: Path,
 ) -> None:
     """The nightly's crash mode with no coverage in the session: the run is red with
     exit 3 (``INTERNALERROR``) and no failed test, because pytest cannot even format
-    the hook's error while ``os.name`` is foreign."""
+    the hook's error while ``os.name`` is foreign. (Control: pins pytest/CPython
+    internals -- red means delete this control, not that the guard broke.)"""
     code, out = _run_inner(
         tmp_path, _LEAKS_INTO_A_FAILING_HOOK, guarded=False, conftest=_TEARDOWN_HOOK_RAISES
     )
@@ -175,6 +213,7 @@ def test_without_the_guard_a_teardown_hook_failure_in_the_window_is_an_internal_
     assert "INTERNALERROR" in out, out
 
 
+@_windows_only
 def test_with_the_guard_the_same_teardown_hook_never_sees_a_foreign_os_name(
     tmp_path: Path,
 ) -> None:
@@ -190,18 +229,25 @@ def test_with_the_guard_the_same_teardown_hook_never_sees_a_foreign_os_name(
     assert "a plugin hook failed" not in out, out
 
 
+@_windows_only
 def test_with_the_guard_a_test_that_leaks_then_fails_reports_its_own_failure(
     tmp_path: Path,
 ) -> None:
-    """The exception path: a test that fails inside the window must not leave the foreign
-    name live for the teardown hooks (here the hook that aborts the run when it sees it)."""
+    """The exception path, in BOTH wrapped phases: a test body (call) or a later fixture
+    (setup) that fails inside the window must not leave the foreign name live for the
+    teardown hooks (here the hook that aborts the run when it sees it)."""
     code, out = _run_inner(
         tmp_path, _LEAKS_THEN_FAILS, guarded=True, conftest=_TEARDOWN_HOOK_RAISES
     )
 
     assert code == 1, out
     assert "INTERNALERROR" not in out, out
+    # Call phase: the test body's own failure.
+    assert "FAILED test_inner.py::test_leaks_then_fails_its_own_assertion" in out, out
     assert "the test's own failure" in out, out
-    # The test's own failure is the report; the guard does not replace it with its message.
+    # Setup phase: the later fixture's own error, reported as an ERROR of that test.
+    assert "ERROR test_inner.py::test_leaks_then_a_later_fixture_fails" in out, out
+    assert "the fixture's own failure" in out, out
+    # Each failure is the report; the guard does not replace it with its message.
     assert "left os.name" not in out, out
     assert "a plugin hook failed" not in out, out

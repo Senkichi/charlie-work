@@ -1,8 +1,9 @@
 """``os.name`` must read the host's value between pytest phases (issue #3010).
 
-Incident (ci-fleet nightly break 16, "unbisectable", no failing test): four tests
-set the process-global ``os.name`` to ``"posix"`` through ``monkeypatch`` on a
-Windows host. A ``monkeypatch`` patch lives until fixture teardown, so it was
+Incident (ci-fleet nightly break 16, "unbisectable", no failing test): 13 test
+items (10 test functions in 5 files) set the process-global ``os.name`` to
+``"posix"`` through ``monkeypatch`` on a Windows host. A ``monkeypatch`` patch
+lives until fixture teardown, so it was
 still in force when the next pytest phase began. On Windows ``pathlib`` builds a
 ``PosixPath`` once ``os.name`` is ``"posix"``, and a drive-letter path is
 "relative" to it -- ``PosixPath.as_uri()`` raises, and ``.parents`` raises
@@ -76,30 +77,31 @@ def _fail_if_foreign(nodeid: str, phase: str) -> None:
         pytest.fail(foreign_name_message(nodeid, phase, live), pytrace=False)
 
 
-@pytest.hookimpl(wrapper=True)
-def pytest_runtest_setup(item: pytest.Item) -> Generator[None, Any, Any]:
+def _guarded_phase(nodeid: str, phase: str) -> Generator[None, Any, Any]:
+    """The one implementation of the guard, shared by every phase wrapper.
+
+    Both ``pytest_runtest_setup`` and ``pytest_runtest_call`` delegate here with
+    ``yield from``, so there is a single exception path to get right (and to test).
+    """
     if not ENFORCED:
         return (yield)
     try:
         result = yield
     except BaseException:
-        # The setup already failed; restoring keeps THAT failure formattable.
+        # The phase already failed (a failing assertion, a raising fixture): it would
+        # otherwise be reported while pathlib is broken. Restore first so the real
+        # failure reaches the report.
         restore_host_os_name()
         raise
-    _fail_if_foreign(item.nodeid, "setup")
+    _fail_if_foreign(nodeid, phase)
     return result
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_setup(item: pytest.Item) -> Generator[None, Any, Any]:
+    return (yield from _guarded_phase(item.nodeid, "setup"))
 
 
 @pytest.hookimpl(wrapper=True)
 def pytest_runtest_call(item: pytest.Item) -> Generator[None, Any, Any]:
-    if not ENFORCED:
-        return (yield)
-    try:
-        result = yield
-    except BaseException:
-        # A failing assertion inside the window would otherwise be reported while
-        # pathlib is broken: restore first so the real failure reaches the report.
-        restore_host_os_name()
-        raise
-    _fail_if_foreign(item.nodeid, "call")
-    return result
+    return (yield from _guarded_phase(item.nodeid, "call"))
