@@ -36,8 +36,11 @@ marks the repoint optional (same PR or a follow-up); this PR defers it.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Iterator
-from typing import Any
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # annotation only: keeps this module free of any runtime config/gh import
+    from charlie_work.config import OrchestratorConfig
 
 # GitHub's own issue-closing keyword set, used here to decide whether a `#N`
 # reference in freeform text actually links the PR to issue N. Shared between
@@ -188,3 +191,63 @@ def linked_issue_number(
         if match:
             return int(match.group(1))
     return None
+
+
+# ``state.issues[N]`` keys that ONLY dispatch writes (``dispatch_state`` stamps
+# both when it launches a worker; rework/reap paths null ``dispatched_at`` but
+# leave ``branch_name``, hence either key counts). Reconcile's
+# ``issue_active_label_with_open_pr`` self-heal writes ``status``/``pr_number``
+# and nothing else, so adopting a PR never mints either key. Deliberately NOT
+# ``status``, ``pr_number`` or any ``agent:*`` label: the daemon's own first
+# adoption would satisfy those and legitimise itself (issue #2763).
+_DISPATCH_PROVENANCE_KEYS = ("dispatched_at", "branch_name")
+
+
+def fleet_owns_pr(
+    pr: Mapping[str, Any],
+    issue_labels: Iterable[str],
+    issue_state_entry: Mapping[str, Any] | None,
+    config: OrchestratorConfig,
+) -> bool:
+    """Is this PR the fleet's to review and merge, not merely bound to a fleet issue?
+
+    ``linked_issue_number`` deliberately binds ANY same-repo PR that names an
+    issue with a closing keyword. Binding is the right read for GitHub's own
+    auto-close and for the label lifecycle of a PR the fleet is already
+    driving; it is the wrong license to START driving a PR (label repair,
+    fleet review, merge hand-off) for an issue the fleet never owned. This
+    predicate is the single act-site gate (issue #2763). True iff the PR is
+    same-repo AND any one of:
+
+    1. its head ref starts with ``dispatch.branch_prefix`` (the orchestrator
+       created that branch);
+    2. the linked issue carries ``labels.ready`` -- it persists through the
+       normal lifecycle (``merged``/``closed_unmerged`` strip it, a dead-worker
+       salvage deferral strips it transiently, which is why 3 exists);
+    3. the linked issue's ``state.issues`` entry carries dispatch provenance
+       (``dispatched_at`` or ``branch_name``), written only by dispatch.
+
+    It is NOT satisfiable by an ``agent:*`` label or by a bare / ``open_passive``
+    state entry: adoption itself writes those, so keying on them would let the
+    daemon's first adoption legitimise every later one. A fork PR, or one whose
+    provenance is unknown (``isCrossRepository`` not exactly ``False``), is
+    never owned -- the same fail-closed rule as ``linked_issue_number``.
+
+    ``review.require_fleet_ownership = False`` is the kill switch: every PR is
+    then treated as owned (the pre-#2763 behavior). It lives here, not at the
+    call sites, so all of them honor it identically.
+
+    Pure: takes the already-resolved label names and state entry, so it adds
+    no GitHub call and no state read of its own.
+    """
+    if not config.review.require_fleet_ownership:
+        return True
+    if pr.get("isCrossRepository") is not False:
+        return False
+    if str(pr.get("headRefName") or "").startswith(config.dispatch.branch_prefix):
+        return True
+    if config.labels.ready in set(issue_labels):
+        return True
+    return bool(issue_state_entry) and any(
+        issue_state_entry.get(key) for key in _DISPATCH_PROVENANCE_KEYS
+    )

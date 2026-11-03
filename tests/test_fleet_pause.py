@@ -90,6 +90,22 @@ def test_read_fails_closed_on_unreadable_flag(tmp_path: Path) -> None:
     assert fleet_pause_pending(str(tmp_path)) is True
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param('{"reason": "x"}'.encode("utf-16"), id="utf16-powershell-5.1-redirect"),
+        pytest.param(b"\xff\xfe\x00\x80{", id="invalid-utf8"),
+    ],
+)
+def test_read_fails_closed_on_a_non_utf8_flag(tmp_path: Path, payload: bytes) -> None:
+    """Reading must not raise: a pause the reader cannot decode is still a pause (#2766)."""
+    path = layout.fleet_pause_path(str(tmp_path))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+    assert read_fleet_pause(str(tmp_path)) == {}
+    assert fleet_pause_pending(str(tmp_path)) is True
+
+
 def test_pause_then_resume_commands(tmp_path: Path) -> None:
     result = run_fleet_pause(_args(tmp_path, reason="why"))
     assert result.ok and result.data["reason"] == "why"

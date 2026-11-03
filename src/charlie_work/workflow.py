@@ -58,6 +58,7 @@ from .github import (
     parse_blockers,  # noqa: F401  (deliberate re-export; used by moved delegates via _wf.)
 )
 from .host_routing import local_prs as host_local_prs  # noqa: F401  (reap_loop seam)
+from .fleet_ownership import pr_fleet_owned
 from .issue_linking import linked_issue_number
 from .pr_body_closing_autofix_flow import autofix_body_closing_kw
 from .pr_unlinked_visibility import summarize_unlinked_prs
@@ -195,6 +196,7 @@ from .throttle_signatures import (
     match_throttle_tail,
     parse_reset_clock_time,
 )
+from . import infra_rerun_refusal as _refusal
 from . import markdown_guard
 from .write_gate import WriteGate
 
@@ -1908,14 +1910,10 @@ def _format_stale_base_alarm_message(pr_number: int, attempts: int, reason: str)
 def _is_rerun_already_running_error(error: str) -> bool:
     """Return True if a ``gh run rerun`` error means the run is still in progress.
 
-    GitHub refuses to rerun a workflow while any job in the run is still
-    running. The CLI surfaces this with the phrase ``already running`` in the
-    error, e.g. ``run <id> cannot be rerun; This workflow is already running``
-    or ``The workflow run containing this job is already running``. Other
-    refusal reasons (expired run, broken workflow file, missing permissions,
-    ...) do not contain this phrase and should not be treated as retryable.
+    Kept as the ``_wf.`` seam its callers use; the classifier itself lives in
+    ``infra_rerun_refusal.is_rerun_already_running`` (shared with the aggregate heal lane).
     """
-    return "already running" in error.lower()
+    return _refusal.is_rerun_already_running(error)
 
 
 def _try_reap_blocked_foreign_writer(
@@ -2016,9 +2014,13 @@ class OrchestratorApp:
         dry_run: bool = False,
         fleet_dir_override: str | None = None,
         host: HostPorts | None = None,
+        ignore_pause: bool = False,
     ):
         # Production composition only; tests use the ``fake_host`` fixture.
         self._host = host
+        # Issue #2766: ``--ignore-pause`` for this process -- the worker launch
+        # gate (fleet_pause.launch_pause_fields) stands down for a deliberate one-shot.
+        self.ignore_pause = ignore_pause
         self.repo_root = repo_root
         self.paths = paths
         self.config = config
@@ -2276,6 +2278,40 @@ class OrchestratorApp:
             branch_prefix=self.config.dispatch.branch_prefix,
             branch_issue_validator=self._make_branch_issue_validator(),
         )
+
+        # Issue #2763: the defence-in-depth backstop for the ownership gate.
+        # `_loop_body` and `review_queue` already route a PR the fleet does not
+        # own to `pr_unlinked_skipped`, so reaching here means an operator-
+        # invoked review or a caller that bypassed them. Refuse before ANY
+        # packet write, label transition or state mutation -- a PR that merely
+        # names an issue with a closing keyword is a human's work, not the
+        # pipeline's. A PR with no resolvable linked issue is out of scope
+        # (it has no issue to own it and keeps its existing behaviour).
+        if issue_number is not None and not pr_fleet_owned(
+            self.gh,
+            self.config,
+            pr,
+            issue_number,
+            load_state_locked(self.paths.state_file),
+        ):
+            if not self.dry_run:
+                log_event(
+                    self.paths.state_file,
+                    # event-consumer: audit-only -- operator-visible refusal; the
+                    # actionable signal for the same PR is the edge-triggered
+                    # `pr_unlinked_skipped` (reason: not_fleet_owned), which the
+                    # merge lane emits on every pass.
+                    "review_refused_not_fleet_owned",
+                    {"pr_number": pr_number, "issue_number": issue_number},
+                    repo=self.repo_root.name,
+                )
+            return _CommandResult(
+                False,
+                f"PR #{pr_number} is not fleet-owned (issue #{issue_number} was never "
+                "dispatched, is not automated-ready, and the PR is off the dispatch "
+                "branch namespace); review refused",
+                {"pr": pr_number, "issue": issue_number, "not_fleet_owned": True},
+            )
 
         # Issue #617: dry-run must short-circuit before the escalation check,
         # the packet writes (pr.json, checks.json, diff.patch, review-prompt.md,
