@@ -1999,9 +1999,13 @@ class OrchestratorApp:
         dry_run: bool = False,
         fleet_dir_override: str | None = None,
         host: HostPorts | None = None,
+        ignore_pause: bool = False,
     ):
         # Production composition only; tests use the ``fake_host`` fixture.
         self._host = host
+        # Issue #2766: ``--ignore-pause`` for this process -- the worker launch
+        # gate (fleet_pause.launch_pause_fields) stands down for a deliberate one-shot.
+        self.ignore_pause = ignore_pause
         self.repo_root = repo_root
         self.paths = paths
         self.config = config

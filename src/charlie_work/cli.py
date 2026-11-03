@@ -53,6 +53,7 @@ from .supervise_loop import (
     PREFLIGHT_REFUSAL_EXIT_CODE,
 )
 from .fleet_pause import (
+    ignore_pause_requested,
     mark_pass_running,
     refuse_pass_while_paused,
     register_fleet_pause_subparsers,
@@ -913,6 +914,7 @@ def build_app(args: argparse.Namespace) -> OrchestratorApp:
         ctx.gh,
         dry_run=args.dry_run,
         fleet_dir_override=args.fleet_dir,
+        ignore_pause=ignore_pause_requested(args),
     )
 
 
@@ -1303,6 +1305,7 @@ def run_fleet_work(args: argparse.Namespace) -> CommandResult:
         merge=None,  # work-only doesn't use merge
         dry_run=args.dry_run,
         work_only=True,
+        ignore_pause=ignore_pause_requested(args),
     )
 
 
@@ -1430,6 +1433,7 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
         dry_run=args.dry_run,
         work_only=False,
         drain=deploy.starved,
+        ignore_pause=ignore_pause_requested(args),
     )
 
 

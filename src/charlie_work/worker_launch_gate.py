@@ -13,6 +13,14 @@ throttle / operator-hold cooldowns.
 Gate sequence -- the ONE implementation, inside
 :func:`issue_worker_launch_permit` (issue #2055 ordering):
 
+P. fleet pause (issue #2766) -- a lock-free read of ``fleet-pause.json``, ahead
+   of everything below. The supervisor reads the flag only between fleet passes,
+   but a fleet pass walks the registry for minutes, so this is what stops the
+   repos it has not reached yet from launching after the operator paused. Defers
+   ``fleet_paused`` (``ok=True``, so ``dispatch_deferred`` records it) with
+   ``paused_at`` / ``pause_reason``; ``--ignore-pause`` (``app.ignore_pause``)
+   bypasses it. Running workers, reviews, reconcile and salvage do not pass
+   through the permit and are untouched;
 0. provider-throttle / operator-hold PRE-CHECK -- a lock-free ``state.json``
    read. A throttled repo defers here without ever touching the fleet lock,
    so a throttled fleet cannot saturate it. The governor has not run at this
@@ -82,7 +90,6 @@ fails if any function other than :func:`_launch_workers` touches the
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import random
@@ -105,6 +112,8 @@ from charlie_work.adapters import (
     write_session_results,
 )
 from charlie_work.atomic_write import write_json_atomic
+from charlie_work.fleet_lock_holder import fleet_lock_held_extra
+from charlie_work.fleet_pause import FLEET_PAUSED, launch_pause_fields
 from charlie_work.fleet_registry import try_acquire_fleet_lock
 from charlie_work.host.launch import worker_error_results
 
@@ -128,6 +137,7 @@ logger = logging.getLogger(__name__)
 _MINT = object()
 
 REASON_FLEET_LOCK_HELD = "fleet_lock_held"
+REASON_FLEET_PAUSED = FLEET_PAUSED
 REASON_PROVIDER_THROTTLED = role_selection.REASON_PROVIDER_THROTTLED
 REASON_CONCURRENCY_CAP = "concurrency_cap"
 REASON_LAUNCH_LOCK_INVALID = "launch_lock_invalid"
@@ -404,50 +414,6 @@ def acquire_fleet_launch_lock(
     )
 
 
-def read_fleet_lock_holder(fleet_dir_override: str | None) -> dict[str, Any]:
-    """Best-effort read of the fleet-launch-lock holder sidecar (issue #2055).
-
-    Returns ``{}`` when absent or unreadable -- a stale sidecar (holder died
-    mid-hold) is still useful diagnostic data for a ``fleet_lock_held``
-    deferral, so no liveness check is done here.
-    """
-    try:
-        raw = json.loads(
-            layout.fleet_lock_holder_path(override=fleet_dir_override).read_text(encoding="utf-8")
-        )
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return raw if isinstance(raw, dict) else {}
-
-
-def _holder_held_seconds(acquired_at: Any) -> float | None:
-    """Seconds since the holder sidecar's ``acquired_at``; ``None`` if unparseable."""
-    if not isinstance(acquired_at, str) or not acquired_at:
-        return None
-    try:
-        acquired = datetime.fromisoformat(acquired_at.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return max(0.0, (datetime.now(UTC) - acquired).total_seconds())
-
-
-def fleet_lock_held_extra(app: OrchestratorApp, wait_seconds: float) -> dict[str, Any]:
-    """Payload fields for a ``fleet_lock_held`` deferral (shared by every lane).
-
-    Carries the exhausted wait budget and, best-effort, who holds the lock.
-    """
-    holder = read_fleet_lock_holder(app.fleet_dir_override)
-    extra: dict[str, Any] = {"lock_wait_seconds": wait_seconds}
-    if isinstance(holder.get("repo"), str):
-        extra["lock_holder_repo"] = holder["repo"]
-    if isinstance(holder.get("pid"), int):
-        extra["lock_holder_pid"] = holder["pid"]
-    held_seconds = _holder_held_seconds(holder.get("acquired_at"))
-    if held_seconds is not None:
-        extra["lock_held_seconds"] = held_seconds
-    return extra
-
-
 def issue_worker_launch_permit(
     app: OrchestratorApp,
     requested: int,
@@ -457,7 +423,7 @@ def issue_worker_launch_permit(
     launch_lock: FleetLaunchLock | None = None,
     acquire: FleetLockAcquirer = try_acquire_fleet_lock,
 ) -> WorkerLaunchPermit | WorkerLaunchDeferral:
-    """Run the throttle pre-check -> fleet lock -> governor -> throttle gates.
+    """Run the pause + throttle pre-checks -> fleet lock -> governor -> throttle gates.
 
     ``launch_lock``: a handle the lane minted at its entry point via
     :func:`acquire_fleet_launch_lock` (borrowed; the lane releases it). When
@@ -473,6 +439,11 @@ def issue_worker_launch_permit(
     called exactly as each lane always called it.
     """
     _wf = _workflow()
+
+    # Issue #2766 pause gate: the flag is read fresh, lock-free, before anything
+    # else -- a fleet pass that began unpaused still stops launching once it is set.
+    if (paused := launch_pause_fields(app)) is not None:
+        return WorkerLaunchDeferral(REASON_FLEET_PAUSED, ok=True, extra=paused)
 
     # Issue #2055 gate 0: lock-free provider-throttle/operator-hold
     # pre-check -- a cheap unlocked ``state.json`` read. A throttled repo
