@@ -315,10 +315,11 @@ def test_kill_process_tree_self_pid_exempt(monkeypatch: Any) -> None:
 
     monkeypatch.setattr("charlie_work.process_utils.os.killpg", fake_killpg, raising=False)
 
-    # Force the POSIX branch so both platform kill paths are gated by the guard.
-    monkeypatch.setattr("charlie_work.process_utils.os.name", "posix")
-
-    killed = kill_process_tree(own_pid)
+    # Force the POSIX branch so both platform kill paths are gated by the guard. Bound to
+    # the call, not the test (issue #3010): see tests/_os_name_guard.py.
+    with monkeypatch.context() as patched:
+        patched.setattr("charlie_work.process_utils.os.name", "posix")
+        killed = kill_process_tree(own_pid)
     assert killed == []
     assert kill_attempts == []
 
