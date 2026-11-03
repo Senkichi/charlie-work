@@ -99,10 +99,14 @@ def settle_reported(
     def advance(current: frozenset[int]) -> frozenset[int]:
         return (current - resolved_set) | unresolved_set
 
-    current = load_reported(path)
-    if advance(current) == current:
-        return frozenset()
     try:
+        # The lock-free read is inside the guard too: ``load_reported`` opens
+        # with ``path.exists()``, which raises on errnos it does not treat as
+        # "missing" (e.g. ``PermissionError``), and nothing here may raise into
+        # ``are_issues_open``.
+        current = load_reported(path)
+        if advance(current) == current:
+            return frozenset()
         path.parent.mkdir(parents=True, exist_ok=True)
         with advisory_file_lock(path):
             # Re-read under the lock: another process may have settled between

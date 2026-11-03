@@ -73,8 +73,9 @@ def graphql_issue_states(
     Returns a mapping ``issue_number -> is_open`` covering the numbers that
     resolved. A requested number ABSENT from the mapping is one the batched
     query could not resolve (``data.repository.s_<n>`` came back ``null``
-    alongside a per-node ``errors`` entry) -- the caller per-issue-fetches
-    exactly those numbers instead of the whole batch (issue #1933). A
+    alongside a per-node ``errors`` entry, or came back without a ``state``)
+    -- the caller per-issue-fetches exactly those numbers instead of the
+    whole batch (issue #1933). A
     whole-query failure -- no usable ``data`` at all, or ``run`` itself
     raising -- still propagates as ``GitHubError`` so the caller's existing
     full-set fallback covers it.
@@ -125,9 +126,18 @@ def graphql_issue_states(
                 # Unresolvable node -- deliberately absent from `states` so
                 # the caller per-issue-fetches just this number.
                 continue
+            raw_state = issue.get("state")
+            if not isinstance(raw_state, str) or not raw_state:
+                # A node with no ``state`` is not a closed one. GitHub answers
+                # ``{}`` -- present, not null, no ``errors`` entry -- for a
+                # union node whose concrete type has no matching inline
+                # fragment (issue #2901), and reading that as "not OPEN" would
+                # silently unblock an issue whose blocker is still open.
+                # Absent from `states` -> the scoped per-issue fallback decides.
+                continue
             returned_number = issue.get("number")
             if returned_number is not None:
                 number = int(returned_number)
-            states[number] = str(issue.get("state") or "").upper() == "OPEN"
+            states[number] = raw_state.upper() == "OPEN"
 
     return states

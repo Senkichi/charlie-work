@@ -23,6 +23,7 @@ is spawned.
 
 from __future__ import annotations
 
+import errno
 import json
 import re
 import threading
@@ -30,10 +31,11 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
-from _fake_transport import FakeAdapter, make_github
+from _fake_transport import FakeAdapter, make_github, ok
 
 from charlie_work import layout
 from charlie_work.github import GitHub
+from charlie_work.github_capabilities import graphql_issue_states as graphql_issue_states_module
 from charlie_work.github_capabilities import issues as issues_module
 from charlie_work.github_capabilities import unresolved_issue_baseline as baseline
 from charlie_work.github_capabilities.circuit_breaker_transport import circuit_breaker_state_path
@@ -45,6 +47,8 @@ KIND = "github_issue_state_partial_fallback"
 
 # ``s_<n>: <lookup>(number: <n>)`` -- the alias grammar of the batched document.
 _ALIAS = re.compile(r"s_(\d+): (issueOrPullRequest|issue)\(number: \d+\)")
+# ``... on <Type> { <fields> }`` -- one inline fragment of a union selection.
+_FRAGMENT = re.compile(r"\.\.\. on (Issue|PullRequest) \{([^{}]*)\}")
 
 
 # ---------------------------------------------------------------------------
@@ -52,11 +56,42 @@ _ALIAS = re.compile(r"s_(\d+): (issueOrPullRequest|issue)\(number: \d+\)")
 # ---------------------------------------------------------------------------
 
 
+def _selects_state(selection: str, type_name: str) -> bool:
+    """True when *selection* carries ``... on <type_name> { ... number ... state ... }``.
+
+    ``issueOrPullRequest`` returns a union, which has no fields of its own: a
+    node is populated only through the inline fragment naming its concrete
+    type, and only with the fields that fragment selects.
+    """
+    return any(
+        name == type_name and {"number", "state"} <= set(fields.split())
+        for name, fields in _FRAGMENT.findall(selection)
+    )
+
+
+def _aliases(document: str) -> list[tuple[int, str, str]]:
+    """``(number, lookup, selection)`` for every ``s_<n>`` alias in *document*.
+
+    A selection runs from the end of its alias header to the start of the next
+    alias, so one alias cannot satisfy another's fragments.
+    """
+    matches = list(_ALIAS.finditer(document))
+    ends = [m.start() for m in matches[1:]] + [len(document)]
+    return [
+        (int(m.group(1)), m.group(2), document[m.end() : end])
+        for m, end in zip(matches, ends, strict=True)
+    ]
+
+
 def _github_emulator(*, issues: dict[int, str], pulls: dict[int, str]) -> FakeAdapter:
     """An HTTP adapter that answers the batched issue-state document the way
     GitHub does: ``issue(number:)`` resolves issues only (a PR number is
     ``null`` plus a per-node ``errors`` entry, HTTP 200), while
-    ``issueOrPullRequest(number:)`` resolves either.
+    ``issueOrPullRequest(number:)`` resolves either -- but, being a union,
+    populates the node only through the inline fragment for its concrete type.
+    A PR whose document lacks ``... on PullRequest { number state }`` (or an
+    issue whose document lacks ``... on Issue { number state }``) comes back as
+    ``{}``: present, not ``null``, no ``errors`` entry, no ``state``.
 
     Anything that is not the batched document -- i.e. the per-issue fallback --
     fails the test: the point of the fix is that no fallback request is made.
@@ -67,12 +102,16 @@ def _github_emulator(*, issues: dict[int, str], pulls: dict[int, str]) -> FakeAd
         assert "s_" in document, f"unexpected non-batch request (per-issue fallback?): {document}"
         repo: dict[str, dict | None] = {}
         errors: list[dict] = []
-        for raw_number, lookup in _ALIAS.findall(document):
-            number = int(raw_number)
-            if number in issues:
-                node: dict | None = {"number": number, "state": issues[number]}
-            elif number in pulls and lookup == "issueOrPullRequest":
-                node = {"number": number, "state": pulls[number]}
+        for number, lookup, selection in _aliases(document):
+            node: dict | None
+            if lookup == "issue":
+                node = {"number": number, "state": issues[number]} if number in issues else None
+            elif number in issues:
+                found = _selects_state(selection, "Issue")
+                node = {"number": number, "state": issues[number]} if found else {}
+            elif number in pulls:
+                found = _selects_state(selection, "PullRequest")
+                node = {"number": number, "state": pulls[number]} if found else {}
             else:
                 node = None
             repo[f"s_{number}"] = node
@@ -160,6 +199,10 @@ def test_pull_request_blockers_resolve_in_the_batch_without_fallback(
     [batch] = http.api_requests
     for number in (10, 11, 2930, 2931, 2932):
         assert f"s_{number}: issueOrPullRequest(number: {number})" in batch.document
+    # A union has no fields of its own: without BOTH inline fragments GitHub
+    # answers `{}` for the node of the omitted type (the emulator models this),
+    # which the parser would read as closed. Pin the document, not only the result.
+    assert "... on Issue" in batch.document and "... on PullRequest" in batch.document
     assert [e for e in events if e[0] == KIND] == []
     # Nothing unresolved, so nothing is written to the baseline either.
     assert not _sidecar(tmp_path).exists()
@@ -184,6 +227,87 @@ def test_emulator_models_the_old_lookup_failing_on_a_pull_request(
     assert body["data"]["repository"]["s_10"] == {"number": 10, "state": "OPEN"}
     assert body["data"]["repository"]["s_2930"] is None
     assert [e["path"] for e in body["errors"]] == [["repository", "s_2930"]]
+
+
+@pytest.mark.parametrize(
+    ("selection", "issue_node", "pull_node"),
+    [
+        ("... on Issue { number state } ... on PullRequest { number state }", True, True),
+        ("... on Issue { number state }", True, False),  # PullRequest fragment dropped
+        ("... on PullRequest { number state }", False, True),  # Issue fragment dropped
+        ("... on Issue { number } ... on PullRequest { number }", False, False),  # no `state`
+    ],
+)
+def test_emulator_populates_a_union_node_only_through_its_own_fragment(
+    tmp_path: Path, selection: str, issue_node: bool, pull_node: bool
+) -> None:
+    """Positive control for the fragment assertions above: the emulator returns
+    `{}` (present, not null, no errors) for a node whose concrete type has no
+    fragment selecting ``number`` and ``state``. This is the response shape
+    that makes a dropped fragment dangerous -- it is not an error to retry --
+    and it is what lets the test above fail when a fragment is removed."""
+    http = _github_emulator(issues={10: "OPEN"}, pulls={2930: "OPEN"})
+    document = (
+        f"query {{ repository {{ s_10: issueOrPullRequest(number: 10) {{ {selection} }} "
+        f"s_2930: issueOrPullRequest(number: 2930) {{ {selection} }} }} }}"
+    )
+
+    reply = http.handler(type("Req", (), {"document": document})())  # type: ignore[misc]
+
+    body = json.loads(reply.body)
+    assert body["errors"] == []
+    assert body["data"]["repository"]["s_10"] == (
+        {"number": 10, "state": "OPEN"} if issue_node else {}
+    )
+    assert body["data"]["repository"]["s_2930"] == (
+        {"number": 2930, "state": "OPEN"} if pull_node else {}
+    )
+
+
+@pytest.mark.parametrize("stateless", [{}, {"number": 12}, {"number": 12, "state": None}])
+def test_a_node_without_a_state_is_unresolved_not_closed(
+    tmp_path: Path, stateless: dict[str, object]
+) -> None:
+    """GitHub answers ``{}`` (present, no ``errors`` entry) for a union node
+    whose fragment is missing. It must reach the caller as "unresolved" -- absent
+    from the mapping, so the scoped per-issue fallback decides -- never as
+    "not OPEN", which would silently unblock an issue whose blocker is open."""
+    body = {"data": {"repository": {"s_11": {"number": 11, "state": "OPEN"}, "s_12": stateless}}}
+    gh, _http, _gh = make_github(tmp_path, http=FakeAdapter("http", [ok(body)]))
+
+    assert gh._graphql_issue_states([11, 12]) == {11: True}
+
+
+def test_a_dropped_pull_request_fragment_degrades_to_the_fallback_not_to_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """End to end, if the document ever regresses to selecting only
+    ``... on Issue``, an open-PR blocker is re-fetched per issue and still
+    blocks -- it is not read as closed. (The test that pins the document is
+    ``test_pull_request_blockers_resolve_in_the_batch_without_fallback``; this
+    one pins the safety net behind it.)"""
+    events = _capture_events(monkeypatch)
+    monkeypatch.setattr(
+        graphql_issue_states_module,
+        "_issue_state_fields",
+        lambda chunk: " ".join(
+            f"s_{n}: issueOrPullRequest(number: {n}) {{ ... on Issue {{ number state }} }}"
+            for n in chunk
+        ),
+    )
+    fetched: list[int] = []
+
+    def issue_view(self: Issues, number: int) -> dict:
+        fetched.append(number)
+        return {"number": number, "state": "OPEN"}
+
+    monkeypatch.setattr(Issues, "issue_view", issue_view)
+    http = _github_emulator(issues={10: "OPEN"}, pulls={2931: "OPEN"})
+    gh, _http, _gh = make_github(tmp_path, http=http)
+
+    assert gh.are_issues_open([10, 2931]) == {10, 2931}
+    assert fetched == [2931]
+    assert [payload["unresolved"] for kind, payload in events if kind == KIND] == [[2931]]
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +519,26 @@ def test_settle_reported_returns_none_when_the_sidecar_cannot_be_updated(
     monkeypatch.setattr(baseline, "advisory_file_lock", fail)
 
     assert baseline.settle_reported(tmp_path / "x.json", resolved=[], unresolved=[361]) is None
+
+
+def test_settle_reported_returns_none_when_the_first_read_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``Path.exists`` raises for errnos it does not treat as "missing" (e.g.
+    EACCES). The lock-free read that opens ``settle_reported`` sits inside the
+    same guard as the locked write, so "never raises into ``are_issues_open``"
+    holds for the first read too."""
+    target = tmp_path / "issue-state-unresolved.json"
+    real_exists = Path.exists
+
+    def exists(self: Path, *args: object, **kwargs: object) -> bool:
+        if self == target:
+            raise PermissionError(errno.EACCES, "denied", str(self))
+        return real_exists(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "exists", exists)
+
+    assert baseline.settle_reported(target, resolved=[], unresolved=[361]) is None
 
 
 def test_layout_places_the_sidecar_beside_state_json(tmp_path: Path) -> None:
