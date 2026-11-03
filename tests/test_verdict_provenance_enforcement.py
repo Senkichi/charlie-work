@@ -64,12 +64,13 @@ from __future__ import annotations
 import ast
 import inspect
 import json
+import unicodedata
 from collections import Counter
 from pathlib import Path
 from typing import Any, NamedTuple
 
 import pytest
-from _src_ast import parsed, source_files
+from _src_ast import parsed, source_files, source_text
 
 from charlie_work.command_result import CommandResult
 from charlie_work.config import OrchestratorConfig
@@ -442,17 +443,43 @@ def _nodes_outside_function_definition(tree: ast.AST, function_name: str) -> lis
     return [n for n in ast.walk(tree) if id(n) not in skip]
 
 
+# ``record_local_review`` (issue #1844's no-remote lane) is the same
+# verdict-ingest contract under a different name -- required
+# verdict_provenance kwarg, same provenance literals -- so its call
+# sites are held to the identical mapping table. One tuple feeds both the
+# AST matcher and ``_may_call_record_review``'s text gate, so a name added
+# here cannot be matched by the one and dropped by the other.
+_RECORD_REVIEW_ATTRS = ("record_review", "record_local_review")
+
+
+def _may_call_record_review(text: str) -> bool:
+    """Cheap, sound pre-filter: could ``text`` hold a ``record_review`` call site?
+
+    Issue #2931: the call-site scan parsed and walked all ~510 files under
+    ``src/`` to find the handful that call ``record_review`` /
+    ``record_local_review``. An ``ast.Attribute`` matched on ``.attr`` must
+    spell that name in its source, so a file whose text lacks every name
+    cannot hold a site and need not be parsed -- the ``source_text`` needle
+    gate the other AST-scanning tests use.
+
+    Sound, not just fast: the parser NFKC-normalizes identifiers, so
+    ``x.ｒecord_review(...)`` (fullwidth ``r``) is a ``record_review``
+    attribute whose raw text lacks the needle. A guard that exists to catch
+    bypasses must not fail open on that rephrase, so non-ASCII text is
+    normalized before the check (``str.isascii`` keeps the common case free).
+    """
+    if not text.isascii():
+        text = unicodedata.normalize("NFKC", text)
+    return any(attr in text for attr in _RECORD_REVIEW_ATTRS)
+
+
 def _record_review_call_sites(tree: ast.AST) -> list[ast.Call]:
     sites: list[ast.Call] = []
-    # ``record_local_review`` (issue #1844's no-remote lane) is the same
-    # verdict-ingest contract under a different name -- required
-    # verdict_provenance kwarg, same provenance literals -- so its call
-    # sites are held to the identical mapping table.
     for node in _nodes_outside_function_definition(tree, "record_review"):
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
-            and node.func.attr in ("record_review", "record_local_review")
+            and node.func.attr in _RECORD_REVIEW_ATTRS
         ):
             sites.append(node)
     return sites
@@ -811,6 +838,12 @@ def test_record_review_call_sites_map_to_expected_provenance_literal() -> None:
     actual: dict[tuple[str, str], Counter[str]] = {}
 
     for path in source_files(_SRC_ROOT):
+        # Issue #2931: only the few files whose text names a record_review
+        # attribute can hold a site; skip parsing and walking the rest. The
+        # equality and total_sites controls below are the evidence that the
+        # gate drops nothing.
+        if not _may_call_record_review(source_text(path)):
+            continue
         tree = parsed(path)
         parents = _build_parent_map(tree)
         for call in _record_review_call_sites(tree):
@@ -852,6 +885,41 @@ def test_record_review_call_sites_map_to_expected_provenance_literal() -> None:
         sum(counter.values()) for counter in _EXPECTED_RECORD_REVIEW_PROVENANCE_BY_SITE.values()
     )
     assert total_sites == 11, _EXPECTED_RECORD_REVIEW_PROVENANCE_BY_SITE
+
+
+# Issue #2931: the text gate in the test above must never under-admit -- a
+# file it skips is a file whose call sites nobody checks. Each case pins the
+# gate against the AST matcher it fronts. The gate may over-admit (a file
+# that only mentions the name in a comment is parsed and found empty); these
+# cases are chosen where the two agree exactly, so ``is has_site`` also proves
+# the gate is not trivially True.
+@pytest.mark.parametrize(
+    ("source", "has_site"),
+    [
+        pytest.param("app.record_review(1)\n", True, id="record_review"),
+        pytest.param("app.record_local_review(1)\n", True, id="record_local_review"),
+        pytest.param("# — note\napp.record_review(1)\n", True, id="non_ascii_file"),
+        # The parser NFKC-normalizes identifiers: a fullwidth ``r`` is still a
+        # ``record_review`` attribute, though the raw text lacks the needle.
+        pytest.param("app.ｒecord_review(1)\n", True, id="fullwidth_identifier"),
+        pytest.param("app.record_decision(1)\n", False, id="other_attribute"),
+        pytest.param("def f():\n    return 1\n", False, id="unrelated"),
+    ],
+)
+def test_record_review_text_gate_never_drops_a_site_the_ast_matcher_finds(
+    source: str, has_site: bool
+) -> None:
+    # Control: the matcher sees what the case claims, so the gate is compared
+    # against a real positive/negative rather than against the author's label.
+    assert bool(_record_review_call_sites(ast.parse(source))) is has_site
+    assert _may_call_record_review(source) is has_site
+
+
+def test_record_review_text_gate_admits_every_attribute_name_the_matcher_accepts() -> None:
+    """Derived from ``_RECORD_REVIEW_ATTRS``, so a name added to the matcher
+    without the gate noticing is caught here, not by a silently shrunken scan."""
+    for attr in _RECORD_REVIEW_ATTRS:
+        assert _may_call_record_review(f"app.{attr}(1)\n"), attr
 
 
 # ---------------------------------------------------------------------------
