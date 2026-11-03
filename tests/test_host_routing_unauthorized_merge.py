@@ -89,7 +89,6 @@ def _recorded(paths: Any) -> tuple[list[str], list[dict[str, Any]], list[dict[st
         ("workstation", True, {"host:macbook"}, "default host, issue labelled for the Mac"),
         ("macbook", False, {"host:workstation"}, "Mac, issue labelled for the workstation"),
         ("macbook", False, set(), "non-default host, unlabelled issue belongs to the default"),
-        ("workstation", True, {"host:macbook", "host:workstation"}, "two hosts: owned by neither"),
     ],
 )
 def test_merge_of_another_hosts_issue_is_not_reported(

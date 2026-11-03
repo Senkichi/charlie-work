@@ -145,13 +145,18 @@ def drop_foreign_findings(app: Any, findings: list[dict[str, Any]]) -> list[dict
     - **It fails towards reporting.** :func:`local_prs` answers "may this host
       act on the PR?", so on an unreadable issue list a non-default host drops
       every PR. A finding is evidence of a possible bypass, so it is dropped
-      only on positive proof: the issue was read and carries another host's
-      label. A finding with no linked issue, an issue outside the fetched
-      window, or an unreadable issue list all stay.
+      only on positive proof: the issue was read and
+      :func:`foreign_issue_numbers` says another host owns it. A finding with
+      no linked issue, an issue outside the fetched window, or an unreadable
+      issue list all stay.
 
     With ``dispatch.host`` unset (routing off) the list is returned untouched
     and no issue read is made. The read is also skipped when no finding names
     an issue.
+
+    Ownership is :func:`foreign_issue_numbers`' own rule, inherited as is: an
+    issue carrying two different host labels belongs to neither host, so it is
+    foreign to both, and a merge linked to one is audited by neither.
     """
     if app.config.dispatch.host is None or not any(f.get("issue") is not None for f in findings):
         return findings
