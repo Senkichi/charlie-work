@@ -17,8 +17,10 @@ import _process_guard
 from _process_guard import (
     _THIS_PID,
     FAST_GUARDS_ENV,
+    descendant_snapshot,
     job_process_ids,
     leak_guard,
+    reap_pid,
 )
 
 _BASE_EXECUTABLE = getattr(sys, "_base_executable", sys.executable)
@@ -212,6 +214,54 @@ def test_leak_guard_still_reports_a_leak_under_a_patched_psutil_process(
     assert f"pid={proc.pid} cmdline=" in report
     # The command line is read off a real process, never off the fake.
     assert "time.sleep" in report
+
+
+def test_reap_pid_kills_a_real_child_under_a_patched_psutil_process() -> None:
+    """Issue #2918: ``reap_pid`` is the guard call that runs while a test's fake
+    is still installed -- conftest's teardown offers it every launched worker pid.
+
+    Its descendant check goes through ``Process.children``, which builds
+    ``Process`` objects from whatever class psutil's module holds; under the fake
+    that raises, and the child would outlive the test. It must be killed, and the
+    test's own patch must still be the installed class afterwards.
+    """
+    child = _spawn_sleeper()
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(psutil, "Process", _ConstantCreateTimeProcess)
+            reap_pid(child.pid)
+            assert psutil.Process is _ConstantCreateTimeProcess
+        try:
+            child.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pytest.fail("reap_pid left the real child running under a patched psutil.Process")
+        assert child.returncode is not None
+    finally:
+        child.kill()
+        child.wait(timeout=10)
+
+
+def test_descendant_snapshot_reads_real_create_times_under_a_patched_psutil_process() -> None:
+    """Issue #2918: the setup snapshot must hold a live child's *real* start time.
+
+    The fake's constant is what a leak check run later under the real class
+    would compare against; a snapshot taken under the fake either raises or
+    records that constant, and the bystander then looks like a fresh leak.
+    """
+    constant = _ConstantCreateTimeProcess().create_time()
+    child = _spawn_sleeper()
+    try:
+        real_create_time = _process_guard._REAL_PROCESS(child.pid).create_time()
+        assert real_create_time != constant, "positive control: real and fake times differ"
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(psutil, "Process", _ConstantCreateTimeProcess)
+            snapshot = descendant_snapshot()
+            assert psutil.Process is _ConstantCreateTimeProcess
+        assert snapshot.get(child.pid) == real_create_time
+        assert constant not in snapshot.values()
+    finally:
+        child.kill()
+        child.wait(timeout=10)
 
 
 def test_real_process_scope_restores_the_tests_fake_when_the_body_raises() -> None:
