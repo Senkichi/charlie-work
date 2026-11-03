@@ -65,10 +65,9 @@ def test_fleet_loop_runs_the_episode_step_on_a_full_pass_only(
     assert result.ok is True
     assert spy.call_count == calls
     if calls:
-        kwargs = spy.call_args.kwargs
-        assert kwargs["fleet_state_path"] == layout.state_file_path(fleet)
-        assert kwargs["dry_run"] is False
-        assert kwargs["fleet_dir_override"] == str(fleet)
+        _config, fleet_dir_override, _notify, dry_run = spy.call_args.args
+        assert dry_run is False
+        assert fleet_dir_override == str(fleet)
 
 
 def test_a_full_fleet_pass_alerts_an_armed_block_exactly_once(fleet: Path, digests: list) -> None:

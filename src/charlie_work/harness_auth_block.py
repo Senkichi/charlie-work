@@ -365,11 +365,10 @@ def _emit_resumed(
 
 def run_fleet_pass(
     config: Any,
-    *,
     fleet_dir_override: str | None,
-    fleet_state_path: Path,
     notify_config: Any,
     dry_run: bool = False,
+    *,
     now: datetime | None = None,
     stage_a: Callable[..., StageAResult] = run_stage_a,
 ) -> list[str]:
@@ -391,7 +390,12 @@ def run_fleet_pass(
     if dry_run or config is None or not harness_auth_enabled(config):
         return []
     from . import fleet_provider_throttle
+    from .fleet_paths import fleet_dir
 
+    # The state file ``fleet_loop`` itself writes -- derived here, from the one
+    # ``fleet_dir_override`` the pass already holds, so the caller cannot hand in
+    # a path that disagrees with the fleet directory the probe/Stage A use.
+    fleet_state_path = layout.state_file_path(fleet_dir(override=fleet_dir_override))
     resolved_now = (now if now is not None else datetime.now(UTC)).replace(microsecond=0)
     actions: list[str] = []
     for block in role_quota_ledger.list_harness_blocks():

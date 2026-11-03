@@ -116,9 +116,7 @@ def test_a_probe_that_outlives_survival_reopens_the_harness(
     fpt.note_probe_launch(key, [(os.getpid(), None)], fleet_dir_override=str(fleet), now=past)
 
     state_path = layout.state_file_path(fleet)
-    done = harness_auth_block.run_fleet_pass(
-        app.config, fleet_dir_override=str(fleet), fleet_state_path=state_path, notify_config=None
-    )
+    done = harness_auth_block.run_fleet_pass(app.config, str(fleet), None)
 
     assert f"{HARNESS}:resumed" in done
     assert not block().episode_open
@@ -126,15 +124,9 @@ def test_a_probe_that_outlives_survival_reopens_the_harness(
     assert resumed["level"] == "info" and resumed["payload"]["harness"] == HARNESS
     app.dispatch(limit=3)
     assert len(launched) == len(ISSUES), "the harness is open again"
-    assert (
-        harness_auth_block.run_fleet_pass(
-            app.config,
-            fleet_dir_override=str(fleet),
-            fleet_state_path=state_path,
-            notify_config=None,
-        )
-        == []
-    ), "an ended episode ends once"
+    assert harness_auth_block.run_fleet_pass(app.config, str(fleet), None) == [], (
+        "an ended episode ends once"
+    )
     assert len(query_events(state_path, kind="harness_auth_resumed")) == 1
 
 
@@ -148,12 +140,7 @@ def test_a_probe_still_inside_the_survival_period_keeps_the_harness_closed(
     key = harness_auth_block.probe_key(HARNESS)
     fpt.note_probe_launch(key, [(os.getpid(), None)], fleet_dir_override=str(fleet))
 
-    done = harness_auth_block.run_fleet_pass(
-        app.config,
-        fleet_dir_override=str(fleet),
-        fleet_state_path=layout.state_file_path(fleet),
-        notify_config=None,
-    )
+    done = harness_auth_block.run_fleet_pass(app.config, str(fleet), None)
 
     assert f"{HARNESS}:resumed" not in done
     assert block().episode_open
@@ -164,7 +151,7 @@ def test_a_probe_that_dies_of_the_signature_rearms_with_backoff_and_no_second_al
 ) -> None:
     state_path = layout.state_file_path(fleet)
     arm(age=LAPSED)
-    first = _pass(fleet, state_path)
+    first = _pass(fleet)
     assert first == [f"{HARNESS}:alerted", f"{HARNESS}:stage_a_green"]
     sessions = dead_devin_session(tmp_path, NOT_LOGGED_IN + "\n")
 
@@ -174,7 +161,7 @@ def test_a_probe_that_dies_of_the_signature_rearms_with_backoff_and_no_second_al
     assert rearmed.consecutive_hits == 2
     assert timedelta(minutes=29) < rearmed.until - datetime.now(UTC) <= timedelta(minutes=30)
     assert rearmed.stage_a_green_at is None
-    assert _pass(fleet, state_path) == []
+    assert _pass(fleet) == []
     assert len(query_events(state_path, kind="harness_auth_blocked")) == 1
     assert len(digests) == 1
 
@@ -189,26 +176,21 @@ def digests(monkeypatch: pytest.MonkeyPatch) -> list:
     return sent
 
 
-def _pass(fleet: Path, state_path: Path, *, stage_a: Any = None, **kw: Any) -> list[str]:
+def _pass(fleet: Path, *, stage_a: Any = None, **kw: Any) -> list[str]:
     stage = stage_a or (lambda *_a, **_k: harness_auth_block.StageAResult(True, "ok"))
     return harness_auth_block.run_fleet_pass(
-        make_config(),
-        fleet_dir_override=str(fleet),
-        fleet_state_path=state_path,
-        notify_config=object(),
-        stage_a=stage,
-        **kw,
+        make_config(), str(fleet), object(), stage_a=stage, **kw
     )
 
 
 def test_the_episode_alerts_once(fleet: Path, digests: list) -> None:
     state_path = layout.state_file_path(fleet)
-    assert _pass(fleet, state_path) == [], "no block, nothing to say"
+    assert _pass(fleet) == [], "no block, nothing to say"
     arm(repo="o/r1", issue=124)
     arm(repo="o/r0", issue=123)
 
-    assert _pass(fleet, state_path) == [f"{HARNESS}:alerted"]
-    assert _pass(fleet, state_path) == []
+    assert _pass(fleet) == [f"{HARNESS}:alerted"]
+    assert _pass(fleet) == []
 
     (event,) = query_events(state_path, kind="harness_auth_blocked")
     assert event["level"] == "error"
@@ -228,22 +210,21 @@ def test_the_episode_alerts_once(fleet: Path, digests: list) -> None:
 def test_a_resumed_harness_that_fails_again_is_a_new_alerted_episode(
     fleet: Path, digests: list
 ) -> None:
-    state_path = layout.state_file_path(fleet)
     arm()
-    _pass(fleet, state_path)
+    _pass(fleet)
     ledger.mark_harness_resumed(HARNESS)
 
     again = arm(age=timedelta(0))
 
     assert again.consecutive_hits == 1 and again.alerted_at is None
-    assert _pass(fleet, state_path) == [f"{HARNESS}:alerted"]
+    assert _pass(fleet) == [f"{HARNESS}:alerted"]
     assert len(digests) == 2
 
 
 def test_a_dry_run_pass_does_nothing(fleet: Path, digests: list) -> None:
     state_path = layout.state_file_path(fleet)
     arm()
-    assert _pass(fleet, state_path, dry_run=True) == []
+    assert _pass(fleet, dry_run=True) == []
     assert digests == [] and query_events(state_path, kind="harness_auth_blocked") == []
     assert block().alerted_at is None
 
@@ -354,7 +335,7 @@ def test_a_lapsed_window_with_green_stage_a_is_stamped_for_one_probe(
 ) -> None:
     arm(age=LAPSED)
 
-    assert _pass(fleet, layout.state_file_path(fleet)) == [
+    assert _pass(fleet) == [
         f"{HARNESS}:alerted",
         f"{HARNESS}:stage_a_green",
     ]
@@ -370,7 +351,7 @@ def test_a_lapsed_window_with_red_stage_a_rearms_without_escalating(
     def red(*_args: Any, **_kwargs: Any) -> harness_auth_block.StageAResult:
         return harness_auth_block.StageAResult(False, "Not logged in")
 
-    done = _pass(fleet, layout.state_file_path(fleet), stage_a=red)
+    done = _pass(fleet, stage_a=red)
 
     assert done == [f"{HARNESS}:alerted", f"{HARNESS}:stage_a_red"]
     after = block()
@@ -386,7 +367,7 @@ def test_a_live_window_runs_no_stage_a(fleet: Path, digests: list) -> None:
     def boom(*_args: Any, **_kwargs: Any) -> harness_auth_block.StageAResult:
         raise AssertionError("Stage A must wait for the window to lapse")
 
-    assert _pass(fleet, layout.state_file_path(fleet), stage_a=boom) == [f"{HARNESS}:alerted"]
+    assert _pass(fleet, stage_a=boom) == [f"{HARNESS}:alerted"]
 
 
 # --- kill switch ------------------------------------------------------------------------------
@@ -404,13 +385,7 @@ def test_with_the_switch_off_nothing_classifies_blocks_or_alerts(
         HARNESS_AUTH_FAILED_KIND
     ), "control: the same death classifies with the switch on"
 
-    state_path = layout.state_file_path(fleet)
-    assert (
-        harness_auth_block.run_fleet_pass(
-            off, fleet_dir_override=str(fleet), fleet_state_path=state_path, notify_config=object()
-        )
-        == []
-    )
+    assert harness_auth_block.run_fleet_pass(off, str(fleet), object()) == []
     assert digests == [] and block().alerted_at is None
 
 
