@@ -56,6 +56,12 @@ UNLINKED_PR_RESOLVED_EVENT_KIND = "pr_unlinked_resolved"
 #: writer, so there is no risk of a concurrent writer clobbering the key.
 UNLINKED_PR_NOTICE_KEY = "unlinked_pr_notice"
 
+#: ``pr_unlinked_skipped`` ``reason`` for the original case: no linked issue
+#: could be resolved. The marker stores no ``last_reason`` for it (so markers
+#: written before issue #2763 stay valid); the other reason is
+#: ``fleet_ownership.NOT_FLEET_OWNED_REASON``.
+NO_LINKED_ISSUE_REASON = "no_linked_issue"
+
 
 @dataclass(frozen=True)
 class UnlinkedPrFingerprint:
@@ -163,6 +169,7 @@ def compute_unlinked_pr_transition(
     fingerprint: UnlinkedPrFingerprint,
     *,
     now: datetime,
+    reason: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Pure edge-detector: decide whether this pass's fingerprint is new.
 
@@ -173,9 +180,19 @@ def compute_unlinked_pr_transition(
     - ``event_extra`` is ``None`` when ``fingerprint`` (after settling any
       unsettled ``mergeable``/``merge_state_status`` value via
       ``_settle_fingerprint``) equals the marker's last-emitted fingerprint
-      -- nothing materially changed, so the caller must neither emit an
-      event nor rewrite ``state.json`` (a standing, unresolved PR costs a
-      single read per pass, not a write).
+      AND ``reason`` equals the marker's last-emitted reason -- nothing
+      materially changed, so the caller must neither emit an event nor
+      rewrite ``state.json`` (a standing, unresolved PR costs a single read
+      per pass, not a write).
+
+    ``reason`` (issue #2763) is why the lane skipped the PR when it is
+    something other than the original "no linked issue" case (``None``). A
+    PR whose classification flips -- e.g. its body gains a closing keyword for
+    an issue the fleet never owned -- keeps an identical fingerprint, so the
+    reason is part of the comparison: otherwise the new classification would
+    never be announced. ``last_reason`` is stored only when ``reason`` is set,
+    leaving markers for the original case byte-identical to what was written
+    before this field existed.
     - Otherwise ``event_extra`` carries ``observed_days`` (days since this PR
       was first observed, tracked in ``first_seen_at`` -- there is no GitHub
       "created at" field in hand without a new API call, so this is time
@@ -187,7 +204,7 @@ def compute_unlinked_pr_transition(
     marker = marker or {}
     previous_fingerprint = marker.get("last_fingerprint")
     current_fingerprint = _settle_fingerprint(previous_fingerprint, fingerprint)
-    if previous_fingerprint == current_fingerprint:
+    if previous_fingerprint == current_fingerprint and marker.get("last_reason") == reason:
         return marker, None
     first_seen_raw = marker.get("first_seen_at")
     first_seen_at = first_seen_raw if isinstance(first_seen_raw, str) else now.isoformat()
@@ -196,6 +213,8 @@ def compute_unlinked_pr_transition(
         "last_fingerprint": current_fingerprint,
         "last_emitted_at": now.isoformat(),
     }
+    if reason is not None:
+        new_marker["last_reason"] = reason
     event_extra = {
         "observed_days": _observed_days_since(first_seen_at, now),
         "previous_state": previous_fingerprint,

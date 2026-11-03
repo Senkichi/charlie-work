@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from .human_block import human_block_gate
 from .model import (
     AccountingFacts,
     Admission,
@@ -97,10 +98,18 @@ def mergequeue_re_add_pending(readiness: Readiness, holds: HoldFacts) -> bool:
     counting gate (issue #2743 review round 1): a pass that never re-adds --
     a merge-hold, an escalated or human-merge hold, or a pass with
     ``should_merge=False`` -- observes the reverted label but does not climb
-    toward the cap.
+    toward the cap. Issue #2763: a human's outstanding request-changes is one
+    more such hold (an unavailable read included -- fail closed), so a
+    human-blocked pass stays flat on the ledger too.
     """
     read_needed = merge_hold_read_needed(readiness, holds)
-    return bool(read_needed and holds.merge_hold is False and not holds.merge_hold_unavailable)
+    _, enter = merge_entry(readiness, holds)
+    return bool(
+        read_needed
+        and holds.merge_hold is False
+        and not holds.merge_hold_unavailable
+        and not human_block_gate(enter, holds).held
+    )
 
 
 def mergequeue_requeue_count(
@@ -166,12 +175,14 @@ def requeue_gate(readiness: Readiness, holds: HoldFacts, *, re_add_pending: bool
     held PR never caps, never gains ``Hold.REQUEUE_CAPPED`` and is never
     routed to rework by the queue cap. The rework route still needs a linked
     issue in a routable status and still defers to a pending human-merge
-    hand-off.
+    hand-off. Issue #2763: a human-blocked pass is a held pass too -- it
+    neither caps nor routes, so an outstanding request-changes is never
+    answered with a dispatch or an escalation.
     """
     cfg = holds.config
     adm = readiness.branch.admission
     can_merge = readiness.gate.can_merge
-    escalated, _enter = merge_entry(readiness, holds)
+    escalated, enter = merge_entry(readiness, holds)
     requeues = mergequeue_requeue_count(
         holds.persisted,
         adm,
@@ -184,6 +195,7 @@ def requeue_gate(readiness: Readiness, holds: HoldFacts, *, re_add_pending: bool
         cfg.mergequeue_label
         and holds.should_merge
         and not escalated
+        and not human_block_gate(enter, holds).held
         and can_merge
         and holds.live_head_sha
         and cap > 0

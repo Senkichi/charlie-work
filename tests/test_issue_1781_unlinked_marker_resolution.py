@@ -88,7 +88,18 @@ def _dependabot_pr(
 
 
 def _issue(number: int = 123) -> dict[str, Any]:
-    return {"number": number, "title": "Fix search", "state": "OPEN", "labels": []}
+    # Issue #2763: the PR in these tests resolves into this issue from a
+    # non-dispatch branch (``dependabot/...``), so the fleet owns the binding
+    # only through the issue's ``labels.ready`` -- the falling edge under test
+    # is "an issue-less PR became a fleet-owned, linked one". Without the
+    # label the PR is correctly classified ``not_fleet_owned`` and stays in the
+    # skipped set (covered by the ownership tests).
+    return {
+        "number": number,
+        "title": "Fix search",
+        "state": "OPEN",
+        "labels": [{"name": OrchestratorConfig().labels.ready}],
+    }
 
 
 def _marker(pr_number: int, first_seen_at: str) -> dict[str, Any]:

@@ -103,6 +103,9 @@ class Hold(StrEnum):
     REVERT_UNDETERMINED = "revert_undetermined"
     CHECKS_UNAVAILABLE = "checks_unavailable"
     REQUEUE_CAPPED = "requeue_capped"
+    # Issue #2763: a human's outstanding request-changes review/comment.
+    HUMAN_BLOCK = "human_block"
+    HUMAN_BLOCK_UNAVAILABLE = "human_block_unavailable"
 
 
 @dataclass(frozen=True)
@@ -179,6 +182,10 @@ class MergePathConfig:
     # Issue #2743: max same-head queue reverts before the hand-off stops being
     # admissible and the PR routes to rework instead. 0 disables the gate.
     mergequeue_requeue_cap: int = 3
+    # Issue #2763: honour a human's outstanding request-changes (a lazily
+    # evaluated hold on the merge path). Off HERE so a bare fixture does not
+    # read comments; ``gather.config_slice`` copies the shipped-ON config.
+    honor_human_block: bool = False
 
 
 # --------------------------------------------------------------------------- #
@@ -368,6 +375,13 @@ class HoldFacts:
     # None = not read. Read only when a hand-off could happen.
     merge_hold: bool | None = None
     merge_hold_unavailable: bool = False
+    # Issue #2763: a human's outstanding request-changes. None = not read. Read
+    # only when ``cfg.honor_human_block`` and a merge or hand-off could happen
+    # (``human_block.human_block_gate``). ``human_block_source`` names the signal
+    # that decided it (``HUMAN_BLOCK_SOURCE_*``); None when it did not block.
+    human_block: bool | None = None
+    human_block_unavailable: bool = False
+    human_block_source: str | None = None
     # Live PR head: anchors the requeue counter's per-head comparison (#2743).
     live_head_sha: str | None = None
 
@@ -384,6 +398,11 @@ class MergePlan:
     read_merge_hold: bool = False
     merge_hold: bool = False
     merge_hold_unavailable: bool = False
+    # Issue #2763: mirrors ``HoldFacts.human_block*`` once the gate has read them.
+    read_human_block: bool = False
+    human_block: bool = False
+    human_block_unavailable: bool = False
+    human_block_source: str | None = None
     reset_failed_attempts_on_hand_off: bool = False
     holds: frozenset[Hold] = frozenset()
     conflict_rework: bool = False

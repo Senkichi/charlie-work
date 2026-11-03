@@ -337,6 +337,7 @@ KNOWN_IGNORED: dict[str, str] = {
     "preflight_config_stale": "preflight diagnostic",
     "preflight_warning": "preflight diagnostic",
     "review_dispatch_skipped_empty_diff": "review-skip record: nothing to review",
+    "review_refused_not_fleet_owned": "review-refusal record: the PR names an issue the fleet never dispatched (issue #2763); pr_unlinked_skipped carries the visibility",
     "review_stale_claim_recovery_skipped": "stale-claim recovery bookkeeping",
     "review_verdict_reconcile_failed": "verdict-reconcile bookkeeping",
     "rework_outcome_apply_failed": "rework-outcome bookkeeping",

@@ -162,6 +162,25 @@ def render_preview_stale_base(
     )
 
 
+def human_block_data(
+    blocked: bool, unavailable: bool, source: str | None = None
+) -> dict[str, Any]:
+    """Result-data keys for the human block (issue #2763) -- present only when it fired.
+
+    The result's key set is pinned by the merge-path characterization harness,
+    so the keys ride along only on the new hold itself: every result that
+    existed before keeps its exact shape, and ``_record_merge_or_error`` still
+    sees ``human_block_check_unavailable`` on the one result that needs it.
+    """
+    if not (blocked or unavailable):
+        return {}
+    return {
+        "human_block": blocked,
+        "human_block_check_unavailable": unavailable,
+        "human_block_source": source,
+    }
+
+
 @dataclass(frozen=True)
 class PreviewFinal:
     """What the preview observed after the stage-3 reads (nothing was applied)."""
@@ -180,6 +199,9 @@ class PreviewFinal:
     stale_base_deferrals: int
     mergequeue_requeues: int = 0
     mergequeue_requeue_capped: bool = False
+    # Issue #2763: a human's outstanding request-changes (see ``human_block``).
+    human_block: bool = False
+    human_block_unavailable: bool = False
 
 
 def preview_message(p: PreviewFinal) -> str:
@@ -197,6 +219,8 @@ def preview_message(p: PreviewFinal) -> str:
         can_merge
         and p.should_merge
         and not p.merge_hold
+        and not p.human_block
+        and not p.human_block_unavailable
         and not p.escalated_merge_hold
         and not r.human_merge_hold
         and not r.human_merge_check_unavailable
@@ -213,6 +237,10 @@ def preview_message(p: PreviewFinal) -> str:
         return base + f" (human-merge label check unavailable for issue #{p.issue_number})"
     if p.merge_hold:
         return base + f" (merge-hold label {p.merge_hold_label!r} present — would be left alone)"
+    if p.human_block:
+        return base + " (human request-changes outstanding — would not merge or hand off)"
+    if p.human_block_unavailable:
+        return base + " (human-review check unavailable — would hold, fail-closed)"
     if r.branch.merge_conflict:
         return base + " (merge conflict — would route to rework on threshold)"
     if r.cross_pr_revert_detected:
@@ -231,7 +259,12 @@ def preview_message(p: PreviewFinal) -> str:
 
 def render_preview_final(ports: MergePathPorts, p: PreviewFinal) -> Any:
     r = p.readiness
-    ok = not (r.checks_unavailable or p.merge_hold_unavailable or r.human_merge_check_unavailable)
+    ok = not (
+        r.checks_unavailable
+        or p.merge_hold_unavailable
+        or p.human_block_unavailable
+        or r.human_merge_check_unavailable
+    )
     return ports.command_result(
         ok,
         preview_message(p),
@@ -266,6 +299,7 @@ def render_preview_final(ports: MergePathPorts, p: PreviewFinal) -> Any:
             "requeue_escalated": False,
             "merge_hold": p.merge_hold,
             "merge_hold_check_unavailable": p.merge_hold_unavailable,
+            **human_block_data(p.human_block, p.human_block_unavailable),
             "human_merge_hold": r.human_merge_hold,
             "human_merge_check_unavailable": r.human_merge_check_unavailable,
             "escalated_merge_hold": p.escalated_merge_hold,
@@ -478,6 +512,16 @@ def live_message(f: LiveFinal) -> str:
         )
     if f.plan.merge_hold:
         return base + f" (merge-hold label {f.merge_hold_label!r} present — left alone)"
+    if f.plan.human_block:
+        return base + (
+            f" (human request-changes outstanding via {f.plan.human_block_source} — "
+            "not merged or handed off; clears when the human approves)"
+        )
+    if f.plan.human_block_unavailable:
+        return base + (
+            f" (human-review check unavailable for PR #{f.pr_number} — "
+            "not merged or handed off, fail-closed)"
+        )
     if f.plan.mergequeue_requeue_capped:
         if res.requeue_escalated:
             outcome = "escalated to a human"
@@ -544,11 +588,16 @@ def render_live_final(ports: MergePathPorts, f: LiveFinal) -> Any:
         "requeue_escalated": res.requeue_escalated,
         "merge_hold": f.plan.merge_hold,
         "merge_hold_check_unavailable": f.plan.merge_hold_unavailable,
+        **human_block_data(
+            f.plan.human_block, f.plan.human_block_unavailable, f.plan.human_block_source
+        ),
         "human_merge_hold": r.human_merge_hold,
         "human_merge_check_unavailable": r.human_merge_check_unavailable,
         "human_merge_label_error": res.human_merge_label_error,
         "escalated_merge_hold": f.plan.escalated_merge_hold,
         **r.gate.as_payload(),
     }
-    ok = not (r.checks_unavailable or f.plan.merge_hold_unavailable)
+    ok = not (
+        r.checks_unavailable or f.plan.merge_hold_unavailable or f.plan.human_block_unavailable
+    )
     return ports.command_result(ok, live_message(f), data)
