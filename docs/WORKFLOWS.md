@@ -183,6 +183,7 @@ worker:
 opencode:            # all optional
   provider: opencode-go   # prefixed onto a bare model -> opencode-go/glm-5.3-flash
   variant: ""             # --variant (low | high | max for glm-5.3-flash)
+  release_blocked_tool: true   # kill switch for the stalled-lane release below
   worker_env: {}          # merged last; operator values win
 ```
 
@@ -215,6 +216,29 @@ the `limitName` window), so the ledger restricts the entry until exactly then; a
 200 means the limit already reset (15-minute cooldown). No credential, a
 network error or any other answer keeps the fixed 24h. One probe per 2 minutes
 per process.
+
+**Silent stalls on an orphaned pipe holder (#2794).** An opencode `bash` tool
+call does not complete until its stdout/stderr pipe reaches EOF. A command that
+backgrounds a process (`server &`, an orphaned test-runner worker) hands that
+process the pipe's write end and outlives its shell; the tool's own timeout kills
+only the shell, so the call -- and with it the whole `opencode run` -- blocks with
+no event, no provider error, a frozen worktree mtime and a live pid. The worker
+then looked like any other stall and was reaped at `stall_minutes` with
+`failure_kind: null`, discarding a session that was one pipe close from finishing.
+The holder is not a descendant of the worker (the shell exited; Windows never
+reparents), so it is found by what it shares with the worker instead: a cwd inside
+the worker's own worktree, a start after the worker's, and no parent chain under
+the worker. When the stalled-session lane sees a STALLED opencode worker, and the
+rate-limit defer does not explain the silence, it kills those holders once
+(`pipe_holder_release.release_pipe_holders`, event `session_tool_released`) and
+leaves the worker running; the blocked call then returns and the model carries on.
+The release is one-shot per dispatch (`tool_released_at` on the sidecar): a worker
+still STALLED `RELEASE_RESUME_GRACE` (10 minutes) later, or one with no holder to
+release, takes the ordinary reap. The primitive refuses unless it can anchor on the
+worker -- the recorded pid must still carry the recorded start time, and its own cwd
+must be inside the worktree -- so a recycled pid or a wrong worktree path kills
+nothing. `opencode.release_blocked_tool: false` restores the outright reap. The
+stall boundary itself is unchanged; what changes is that the session survives it.
 
 `charlie doctor --adapter-probe` probes the opencode binary whenever opencode is
 the primary *or* any fallback entry, so a missing binary surfaces before a

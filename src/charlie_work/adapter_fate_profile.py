@@ -57,6 +57,11 @@ class AdapterFateProfile:
     # no detection: a harness declares one only once a real log line has been
     # captured (devin-shell today), never a guessed string.
     harness_auth_evidence: Callable[[str], str | None] | None = None
+    # Issue #2794: whether a STALLED worker on this harness may have a tool call
+    # blocked on an orphaned process holding the call's output pipe, which the
+    # stalled lane can release (``pipe_holder_release``) instead of killing the
+    # whole session. True only where that mechanism was reproduced (opencode).
+    releases_blocked_tool: bool = False
 
 
 _PROFILES: dict[str, AdapterFateProfile] | None = None
@@ -172,6 +177,7 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
             writes_terminal_record=True,
             log_digest=provider_error_digest,
             quota_reset=_opencode_quota_reset,
+            releases_blocked_tool=True,
         ),
         # "command" and "manual" have no failure-classification or budget
         # consumer today: dead_worker_reap.py's 14 sites never branch on

@@ -342,6 +342,7 @@ KNOWN_IGNORED: dict[str, str] = {
     "salvage_push_failed": "stranded-commit salvage record",
     "session_budget_exceeded": "session-budget record",
     "session_stalled": "session-stall record; worker exits carry the fate",
+    "session_tool_released": "stalled-lane release of a tool call blocked on a pipe holder (#2794); the worker keeps running, so the later exit carries the fate",
     "spec_review": "spec-review bookkeeping",
     "spec_review_failed": "spec-review bookkeeping",
     "supervisor_wedged_killed": "watchdog kill record",
