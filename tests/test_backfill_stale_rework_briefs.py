@@ -464,14 +464,21 @@ def test_deployment_gate_fails_when_fix_not_merged(tiny_git_repo: Path, bf: Modu
     assert fix_sha in failures[0]
 
 
-def test_deployment_gate_passes_once_fix_is_ancestor(tiny_git_repo: Path, bf: ModuleType) -> None:
-    _git(tiny_git_repo, "checkout", "-q", "-b", "fix-branch")
-    (tiny_git_repo / "b.txt").write_text("b", encoding="utf-8")
-    _git(tiny_git_repo, "add", "b.txt")
-    _git(tiny_git_repo, "commit", "-q", "-m", "the fix")
-    fix_sha = _git(tiny_git_repo, "rev-parse", "HEAD").stdout.strip()
+def test_deployment_gate_passes_once_fix_is_ancestor(
+    deployment_gate_repos: tuple[Path, str, Path], bf: ModuleType
+) -> None:
+    """Issue #3022: the pass case reads the shared ``deployment_gate_repos`` pair.
 
-    ok, failures = bf.check_deployment_gate(tiny_git_repo, [fix_sha])
+    The per-test build was ``checkout -b`` / ``add`` / ``commit`` / ``rev-parse``
+    before the gate's own ``merge-base`` -- five call-phase ``git`` spawns, which
+    the ledger flagged at 4.1x baseline once the runner pool's per-spawn price
+    inflated. ``deployment_gate_repos`` already builds a repo whose HEAD contains
+    the fix commit (``main`` is fast-forwarded to it), once per worker in module
+    setup, so only the ``merge-base`` probe remains in the call phase. The pair is
+    read-only here, as its contract requires."""
+    repo_with_fix, fix_sha, _ = deployment_gate_repos
+
+    ok, failures = bf.check_deployment_gate(repo_with_fix, [fix_sha])
     assert ok is True
     assert failures == []
 
