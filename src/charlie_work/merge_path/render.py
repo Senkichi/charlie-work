@@ -21,7 +21,6 @@ from .model import (
     MergePlan,
     Readiness,
 )
-
 from .ports import MergePathPorts
 
 HEAD_MOVED_MESSAGE = "PR head moved since approval — re-review required"

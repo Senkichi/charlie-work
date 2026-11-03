@@ -570,7 +570,7 @@ def _cap_escalation_pr_extra(
     Issue #1106: clears startup-death flags on escalate. Issue (this fix):
     adds ``worker_launched`` -- see ``_worker_launched_before_cap_escalation``.
     Issue #2900: also stamps ``<attempts_key>_escalated_head`` -- the head the
-    PR carries at     escalation time -- as the merge lane's skip anchor. Without
+    PR carries at escalation time -- as the merge lane's skip anchor. Without
     it the pre-#2900 code left only ``<attempts_key>_last_head`` from the last
     routing pass, which can lag the live head at this very escalation (the
     settled-cycle burn path escalates AFTER the head moved). A falsy head
