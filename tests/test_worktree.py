@@ -8586,3 +8586,41 @@ def test_salvage_push_stranded_commits_dry_run_does_not_push(tmp_path: Path) -> 
     # The branch must STILL NOT exist on origin -- no real push happened.
     show_ref_after = _git(remote, "show-ref")
     assert branch not in show_ref_after.stdout
+
+
+def test_rescue_capture_with_missing_worktree_directory_permits_reset(
+    tmp_path: Path,
+) -> None:
+    """AC3 (#2904): a branch with local commits whose worktree directory is gone
+    has no dirty content to capture, so the redispatch proceeds instead of
+    failing every git call with [WinError 267] and escalating the issue on
+    every requeue. The stranded tip is snapshotted to an attempt ref before
+    the branch is reset, and the fresh worktree re-applies it."""
+    remote, repo = _init_repo_with_remote(tmp_path)
+
+    branch_name = "agent/issue-2904-rescue-ac3"
+    info1 = create_worktree(repo, branch_name, base_ref="origin/main")
+    # A local commit that never reached origin.
+    (info1.path / "stranded.txt").write_text("stranded work\n", encoding="utf-8")
+    _git(info1.path, "add", "stranded.txt")
+    _git(info1.path, "commit", "-m", "stranded local commit")
+
+    # The worktree directory disappears without going through remove_worktree,
+    # leaving the git worktree entry pointing at nothing.
+    shutil.rmtree(info1.path)
+
+    info2 = create_worktree(repo, branch_name, base_ref="origin/main", issue_number=2904)
+
+    # The redispatch succeeded — no WorktreeUnsafeError, no escalation.
+    assert info2.path.is_dir()
+
+    # The stranded tip is durable on an attempt ref.
+    refs = _git(
+        repo, "for-each-ref", "--format=%(refname)", "refs/charlie/attempts/issue-2904"
+    ).stdout.split()
+    assert refs, "no attempt ref was written for the stranded tip"
+    rescued = _git(repo, "show", f"{refs[-1]}:stranded.txt").stdout
+    assert rescued == "stranded work\n"
+
+    # Clean up.
+    remove_worktree(repo, info2.path, branch=branch_name)
