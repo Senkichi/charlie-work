@@ -258,9 +258,13 @@ def test_merge_ready_mergequeue_handoff_refusal_propagates_cleanly(
     without touching the merge counters, the alarm, or the mergequeue status.
     """
     # Skip-line off: its issue read would otherwise be the first refusal site
-    # (pinned by the TIS-CW-7 test below).
+    # (pinned by the TIS-CW-7 test below). Human-block off: its comment read
+    # (#2763) is likewise an earlier site, pinned by the test after TIS-CW-7.
     app, paths, fake_gh = _merge_ready_app(
-        tmp_path, mergequeue_label="mergequeue", mergequeue_skip_line_label=None
+        tmp_path,
+        mergequeue_label="mergequeue",
+        mergequeue_skip_line_label=None,
+        honor_human_block=False,
     )
     spent = {"hit": False}
     real_issue_view = fake_gh.issue_view
@@ -296,7 +300,10 @@ def test_merge_ready_skip_line_read_refusal_propagates_cleanly(tmp_path: Path) -
     It runs before the queue label, so a refusal there leaves nothing applied,
     exactly like a refusal at the label add.
     """
-    app, paths, fake_gh = _merge_ready_app(tmp_path, mergequeue_label="mergequeue")
+    # Human-block off: its comment read (#2763) would be the first refusal site.
+    app, paths, fake_gh = _merge_ready_app(
+        tmp_path, mergequeue_label="mergequeue", honor_human_block=False
+    )
     fake_gh.issues[0]["labels"] = [{"name": "automated-ready"}, {"name": "priority:critical"}]
     spent = {"hit": False}
     real_issue_view = fake_gh.issue_view
@@ -319,6 +326,43 @@ def test_merge_ready_skip_line_read_refusal_propagates_cleanly(tmp_path: Path) -
     assert fake_gh.merged == []
     pr_state = load_state(paths.state_file)["prs"].get("456", {})
     assert pr_state.get("status") != "mergequeue"
+
+
+def test_merge_ready_human_block_read_refusal_propagates_cleanly(tmp_path: Path) -> None:
+    """Issue #2763: the human-block comment read is a refusal site before the hand-off.
+
+    It runs after the merge decision says a hand-off is imminent and before the
+    queue label, so a spent in-pass deadline refuses it with nothing applied --
+    exactly like a refusal at the label add. It must escape as the deadline
+    exception, never be absorbed into the fail-closed "unreadable -> hold" path
+    (that would record a spurious hold and swallow the deferral).
+    """
+    app, paths, fake_gh = _merge_ready_app(
+        tmp_path, mergequeue_label="mergequeue", mergequeue_skip_line_label=None
+    )
+    spent = {"hit": False}
+    real_issue_view = fake_gh.issue_view
+    fake_gh.issue_list = lambda *a, **k: []  # type: ignore[method-assign]
+
+    def _issue_view_then_spend(number: int) -> Any:
+        result = real_issue_view(number)
+        spent["hit"] = True
+        return result
+
+    fake_gh.issue_view = _issue_view_then_spend  # type: ignore[method-assign]
+    set_pass_deadline_exceeded(fake_gh, lambda: spent["hit"])
+
+    with pytest.raises(PassDeadlineExceeded):
+        app.merge_ready(456, merge=True)
+
+    assert fake_gh.deadline_refusals == ["run"]
+    assert fake_gh.pr_labels_added == []
+    assert fake_gh.merged == []
+    state = load_state(paths.state_file)
+    pr_state = state["prs"].get("456", {})
+    assert pr_state.get("status") != "mergequeue"
+    assert pr_state.get("consecutive_failed_merge_attempts", 0) == 0
+    assert [e for e in state["events"] if e["kind"] == "merge_ready"] == []
 
 
 # ---------------------------------------------------------------------------

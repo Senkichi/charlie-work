@@ -16,6 +16,8 @@ could be attempted rather than only when a mergequeue label is set.
 
 from __future__ import annotations
 
+import importlib
+import re
 from dataclasses import dataclass, replace
 from datetime import datetime
 from types import MappingProxyType
@@ -24,7 +26,7 @@ from typing import TYPE_CHECKING, Any, Callable, Literal
 from ..checks import CheckSummary, summarize_checks
 from ..cross_pr_revert import CrossPrRevertStatus
 from ..escalation import _escalation_flags
-from ..github import GitHubError, label_names
+from ..github import GitHubError, GitHubRunResult, label_names
 from ..host import current as _host_current
 from ..janitor import check_operator_containment
 from .decide import (
@@ -35,7 +37,15 @@ from .decide import (
     decide_readiness,
     needs_carry_forward,
 )
-from .mergequeue import is_already_in_mergequeue
+from .human_block import (
+    CHANGES_REQUESTED,
+    HUMAN_BLOCK_SOURCE_REVIEW_DECISION,
+    HumanBlockRead,
+    classify_human_block,
+    compile_verdict_pattern,
+    human_block_read_needed,
+)
+from .mergequeue import is_already_in_mergequeue, merge_entry
 from .issue_labels import open_issue_labels
 from .model import (
     UNAVAILABLE,
@@ -92,6 +102,7 @@ def config_slice(config: OrchestratorConfig) -> MergePathConfig:
         skip_line_label=auto.mergequeue_skip_line_label,
         priority_prefix=config.labels.priority_prefix,
         mergequeue_requeue_cap=auto.mergequeue_requeue_cap,
+        honor_human_block=auto.honor_human_block,
     )
 
 
@@ -498,6 +509,82 @@ def gather_merge_hold(app: Any, pr: dict[str, Any], issue_number: int | None) ->
     if not isinstance(issue, dict) or "labels" not in issue:
         return False, True
     return labels.merge_hold in label_names(issue), False
+
+
+def _pr_issue_comments(gh: Any, pr_number: int) -> list[dict[str, Any]] | None:
+    """The PR's issue-level comments, oldest first; ``None`` when they cannot be read.
+
+    Unlike ``workflow._gh_api_list`` (which collapses a failure into ``[]`` --
+    right for findings ingestion, where silence loses nothing it can act on)
+    this keeps "unreadable" distinct from "no comments": the human block must
+    fail closed, and an empty list would read as "no block".
+    """
+    try:
+        result = gh.run(
+            ["api", "--paginate", f"repos/{{owner}}/{{repo}}/issues/{pr_number}/comments"],
+            json_output=True,
+            allow_failure=True,
+        )
+    except (GitHubError, ValueError):
+        return None
+    if isinstance(result, GitHubRunResult):
+        result = result.value if result.ok else None
+    if not isinstance(result, list):
+        return None
+    return [item for item in result if isinstance(item, dict)]
+
+
+def gather_human_block(app: Any, pr: dict[str, Any], pr_number: int) -> HumanBlockRead:
+    """Issue #2763: does a human's outstanding request-changes hold this PR?
+
+    ``reviewDecision`` on the payload in hand decides without a read; only
+    otherwise are the issue comments fetched (one paginated ``gh api`` call).
+    The orchestrator-comment test is resolved at call time because the marker
+    lives in ``charlie_work.workflow``, which imports this package.
+    """
+    auto = app.config.auto_merge
+    review_decision = pr.get("reviewDecision")
+    if review_decision == CHANGES_REQUESTED:
+        return HumanBlockRead(True, source=HUMAN_BLOCK_SOURCE_REVIEW_DECISION)
+    try:
+        request_changes = compile_verdict_pattern(auto.human_block_request_changes_pattern)
+        approved = compile_verdict_pattern(auto.human_block_approved_pattern)
+    except re.error:
+        return HumanBlockRead(False, unavailable=True)
+    comments = _pr_issue_comments(app.gh, pr_number)
+    if comments is None:
+        return HumanBlockRead(False, unavailable=True)
+    return classify_human_block(
+        review_decision,
+        comments,
+        request_changes=request_changes,
+        approved=approved,
+        is_orchestrator_comment=importlib.import_module(
+            "charlie_work.workflow"
+        )._is_orchestrator_comment,
+    )
+
+
+def with_human_block(
+    app: Any, pr: dict[str, Any], pr_number: int, readiness: Readiness, holds: HoldFacts
+) -> HoldFacts:
+    """``holds`` with the human block read in -- only when a merge or hand-off is imminent.
+
+    The single place the lazy read is decided, shared by the live shell and the
+    dry-run preview so the two cannot drift. A pass that cannot merge (not
+    ``can_merge``, ``should_merge`` off, escalated, human-merge hold) returns
+    ``holds`` untouched and makes no GitHub call.
+    """
+    _, enter = merge_entry(readiness, holds)
+    if not human_block_read_needed(enter, holds):
+        return holds
+    read = gather_human_block(app, pr, pr_number)
+    return replace(
+        holds,
+        human_block=read.blocked,
+        human_block_unavailable=read.unavailable,
+        human_block_source=read.source,
+    )
 
 
 def holds_from_snapshot(

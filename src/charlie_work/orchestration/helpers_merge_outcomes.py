@@ -195,8 +195,10 @@ def _record_merge_or_error(
     merges: list[dict[str, Any]],
 ) -> None:
     """Append a merge_ready result to merges or errors if a gh check failed."""
-    if merge_result.data.get("checks_unavailable") or merge_result.data.get(
-        "merge_hold_check_unavailable"
+    if (
+        merge_result.data.get("checks_unavailable")
+        or merge_result.data.get("merge_hold_check_unavailable")
+        or merge_result.data.get("human_block_check_unavailable")
     ):
         errors.append({"pr": merge_result.data.get("pr"), "error": merge_result.message})
     else:

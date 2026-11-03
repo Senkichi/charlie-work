@@ -1,0 +1,10 @@
+warning
+# Issue #2763: review() was invoked for a PR the fleet does not own -- a
+# same-repo PR that merely names an issue with a closing keyword, off the
+# dispatch branch namespace, for an issue with no `labels.ready` and no
+# dispatch provenance in state.issues. The loop and review_queue already route
+# such a PR to `pr_unlinked_skipped` (reason: not_fleet_owned), so reaching
+# review() means an operator-invoked review or a caller that bypassed that
+# gate. Warning, not info: the refusal is the defence-in-depth backstop and an
+# operator should see it. Not error: nothing is broken -- the PR is simply
+# outside the pipeline's unit of work, and the refusal wrote no state.

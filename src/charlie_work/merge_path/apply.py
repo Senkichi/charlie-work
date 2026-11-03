@@ -45,6 +45,7 @@ from .gather import (
     holds_from_snapshot,
     proceed,
     readiness_facts,
+    with_human_block,
 )
 from .readiness_gates import decide_revert, deescalation_read_needed, with_human_merge
 from .model import BranchGate, BranchStop, EffectResults, MergePathConfig, PlanKind
@@ -296,6 +297,7 @@ def _readiness_and_merge(
     if merge_hold_read_needed(readiness, holds):
         merge_hold, unavailable = gather_merge_hold(app, pr, issue_number)
         holds = replace(holds, merge_hold=merge_hold, merge_hold_unavailable=unavailable)
+    holds = with_human_block(app, pr, pr_number, readiness, holds)
     plan = decide_merge(readiness, holds)
 
     results, label_error = apply_merge_plan(
