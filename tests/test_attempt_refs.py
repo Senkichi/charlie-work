@@ -3,8 +3,8 @@
 Covers the plumbing in isolation (snapshot creation, attempt numbering,
 listing, ahead-of-main computation, graceful failure) — the end-to-end
 redispatch integration (attempt ref survives a real ``create_worktree``
-branch reset) lives in test_worktree.py alongside the other recovery-path
-tests it shares fixtures with.
+branch reset) lives in test_worktree_recovery.py alongside the other
+recovery-path tests it shares fixtures with.
 """
 
 from __future__ import annotations

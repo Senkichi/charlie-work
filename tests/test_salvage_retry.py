@@ -10,7 +10,7 @@ retry's push is handled by cause: work already on origin attaches, a push
 timeout or an unanswered probe defers, anything that means a second writer
 falls through to the guards.
 
-The #807/#257 refusal tests in ``test_worktree.py`` call ``create_worktree``
+The #807/#257 refusal tests in ``test_worktree_recovery.py`` call ``create_worktree``
 without a ``config``; they are the unchanged control for the no-retry path.
 """
 
