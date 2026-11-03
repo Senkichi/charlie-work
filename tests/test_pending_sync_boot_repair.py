@@ -91,6 +91,9 @@ def test_boot_repair_syncs_and_clears_marker_at_head(tmp_path: Path) -> None:
     assert payload["synced"] is True
     assert payload["deferred"] is False
     assert payload["cleared_marker"] is True
+    # No uv.lock in this checkout, so ``--locked --check`` cannot run: the
+    # post-sync probe is skipped (and consumed no response above), not failed.
+    assert payload["post_sync_check"] == "skipped"
 
 
 def test_boot_repair_defers_to_live_workers(tmp_path: Path) -> None:
@@ -167,6 +170,7 @@ def test_boot_repair_probe_detects_skew_without_marker(tmp_path: Path) -> None:
         [
             RunResult(1, "", "environment is not in sync"),  # probe
             RunResult(0, "", ""),  # uv sync --locked --inexact
+            RunResult(0, "", ""),  # post-sync probe: converged
         ]
     )
 
@@ -178,11 +182,124 @@ def test_boot_repair_probe_detects_skew_without_marker(tmp_path: Path) -> None:
     assert [c[0] for c in calls] == [
         ["uv", "sync", "--locked", "--check", "--inexact"],
         ["uv", "sync", "--locked", "--inexact"],
+        ["uv", "sync", "--locked", "--check", "--inexact"],
     ]
     events = query_events(state_path, kind="self_deploy_boot_sync")
     assert len(events) == 1
     assert events[0]["payload"]["detected_via"] == "probe"
     assert events[0]["payload"]["cleared_marker"] is False
+    assert events[0]["payload"]["post_sync_check"] == "clean"
+
+
+def test_boot_repair_sync_that_leaves_drift_reports_not_synced(tmp_path: Path) -> None:
+    """``uv sync`` exiting 0 is not convergence. When the post-sync probe still
+    exits 1, the outcome is ``synced=False`` with a "did not converge" detail
+    (so the caller does not restart into the same sync), and the event says so."""
+    state_root = _state_root(tmp_path)
+    (tmp_path / "uv.lock").write_bytes(b"lock\n")
+    state_path = layout.state_file_path(state_root)
+
+    runner, calls = _make_fake_runner(
+        [
+            RunResult(1, "", "environment is not in sync"),  # probe
+            RunResult(0, "", ""),  # uv sync --locked --inexact
+            RunResult(1, "", "environment is not in sync"),  # post-sync probe: still drift
+        ]
+    )
+
+    outcome = _heal(tmp_path, run_command=runner)
+
+    assert outcome.synced is False
+    assert outcome.deferred is False
+    assert outcome.detected_via == "probe"
+    assert outcome.detail is not None
+    assert "did not converge" in outcome.detail
+    assert [c[0] for c in calls] == [
+        ["uv", "sync", "--locked", "--check", "--inexact"],
+        ["uv", "sync", "--locked", "--inexact"],
+        ["uv", "sync", "--locked", "--check", "--inexact"],
+    ]
+    events = query_events(state_path, kind="self_deploy_boot_sync")
+    assert len(events) == 1
+    payload = events[0]["payload"]
+    assert payload["synced"] is False
+    assert payload["post_sync_check"] == "drift"
+    assert "did not converge" in payload["error"]
+
+
+def test_boot_repair_marker_sync_that_leaves_drift_clears_marker_without_synced(
+    tmp_path: Path,
+) -> None:
+    """The marker path gets the same post-sync check. The marker is still cleared
+    -- the sync it was parked for did run -- so persistent drift is the probe's
+    to re-detect on the next boot, not the marker's to replay."""
+    state_root = _state_root(tmp_path)
+    marker_path = _plant_marker(state_root)
+    (tmp_path / "uv.lock").write_bytes(b"lock\n")
+
+    runner, calls = _make_fake_runner(
+        [
+            RunResult(0, "def456\n", ""),  # git rev-parse HEAD (marker check)
+            RunResult(0, "", ""),  # uv sync --locked --inexact
+            RunResult(1, "", "environment is not in sync"),  # post-sync probe: still drift
+        ]
+    )
+
+    outcome = _heal(tmp_path, run_command=runner)
+
+    assert outcome.synced is False
+    assert outcome.detected_via == "marker"
+    assert outcome.detail is not None
+    assert "did not converge" in outcome.detail
+    assert [c[0] for c in calls] == [
+        ["git", "rev-parse", "HEAD"],
+        ["uv", "sync", "--locked", "--inexact"],
+        ["uv", "sync", "--locked", "--check", "--inexact"],
+    ]
+    assert not marker_path.exists()
+    (event,) = query_events(layout.state_file_path(state_root), kind="self_deploy_boot_sync")
+    assert event["payload"]["cleared_marker"] is True
+    assert event["payload"]["synced"] is False
+
+
+@pytest.mark.parametrize(
+    "post_probe",
+    [
+        pytest.param(
+            RunResult(2, "", "error: Failed to parse `uv.lock`", error="command exited 2"),
+            id="uv-error",
+        ),
+        pytest.param(
+            RunResult(None, "", "", timed_out=True, error="command timed out after 30s"),
+            id="timeout",
+        ),
+    ],
+)
+def test_boot_repair_inconclusive_post_sync_probe_stays_synced(
+    tmp_path: Path, post_probe: RunResult
+) -> None:
+    """Only exit 1 is drift. A post-sync probe that times out or errors proves
+    nothing about the venv, so it must not suppress the restart the successful
+    sync calls for -- it is recorded on the event instead."""
+    state_root = _state_root(tmp_path)
+    (tmp_path / "uv.lock").write_bytes(b"lock\n")
+
+    runner, _calls = _make_fake_runner(
+        [
+            RunResult(1, "", "environment is not in sync"),  # probe
+            RunResult(0, "", ""),  # uv sync --locked --inexact
+            post_probe,
+        ]
+    )
+
+    outcome = _heal(tmp_path, run_command=runner)
+
+    assert outcome == BootSyncRepair(
+        detected_via="probe", synced=True, deferred=False, detail=None
+    )
+    (event,) = query_events(layout.state_file_path(state_root), kind="self_deploy_boot_sync")
+    assert event["payload"]["synced"] is True
+    assert event["payload"]["post_sync_check"] == "inconclusive"
 
 
 def test_boot_repair_failed_sync_keeps_marker(tmp_path: Path) -> None:
