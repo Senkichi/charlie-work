@@ -22,7 +22,14 @@ from pathlib import Path
 
 import pytest
 
-from _worktree_fixtures import REJECTED_PUSH_MESSAGE, _clone_repo, _git, _init_repo, _reject_pushes
+from _worktree_fixtures import (
+    REJECTED_PUSH_MESSAGE,
+    _clone_repo,
+    _git,
+    _init_repo,
+    _reject_pushes,
+    _seed_diverged_branch,
+)
 from _worktree_fixtures import _wt_scratch as _register_wt_scratch  # noqa: F401 -- registers the wt_scratch fixture: worker sandboxes redirect TEMP/TMPDIR deep inside the checkout, where tmp_path-derived repo roots overrun git's internal worktree-path buffer (``git worktree add`` exits 128)
 from charlie_work.config import DispatchConfig, OrchestratorConfig
 from charlie_work.instrumentation import query_events
@@ -231,6 +238,11 @@ def test_with_remote_unpushed_commits_still_refuses(wt_scratch: Path) -> None:
     when the push cannot land. The remote therefore rejects pushes — and the
     assertions below still pin the #1944 property: a repo with a remote never
     takes the local archive shortcut, and a failed rescue leaves the tip intact.
+
+    The abandoned-worker state (diverged branch, no worktree) is seeded in one
+    ``git fast-import`` spawn rather than built through ``create_worktree`` /
+    ``remove_worktree``: the dispatch under test now runs the salvage push, and
+    on the Windows runners the test ledger's time tracks spawn count (#3008).
     """
     remote_repo = wt_scratch / "remote"
     _init_repo(remote_repo)
@@ -240,9 +252,7 @@ def test_with_remote_unpushed_commits_still_refuses(wt_scratch: Path) -> None:
     branch = "agent/issue-204-remote"
     main_tip = _git(repo_root, "rev-parse", "main").stdout.strip()
 
-    info1 = create_worktree(repo_root, branch, base_ref="HEAD", issue_number=204)
-    old_tip = _commit_in(info1.path)
-    assert remove_worktree(repo_root, info1.path)
+    old_tip = _seed_diverged_branch(repo_root, branch)
 
     with pytest.raises(WorktreeUnsafeError, match="local commit") as excinfo:
         create_worktree(repo_root, branch, base_ref="HEAD", issue_number=204)
