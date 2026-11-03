@@ -46,7 +46,7 @@ def _worker(**kw: Any) -> WorkerView:
         "issue_number": ISSUE,
         "repo_key": "",
         "pid": 4242,
-        "started_at": "2026-09-30T10:00:00Z",
+        "started_at": (NOW - timedelta(hours=2)).isoformat(),
         "process_start_time": 111.0,
         "log_path": "x.log",
         "worktree_path": "wt",
@@ -80,7 +80,7 @@ def _answers(
         KillOrphans: (13,),
         RecordFailure: ("stalled", None),
         ProbeCompletedHandoff: False,
-        ReadLogTail: LogTail("last line", "2026-09-30 11:00:00+00:00"),
+        ReadLogTail: LogTail("last line", str(NOW - timedelta(hours=1))),
     }
 
 
@@ -189,7 +189,7 @@ def test_only_a_stalled_worker_is_ever_released(health: WorkerHealth) -> None:
 
 def test_a_rate_limit_defer_wins_over_a_release() -> None:
     """A provider throttle explains the silence; nothing is held, nothing is killed."""
-    plan, asked = _drive(_facts(), _answers(defer="2026-09-30T13:00:00Z"))
+    plan, asked = _drive(_facts(), _answers(defer=(NOW + timedelta(hours=1)).isoformat()))
 
     assert plan.entry is None
     assert ReleaseBlockedTool not in _asked_types(asked)
