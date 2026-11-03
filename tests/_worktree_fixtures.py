@@ -3,9 +3,9 @@
 Hoisted out of ``test_worktree.py`` (issue #1284): a thin ``git`` subprocess
 runner, a fresh-clone-with-identity builder, and a minimal repo initializer,
 all imported by other test modules that need a real (non-bare) git repo to
-exercise worktree behaviour against. ``test_worktree.py`` itself is one of
-the three monoliths issue #1284 marks out of scope for a full split -- only
-the exported symbols move; the rest of the file is untouched.
+exercise worktree behaviour against. ``test_worktree.py`` was later split
+into seam-named ``test_worktree_*.py`` siblings (issue #1555); the helpers
+more than one of them shares live in ``_worktree_shared_fixtures.py``.
 
 ``_init_repo`` joined the hoist under the #1688 rework: the file-size
 ratchet (issue #1442) required moving the new pre-merge-repair regression
