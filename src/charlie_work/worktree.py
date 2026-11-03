@@ -56,6 +56,7 @@ from .worktree_archive import (
 from .worktree_closed_reclaim import issue_confirmed_closed, reclaim_closed_issue_worktree
 from .worktree_pr_lanes import pr_lane_verdict
 from .worktree_pr_lookup import WorktreeCleanGH, _pr_number_for_head_branch
+from .worktree_stranded_tip import preserve_stranded_branch_tip, salvage_ref_for_branch
 from .salvage_retry import retry_failed_salvage_push
 from .rescue_capture_exclusions import (  # noqa: F401  (deliberate re-export)
     _build_rescue_capture_exclusions,
@@ -215,6 +216,11 @@ class RescueCapture:
     ``ref_name``/``commit_sha`` are None when capture failed (``error`` set).
     Callers must treat capture failure as a hard refusal — the reset must NOT
     proceed if the work could not be preserved.
+
+    When the worktree directory is gone (issue #2904) there is no tree to
+    capture, so ``ref_name`` instead names the REMOTE ref that holds the branch
+    tip (``refs/heads/salvage/<branch>``, or a branch / PR head that already
+    contained it) rather than a ``RESCUE_REF_PREFIX`` ref.
     """
 
     ref_name: str | None
@@ -2253,7 +2259,8 @@ def _worktree_refuse_to_reset_reason(
             return (
                 f"worktree has local commits not on remote branch "
                 f"(refs/heads/{branch} @ {local_sha[:12]}); push to a "
-                f"salvage ref with: git push origin {local_sha}:refs/heads/salvage/{branch}"
+                f"salvage ref with: git push origin "
+                f"{local_sha}:{salvage_ref_for_branch(branch)}"
             )
         merge_base = merge_base_result.stdout.strip()
         rev_list_result = run_captured(
@@ -2270,7 +2277,8 @@ def _worktree_refuse_to_reset_reason(
             return (
                 f"worktree has {count} local commit(s) not on remote branch "
                 f"(refs/heads/{branch} @ {local_sha[:12]}); push to a "
-                f"salvage ref with: git push origin {local_sha}:refs/heads/salvage/{branch}"
+                f"salvage ref with: git push origin "
+                f"{local_sha}:{salvage_ref_for_branch(branch)}"
             )
         return None
 
@@ -2294,7 +2302,7 @@ def _worktree_refuse_to_reset_reason(
         f"worktree has local commits not on remote branch "
         f"(refs/heads/{branch} @ {local_sha[:12]} diverged from origin/{branch} "
         f"@ {remote_sha[:12]}); push to a salvage ref with: "
-        f"git push origin {local_sha}:refs/heads/salvage/{branch}"
+        f"git push origin {local_sha}:{salvage_ref_for_branch(branch)}"
     )
 
 
@@ -3250,8 +3258,22 @@ def create_worktree(
         ``git merge --ff-only`` that doesn't touch the dirty files would leave
         them in place, silently surviving into the next worker's session
         (issue #849 rework finding).
+
+        A ``check_path`` that is not a directory has no working tree to stage
+        (issue #2904): ``git add``/``write-tree`` there fail on a bad ``cwd``
+        (``[WinError 267]``) and the refusal would repeat on every requeue.
+        The only work at risk is the committed branch tip, so that is
+        published to the salvage ref instead, and there is no tree to clean.
+        A failed push keeps the refusal, with the push's own error appended.
         """
         nonlocal rescue_capture
+        if not check_path.is_dir():
+            tip = preserve_stranded_branch_tip(repo_root, branch, _run_remote_captured)
+            if tip.error is not None or tip.ref_name is None:
+                raise WorktreeUnsafeError(f"{unsafe_reason}; rescue capture failed: {tip.error}")
+            rescue_capture = RescueCapture(ref_name=tip.ref_name, commit_sha=tip.commit_sha)
+            _emit_rescue_event(rescue_capture, unsafe_reason, check_path)
+            return
         capture = _capture_worktree_work_to_rescue_ref(
             repo_root,
             check_path,

@@ -19,11 +19,15 @@ reason is recorded as an event.
 A usable wrapper can still be useless: when the repo's selection map is stale
 (or missing) ``ci-fleet test`` runs the whole suite, which for a worker is a serial
 run that outlasts its foreground limit. ``probe_selection`` asks the selector
-itself, once per rendered worker or rework prompt, whether it can narrow anything;
-when it can only answer ``full`` the prompt keeps the hand-picked targeted
-command (reason ``selection-full``) and returns to the wrapper by itself once the
-map is fresh again. The merge gate is not probed: a full run there is the correct
-fail-open.
+itself whether it can narrow anything; when it can only answer ``full`` the prompt
+keeps the hand-picked targeted command (reason ``selection-full``) and returns to
+the wrapper by itself once the map is fresh again. The merge gate is not probed: a
+full run there is the correct fail-open.
+
+The answer belongs to the repo, not to the prompt (issue #2921). ``worker_selection``
+resolves it, probe included, once per pass per repo and reuses it for every prompt
+the pass renders, and it writes its fallback event when the answer changes, not for
+every prompt. Both halves live in ``selection_answer``.
 """
 
 from __future__ import annotations
@@ -38,6 +42,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from .layout import worker_selection_answer_path
+from .selection_answer import once_per_pass, settle_answer
 from .subprocess_runner import run_captured
 
 CI_FLEET_EXE_NAME = "ci-fleet.exe" if os.name == "nt" else "ci-fleet"
@@ -236,20 +242,49 @@ def worker_selection(
     checked by ``probe_selection``; a selector that can only answer ``full`` falls
     back like any other unavailable wrapper, through the same event.
 
+    Issue #2921: the answer is resolved once per pass per repo (``once_per_pass``),
+    so rendering N prompts in a pass runs ``ci-fleet select`` at most once; and the
+    event is written when the repo's answer or its reason changes
+    (``settle_answer``), not for every prompt. ``payload`` therefore names the
+    prompt that happened to observe the change.
+
     ``log_event`` (not ``_record_event``): prompts are rendered outside the state
     lock, like ``_build_module_map_value``. With no repo root (test callers only)
     there is nothing to report.
     """
-    from .instrumentation import log_event
-
     if repo_root is None:
         return None
+    key = (str(repo_root), configured_base_ref, probe, str(state_file))
+    return once_per_pass(
+        key,
+        lambda: _resolve_and_report(
+            repo_root, configured_base_ref, state_file=state_file, payload=payload, probe=probe
+        ),
+    )
+
+
+def _resolve_and_report(
+    repo_root: Path,
+    configured_base_ref: str,
+    *,
+    state_file: Path,
+    payload: Mapping[str, object],
+    probe: bool,
+) -> SelectionTarget | None:
+    """The uncached body of ``worker_selection``: resolve, probe, and report a change."""
+    from .instrumentation import log_event
+
+    baseline = worker_selection_answer_path(state_file.parent)
     selection = resolve_selection(repo_root, configured_base_ref=configured_base_ref)
     if isinstance(selection, SelectionTarget):
         unavailable = probe_selection(selection, repo_root) if probe else None
         if unavailable is None:
+            # A usable wrapper clears the baseline, so a later fallback reports afresh.
+            settle_answer(baseline, None)
             return selection
         selection = unavailable
+    if not settle_answer(baseline, (selection.reason, selection.detail)):
+        return None
     fields = {**payload, "reason": selection.reason, "detail": selection.detail}
     if selection.reason == DISABLED:
         log_event(
