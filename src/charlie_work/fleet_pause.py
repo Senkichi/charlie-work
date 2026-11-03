@@ -106,14 +106,18 @@ def read_fleet_pause(fleet_dir_override: str | None) -> dict[str, Any] | None:
 
     Existence is the signal: a present-but-unreadable/malformed flag still
     means *paused* (payload ``{}``) -- failing open would silently resume a
-    fleet the operator paused. Only an absent file is ``None``.
+    fleet the operator paused. Only an absent file is ``None``. "Malformed"
+    includes bytes that are not UTF-8: Windows PowerShell 5.1 writes UTF-16
+    for ``... > fleet-pause.json``, and since issue #2766 this read sits on
+    every worker launch, where raising would crash the lane instead of
+    deferring it.
     """
     path = layout.fleet_pause_path(fleet_dir_override)
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         logger.warning("unreadable fleet pause flag %s; treating as paused", path)
         return {}
     try:

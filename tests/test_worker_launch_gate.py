@@ -295,13 +295,22 @@ def test_ignore_pause_launches_through_the_flag(tmp_path: Path, fake_host, lane:
     assert fleet_pause_pending(app.fleet_dir_override)  # the override does not resume the fleet
 
 
-def test_torn_pause_flag_still_blocks_launch(tmp_path: Path, fake_host) -> None:
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(b"{torn", id="torn-json"),
+        pytest.param('{"reason": "x"}'.encode("utf-16"), id="utf16-powershell-5.1-redirect"),
+    ],
+)
+def test_unreadable_pause_flag_still_blocks_launch(
+    tmp_path: Path, fake_host, payload: bytes
+) -> None:
     """Fail closed, like every other reader of the flag (``read_fleet_pause``)."""
     app = _app(tmp_path, FRESH)
     calls = _spy_dispatch_sessions(fake_host)
     flag = layout.fleet_pause_path(app.fleet_dir_override)
     flag.parent.mkdir(parents=True, exist_ok=True)
-    flag.write_text("{torn", encoding="utf-8")
+    flag.write_bytes(payload)
 
     result = app.dispatch()
 
