@@ -44,13 +44,13 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from charlie_work.dispatch_deferral import deferral_reason, record_lane_result
+from charlie_work.fleet_lock_holder import fleet_lock_held_extra
 from charlie_work.fleet_registry import try_acquire_fleet_lock
 from charlie_work.worker_launch_gate import (
     REASON_FLEET_LOCK_HELD,
     FleetLaunchLock,
     FleetLockAcquirer,
     acquire_fleet_launch_lock,
-    fleet_lock_held_extra,
 )
 
 if TYPE_CHECKING:

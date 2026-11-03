@@ -1794,6 +1794,7 @@ def fleet_loop(
     now: datetime.datetime | None = None,
     deadline_seconds: int | None = None,
     pass_clock: Callable[[], float] = time.monotonic,
+    ignore_pause: bool = False,
 ) -> CommandResult:
     """Run a fleet pass across all (or selected) registered repos.
 
@@ -1845,6 +1846,10 @@ def fleet_loop(
         pass_clock: Injectable monotonic clock for the deadline check, so
             tests can control elapsed time without a real sleep. Defaults to
             ``time.monotonic``.
+        ignore_pause: ``--ignore-pause`` (issues #2660, #2766): each lane's
+            app skips the worker-launch pause gate. Only the one-shot CLI
+            entrypoints set it; the supervisor never does, so a pause written
+            part-way through a fleet pass stops its remaining launches.
 
     Returns:
         A CommandResult with per-repo results and the consolidated digest.
@@ -2261,6 +2266,7 @@ def fleet_loop(
                         gh,
                         dry_run=dry_run,
                         fleet_dir_override=fleet_dir_override,
+                        ignore_pause=ignore_pause,
                     )
                     future = lane_pool.submit(
                         _run_fleet_repo_lane,

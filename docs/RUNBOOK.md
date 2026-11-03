@@ -832,16 +832,25 @@ called out in the command's own output.
 persistent `fleet-pause.json` next to `fleet.json`. The supervisor reads it at
 the top of each loop iteration (between passes, never mid-pass), stamps
 `exit_code`=5 / `exited_at` on the heartbeat, and exits without killing
-anything; `scripts/fleet-pass.ps1` refuses to launch while the flag exists, so
-the scheduled task stays enabled and the pause survives reboot/logon. No
-`Disable-ScheduledTask`, no PID kills. `charlie fleet resume` removes the flag
+anything. A fleet pass already under way keeps walking the registry until it
+ends, but **launches no new workers once the flag exists** (#2766): every
+worker launch goes through the launch gate
+(`worker_launch_gate.issue_worker_launch_permit`), which reads the flag fresh
+and defers with `deferred_reason: fleet_paused` (a `dispatch_deferred` event,
+`lane` `dispatch` / `dispatch_rework` / `local_dispatch_rework`, with
+`paused_at` and `pause_reason`). Running workers, in-flight reviews, reconcile
+and salvage are untouched; the issue stays queued and launches after
+`fleet resume`. `scripts/fleet-pass.ps1` refuses to launch while the flag
+exists, so the scheduled task stays enabled and the pause survives
+reboot/logon. No `Disable-ScheduledTask`, no PID kills. `charlie fleet resume` removes the flag
 and the next tick relaunches. `fleet status` reports the pause while it is set.
 The one-shot pass entrypoints (`fleet bash-rats`, `fleet work`, per-repo
 `bash-rats` and `work`) honour the same flag (#2660): while it exists they run
 no `self_deploy()` and dispatch nothing, log a warning naming `fleet-pause.json`,
 and exit 5 (`EXIT_FLEET_PAUSED`), so an external scheduler cannot launch work
 into a paused fleet. A deliberate operator one-shot passes `--ignore-pause`
-(`charlie fleet bash-rats --ignore-pause`), which runs and logs the override.
+(`charlie fleet bash-rats --ignore-pause`), which runs, logs the override, and
+also stands the launch gate down for that process so the one-shot can start workers.
 **A pause also freezes runner allocation** (same supervisor pass) at the last
 converged parked floor. To verify a pause, check that no new supervisor starts
 for one full watchdog window, not just that the process is gone.

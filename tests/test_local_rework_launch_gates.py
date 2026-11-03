@@ -15,6 +15,7 @@ import pytest
 from _local_lane_fixtures import new_repo_root, rework_pending_app, spy_dispatch_sessions
 from charlie_work import fleet_provider_throttle as fpt
 from charlie_work.adapters import SessionDispatchResult
+from charlie_work.fleet_pause import write_fleet_pause
 from charlie_work.state import (
     load_state,
     load_state_locked,
@@ -70,6 +71,17 @@ class TestLocalReworkLaunchGates:
 
         assert calls == []
         self._assert_deferred(app, result, "provider_throttled")
+
+    def test_fleet_pause_defers_local_rework(self, repo: Path, fake_host) -> None:
+        """Issue #2766: the local lane shares the permit, so a pause stops it too."""
+        app = self._rework_pending(repo)
+        calls = self._spy(fake_host)
+        write_fleet_pause(app.fleet_dir_override, reason="shed host load")
+
+        result = app._local_dispatch_rework()
+
+        assert calls == []
+        self._assert_deferred(app, result, "fleet_paused")
 
     def test_fleet_lock_held_defers_local_rework(
         self, repo: Path, monkeypatch: pytest.MonkeyPatch, fake_host
