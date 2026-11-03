@@ -196,10 +196,31 @@ def test_a_rate_limit_defer_wins_over_a_release() -> None:
     assert "session_rate_limit_deferred" in _kinds(plan)
 
 
-def test_dry_run_records_the_release_event_but_stamps_no_sidecar() -> None:
+def test_dry_run_never_asks_for_a_release_and_previews_the_ordinary_reap() -> None:
+    """Nothing may be killed under dry-run, so the holders cannot even be looked for.
+
+    This is the outcome production reaches: the shell would answer a dry-run
+    release request with ``()`` and the flow would fall through to the reap
+    preview anyway, so the decision says so up front instead of carrying a stamp
+    and an event for a state that cannot occur.
+    """
     plan, asked = _drive(_facts(dry_run=True), _answers())
 
-    assert ReleaseBlockedTool(ISSUE) in asked
+    assert ReleaseBlockedTool not in _asked_types(asked)
+    assert _is_reaped(plan, asked)
+    assert "session_tool_released" not in _kinds(plan)
+    assert not any(
+        isinstance(c, StampSidecar) and ("tool_released_at", NOW.isoformat()) in c.fields
+        for c in plan.commits
+    )
+
+
+def test_dry_run_still_leaves_a_worker_inside_an_earlier_releases_grace_alone() -> None:
+    """Reading the stamp is not an effect: the preview matches what a live pass would do."""
+    released_at = (NOW - RELEASE_RESUME_GRACE + timedelta(seconds=30)).isoformat()
+    plan, asked = _drive(_facts(dry_run=True, tool_released_at=released_at), _answers())
+
     assert plan.entry is None
-    assert _kinds(plan) == ["session_tool_released"]
-    assert not any(isinstance(c, StampSidecar) for c in plan.commits)
+    assert KillTree(ISSUE) not in asked
+    assert ReleaseBlockedTool not in _asked_types(asked)
+    assert _kinds(plan) == []

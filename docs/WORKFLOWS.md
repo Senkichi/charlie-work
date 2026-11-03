@@ -227,9 +227,15 @@ then looked like any other stall and was reaped at `stall_minutes` with
 `failure_kind: null`, discarding a session that was one pipe close from finishing.
 The holder is not a descendant of the worker (the shell exited; Windows never
 reparents), so it is found by what it shares with the worker instead: a cwd inside
-the worker's own worktree, a start after the worker's, and no parent chain under
-the worker. When the stalled-session lane sees a STALLED opencode worker, and the
-rate-limit defer does not explain the silence, it kills those holders once
+the worker's own worktree, a start after the worker's, and an orphaned parentage
+(the recorded parent is missing, or its pid was recycled onto a younger process --
+a process with a live parent is never selected). The cwd rule is new kill reach:
+`sweep_orphan_processes` matches the worktree path in the CommandLine, not the
+cwd, so the release can end an orphan that sweep would not (for example a helper
+the worker detached from its launcher); it runs once per dispatch, only for a
+worker already past `stall_minutes`. A dry-run pass never asks for a release and
+previews the ordinary reap. When the stalled-session lane sees a STALLED opencode
+worker, and the rate-limit defer does not explain the silence, it kills those holders once
 (`pipe_holder_release.release_pipe_holders`, event `session_tool_released`) and
 leaves the worker running; the blocked call then returns and the model carries on.
 The release is one-shot per dispatch (`tool_released_at` on the sidecar): a worker

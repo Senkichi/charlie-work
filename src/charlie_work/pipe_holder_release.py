@@ -24,14 +24,30 @@ tool call. So the holders are the processes that
 
 * run with a cwd inside the worker's own worktree (exclusive to this worker),
 * started after the worker did (an operator shell opened earlier is spared), and
-* are not the worker, one of its live descendants (its own LSP/MCP helpers -- a
-  holder is an orphan by construction, so a live parent chain means legitimate),
-  or this process or one of its ancestors.
+* are true orphans: the recorded parent is missing, or its pid was recycled onto a
+  process created after the child. A process with a live parent -- the worker's
+  own LSP/MCP helpers, an editor or shell an operator opened in the worktree
+  after the dispatch, a build tool another process started there -- is
+  legitimate by construction and is spared, as are this process and its
+  ancestors. (A chain is only as orphaned as its first link: a live parent means
+  the chain passes through a live process, so only the direct parent is read.)
 
 Killing them closes the pipe; the blocked call completes with its normal timeout
 result and the model carries on, exiting cleanly at the end of its turn. A holder
-that moved to a cwd outside the worktree is not found; the stalled lane then
+that moved to a cwd outside the worktree, or a POSIX holder the kernel reparented
+to init (a live parent, so never selected), is not found; the stalled lane then
 falls through to its ordinary reap.
+
+Residual risk, stated plainly: the cwd rule is *new* kill reach.
+``orphan_sweep.sweep_orphan_processes`` matches the worktree path in a process's
+CommandLine, not its cwd, so it does not select a process merely for sitting in
+the worktree. The orphan test narrows the new rule to leftovers, but an
+orphaned process that started after the worker with its cwd in the worktree is
+killed whatever it was for -- including a helper the worker itself detached from
+its launcher. That is bounded: it runs once per dispatch, only for a worker
+already STALLED past ``stall_minutes`` with no rate-limit explanation, and a
+worker that does not resume within ``RELEASE_RESUME_GRACE`` takes the ordinary
+reap it would have taken anyway.
 
 Containment is relative to its anchor, so the anchor is asserted first: the
 worker's *own* cwd must be inside the worktree, and the worker's identity is
@@ -80,18 +96,34 @@ def _worker_anchored(worktree: Path, worker_pid: int, worker_start_time: float) 
         return False
 
 
-def _live_descendants(worker_pid: int) -> frozenset[int]:
-    """The worker's live descendants by parent chain; empty when unreadable."""
+def _is_orphan(proc: psutil.Process) -> bool:
+    """True only when ``proc``'s parent is provably gone; anything unreadable is False.
+
+    The parent is gone when its pid names no process, or names one created after
+    ``proc`` -- a user-mode parent always predates its child, so a younger
+    "parent" is a recycled pid, not an ancestor (the rule ``psutil.Process.parent()``
+    and ``process_chain.ancestor_chain_pids`` apply). Windows never reparents, so
+    an orphan keeps its dead parent's number. Fail-safe: a process whose parent
+    cannot be read is spared, never killed.
+    """
     try:
-        return frozenset(c.pid for c in psutil.Process(worker_pid).children(recursive=True))
-    except psutil.Error:
-        return frozenset()
+        ppid = proc.ppid()
+        if ppid <= 0:
+            return False  # no recorded parent is not the same as a dead one
+        created = proc.create_time()
+        try:
+            parent_created = psutil.Process(ppid).create_time()
+        except psutil.NoSuchProcess:
+            return True
+        return parent_created > created
+    except (psutil.Error, OSError):
+        return False
 
 
 def _holders(
     worktree: Path, worker_pid: int, worker_start_time: float, exempt: frozenset[int]
 ) -> list[psutil.Process]:
-    spared = exempt | {worker_pid} | _live_descendants(worker_pid)
+    spared = exempt | {worker_pid}
     holders: list[psutil.Process] = []
     for proc in psutil.process_iter():
         if proc.pid in spared:
@@ -102,7 +134,7 @@ def _holders(
             )
         except (psutil.Error, OSError):
             continue
-        if started_before_worker or not _cwd_inside(worktree, proc):
+        if started_before_worker or not _cwd_inside(worktree, proc) or not _is_orphan(proc):
             continue
         holders.append(proc)
     return holders
@@ -113,8 +145,8 @@ def release_pipe_holders(
 ) -> tuple[int, ...]:
     """Kill the processes a worker's tool call may be blocked on; return those verified gone.
 
-    Spares the worker itself. Returns ``()`` -- touching nothing -- when the
-    worker cannot be anchored (no pid or start time, gone, recycled, or its cwd
+    Spares the worker itself and every process with a live parent. Returns ``()``
+    -- touching nothing -- when the worker cannot be anchored (no pid or start time, gone, recycled, or its cwd
     is not inside ``worktree_path``) or when no holder exists. Never raises.
     """
     if not worker_pid or worker_pid <= 0 or worker_start_time is None:

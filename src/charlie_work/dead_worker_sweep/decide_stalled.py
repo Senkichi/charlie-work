@@ -111,18 +111,26 @@ def _release_flow(facts: StalledFacts) -> Flow:
     dispatch (the marker lives on the dispatch's sidecar). Returns True when the
     worker should be left running -- either just released, or still inside the
     resume grace of an earlier release; False to fall through to the reap
-    (nothing held the pipe, or the release did not get the worker moving).
+    (nothing held the pipe, the release did not get the worker moving, or this
+    is a dry run).
+
+    Dry run: finding the holders is the kill primitive's first half and nothing
+    may be killed, so a dry-run pass cannot know whether a live pass would find
+    any. It never asks for a release and previews the ordinary reap, exactly as
+    it did for every stalled worker before #2794. An earlier release's grace
+    window is still honoured -- that is a read of the stamp, not an effect.
     """
     w = facts.worker
     issue = w.issue_number
     released_at = _parse_defer_until(w.tool_released_at)
     if released_at is not None:
         return facts.now < released_at + RELEASE_RESUME_GRACE
+    if facts.dry_run:
+        return False
     released = yield ReleaseBlockedTool(issue)
     if not released:
         return False
-    if not facts.dry_run:
-        yield StampSidecar(issue, _pairs(tool_released_at=facts.now.isoformat()))
+    yield StampSidecar(issue, _pairs(tool_released_at=facts.now.isoformat()))
     tail = yield ReadLogTail(issue)
     yield StateTxn(
         event_kind="session_tool_released",

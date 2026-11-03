@@ -142,9 +142,10 @@ def _serve(
         return tuple(write_gate.kill_process_tree(w.pid, w.process_start_time))
     if isinstance(request, ReleaseBlockedTool):
         # Issue #2794: the worker is spared; only the orphans holding its tool
-        # call's pipe die (identity-anchored inside the primitive). Dry-run is
-        # honoured here, not by a ``WriteGate`` method: that class is attachment-
-        # saturated, and this is the only caller.
+        # call's pipe die (identity-anchored inside the primitive). ``decide_stalled``
+        # never asks for a release under dry-run; this guard is the effect
+        # boundary's own backstop, honoured here rather than by a ``WriteGate``
+        # method (that class is attachment-saturated, and this is the only caller).
         if write_gate.dry_run:
             return ()
         return release_pipe_holders(Path(w.worktree_path), w.pid, w.process_start_time)
