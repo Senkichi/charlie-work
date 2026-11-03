@@ -69,6 +69,10 @@ class BranchStop(StrEnum):
 
     CONFLICT_IN_FLIGHT = "conflict_in_flight"
     CONFLICT_BLOCKED = "conflict_blocked"
+    # Issue #2900: past the conflict lane's rework cap, escalated for it, and
+    # the head is still the one the lane escalated at -- nothing to do until
+    # the head moves or the operator unescalates.
+    CONFLICT_CAP_EXCEEDED = "conflict_cap_exceeded"
     NOT_TRAIN_HEAD = "not_train_head"
     STALE_BASE = "stale_base"
 
@@ -140,6 +144,18 @@ class PersistedPr:
     # a revert observed under a different live head restarts the count.
     mergequeue_requeues: int = 0
     mergequeue_requeues_head_sha: str | None = None
+    # Issue #2900: PR-level facts of the conflict lane's cap escalation.
+    # ``conflict_cap_escalated`` is True when the PR's escalation history
+    # contains ``conflict_rework_attempts_cap_exceeded`` (computed by
+    # ``persisted_from``); the two head fields are the head the cap
+    # escalation stamped (``..._escalated_head``) and the lane's prior
+    # routing baseline (``..._last_head``), recorded by
+    # ``_route_janitor_gate_failure_to_rework``. Pre-#2900 escalations carry
+    # no ``..._escalated_head``; the fallback then serves as best-effort
+    # anchor for records escalated by the old code.
+    conflict_cap_escalated: bool = False
+    conflict_rework_attempts_escalated_head: str | None = None
+    conflict_rework_attempts_last_head: str | None = None
 
 
 @dataclass(frozen=True)
@@ -230,6 +246,11 @@ class BranchFacts:
     base_current_read: bool = False
     base_current: bool | None = None
     should_update_branch: bool | None = None
+    # Issue #2900: the branch gate's conflict-cap stop is already armed for
+    # this PR this pass (escalated for the conflict lane's cap AND the head
+    # still equals the escalation-time anchor). Computed once by the gather
+    # step via :func:`charlie_work.merge_path.decide.conflict_cap_stop`.
+    conflict_cap_stop: bool = False
 
 
 @dataclass(frozen=True)

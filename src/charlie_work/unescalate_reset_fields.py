@@ -44,6 +44,9 @@ UNESCALATE_PR_RESET_FIELDS = (
     "request_changes_count",
     "conflict_rework_attempts",
     "conflict_rework_attempts_last_head",
+    # Issue #2900: the merge lane's skip anchor (the head the cap escalation
+    # stamped). A stale anchor would keep the skip armed after the re-arm.
+    "conflict_rework_attempts_escalated_head",
     # The stall clock (_check_janitor_rework_stall, issue #765) is the
     # third companion of each rework lane, alongside the counter and the
     # _last_head baseline. Only a head change or the stall escalation
@@ -67,6 +70,8 @@ UNESCALATE_PR_RESET_FIELDS = (
     "mergequeue_requeues_head_sha",
     "mergequeue_rework_attempts",
     "mergequeue_rework_attempts_last_head",
+    # Issue #2900: the lane's cap-escalation head stamp.
+    "mergequeue_rework_attempts_escalated_head",
     "mergequeue_rework_attempts_stall_since",
     "mergequeue_rework_attempts_stall_head",
     # Issue #1972: the local merge gate's per-kind rework counters and the
@@ -84,6 +89,9 @@ UNESCALATE_PR_RESET_FIELDS = (
     "local_gate_abort_streak_patch_id",
     "no_op_rework_attempts",
     "no_op_rework_attempts_last_head",
+    # Issue #2900: the lane's cap-escalation head stamps (also written for
+    # the no-op and mergequeue lanes by _cap_escalation_pr_extra).
+    "no_op_rework_attempts_escalated_head",
     "no_op_rework_attempts_stall_since",
     "no_op_rework_attempts_stall_head",
     # Issue #2108: per-head attempt counts of the PR-body closing-keyword autofix
@@ -300,11 +308,15 @@ def stamp_unescalate_cleared_markers(
 # (Issue #783 hazard (b)), so the per-episode reset cannot unbound the
 # paid-session loop.
 REWORK_BUDGET_RESET_BY_ESCALATION_REASON: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    # Each lane's companion list now also pops the cap-escalation head stamp
+    # (issue #2900) ``_cap_escalation_pr_extra`` writes: a re-arm that left
+    # it behind would keep the merge lane's conflict-cap skip armed.
     "max_rework_cycles_exceeded": (("request_changes_count",), ()),
     "no_op_rework_attempts_cap_exceeded": (
         ("no_op_rework_attempts",),
         (
             "no_op_rework_attempts_last_head",
+            "no_op_rework_attempts_escalated_head",
             "no_op_rework_attempts_stall_since",
             "no_op_rework_attempts_stall_head",
         ),
@@ -313,6 +325,7 @@ REWORK_BUDGET_RESET_BY_ESCALATION_REASON: dict[str, tuple[tuple[str, ...], tuple
         ("no_op_rework_attempts",),
         (
             "no_op_rework_attempts_last_head",
+            "no_op_rework_attempts_escalated_head",
             "no_op_rework_attempts_stall_since",
             "no_op_rework_attempts_stall_head",
         ),
@@ -321,6 +334,7 @@ REWORK_BUDGET_RESET_BY_ESCALATION_REASON: dict[str, tuple[tuple[str, ...], tuple
         ("conflict_rework_attempts",),
         (
             "conflict_rework_attempts_last_head",
+            "conflict_rework_attempts_escalated_head",
             "conflict_rework_attempts_stall_since",
             "conflict_rework_attempts_stall_head",
         ),
@@ -329,6 +343,7 @@ REWORK_BUDGET_RESET_BY_ESCALATION_REASON: dict[str, tuple[tuple[str, ...], tuple
         ("conflict_rework_attempts",),
         (
             "conflict_rework_attempts_last_head",
+            "conflict_rework_attempts_escalated_head",
             "conflict_rework_attempts_stall_since",
             "conflict_rework_attempts_stall_head",
         ),
@@ -343,6 +358,7 @@ REWORK_BUDGET_RESET_BY_ESCALATION_REASON: dict[str, tuple[tuple[str, ...], tuple
         (
             "mergequeue_requeues_head_sha",
             "mergequeue_rework_attempts_last_head",
+            "mergequeue_rework_attempts_escalated_head",
             "mergequeue_rework_attempts_stall_since",
             "mergequeue_rework_attempts_stall_head",
         ),
@@ -352,6 +368,7 @@ REWORK_BUDGET_RESET_BY_ESCALATION_REASON: dict[str, tuple[tuple[str, ...], tuple
         (
             "mergequeue_requeues_head_sha",
             "mergequeue_rework_attempts_last_head",
+            "mergequeue_rework_attempts_escalated_head",
             "mergequeue_rework_attempts_stall_since",
             "mergequeue_rework_attempts_stall_head",
         ),
