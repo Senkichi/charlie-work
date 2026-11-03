@@ -78,6 +78,17 @@ _LEAKS_INTO_A_FAILING_HOOK = textwrap.dedent(
 )
 
 
+_LEAKS_THEN_FAILS = textwrap.dedent(
+    f"""
+    import os
+
+    def test_leaks_then_fails_its_own_assertion(monkeypatch):
+        monkeypatch.setattr(os, "name", {_FOREIGN!r})
+        raise AssertionError("the test's own failure")
+    """
+)
+
+
 def _run_inner(tmp_path: Path, body: str, *, guarded: bool, conftest: str = "") -> tuple[int, str]:
     proj = tmp_path / "proj"
     proj.mkdir()
@@ -176,4 +187,21 @@ def test_with_the_guard_the_same_teardown_hook_never_sees_a_foreign_os_name(
     # One failed test, named, with the remedy -- and the hook found the host's value.
     assert "FAILED test_inner.py::test_leaks_into_a_failing_teardown_hook" in out, out
     assert "left os.name == 'posix'" in out, out
+    assert "a plugin hook failed" not in out, out
+
+
+def test_with_the_guard_a_test_that_leaks_then_fails_reports_its_own_failure(
+    tmp_path: Path,
+) -> None:
+    """The exception path: a test that fails inside the window must not leave the foreign
+    name live for the teardown hooks (here the hook that aborts the run when it sees it)."""
+    code, out = _run_inner(
+        tmp_path, _LEAKS_THEN_FAILS, guarded=True, conftest=_TEARDOWN_HOOK_RAISES
+    )
+
+    assert code == 1, out
+    assert "INTERNALERROR" not in out, out
+    assert "the test's own failure" in out, out
+    # The test's own failure is the report; the guard does not replace it with its message.
+    assert "left os.name" not in out, out
     assert "a plugin hook failed" not in out, out
