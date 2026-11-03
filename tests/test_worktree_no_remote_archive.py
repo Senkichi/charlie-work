@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-from _worktree_fixtures import _clone_repo, _git, _init_repo
+from _worktree_fixtures import REJECTED_PUSH_MESSAGE, _clone_repo, _git, _init_repo, _reject_pushes
 from _worktree_fixtures import _wt_scratch as _register_wt_scratch  # noqa: F401 -- registers the wt_scratch fixture: worker sandboxes redirect TEMP/TMPDIR deep inside the checkout, where tmp_path-derived repo roots overrun git's internal worktree-path buffer (``git worktree add`` exits 128)
 from charlie_work.config import DispatchConfig, OrchestratorConfig
 from charlie_work.instrumentation import query_events
@@ -223,11 +223,20 @@ def test_no_remote_archive_kill_switch_off_still_refuses(wt_scratch: Path) -> No
 
 def test_with_remote_unpushed_commits_still_refuses(wt_scratch: Path) -> None:
     """Spec AC 2: a repo WITH an origin remote keeps refusing — unpushed
-    commits there can be salvaged by a real push, so no archive shortcut."""
+    commits there can be salvaged by a real push, so no archive shortcut.
+
+    Issue #2904 changed what "salvaged by a real push" means here: with the
+    worktree directory gone, ``create_worktree`` now performs that push itself
+    (see ``tests/test_worktree_stranded_tip.py``), so the refusal only holds
+    when the push cannot land. The remote therefore rejects pushes — and the
+    assertions below still pin the #1944 property: a repo with a remote never
+    takes the local archive shortcut, and a failed rescue leaves the tip intact.
+    """
     remote_repo = wt_scratch / "remote"
     _init_repo(remote_repo)
     repo_root = wt_scratch / "repo"
     _clone_repo(remote_repo, repo_root)
+    _reject_pushes(remote_repo)
     branch = "agent/issue-204-remote"
     main_tip = _git(repo_root, "rev-parse", "main").stdout.strip()
 
@@ -235,8 +244,9 @@ def test_with_remote_unpushed_commits_still_refuses(wt_scratch: Path) -> None:
     old_tip = _commit_in(info1.path)
     assert remove_worktree(repo_root, info1.path)
 
-    with pytest.raises(WorktreeUnsafeError, match="local commit"):
+    with pytest.raises(WorktreeUnsafeError, match="local commit") as excinfo:
         create_worktree(repo_root, branch, base_ref="HEAD", issue_number=204)
+    assert REJECTED_PUSH_MESSAGE in str(excinfo.value)
 
     # Refusal preserved everything: no archive ref, diverged branch intact.
     assert _archive_refs(repo_root, branch) == {}
