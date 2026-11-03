@@ -68,6 +68,17 @@ class KillOrphans:
 
 
 @dataclass(frozen=True)
+class ReleaseBlockedTool:
+    """Kill the orphans holding a blocked tool call's pipe, sparing the worker (issue #2794).
+
+    Result: the pids verified gone (``tuple[int, ...]``), empty when the worker
+    cannot be anchored or nothing holds the pipe.
+    """
+
+    issue: int
+
+
+@dataclass(frozen=True)
 class RecordFailure:
     """Classify the sidecar via the adapter profile: ``(failure_kind, throttled_until)``."""
 
@@ -94,6 +105,7 @@ STALLED_REQUEST_TYPES = (
     ProbeRateLimitDefer,
     KillTree,
     KillOrphans,
+    ReleaseBlockedTool,
     RecordFailure,
     ProbeCompletedHandoff,
     ReadLogTail,
@@ -106,6 +118,7 @@ STALLED_REQUEST_TYPES = (
 class AdapterFacts:
     over_budget: bool
     can_record_failure: bool
+    can_release_blocked_tool: bool = False  # issue #2794
 
 
 @dataclass(frozen=True)

@@ -201,6 +201,9 @@ class ClaudeWorkerRecord:
     provider: str = ""
     xdist_cap: str | None = None  # resolved PYTEST_XDIST_AUTO_NUM_WORKERS at launch (issue #646)
     uv_no_sync: str | None = None  # resolved UV_NO_SYNC at launch, or None if no .venv (#646)
+    # ISO timestamp of the stalled lane's one pipe-holder release for this dispatch
+    # (issue #2794). A relaunch writes a fresh record, so the marker never outlives it.
+    tool_released_at: str | None = None
 
     def __post_init__(self) -> None:
         """Enforce a canonical ISO-8601 UTC ``started_at`` at construction time."""
@@ -246,6 +249,7 @@ class ClaudeWorkerRecord:
             provider=str(payload.get("provider", "")),
             xdist_cap=payload.get("xdist_cap"),
             uv_no_sync=payload.get("uv_no_sync"),
+            tool_released_at=payload.get("tool_released_at"),
         )
 
 
