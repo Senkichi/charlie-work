@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -100,6 +101,34 @@ def _install_fake_create_worktree(
         return _fake_worktree(tmp_path, branch)
 
     monkeypatch.setattr(devin_shell, "create_worktree", fake_create_worktree)
+
+
+def _install_fake_popen_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fake ``devin_shell.popen_worker`` so a launch never spawns a real process.
+
+    For tests that assert only on what ``launch_devin_session`` hands to
+    ``create_worktree`` (issue #2950). Left real, the spawn seam makes such a
+    test's cost and behavior depend on whether the host has the ``devin`` CLI:
+    where it is installed, ``Popen`` resolves the bare ``devin`` from PATH and
+    starts a REAL Devin session against a prompt file that does not exist (the
+    conftest ``_no_real_cli_binaries`` guard covers only ``claude_code``); where
+    it is not (every CI runner), ``Popen`` fails and ``launch_devin_session``
+    runs its failure teardown -- ``remove_worktree``, i.e. up to four real
+    ``git worktree``/``git branch`` subprocesses per launch against a non-repo
+    directory, ~10x the call time -- and still returns a record the test's
+    assertions accept. Pair this with an assertion that ``record.error is None``
+    so a launch that never reached the spawn seam cannot pass.
+
+    The fake process reports an immediate clean exit (``poll() == 0``) so the
+    terminal-status watcher thread ends at once instead of polling forever.
+    Opt-in: modules that exercise a real spawn (``_write_fake_devin``) do not
+    call it.
+    """
+
+    def fake_popen_worker(command, *args, **kwargs):
+        return SimpleNamespace(pid=4242, returncode=0, poll=lambda: 0)
+
+    monkeypatch.setattr(devin_shell, "popen_worker", fake_popen_worker)
 
 
 def _init_repo(repo_root: Path) -> None:
