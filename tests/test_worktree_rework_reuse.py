@@ -1,5 +1,5 @@
 """Rework dispatch against an existing worktree/branch: reuse, attach, fast-forward,
-reset and merge-update conflicts."""
+reset, reclaim of detached/deleted worktrees and merge-update conflicts."""
 
 from __future__ import annotations
 
@@ -635,3 +635,76 @@ def test_rework_attach_resets_on_non_ff_different_patch_id(tmp_path: Path) -> No
     assert info.attempt_snapshot.ref_name is not None
 
     remove_worktree(repo_root, info.path)
+
+
+def test_rework_reclaims_detached_worktree_at_target_path(tmp_path: Path) -> None:
+    """Issue #461: a leftover worktree registered at the rework target path but
+    left DETACHED (crashed mid-rework, reboot) is invisible to the branch-name
+    lookup (`git worktree list --porcelain` emits no `branch` line for it).
+    The by-path reclaim must remove it first so the attach path can succeed."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    branch_name = "agent/issue-9-x"
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+    _git(info1.path, "checkout", "--detach")
+
+    worktrees = list_worktrees(repo_root)
+    stale = next(wt for wt in worktrees if Path(wt["worktree"]) == info1.path)
+    assert not stale.get("branch")
+
+    info2 = create_worktree(repo_root, branch_name, rework=True)
+
+    assert info2.path == info1.path
+    assert info2.path.exists()
+    current_branch = _git(info2.path, "branch", "--show-current").stdout.strip()
+    assert current_branch == branch_name
+
+    remove_worktree(repo_root, info2.path)
+
+
+def test_rework_reclaim_refuses_dirty_detached_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A detached leftover worktree with uncommitted work must not be silently
+    clobbered by the by-path reclaim — WorktreeUnsafeError, work survives."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    branch_name = "agent/issue-10-dirty-detach"
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+    _git(info1.path, "checkout", "--detach")
+    (info1.path / "dirty.txt").write_text("uncommitted worker edit\n", encoding="utf-8")
+
+    _force_capture_failure(monkeypatch)
+    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted source work"):
+        create_worktree(repo_root, branch_name, rework=True)
+
+    assert info1.path.exists()
+    assert (info1.path / "dirty.txt").read_text(encoding="utf-8") == "uncommitted worker edit\n"
+
+    remove_worktree(repo_root, info1.path)
+
+
+def test_rework_reclaims_worktree_when_directory_deleted(tmp_path: Path) -> None:
+    """A worktree registered at the rework target path whose directory was
+    deleted out-of-band (not via `git worktree remove`) is pruned before the
+    attach path runs `git worktree add`."""
+    import shutil
+
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    branch_name = "agent/issue-11-pruned-detach"
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+    _git(info1.path, "checkout", "--detach")
+    shutil.rmtree(info1.path)
+
+    info2 = create_worktree(repo_root, branch_name, rework=True)
+
+    assert info2.path == info1.path
+    assert info2.path.exists()
+    current_branch = _git(info2.path, "branch", "--show-current").stdout.strip()
+    assert current_branch == branch_name
+
+    remove_worktree(repo_root, info2.path)
