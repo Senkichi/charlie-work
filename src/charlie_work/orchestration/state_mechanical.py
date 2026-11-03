@@ -42,7 +42,11 @@ def _deescalate_mechanical_issue(self, issue_number: int) -> dict[str, Any]:
     live, no open PR is bound to the issue, or the fresh
     mergeable/janitor check failed (this is the expected, common
     outcome; the reason string is what the caller histograms into
-    ``deescalation_pass_completed``, see ``_deescalation_skip``). Returns
+    ``deescalation_pass_completed``, see ``_deescalation_skip``). An
+    ``empty_diff_zero_file`` escalation (issue #2899) is skipped as
+    ``empty_diff_head_unchanged`` while the PR's live head still equals the
+    head the route fired for, so the operator-queue exit is durable until the
+    head moves. Returns
     ``{"cap_exhausted": True, ...}`` the first time
     ``auto_deescalation_count`` has already reached
     ``config.deescalation.max_auto_deescalations``. Returns
@@ -281,6 +285,24 @@ def _deescalate_mechanical_issue(self, issue_number: int) -> dict[str, Any]:
             return _wf._deescalation_skip("worktree_still_unsafe", issue_number)
 
     pr = self.gh.pr_view(pr_number)
+    # Issue #2899: an ``empty_diff_zero_file`` escalation is parked for the
+    # operator, not for health: an open, mergeable, janitor-green zero-diff PR
+    # passes every clear condition below, so clearing it here would let the
+    # head-scoped route marker (review_empty_diff_route.py) keep the empty-diff
+    # gate silent forever -- no exit, now with no signal. Leave it escalated
+    # while the live head is still the head the route fired for; once the head
+    # moves this falls through and the sweep clears as usual, so a regained diff
+    # is reviewed and a new empty head re-routes once. Needs a truthy marker: an
+    # absent/None marker (unreadable packet head at route time) names no head,
+    # so there is nothing to be unchanged against. Placed before the janitor
+    # reads so a parked PR also costs no GitHub calls per sweep.
+    routed_head = state["prs"][str(pr_number)].get(_wf.EMPTY_DIFF_ROUTED_HEAD_FIELD)
+    if (
+        issue_entry.get("escalation_reason") == _wf.EMPTY_DIFF_ESCALATION_REASON
+        and routed_head
+        and routed_head == pr.get("headRefOid")
+    ):
+        return _wf._deescalation_skip("empty_diff_head_unchanged", issue_number)
     pr_state_str = str(pr.get("state") or "").upper()
     # Mirror janitor._check_mergeable's own permissive definition of
     # "mergeable" exactly: it fails a PR only on the literal

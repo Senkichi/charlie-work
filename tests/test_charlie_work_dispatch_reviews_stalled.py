@@ -375,10 +375,18 @@ def test_dispatch_reviews_recorded_verdict_suppresses_later_stalled_throttle(
 
 
 def test_dispatch_reviews_skips_empty_diff_pr(monkeypatch, tmp_path: Path) -> None:
-    """Issue #1251: a PR whose diff.patch is empty (zero-file diff vs base)
-    must not burn a paid reviewer session. The pre-flight gate skips dispatch,
-    emits review_dispatch_skipped_empty_diff, and does NOT increment
-    review_dispatch_attempt_count (an empty diff is not a review attempt)."""
+    """Issue #2899 (replacing #1251's per-pass warning): a PR whose diff.patch
+    is empty (zero-file diff vs base) must not burn a paid reviewer session.
+    The pre-flight gate still skips dispatch and still does NOT increment
+    review_dispatch_attempt_count (an empty diff is not a review attempt, and
+    none of the attempts are spent on the route either), but the first pass
+    that observes the empty diff routes the linked issue to the operator
+    queue once through review_dispatch_escalated with a reason naming the
+    empty diff -- the no-exit shape of one warning per pass forever is gone.
+    The PR binds issue #10 through its closing-keyword body (the branch
+    validator finds no such open issue, so the binding falls through to the
+    keyword path), so the route carries the full mechanical escalation:
+    operator_queue label edge, issue+PR escalation records."""
     prs = [
         {
             "number": 100,
@@ -419,14 +427,36 @@ def test_dispatch_reviews_skips_empty_diff_pr(monkeypatch, tmp_path: Path) -> No
     assert result.data["launched_count"] == 0
     # The PR must appear in the skipped_empty_diff payload.
     assert 100 in result.data["skipped_empty_diff"]
-    # review_dispatch_skipped_empty_diff event must have been emitted.
-    skip_events = query_events(app.paths.state_file, kind="review_dispatch_skipped_empty_diff")
-    assert len(skip_events) == 1
-    assert skip_events[0]["pr_number"] == 100
+    # The operator-queue route fired exactly once this pass.
+    assert result.data["empty_diff_operator_queued"] == [100]
+    # Exactly one escalation event naming the empty diff; the retired
+    # per-pass warning kind (#1251) is no longer emitted.
+    escalated = query_events(app.paths.state_file, kind="review_dispatch_escalated")
+    assert len(escalated) == 1
+    payload = escalated[0]["payload"]
+    assert payload["pr_number"] == 100
+    assert payload["issue_number"] == 10
+    assert payload["reason"] == "empty_diff_zero_file"
+    assert payload["attempt_count"] == 0
+    assert payload["packet_head_sha"] == "sha-100"
+    assert query_events(app.paths.state_file, kind="review_dispatch_skipped_empty_diff") == []
+    # Exactly one label transition, and it lands the operator-queue label,
+    # never human-needed: this is a mechanical escalation.
+    assert app.gh.labels_added.count((10, app.config.labels.operator_queue)) == 1
+    assert (10, app.config.labels.human_needed) not in app.gh.labels_added
     # review_dispatch_attempt_count must NOT have been incremented.
     state = load_state(app.paths.state_file)
     pr_state = state["prs"].get("100", {})
     assert int(pr_state.get("review_dispatch_attempt_count", 0)) == 0
+    # The issue and PR records escalated with reason_class mechanical and the
+    # PR recorded the head-scoped dedup marker.
+    issue_state = state["issues"].get("10", {})
+    assert issue_state.get("status") == "escalated"
+    assert issue_state.get("escalation_reason") == "empty_diff_zero_file"
+    assert issue_state.get("reason_class") == "mechanical"
+    assert pr_state.get("status") == "escalated"
+    assert pr_state.get("escalation_reason") == "empty_diff_zero_file"
+    assert pr_state.get("empty_diff_operator_queued_head_sha") == "sha-100"
     # No dispatch claim must have been written.
     assert pr_state.get("review_dispatch_status") != "review_dispatch_pending"
 
@@ -502,22 +532,20 @@ def test_dispatch_reviews_empty_diff_mixed_with_nonempty(monkeypatch, tmp_path: 
 def test_dispatch_reviews_empty_diff_skip_is_registered_and_never_launches(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Issue #1258 (AC5): the #1251 empty-diff pre-flight guard already
-    landed on this clone's main (commit 7de2fa9, PR #1278) before this item
-    started -- per the task's "integrate with it instead of duplicating"
-    instruction, this item does not reimplement it. This test pins the two
-    concrete AC5 guarantees against the ALREADY-MERGED gate as an explicit
-    W1 regression (not just #1251's own suite): zero reviewer-launch calls
-    for a zero-file PR, and its dedicated event kind is genuinely registered
-    in instrumentation.py's exhaustive registry (not just a bare string).
+    """Issue #1258 (AC5), updated by #2899: the #1251 empty-diff pre-flight
+    guard landed on main (commit 7de2fa9, PR #1278); #2899 replaced its
+    per-pass warning emission with the single operator-queue route. This test
+    still pins both concrete AC5 guarantees against the gate as a W1
+    regression: zero reviewer-launch calls for a zero-file PR, and the
+    escalation event kind it now emits being genuinely registered in
+    instrumentation.py's exhaustive registry (not just a bare string).
 
-    Naming note: the event kind was originally ``review_skipped_empty_diff``
-    (#1251, PR #1278) and has been renamed to ``review_dispatch_skipped_empty_diff``
-    for issue #1258 (AC5) so it shares the ``review_dispatch_*`` family AC4
-    pins for the new CI-red kind. The rename touches only the
-    ``_LEVEL_BY_KIND`` registry key, its single emitter call site, and this
-    suite's assertions -- the emission site, payload shape, and warning
-    level are unchanged, so this is not a behavior change.
+    Naming note: the #1251 event kind ``review_skipped_empty_diff`` (renamed
+    ``review_dispatch_skipped_empty_diff`` for #1258, AC5) is retired by
+    #2899 -- the route reuses the registered ``review_dispatch_escalated``
+    kind with a reason naming the empty diff instead. The kind registry pin
+    moves with it; the retired key stays registered for historical events
+    but is no longer emitted.
 
     ``_dispatch_reviews_app`` defaults ``review_dispatch.enabled=True``, so
     ``launched == []`` here is a real launch-avoidance assertion, not a
@@ -528,7 +556,7 @@ def test_dispatch_reviews_empty_diff_skip_is_registered_and_never_launches(
     """
     from charlie_work.instrumentation import _LEVEL_BY_KIND
 
-    assert "review_dispatch_skipped_empty_diff" in _LEVEL_BY_KIND
+    assert "review_dispatch_escalated" in _LEVEL_BY_KIND
 
     prs = [
         {
@@ -556,9 +584,10 @@ def test_dispatch_reviews_empty_diff_skip_is_registered_and_never_launches(
     assert result.ok is True
     assert launched == []
     assert result.data["launched_count"] == 0
-    skip_events = query_events(app.paths.state_file, kind="review_dispatch_skipped_empty_diff")
-    assert len(skip_events) == 1
-    assert skip_events[0]["pr_number"] == 100
+    escalated = query_events(app.paths.state_file, kind="review_dispatch_escalated")
+    assert len(escalated) == 1
+    assert escalated[0]["payload"]["pr_number"] == 100
+    assert escalated[0]["payload"]["reason"] == "empty_diff_zero_file"
 
 
 def test_dispatch_reviews_dry_run_empty_diff_preview_is_read_only(

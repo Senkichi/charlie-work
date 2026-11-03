@@ -1000,6 +1000,9 @@ def test_skip_reason_vocabulary_is_derived_from_the_branches() -> None:
     # `if not (... and ... and ...)` is what made "0 cleared" unreadable, and
     # only `janitor_blocked` means "the sweep works but the PR is not ready".
     assert {"janitor_blocked", "pr_not_open", "pr_conflicting", "no_open_pr"} <= set(reasons)
+    # Issue #2899: the durable-exit skip for an unchanged empty-diff head is
+    # its own histogram bucket, distinct from every health-based skip.
+    assert "empty_diff_head_unchanged" in reasons
 
 
 # --- Issue #807: worktree_unsafe split — local commits must NOT auto-de-escalate ---
