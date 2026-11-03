@@ -385,6 +385,15 @@ class DispatchConfig:
     # so an operator adding or removing the label mid-flight takes effect on
     # the next pass.
     human_merge_labels: Annotated[tuple[str, ...], Typed, NotNull] = ()
+    # Issue #2920: required checks only the operator can clear (an approval-label
+    # gate), not a code push. When EVERY failed required check on a PR is listed
+    # here, that failure is the PR's sole janitor failure, and its bound issue carries
+    # a ``human_merge_labels`` label, review skips the ``request_changes`` verdict, the
+    # flake rerun and the rework worker, and parks the issue on
+    # ``agent:operator-queue`` directly (see ``operator_gated_route``). A name here
+    # only matters if it is also in ``auto_merge.required_checks``. Default empty:
+    # every failed required check routes to rework exactly as before.
+    operator_gated_checks: Annotated[tuple[str, ...], Typed, NotNull] = ()
     # Spec C2 (host_routing): this orchestrator's host name; None = every issue is local.
     host: Annotated[str | None, Typed, NonEmpty] = None
     default_host: Annotated[bool, Typed, NotNull] = True
@@ -622,6 +631,7 @@ class DispatchConfig:
             "worker_prompt_comment_associations",
             "worker_prompt_excluded_comment_authors",
             "human_merge_labels",
+            "operator_gated_checks",
         ):
             value = getattr(self, field_name)
             normalized = (str(value),) if isinstance(value, str) else tuple(str(v) for v in value)
