@@ -43,7 +43,13 @@ from charlie_work.merge_path.human_block import (
     human_block_gate,
 )
 from charlie_work.merge_path.model import FactNotGathered, Hold, MergePathConfig, PlanKind
-from charlie_work.workflow import ORCHESTRATOR_COMMENT_MARKER, _is_orchestrator_comment
+from charlie_work.paths import runtime_paths
+from charlie_work.workflow import (
+    ORCHESTRATOR_COMMENT_MARKER,
+    OrchestratorApp,
+    _is_bot_comment,
+    _is_orchestrator_comment,
+)
 
 _AUTO = AutoMergeConfig()
 REQUEST_CHANGES = compile_verdict_pattern(_AUTO.human_block_request_changes_pattern)
@@ -55,9 +61,13 @@ RC_PLAIN = "**Verdict: request changes.** The retry path swallows the error."
 OK_PLAIN = "**Verdict: approved.** Addressed."
 
 
-def _c(body: str, *, orchestrator: bool = False) -> dict[str, Any]:
+def _c(body: str, *, orchestrator: bool = False, bot: bool = False) -> dict[str, Any]:
+    """A REST issue comment. ``bot`` gives it the GitHub App shape (``user.type == "Bot"``)."""
     prefix = f"{ORCHESTRATOR_COMMENT_MARKER}\n" if orchestrator else ""
-    return {"body": prefix + body, "user": {"login": "someone", "type": "User"}}
+    user = (
+        {"login": "some-app[bot]", "type": "Bot"} if bot else {"login": "someone", "type": "User"}
+    )
+    return {"body": prefix + body, "user": user}
 
 
 def _classify(
@@ -69,6 +79,7 @@ def _classify(
         request_changes=REQUEST_CHANGES,
         approved=APPROVED,
         is_orchestrator_comment=_is_orchestrator_comment,
+        is_bot_comment=_is_bot_comment,
     )
 
 
@@ -119,6 +130,48 @@ def test_orchestrator_marker_comments_are_ignored() -> None:
 
     human_approve_then_fleet_block = [_c(OK_PLAIN), _c(RC_MARKER, orchestrator=True)]
     assert _classify(human_approve_then_fleet_block).blocked is False
+
+
+def test_a_bot_authored_approve_does_not_clear_a_human_block() -> None:
+    """A GitHub App's ``Verdict: approved`` is not a human's: it must not release
+    a human's outstanding request-changes (the 2026-10-19 shape, with a bot as the
+    newest commenter). The identical pair from a non-bot author does clear it."""
+    human_block_then_bot_approve = [_c(RC_PLAIN), _c(OK_PLAIN, bot=True)]
+    assert _classify(human_block_then_bot_approve) == HumanBlockRead(
+        True, source=HUMAN_BLOCK_SOURCE_COMMENT
+    )
+
+    # Control: same bodies, same order, non-bot author -> cleared.
+    human_block_then_human_approve = [_c(RC_PLAIN), _c(OK_PLAIN)]
+    assert _classify(human_block_then_human_approve) == HumanBlockRead(False)
+
+
+def test_a_bot_authored_request_changes_does_not_raise_a_block() -> None:
+    """The mirror: a bot's ``Verdict: request changes`` neither blocks nor masks a
+    human's earlier approve. The identical pair from a non-bot author does block."""
+    human_approve_then_bot_block = [_c(OK_PLAIN), _c(RC_PLAIN, bot=True)]
+    assert _classify(human_approve_then_bot_block).blocked is False
+
+    # Control: same bodies, same order, non-bot author -> blocked.
+    assert _classify([_c(OK_PLAIN), _c(RC_PLAIN)]).blocked is True
+
+
+@pytest.mark.parametrize(
+    "bot_fields",
+    [
+        pytest.param({"user": {"login": "x[bot]", "type": "Bot"}}, id="rest-user-type"),
+        pytest.param({"author": {"login": "x", "type": "Bot"}}, id="graphql-author-type"),
+        pytest.param({"author": {"login": "x", "is_bot": True}}, id="graphql-author-is-bot"),
+    ],
+)
+def test_every_shape_workflow_treats_as_a_bot_is_skipped(bot_fields: dict[str, Any]) -> None:
+    """The skip is ``workflow._is_bot_comment`` itself, not a narrower re-check of
+    ``user.type``: every author shape it recognises is honoured here too."""
+    bot_approve = {"body": OK_PLAIN, **bot_fields}
+    assert _classify([_c(RC_PLAIN), bot_approve]).blocked is True
+
+    # Control: the same body without the bot discriminator clears the block.
+    assert _classify([_c(RC_PLAIN), {"body": OK_PLAIN}]).blocked is False
 
 
 def test_a_quote_reply_that_merely_contains_the_marker_is_still_a_human_comment() -> None:
@@ -391,6 +444,33 @@ def test_a_marker_bearing_request_changes_comment_is_ignored(tmp_path: Path) -> 
     assert out.gh.pr_labels_added == [(_PR, "mergequeue")]
 
 
+def test_a_bot_authored_approve_comment_does_not_clear_a_human_block_end_to_end(
+    tmp_path: Path,
+) -> None:
+    """Through ``gather_human_block``'s lazy-import seam (not an injected fake): a bot's
+    newest ``Verdict: approved`` leaves the human's request-changes holding, while the
+    identical comment list from a non-bot author hands off."""
+    held = _pass(tmp_path / "bot", comments=[_c(RC_PLAIN), _c(OK_PLAIN, bot=True)])
+    _assert_held(held)
+    assert held.data["human_block"] is True
+    assert held.data["human_block_source"] == HUMAN_BLOCK_SOURCE_COMMENT
+
+    control = _pass(tmp_path / "human", comments=[_c(RC_PLAIN), _c(OK_PLAIN)])
+    assert control.gh.pr_labels_added == [(_PR, "mergequeue")]
+    assert "human_block" not in control.data
+
+
+def test_a_bot_authored_request_changes_comment_does_not_hold_end_to_end(tmp_path: Path) -> None:
+    out = _pass(tmp_path / "bot", comments=[_c(OK_PLAIN), _c(RC_PLAIN, bot=True)])
+    assert out.gh.pr_labels_added == [(_PR, "mergequeue")]
+    assert "human_block" not in out.data
+
+    # Control: the identical list from a non-bot author holds.
+    control = _pass(tmp_path / "human", comments=[_c(OK_PLAIN), _c(RC_PLAIN)])
+    _assert_held(control)
+    assert control.data["human_block"] is True
+
+
 def test_unreadable_comments_hold_the_pr_fail_closed(tmp_path: Path) -> None:
     out = _pass(tmp_path, unreadable=True)
 
@@ -399,6 +479,48 @@ def test_unreadable_comments_hold_the_pr_fail_closed(tmp_path: Path) -> None:
     assert out.result.ok is False
     assert "human-review check unavailable" in out.result.message
     assert out.gh.comment_reads == 1
+
+
+def _loop_pass(tmp_path: Path, *, unreadable: bool) -> tuple[Any, _Gh]:
+    """One full ``app.loop`` pass over PR ``_PR`` carrying an approved verdict at its head.
+
+    ``merge_ready`` is reached the way production reaches it (``reap_loop`` ->
+    ``merge_ready_unless_queued`` -> ``_record_merge_or_error``), unlike ``_pass``,
+    which calls ``merge_ready`` directly and so never touches the loop's error bucket.
+    """
+    config = _config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = _Gh()
+    gh.pr_external_issue_comments[_PR] = []
+    app = OrchestratorApp(tmp_path, paths, config, gh)
+    app.record_review(_PR, "approved", summary="ok", verdict_provenance="fresh_llm_review")
+    gh.comment_reads = 0
+    gh.comments_unreadable = unreadable
+    return app.loop(limit=0, merge=True), gh
+
+
+def test_loop_lists_a_pr_with_an_unreadable_human_block_read_in_errors(tmp_path: Path) -> None:
+    """The ``human_block_check_unavailable`` clause of ``_record_merge_or_error``: an
+    unreadable comment read held the PR (fail closed) and must also surface as a loop
+    error -- ``ok`` False, the PR in ``errors``, not in ``merges`` -- rather than
+    passing as a quiet, successful hold."""
+    result, gh = _loop_pass(tmp_path / "unreadable", unreadable=True)
+
+    assert gh.comment_reads >= 1  # the human-block read really ran inside the loop
+    assert result.ok is False
+    assert [e["pr"] for e in result.data["errors"]] == [_PR]
+    assert "human-review check unavailable" in result.data["errors"][0]["error"]
+    assert result.data["merges"] == []
+    assert gh.pr_labels_added == []  # held: no hand-off, no merge
+    assert gh.merged == []
+
+    # Control: same loop, same PR, comments readable -> not an error, and it hands off.
+    control, control_gh = _loop_pass(tmp_path / "readable", unreadable=False)
+    assert control_gh.comment_reads >= 1
+    assert control.data["errors"] == []
+    assert control.ok is True
+    assert [m["pr"] for m in control.data["merges"]] == [_PR]
+    assert control_gh.pr_labels_added == [(_PR, "mergequeue")]
 
 
 def test_kill_switch_restores_the_old_behaviour_and_reads_nothing(tmp_path: Path) -> None:

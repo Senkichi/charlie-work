@@ -539,8 +539,8 @@ def gather_human_block(app: Any, pr: dict[str, Any], pr_number: int) -> HumanBlo
 
     ``reviewDecision`` on the payload in hand decides without a read; only
     otherwise are the issue comments fetched (one paginated ``gh api`` call).
-    The orchestrator-comment test is resolved at call time because the marker
-    lives in ``charlie_work.workflow``, which imports this package.
+    The orchestrator-comment and bot-comment tests are resolved at call time
+    because both live in ``charlie_work.workflow``, which imports this package.
     """
     auto = app.config.auto_merge
     review_decision = pr.get("reviewDecision")
@@ -554,14 +554,14 @@ def gather_human_block(app: Any, pr: dict[str, Any], pr_number: int) -> HumanBlo
     comments = _pr_issue_comments(app.gh, pr_number)
     if comments is None:
         return HumanBlockRead(False, unavailable=True)
+    workflow = importlib.import_module("charlie_work.workflow")
     return classify_human_block(
         review_decision,
         comments,
         request_changes=request_changes,
         approved=approved,
-        is_orchestrator_comment=importlib.import_module(
-            "charlie_work.workflow"
-        )._is_orchestrator_comment,
+        is_orchestrator_comment=workflow._is_orchestrator_comment,
+        is_bot_comment=workflow._is_bot_comment,
     )
 
 

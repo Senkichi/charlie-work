@@ -1296,10 +1296,11 @@ class AutoMergeConfig:
     # happen, so a normal pass adds no GitHub call) holds the PR: no
     # ``mergequeue`` label, no merge, no escalation, and it self-clears when the
     # signal clears. Comments carrying the orchestrator-generated marker are
-    # the fleet's own and are never read as a human verdict. Unreadable
+    # the fleet's own, and comments by GitHub App/bot accounts are not a
+    # human's; neither is ever read as a human verdict. Unreadable
     # comments fail closed (hold). Ships ON; False is the kill switch.
     honor_human_block: bool = True
-    # Case-insensitive patterns deciding the newest non-fleet verdict comment.
+    # Case-insensitive patterns deciding the newest non-fleet, non-bot verdict comment.
     # The defaults match the marker form (``<!-- review-verdict: request-changes -->``
     # / ``<!-- review-verdict: approved -->``) and the plain ``**Verdict: request
     # changes.**`` / ``Verdict: approved`` text sessions already post.

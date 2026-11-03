@@ -21,10 +21,13 @@ Signal precedence, strongest first:
    hand: blocks. No comment read -- and a later comment cannot clear a formal
    review; GitHub's own ``reviewDecision`` does that.
 2. Otherwise the issue comments, newest first, skipping the orchestrator's own
-   (provenance-marker) comments. The newest remaining comment that matches a
-   verdict pattern decides: request-changes blocks, approved clears. A comment
-   matching neither is not a verdict and is skipped. A comment matching both
-   resolves to request-changes (fail closed).
+   (provenance-marker) comments and anything a GitHub App/bot account wrote
+   (``user.type == "Bot"``): a bot is not a human reviewer, so its text can
+   neither raise a block nor clear one -- the same two skips the external-
+   findings ingestion path applies. The newest remaining comment that matches
+   a verdict pattern decides: request-changes blocks, approved clears. A
+   comment matching neither is not a verdict and is skipped. A comment
+   matching both resolves to request-changes (fail closed).
 3. Unreadable comments hold (fail closed), reported as ``unavailable``.
 """
 
@@ -66,17 +69,24 @@ def classify_human_block(
     request_changes: re.Pattern[str],
     approved: re.Pattern[str],
     is_orchestrator_comment: Callable[[Mapping[str, Any]], bool],
+    is_bot_comment: Callable[[Mapping[str, Any]], bool],
 ) -> HumanBlockRead:
     """Decide the human block from the signals in hand (pure).
 
     ``comments`` is in the API's order (oldest first); the scan runs newest
-    first. ``is_orchestrator_comment`` is injected because the marker lives in
-    ``charlie_work.workflow``, which this package cannot import at module load.
+    first. ``is_orchestrator_comment`` and ``is_bot_comment`` are injected
+    because both predicates live in ``charlie_work.workflow``, which this
+    package cannot import at module load. Both are required (no default) so a
+    caller cannot silently drop one and let a non-human comment decide.
     """
     if review_decision == CHANGES_REQUESTED:
         return HumanBlockRead(True, source=HUMAN_BLOCK_SOURCE_REVIEW_DECISION)
     for comment in reversed(comments):
-        if not isinstance(comment, Mapping) or is_orchestrator_comment(comment):
+        if (
+            not isinstance(comment, Mapping)
+            or is_bot_comment(comment)
+            or is_orchestrator_comment(comment)
+        ):
             continue
         body = comment.get("body")
         if not isinstance(body, str):
