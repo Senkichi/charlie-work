@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import json
-import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from _worker_fixtures import _wg
+from _worktree_fixtures import _init_bare_remote_and_clone, _setup_completed_worktree
 from charlie_work.claude_code import ClaudeWorkerRecord
 from charlie_work.config import (
     AutoMergeConfig,
@@ -1023,41 +1023,13 @@ def test_workflow_classify_dead_sessions_reaps_probe_error_sidecar(
 
 
 # --- helpers for issue #656 workflow call-site regression coverage ----------
-
-
-def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, check=True)
-
-
-def _init_bare_remote_and_clone(tmp_path: Path) -> tuple[Path, Path]:
-    """A bare remote + a non-bare clone with one commit on main, pushed."""
-    remote = tmp_path / "remote.git"
-    remote.mkdir(parents=True, exist_ok=True)
-    _git(remote, "init", "--bare", "--initial-branch=main")
-    clone = tmp_path / "clone"
-    clone.mkdir(parents=True, exist_ok=True)
-    _git(clone, "init", "--initial-branch=main")
-    _git(clone, "config", "user.email", "test@example.test")
-    _git(clone, "config", "user.name", "Test User")
-    _git(clone, "config", "commit.gpgSign", "false")
-    _git(clone, "remote", "add", "origin", str(remote))
-    (clone / "README.md").write_text("hello\n", encoding="utf-8")
-    _git(clone, "add", "README.md")
-    _git(clone, "commit", "-m", "initial commit")
-    _git(clone, "push", "-u", "origin", "main")
-    return remote, clone
-
-
-def _setup_completed_worktree(repo_root: Path, issue_number: int) -> tuple[Path, str]:
-    """Create a worktree with one commit beyond origin/main (WorktreeState.COMPLETED)."""
-    from charlie_work.worktree import create_worktree
-
-    branch = f"agent/issue-{issue_number}"
-    info = create_worktree(repo_root, branch, base_ref="origin/main")
-    (info.path / "feature.txt").write_text("feature\n", encoding="utf-8")
-    _git(info.path, "add", "feature.txt")
-    _git(info.path, "commit", "-m", "feature commit")
-    return info.path, branch
+#
+# The bare remote + clone and the completed worktree come from the shared
+# ``_worktree_fixtures`` builders. ``_init_bare_remote_and_clone`` is a per-process
+# git-template copy (no git process once warm, ``_git_templates``); the module used
+# to hand-run its own nine-spawn copy (issue #3019). Process count is what the test
+# ledger's call-phase time tracks on the Windows runners (same lever as #2569, #3008
+# and #3014).
 
 
 # Adapter-kind -> sidecar filename suffix (mirrors claude_code sidecar naming).
