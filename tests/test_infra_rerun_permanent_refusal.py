@@ -13,10 +13,10 @@ import pytest
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
 from _fakes_github_rerun import FakeGitHubWithRerunCapture
 from _review_fixtures import _required_checks_config
-from charlie_work.infra_rerun_refusal import is_permanent_rerun_refusal
+from charlie_work.infra_rerun_refusal import is_permanent_rerun_refusal, is_rerun_already_running
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state
-from charlie_work.workflow import OrchestratorApp
+from charlie_work.workflow import OrchestratorApp, _is_rerun_already_running_error
 
 _RUN_LINK = "https://github.com/owner/repo/actions/runs/12345/job/67890"
 _CHECKS = [
@@ -60,6 +60,23 @@ def _events(paths, kind: str) -> list[dict]:
 )
 def test_classifier(error: str, expected: bool) -> None:
     assert is_permanent_rerun_refusal(error) is expected
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        ("run 1 cannot be rerun; This workflow is already running", True),
+        ("The workflow run containing this job is already running", True),
+        ("HTTP 403: Cannot rerun a workflow that is ALREADY RUNNING", True),
+        (_REFUSAL_403, False),
+        ("HTTP 502: Bad Gateway", False),
+        ("", False),
+    ],
+)
+def test_already_running_classifier(error: str, expected: bool) -> None:
+    assert is_rerun_already_running(error) is expected
+    # workflow's `_wf.` seam delegates to the same classifier (one source of truth).
+    assert _is_rerun_already_running_error(error) is expected
 
 
 def test_403_one_attempt_one_escalation(tmp_path: Path) -> None:

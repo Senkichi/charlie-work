@@ -488,6 +488,76 @@ def test_a_refused_rerun_is_retried_a_bounded_number_of_times(tmp_path: Path) ->
     assert query_events(app.paths.state_file, kind="aggregate_job_rerun_triggered") == []
 
 
+ALREADY_RUNNING = f"run {RUN} cannot be rerun; This workflow is already running"
+
+
+def _recorded_calls(app: OrchestratorApp) -> int:
+    """The persisted refused-call count for ``RUN`` (0 when the lane never recorded it)."""
+    reruns = load_state(app.paths.state_file).get("aggregate_job_heal", {}).get("reruns", {})
+    return int(reruns.get(str(RUN), {}).get("calls", 0))
+
+
+def test_an_already_running_refusal_is_a_deferral_not_a_failed_attempt(tmp_path: Path) -> None:
+    # The timed-out aggregate's run is still draining other jobs, so GitHub refuses the
+    # rerun with "already running". That is a retry-later race: it must outlast
+    # MAX_RERUN_CALLS ticks without spending the budget, then heal when the run settles.
+    app, gh = _app(tmp_path)
+    _wedge(gh)
+    gh.rerun_error = ALREADY_RUNNING
+    interval = timedelta(minutes=app.config.auto_merge.aggregate_heal_interval_minutes + 1)
+    ticks = MAX_RERUN_CALLS + 3
+    tick = NOW
+    for attempt in range(1, ticks + 1):
+        assert heal_wedged_aggregates(app, now=tick) == 0
+        assert len(gh.rerun_calls) == attempt  # re-requested on EVERY tick, never abandoned
+        assert _recorded_calls(app) == 0  # the deferral spent nothing
+        tick += interval
+    assert query_events(app.paths.state_file, kind="aggregate_job_rerun_failed") == []
+    assert query_events(app.paths.state_file, kind="aggregate_job_rerun_triggered") == []
+
+    gh.rerun_error = None  # the run finished; GitHub now accepts the rerun
+
+    assert heal_wedged_aggregates(app, now=tick) == 1
+    assert len(gh.rerun_calls) == ticks + 1
+    assert query_events(app.paths.state_file, kind="aggregate_job_rerun_failed") == []
+    triggered = query_events(app.paths.state_file, kind="aggregate_job_rerun_triggered")
+    assert len(triggered) == 1 and triggered[0]["payload"]["run_id"] == RUN
+    assert _recorded_calls(app) == 1  # only the accepted call is on the books
+    assert not rerun_allowed(
+        load_state(app.paths.state_file)["aggregate_job_heal"]["reruns"][str(RUN)]
+    )
+
+    # ...and it stays one rerun per run id: a later tick does not request another.
+    assert heal_wedged_aggregates(app, now=tick + interval) == 0
+    assert len(gh.rerun_calls) == ticks + 1
+
+
+def test_deferrals_do_not_loosen_the_bound_on_generic_refusals(tmp_path: Path) -> None:
+    # Interleaved: a generic refusal is charged, a deferral is not, and the generic budget
+    # still runs out at exactly MAX_RERUN_CALLS charged calls.
+    app, gh = _app(tmp_path)
+    _wedge(gh)
+    interval = timedelta(minutes=app.config.auto_merge.aggregate_heal_interval_minutes + 1)
+    tick = NOW
+    gh.rerun_error = "HTTP 403: workflow run cannot be re-run"
+    assert heal_wedged_aggregates(app, now=tick) == 0
+    assert _recorded_calls(app) == 1
+    for _ in range(MAX_RERUN_CALLS + 1):
+        tick += interval
+        gh.rerun_error = ALREADY_RUNNING
+        assert heal_wedged_aggregates(app, now=tick) == 0
+        assert _recorded_calls(app) == 1  # unchanged by the deferrals
+    gh.rerun_error = "HTTP 403: workflow run cannot be re-run"
+    for _ in range(MAX_RERUN_CALLS + 2):
+        tick += interval
+        assert heal_wedged_aggregates(app, now=tick) == 0
+
+    assert _recorded_calls(app) == MAX_RERUN_CALLS
+    failed = query_events(app.paths.state_file, kind="aggregate_job_rerun_failed")
+    assert len(failed) == MAX_RERUN_CALLS  # none of them a deferral
+    assert all("already running" not in e["payload"]["error"] for e in failed)
+
+
 def test_a_refused_rerun_does_not_burn_the_one_rerun_budget(tmp_path: Path) -> None:
     app, gh = _app(tmp_path)
     _wedge(gh)

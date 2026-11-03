@@ -31,8 +31,15 @@ run has the same name and a higher id, and only the latest per name is judged.
 Bounded: one rerun per workflow run id, persisted under ``state["aggregate_job_heal"]``
 (``reruns``), so a job that wedges again on the rerun surfaces to a human instead of
 looping. A rerun *call* that GitHub refuses is retried on later ticks, at most
-``MAX_RERUN_CALLS`` times per run id. Nothing is written to ``state["prs"]``: an
-``mq-bot-*`` draft is not fleet-owned and must not gain an entry there.
+``MAX_RERUN_CALLS`` times per run id. The one exception is the "already running" refusal
+(``infra_rerun_refusal.is_rerun_already_running``): it means another job of the timed-out
+run is still in progress, so the rerun cannot be requested *yet*. That is a deferral, not a
+failure -- it spends no ``calls``, writes no state, emits no ``aggregate_job_rerun_failed``
+event, and is retried on the next tick for as long as the run stays in progress (a run is
+finite, so the retry is self-limiting). Charging it to ``MAX_RERUN_CALLS`` would abandon a
+healable PR after ``MAX_RERUN_CALLS`` ticks while its run was merely still draining.
+Nothing is written to ``state["prs"]``: an ``mq-bot-*`` draft is not fleet-owned and must
+not gain an entry there.
 
 Cost: REST only (never GraphQL, so it is not a budget-governor lane). One open-PR list per
 tick plus one check-run read per candidate, gated by
@@ -53,6 +60,7 @@ from .checks import _run_id_from_link
 from .config import OrchestratorConfig
 from .github import GitHubError, GitHubRunResult, label_names
 from .host import current as _host_current
+from .infra_rerun_refusal import is_rerun_already_running
 from .local_work_park import publishes_pull_requests
 from .queue_bot import is_queue_bot_pr
 from .reconcile import _latest_check_runs_by_name, _normalize_reconcile_pr
@@ -69,6 +77,7 @@ SOURCE_QUEUE_BOT_DRAFT = "queue_bot_draft"
 TIMEOUT_MESSAGE = "exceeded the maximum execution time"
 
 # Refused rerun calls (not reruns) tolerated per run id before the lane gives up on it.
+# An "already running" refusal is a deferral and is never counted here.
 MAX_RERUN_CALLS = 3
 # Run ids remembered in state; run ids grow monotonically, so the newest are kept.
 _KEEP_RUNS = 200
@@ -334,6 +343,15 @@ def heal_wedged_aggregates(app: Any, *, now: datetime | None = None) -> int:
             if not rerun_allowed(entry):
                 continue
             accepted, error = _rerun_failed_jobs(app.gh, run_id)
+            if error is not None and is_rerun_already_running(error):
+                # Retry-later race: another job of the run is still in progress. Not an
+                # attempt -- nothing is charged, persisted or emitted; the next tick re-judges.
+                logger.info(
+                    "aggregate job heal: rerun of run %s deferred, still in progress (PR #%s)",
+                    run_id,
+                    pr.number,
+                )
+                continue
             _record_attempt(
                 app,
                 pr,
