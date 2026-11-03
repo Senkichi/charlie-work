@@ -190,6 +190,49 @@ EOT
     _git(repo_root, "checkout", "-f", "feature")
 
 
+_TRACKED_VENV_BRANCH = "tracked-venv"
+
+
+def _seed_tracked_venv_branch(repo_root: Path) -> str:
+    """Branch off ``main`` with ``.venv/pyvenv.cfg`` committed; returns its name.
+
+    A worktree added from this ref already contains ``.venv`` when
+    ``create_worktree`` reaches its venv-link step, so
+    ``_create_junction_or_symlink``'s "link target already exists" guard is
+    what fires -- the state ``create_worktree``'s docstring names ("that link
+    target already exists in the fresh worktree"). A hand-made stale directory
+    at the worktree path cannot reach the guard: git refuses ``worktree add``
+    into a non-empty directory first (exit 128), so a bare
+    ``pytest.raises(RuntimeError)`` passes whether or not the guard exists
+    (issue #2915).
+
+    One ``git fast-import`` spawn, no checkout: ``main`` and the working tree
+    stay as ``_init_repo`` left them (same shape as
+    ``_seed_staged_addition_bubble``).
+    """
+    subprocess.run(
+        ["git", "fast-import", "--quiet"],
+        cwd=repo_root,
+        # input as bytes: text=True would translate \n to \r\n on Windows
+        # stdin, and git parses the \r as part of each command line.
+        input=f"""\
+commit refs/heads/{_TRACKED_VENV_BRANCH}
+committer Test User <test@example.test> 0 +0000
+data <<MSG
+track a venv directory
+MSG
+from refs/heads/main
+M 100644 inline .venv/pyvenv.cfg
+data <<EOT
+home = somewhere
+EOT
+""".encode(),
+        check=True,
+        capture_output=True,
+    )
+    return _TRACKED_VENV_BRANCH
+
+
 def _clone_repo(remote_repo: Path, repo_root: Path, *, fresh: bool = False) -> None:
     """``git clone`` plus the test identity; a template copy when ``remote_repo`` is an
     unchanged repo this process materialized (``_git_templates``)."""
