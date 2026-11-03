@@ -176,6 +176,7 @@ KNOWN_IGNORED: dict[str, str] = {
     "blocker_cycle": "dependency-graph diagnostic",
     "dispatch_skip_blocked": "dispatch-skip record; dispatchable counts come from pass_samples",
     "dispatch_skip_operator_claimed": "dispatch-skip record; dispatchable counts come from pass_samples",
+    "dispatch_priority_reserve": "audit record of rework slots held for critical fresh issues; those issues surface via their own dispatch events",
     "dispatch_stale": "a paused fleet's stale-dispatch signal",
     "dispatch_blocked_chain_dead": "dispatch-skip record: a blocked chain went dead",
     "dispatch_blocked_environment": "environment-block dispatch record",

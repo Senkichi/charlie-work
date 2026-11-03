@@ -1,18 +1,22 @@
 """Generic issue priority: the ``priority:<level>`` label (TIS-CW-7).
 
 Any issue may carry ``priority:<level>``; nothing special-cases who filed it.
-Two places read it:
+Three places read it:
 
 * fresh dispatch claims ready issues in priority order, ``critical`` first
   (``OrchestratorApp._order_dispatch_candidates``, the one ordering both the
   real and the dry-run pass use) -- a stable re-rank, so the configured
   ``dispatch.order`` still decides within a level;
+* the rework lane's slot budget: ``loop()`` leaves
+  ``priority_reserve.critical_fresh_reserve`` slots of the wave unclaimed
+  before rework spends it, one per ready ``critical`` fresh issue, so a
+  critical issue is not queued behind the rework backlog (#2917);
 * the Aviator hand-off adds ``auto_merge.mergequeue_skip_line_label`` to a PR
   whose linked issue is ``critical``, so it is queued at the front.
 
 :data:`LEVELS` is the vocabulary, most urgent first. A level outside it, or no
 label, ranks as ``normal``; an issue with several levels takes the most urgent.
-The prefix is ``LabelConfig.priority_prefix``; an empty prefix turns both off.
+The prefix is ``LabelConfig.priority_prefix``; an empty prefix turns all three off.
 """
 
 from __future__ import annotations
