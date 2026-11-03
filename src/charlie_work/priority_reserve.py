@@ -31,8 +31,8 @@ labelled ready, and every such pass emits ``dispatch_priority_reserve`` naming
 it, so the hold is visible rather than silent.
 
 An empty ``labels.priority_prefix`` turns the reserve off (zero reads), and a
-GitHub failure while counting reserves nothing: the pass behaves as it did
-before this module existed.
+GitHub failure or a busy state lock while counting reserves nothing: the pass
+behaves as it did before this module existed.
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ from typing import TYPE_CHECKING
 
 from .github import GitHubError, label_names
 from .issue_priority import is_critical
-from .state import load_state_locked, operator_claimed_issues
+from .state import StateLockBusy, load_state_locked, operator_claimed_issues
 
 if TYPE_CHECKING:
     from .workflow import OrchestratorApp
@@ -81,7 +81,10 @@ def critical_fresh_reserve(app: OrchestratorApp, wave_limit: int) -> int:
         headroom = app._apply_concurrency_governor(
             wave_limit, apply_open_pr_backpressure=True
         ).dispatch_limit
-    except GitHubError as exc:
+    except (GitHubError, StateLockBusy) as exc:
+        # Fail open to the pre-reserve pass. StateLockBusy matters here: this runs before
+        # ``dispatch_rework`` is entered, so nothing downstream would absorb it into a
+        # deferral and it would fail the whole ``loop()`` pass.
         logger.warning("priority reserve skipped, could not read ready issues: %s", exc)
         return 0
     reserve = min(len(numbers), wave_limit, max(0, headroom))

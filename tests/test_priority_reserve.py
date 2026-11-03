@@ -21,7 +21,7 @@ from charlie_work.github import GitHubError
 from charlie_work.instrumentation import query_events
 from charlie_work.paths import runtime_paths
 from charlie_work.priority_reserve import critical_fresh_reserve
-from charlie_work.state import load_state, save_state, state_lock
+from charlie_work.state import StateLockBusy, load_state, save_state, state_lock
 from charlie_work.workflow import OrchestratorApp
 
 REWORK_ISSUES = (123, 124, 125)
@@ -254,6 +254,23 @@ def test_a_github_failure_reserves_nothing(
     app = _app(tmp_path, _Unreadable(_ready(FRESH_ISSUE, "priority:critical")), _config())
     with caplog.at_level("WARNING", logger="charlie_work.priority_reserve"):
         assert critical_fresh_reserve(app, 2) == 0
+    assert "priority reserve skipped" in caplog.text
+
+
+def test_a_busy_state_lock_reserves_nothing_and_does_not_fail_the_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The reserve runs before ``dispatch_rework`` is entered, so nothing downstream absorbs this."""
+
+    def _busy(_path: Path) -> dict[str, Any]:
+        raise StateLockBusy("held")
+
+    app = _app(tmp_path, _Backlog(_ready(FRESH_ISSUE, "priority:critical")), _config())
+    monkeypatch.setattr("charlie_work.priority_reserve.load_state_locked", _busy)
+    with caplog.at_level("WARNING", logger="charlie_work.priority_reserve"):
+        result = app.loop(limit=2)
+    assert result.ok, result.message
+    assert len(_launched(result, "dispatch_rework")) == 2
     assert "priority reserve skipped" in caplog.text
 
 
