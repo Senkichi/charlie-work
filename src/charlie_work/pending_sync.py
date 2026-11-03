@@ -215,6 +215,14 @@ def record_sync_deferral(
 #: separately. A clean no-op emits nothing.
 SELF_DEPLOY_BOOT_SYNC_KIND = "self_deploy_boot_sync"
 
+#: Exit reason for the supervisor exit that follows a boot repair which really
+#: synced (issue #2919). The sync replaced packages the process had already
+#: imported, so every module in memory predates the install on disk. Declared
+#: here, next to the repair that produces it, and listed in
+#: ``fleet_dispatch.RESTART_EXIT_REASONS`` so ``restart_requested`` (and with
+#: it ``EXIT_RESTART_REQUESTED``) is derived from the vocabulary, not set by hand.
+BOOT_SYNC_EXIT_REASON = "boot_sync"
+
 _BOOT_SYNC_PROBE_TIMEOUT_SECONDS = 30
 _BOOT_SYNC_SYNC_TIMEOUT_SECONDS = 300
 
@@ -231,6 +239,12 @@ class BootSyncRepair:
     detected but live fleet runners are active -- the merge and sync stay
     parked for ``self_deploy``/the next restart. ``detail`` carries the
     operator-facing reason for deferred/failed outcomes.
+
+    ``synced`` is also the one field a caller restarts on (issue #2919): it is
+    the only outcome that changed the install under a process that has already
+    imported its modules. A failed, deferred, or no-op repair changed nothing,
+    so none of them may request a restart -- a persistent sync failure would
+    otherwise become a restart loop.
     """
 
     detected_via: str | None = None
