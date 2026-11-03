@@ -10,6 +10,7 @@ from __future__ import annotations
 import subprocess
 import sys
 
+import psutil
 import pytest
 
 import _process_guard
@@ -21,6 +22,17 @@ from _process_guard import (
 )
 
 _BASE_EXECUTABLE = getattr(sys, "_base_executable", sys.executable)
+
+
+class _ConstantCreateTimeProcess:
+    """A test's ``psutil.Process`` fake (issue #2918): a constant ``create_time``
+    and nothing else -- no ``children``, ``status`` or ``cmdline``."""
+
+    def __init__(self, pid: int | None = None) -> None:
+        self.pid = pid
+
+    def create_time(self) -> float:
+        return 1_760_000_000.25
 
 
 def _spawn_sleeper(seconds: int = 60) -> subprocess.Popen:
@@ -148,3 +160,74 @@ def test_no_job_falls_back_to_the_psutil_walk(monkeypatch: pytest.MonkeyPatch) -
     with leak_guard():
         pass
     assert reaped == [{9: 3.0}]
+
+
+@pytest.mark.parametrize("switch", ["on", "off"])
+def test_leak_guard_exits_cleanly_under_a_patched_psutil_process(
+    monkeypatch: pytest.MonkeyPatch, switch: str
+) -> None:
+    """Issue #2918: a fake ``psutil.Process`` still installed at guard exit must
+    not crash the guard when another real child was alive at setup and exit.
+
+    The sleeper is created before the guard and outlives it, so nothing leaked;
+    the fake's constant ``create_time`` is what used to make it look new.
+    """
+    monkeypatch.setenv(FAST_GUARDS_ENV, switch)
+    bystander = _spawn_sleeper()
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            with leak_guard(grace=0.2):
+                patch.setattr(psutil, "Process", _ConstantCreateTimeProcess)
+            # The guard borrowed the real class for its own reads and put the
+            # test's fake back: this test's patch is not the guard's to undo.
+            assert psutil.Process is _ConstantCreateTimeProcess
+    finally:
+        bystander.kill()
+        bystander.wait(timeout=10)
+
+
+@pytest.mark.parametrize("switch", ["on", "off"])
+def test_leak_guard_still_reports_a_leak_under_a_patched_psutil_process(
+    monkeypatch: pytest.MonkeyPatch, switch: str
+) -> None:
+    """Same patch, a child that really leaks: reported by pid and command line."""
+    monkeypatch.setenv(FAST_GUARDS_ENV, switch)
+    spawned: list[subprocess.Popen] = []
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            with pytest.raises(
+                pytest.fail.Exception,
+                match=r"test left live child process\(es\) behind:\n  pid=\d+",
+            ) as excinfo:
+                with leak_guard(grace=0.2):
+                    patch.setattr(psutil, "Process", _ConstantCreateTimeProcess)
+                    spawned.append(_spawn_sleeper())
+            assert psutil.Process is _ConstantCreateTimeProcess
+    finally:
+        for proc in spawned:
+            proc.kill()
+            proc.wait(timeout=10)
+    [proc] = spawned
+    report = str(excinfo.value)
+    assert f"pid={proc.pid} cmdline=" in report
+    # The command line is read off a real process, never off the fake.
+    assert "time.sleep" in report
+
+
+def test_real_process_scope_restores_the_tests_fake_when_the_body_raises() -> None:
+    """Every exit of the scope puts the test's own ``psutil.Process`` back."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(psutil, "Process", _ConstantCreateTimeProcess)
+        with pytest.raises(RuntimeError, match="boom"):
+            with _process_guard._real_process_class():
+                assert psutil.Process is _process_guard._REAL_PROCESS
+                raise RuntimeError("boom")
+        assert psutil.Process is _ConstantCreateTimeProcess
+
+
+def test_real_process_scope_leaves_an_unpatched_psutil_alone() -> None:
+    real = psutil.Process
+    assert real is _process_guard._REAL_PROCESS, "positive control: nothing patched it"
+    with _process_guard._real_process_class():
+        assert psutil.Process is real
+    assert psutil.Process is real
