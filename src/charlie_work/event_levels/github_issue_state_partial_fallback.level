@@ -4,14 +4,15 @@ info
 # numbers unresolved, and the parallel per-issue `issue_view` fallback ran
 # for exactly those numbers instead of the whole batch. The payload names
 # the unresolved numbers (the telemetry the incident lacked).
-# Info, not warning (rework review): the edge-trigger dedupe that makes
-# this fire once per newly-unresolved number lives on the Issues instance,
-# and instance lifetime depends on the caller. The single-repo supervisor
-# (supervise.run_supervised) keeps one GitHub for the whole process, so
-# there a persistent stale blocker emits one row per process. But the
-# fleet supervisor (fleet_loop) builds a fresh GitHub per repo on every
-# pass, so there the same blocker emits once per pass per repo -- an
-# every-pass warning row into check_warning_events is the flood shape
-# #1271/#1768 already burned once for check_warning_events. At info the
-# per-pass rows still record the degradation each pass without alarming
-# on an expected repeat.
+# Edge-triggered per number and durable across passes (issue #2901): the
+# baseline of already-reported numbers is a per-repo sidecar next to
+# state.json (github_capabilities/unresolved_issue_baseline.py), so a
+# persistent stale blocker emits ONE row, not one per pass -- the fleet
+# supervisor rebuilds its GitHub client every pass, which is why the earlier
+# instance-local baseline re-reported it every pass (2,081 rows/week in one
+# consumer repo). A number re-emits only after a later batch positively
+# resolves it and it then goes stale again. If the sidecar cannot be written
+# the client falls back to the instance-local baseline, whose per-pass repeat
+# is the flood shape #1271/#1768 burned check_warning_events with once.
+# Info, not warning: this records a degradation that the per-issue fallback
+# already absorbed (the answer is still correct), so it must not alarm.

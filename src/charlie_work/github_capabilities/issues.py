@@ -46,6 +46,7 @@ from ci_fleet.github import GitHubError
 # rationale (it is shared with ``PullRequests`` members and, until this leaf,
 # with ``GitHub.issue_list``). ``issue_list`` (moved below) references it as a
 # bare global.
+from .. import layout
 from ..github_transport.json_read import JsonRead
 from ..github_transport.request import RestRequest
 from ._base import CapabilityCollaborator, GitHubRunResult, _LIST_LIMIT
@@ -58,6 +59,7 @@ from .issue_list_rest import (
 )
 from .circuit_breaker_transport import circuit_breaker_state_path
 from .cross_repo_blockers import CrossRepoBlocker, make_blocker, repo_from_repository_url
+from .unresolved_issue_baseline import settle_reported
 from ..instrumentation import log_event
 
 if TYPE_CHECKING:
@@ -303,25 +305,25 @@ class Issues(CapabilityCollaborator):
         # observation. A number leaves the set only when a later batch
         # positively resolves it; an unrelated clean batch (one that never
         # named the stale number) leaves the set untouched, so a persistent
-        # stale blocker fires once per GitHub-instance lifetime instead of
-        # once per batch observation. The earlier single-frozenset
-        # signature did reset on any unrelated clean batch, and with
-        # multiple are_issues_open calls per pass (github_ops_blockers
-        # prefetch, backlog_reachability per-issue, blocker_cycles) the
-        # same stale blocker refired every pass.
+        # stale blocker fires once instead of once per batch observation.
+        # The earlier single-frozenset signature did reset on any unrelated
+        # clean batch, and with multiple are_issues_open calls per pass
+        # (github_ops_blockers prefetch, backlog_reachability per-issue,
+        # blocker_cycles) the same stale blocker refired every pass.
         # Lives on the collaborator instance, NOT in ``_list_cache``:
         # ``_list_cache`` is cleared every pass
         # (``repo_meta.invalidate_list_cache``), so cache-resident state
         # could never dedupe the event even within one instance's
-        # lifetime. How far that lifetime reaches depends on the caller:
-        # the single-repo supervisor (``supervise.run_supervised``) keeps
-        # one GitHub/Issues pair for the whole process, but the fleet
+        # lifetime.
+        # Issue #2901: this set is no longer the source of truth. The fleet
         # supervisor builds a fresh GitHub per repo on every pass
-        # (``fleet_dispatch.fleet_loop``), so there this set dedupes only
-        # within a pass and a persistent stale blocker emits once per pass
-        # per repo. That repeat is why the kind is registered ``info``,
-        # not ``warning`` (see its ``event_levels/`` entry). An instance
-        # attribute never lands in ``vars(Issues)`` --
+        # (``fleet_dispatch.fleet_loop``), so an instance-lifetime baseline
+        # was empty at the start of each pass and a persistent stale blocker
+        # reported once per pass (2,081 rows in a week in one consumer
+        # repo). The durable baseline is the per-repo sidecar owned by
+        # ``unresolved_issue_baseline``; this set is only the degraded-mode
+        # fallback ``are_issues_open`` uses when that sidecar cannot be
+        # written. An instance attribute never lands in ``vars(Issues)`` --
         # ``github_delegation._routable_members`` only yields class-level
         # callables -- so adding it changes neither ``_ROUTES`` nor
         # ``GitHub``'s surface.
@@ -499,17 +501,36 @@ class Issues(CapabilityCollaborator):
                     open_issues.add(number)
 
             unresolved = [number for number in uncached if number not in states]
+            fresh: frozenset[int] = frozenset()
             if not batch_failed:
                 # Per-number edge tracking: a number this batch positively
-                # resolved leaves the reported set, so a later re-stale of
-                # that number is a fresh edge. Numbers this batch never
-                # named leave the set untouched -- an unrelated clean batch
-                # must NOT reset the baseline (the round-2 review finding:
-                # with multiple are_issues_open calls per pass, clearing on
-                # any clean batch refired the same stale blocker every
-                # pass). Whole-batch failures neither emit nor disturb the
-                # set.
+                # resolved leaves the baseline, so a later re-stale of that
+                # number is a fresh edge. Numbers this batch never named leave
+                # it untouched -- an unrelated clean batch must NOT reset the
+                # baseline (the round-2 review finding: with multiple
+                # are_issues_open calls per pass, clearing on any clean batch
+                # refired the same stale blocker every pass). Whole-batch
+                # failures neither emit nor disturb the baseline.
+                #
+                # The baseline is durable (issue #2901): the fleet supervisor
+                # rebuilds this client every pass, so an instance-local set
+                # re-reported a persistent stale number on every one of them.
+                # ``settle_reported`` returns the numbers that were not yet
+                # in the sidecar baseline -- or ``None`` when the sidecar is
+                # unusable, in which case the instance-local set decides.
+                state_path = circuit_breaker_state_path(self.runtime, self.repo_root)
+                durable_fresh = settle_reported(
+                    layout.issue_state_unresolved_path(state_path.parent),
+                    resolved=states,
+                    unresolved=unresolved,
+                )
+                fresh = (
+                    durable_fresh
+                    if durable_fresh is not None
+                    else frozenset(unresolved) - self._partial_fallback_reported
+                )
                 self._partial_fallback_reported.difference_update(states)
+                self._partial_fallback_reported.update(unresolved)
             if unresolved:
                 if not batch_failed:
                     logger.warning(
@@ -519,14 +540,13 @@ class Issues(CapabilityCollaborator):
                         len(unresolved),
                         unresolved,
                     )
-                    if set(unresolved) - self._partial_fallback_reported:
+                    if fresh:
                         # write-gate-exempt(issue=1933): GitHub client layer has no WriteGate; lock-free telemetry
                         log_event(
                             circuit_breaker_state_path(self.runtime, self.repo_root),
                             "github_issue_state_partial_fallback",
                             {"unresolved": unresolved, "requested": len(uncached)},
                         )
-                    self._partial_fallback_reported.update(unresolved)
 
                 # Fallback to the previous parallel per-issue view fetch.
                 def _fetch_state(number: int) -> tuple[int, bool]:
