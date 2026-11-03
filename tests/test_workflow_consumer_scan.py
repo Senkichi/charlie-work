@@ -25,10 +25,23 @@ import _workflow_consumer_scan as scan
 import pytest
 from _src_ast import parsed, source_files, source_text
 
-_CANDIDATES = {"_alpha", "_beta", "_gamma", "_delta", "_epsilon", "_zeta", "_eta", "_alp"}
+_CANDIDATES = {
+    "_alpha",
+    "_beta",
+    "_gamma",
+    "_delta",
+    "_epsilon",
+    "_zeta",
+    "_eta",
+    "_alp",
+    "_theta",
+    "_iota",
+    "_kappa",
+    "_lambda",
+}
 
-# One file per reference form, plus the near-misses each form must not match.
-_CORPUS: dict[str, str] = {
+# One file per reference form.
+_REFERENCES: dict[str, str] = {
     "a_absolute_import.py": "from charlie_work.workflow import _alpha\n",
     "b_relative_import.py": "from .workflow import _beta\n",
     "c_parenthesized_import.py": (
@@ -38,15 +51,37 @@ _CORPUS: dict[str, str] = {
     "e_attribute.py": "workflow._epsilon(1)\n",
     "f_wf_alias.py": "wf._zeta(2)\n",
     "g_setattr_string.py": 'monkeypatch.setattr("charlie_work.workflow._eta", x)\n',
-    # Near-misses: none of these is a reference to a candidate.
-    "h_backtick_docstring.py": '"""See ``charlie_work.workflow._alpha`` for details."""\n',
-    "i_longer_name.py": "workflow._alphabet(1)\nworkflow._betamax(2)\n",
-    "j_fully_qualified_attribute.py": "charlie_work.workflow._beta(1)\n",
-    "k_other_module.py": "from charlie_work.other import _gamma\nother._delta(1)\n",
-    "l_no_token.py": "x = 1\n",
     # A later file that repeats an earlier file's reference: first one wins.
     "z_repeat.py": "from charlie_work.workflow import _alpha\nworkflow._epsilon(1)\n",
 }
+
+# Near-misses: none of these is a reference to a candidate. The scan keeps the
+# *first* file that reaches a name, so a near-miss spelling a name an earlier file
+# already claims could never change the result -- the regex mutant it exists to
+# catch would still agree with the oracle (the review of #2943 found exactly that
+# for ``_alpha``..``_delta``). Each therefore spells a candidate that no other file
+# spells; ``test_each_near_miss_spells_a_name_no_other_file_does`` holds the line.
+_NEAR_MISSES: dict[str, str] = {
+    # Backtick-quoted, not quote-delimited: the string-literal form needs a quote.
+    "h_backtick_docstring.py": '"""See ``charlie_work.workflow._theta`` for details."""\n',
+    # ``workflow.`` is the tail of a longer dotted chain: the receiver lookbehind.
+    "j_fully_qualified_attribute.py": "charlie_work.workflow._iota(1)\n",
+    # A different module that is also named ``workflow`` (so the file is parsed and
+    # the ``ImportFrom`` module filter decides), and an attribute on a non-receiver.
+    "k_other_module.py": "from other.workflow import _kappa\nother._kappa(1)\n",
+    # ``workflow`` is the tail of a longer identifier: the lookbehind's ``\w`` half.
+    "m_receiver_suffix.py": "my_workflow._lambda(1)\n",
+}
+
+# Negative controls that spell no candidate as a whole token, so first-file-wins
+# has nothing to mask: ``_alp`` is only a prefix of ``_alphabet``, and the scan
+# must take the maximal identifier.
+_NO_NAME_CONTROLS: dict[str, str] = {
+    "i_longer_name.py": "workflow._alphabet(1)\nworkflow._betamax(2)\n",
+    "l_no_token.py": "x = 1\n",
+}
+
+_CORPUS: dict[str, str] = {**_REFERENCES, **_NEAR_MISSES, **_NO_NAME_CONTROLS}
 
 
 def _legacy_scan(
@@ -131,6 +166,25 @@ def test_scan_agrees_with_the_loop_it_replaced(tmp_path: Path, receivers: tuple[
     if "wf" in receivers:
         expected["_zeta"] = "f_wf_alias.py"
     assert new == expected
+
+
+def test_each_near_miss_spells_a_name_no_other_file_does() -> None:
+    """The oracle test's negative controls stay capable of failing.
+
+    The scan keeps the first file to reach a name, so a near-miss whose candidate
+    name an earlier file already claims is masked: a regex that wrongly matched it
+    would still produce the same dict. Derived from the corpus, so a new near-miss
+    or a renamed candidate cannot quietly reintroduce the shadowing.
+    """
+    tokens = {name: set(re.findall(r"\w+", source)) for name, source in _CORPUS.items()}
+    for near_miss in _NEAR_MISSES:
+        spelled = tokens[near_miss] & _CANDIDATES
+        elsewhere = set().union(*(t for other, t in tokens.items() if other != near_miss))
+
+        assert spelled, f"{near_miss} spells no candidate name, so it can never fail"
+        assert not spelled & elsewhere, (
+            f"{near_miss} is masked: {sorted(spelled & elsewhere)} also appear in another file"
+        )
 
 
 def test_receivers_restrict_which_aliases_count(tmp_path: Path) -> None:
