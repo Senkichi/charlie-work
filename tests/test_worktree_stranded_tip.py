@@ -1,0 +1,677 @@
+"""Issue #2904: rescue of a branch whose worktree directory no longer exists.
+
+``create_worktree`` refuses to reset a branch whose commits are not on the
+remote, and tries to rescue the work onto a ref first. The rescue staged the
+working tree with ``cwd`` set to the worktree path, so with the directory gone
+every call failed (``[WinError 267] The directory name is invalid``) and the
+issue re-escalated on every requeue. A missing directory has no dirty content;
+the committed tip is pushed to the salvage ref the refusal message names.
+
+``tests/test_worktree.py`` is at its file-size ratchet mark, so these tests
+live in their own module. They drive real git repos (a bare-ish remote and a
+clone) through the shared ``_worktree_fixtures`` helpers -- no mocks on the
+code under test.
+"""
+
+from __future__ import annotations
+
+import shutil
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from _worktree_fixtures import (
+    REJECTED_PUSH_MESSAGE,
+    _clone_repo,
+    _git,
+    _init_repo,
+    _reject_pushes,
+)
+from _worktree_fixtures import _wt_scratch as _register_wt_scratch  # noqa: F401 -- registers the wt_scratch fixture: worker sandboxes redirect TEMP/TMPDIR deep inside the checkout, where tmp_path-derived repo roots overrun git's internal worktree-path buffer (``git worktree add`` exits 128)
+from charlie_work.config import OrchestratorConfig
+from charlie_work.instrumentation import query_events
+from charlie_work.paths import runtime_paths
+from charlie_work.subprocess_runner import RunResult, run_captured
+from charlie_work.worktree import (
+    _REMOTE_TIMEOUT_SECONDS,
+    RESCUE_REF_PREFIX,
+    RescueCapture,
+    WORKTREE_UNSAFE_KIND_LOCAL_COMMITS,
+    WorktreeUnsafeError,
+    _run_remote_captured,
+    create_worktree,
+)
+from charlie_work.worktree_stranded_tip import (
+    _DEFAULT_TIMEOUT_SECONDS,
+    preserve_stranded_branch_tip,
+    salvage_ref_for_branch,
+)
+
+ISSUE = 2904
+# Substrings of the failure this issue removes. Neither may appear anywhere in
+# a refusal: the rescue must not even attempt the working-tree capture.
+WORKING_TREE_CAPTURE_FAILURES = ("WinError 267", "add/write-tree")
+
+# A remote read that failed the way a network/auth fault does.
+FAILED_REMOTE_READ = RunResult(
+    returncode=128,
+    stdout="",
+    stderr="fatal: unable to access 'origin': Could not resolve host",
+    error="command exited 128",
+)
+# stderr the shared transient-network classifier would retry. The salvage push
+# must still be attempted exactly once when it looks like this.
+TRANSIENT_PUSH_FAILURE = RunResult(
+    returncode=128,
+    stdout="",
+    stderr="fatal: unable to access 'origin': Could not resolve host: github.com",
+    error="command exited 128",
+)
+
+# Override hook for the recording fakes: return a RunResult to replace the
+# command's real outcome, or None to let the real command run.
+Override = Callable[[list[str]], RunResult | None]
+
+
+def _salvage_ref(branch: str) -> str:
+    """The salvage ref spelled out here, NOT derived from ``salvage_ref_for_branch``.
+
+    The refusal message tells the operator to push to exactly this ref, so a
+    test that derived its expectation from the production helper would stay
+    green if the helper (and with it the message) drifted.
+    """
+    return f"refs/heads/salvage/{branch}"
+
+
+def _is_remote_probe(command: list[str]) -> bool:
+    """The first ``ls-remote`` -- the already-on-the-remote probe."""
+    return command[:3] == ["git", "ls-remote", "origin"] and "refs/heads/*" in command
+
+
+def _is_readback(command: list[str], salvage_ref: str) -> bool:
+    """The post-push ``ls-remote`` of the salvage ref."""
+    return command[:3] == ["git", "ls-remote", "origin"] and command[-1] == salvage_ref
+
+
+class _RecordingRemote:
+    """A ``run_remote`` that records every command it is given.
+
+    Delegates to the production ``_run_remote_captured`` unless ``override``
+    substitutes a result for that command.
+    """
+
+    def __init__(self, override: Override | None = None) -> None:
+        self.commands: list[list[str]] = []
+        self._override = override
+
+    def __call__(self, command: list[str], cwd: Path) -> RunResult:
+        self.commands.append(list(command))
+        if self._override is not None:
+            replaced = self._override(list(command))
+            if replaced is not None:
+                return replaced
+        return _run_remote_captured(command, cwd)
+
+
+def _spy_run_captured(
+    monkeypatch: pytest.MonkeyPatch, override: Override | None = None
+) -> list[tuple[list[str], dict[str, Any]]]:
+    """Record every ``run_captured`` call the helper makes; optionally fake some.
+
+    Patches the name the module under test looks up, so the helper's own local
+    git calls (``rev-parse``, ``for-each-ref``) and its salvage push are seen.
+    """
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+
+    def spy(command: list[str], **kwargs: Any) -> RunResult:
+        calls.append((list(command), dict(kwargs)))
+        if override is not None:
+            replaced = override(list(command))
+            if replaced is not None:
+                return replaced
+        return run_captured(command, **kwargs)
+
+    monkeypatch.setattr("charlie_work.worktree_stranded_tip.run_captured", spy)
+    return calls
+
+
+def _commit_in(worktree_path: Path, name: str = "work.txt") -> str:
+    """Commit a file inside the worktree; return the new tip sha."""
+    (worktree_path / name).write_text("stranded work\n", encoding="utf-8")
+    _git(worktree_path, "add", name)
+    _git(worktree_path, "commit", "-m", "worker commit on agent branch")
+    return _git(worktree_path, "rev-parse", "HEAD").stdout.strip()
+
+
+def _remote_ref_sha(remote: Path, ref: str) -> str | None:
+    out = _git(remote, "for-each-ref", "--format=%(objectname)", ref).stdout.strip()
+    return out or None
+
+
+def _stranded_branch(wt_scratch: Path, *, delete_dir: bool = True) -> tuple[Path, Path, str, str]:
+    """A repo with a remote and an agent branch ahead of it, worktree dir gone.
+
+    Returns ``(remote, repo, branch, tip)``. By default the directory is deleted
+    from under git (the registration is left stale, as after a crashed
+    cleanup); ``delete_dir=False`` leaves the clean worktree in place.
+    """
+    remote = wt_scratch / "remote"
+    _init_repo(remote)
+    repo = wt_scratch / "repo"
+    _clone_repo(remote, repo)
+    branch = f"agent/issue-{ISSUE}-stranded"
+    info = create_worktree(repo, branch, base_ref="HEAD", issue_number=ISSUE)
+    tip = _commit_in(info.path)
+    if delete_dir:
+        shutil.rmtree(info.path)
+    assert info.path.exists() is not delete_dir
+    return remote, repo, branch, tip
+
+
+def _events(repo: Path, config: OrchestratorConfig) -> list[dict]:
+    state_file = runtime_paths(repo, config.runtime.state_dir).state_file
+    return query_events(state_file, kind="worktree_rescue_captured")
+
+
+def _direct(repo: Path, branch: str):
+    return preserve_stranded_branch_tip(repo, branch, _run_remote_captured)
+
+
+# --- acceptance: the dispatch-level behaviour -------------------------------
+
+
+def test_missing_worktree_dir_pushes_tip_to_salvage_ref_and_dispatch_proceeds(
+    wt_scratch: Path,
+) -> None:
+    """Acceptance 1: branch ahead of the remote, no worktree directory -> the
+    salvage ref holds the tip, dispatch proceeds, no add/write-tree failure."""
+    remote, repo, branch, tip = _stranded_branch(wt_scratch)
+    main_tip = _git(repo, "rev-parse", "main").stdout.strip()
+    config = OrchestratorConfig()
+    salvage_ref = _salvage_ref(branch)
+    assert _remote_ref_sha(remote, salvage_ref) is None
+
+    info = create_worktree(repo, branch, base_ref="HEAD", issue_number=ISSUE, config=config)
+
+    assert _remote_ref_sha(remote, salvage_ref) == tip
+    assert info.rescue_capture == RescueCapture(ref_name=salvage_ref, commit_sha=tip)
+    # The dispatch really went ahead: a fresh branch at the base, no stranded file.
+    assert info.path.exists()
+    assert _git(repo, "rev-parse", branch).stdout.strip() == main_tip
+    assert not (info.path / "work.txt").exists()
+    # The existing rescue event is emitted, naming the durable ref.
+    events = _events(repo, config)
+    assert len(events) == 1
+    payload = events[0]["payload"]
+    assert payload["rescue_ref"] == salvage_ref
+    assert payload["commit_sha"] == tip
+    assert payload["issue_number"] == ISSUE
+    assert "not on remote branch" in payload["reason"]
+    assert not any(marker in str(payload) for marker in WORKING_TREE_CAPTURE_FAILURES)
+
+
+def test_redispatch_over_a_present_clean_worktree_reaches_the_same_push(
+    wt_scratch: Path,
+) -> None:
+    """The directory need not be gone when dispatch starts. A fresh dispatch over
+    a PRESENT worktree that is clean but holds unpushed commits removes the
+    directory itself, then re-checks the branch -- so the missing-directory
+    rescue runs there too. Before the fix that second check failed with
+    ``[WinError 267]`` for exactly the same reason."""
+    remote, repo, branch, tip = _stranded_branch(wt_scratch, delete_dir=False)
+    salvage_ref = _salvage_ref(branch)
+    config = OrchestratorConfig()
+
+    info = create_worktree(repo, branch, base_ref="HEAD", issue_number=ISSUE, config=config)
+
+    assert _remote_ref_sha(remote, salvage_ref) == tip
+    assert info.rescue_capture is not None
+    assert info.rescue_capture.ref_name == salvage_ref
+    assert info.path.exists()
+    assert not (info.path / "work.txt").exists()
+    assert salvage_ref in [e["payload"]["rescue_ref"] for e in _events(repo, config)]
+
+
+def test_push_failure_keeps_worktree_unsafe_error_with_push_error(wt_scratch: Path) -> None:
+    """Acceptance 2: a failed push must not weaken the refusal, and the push's
+    own error is in the message."""
+    remote, repo, branch, tip = _stranded_branch(wt_scratch)
+    _reject_pushes(remote)
+    config = OrchestratorConfig()
+    salvage_ref = _salvage_ref(branch)
+
+    with pytest.raises(WorktreeUnsafeError) as excinfo:
+        create_worktree(repo, branch, base_ref="HEAD", issue_number=ISSUE, config=config)
+
+    message = str(excinfo.value)
+    assert excinfo.value.kind == WORKTREE_UNSAFE_KIND_LOCAL_COMMITS
+    assert "rescue capture failed" in message
+    assert f"push to {salvage_ref} failed" in message
+    assert REJECTED_PUSH_MESSAGE in message
+    assert not any(marker in message for marker in WORKING_TREE_CAPTURE_FAILURES)
+    # The refusal's own suggested push is the one that was attempted: the
+    # message and the rescue share one spelling of the salvage ref, and that
+    # spelling is the literal ``refs/heads/salvage/<branch>`` operators act on.
+    assert f"git push origin {tip}:refs/heads/salvage/{branch}" in message
+    assert salvage_ref == f"refs/heads/salvage/{branch}"
+    # Nothing was reset or published, and no rescue event claims durability.
+    assert _git(repo, "rev-parse", branch).stdout.strip() == tip
+    assert _remote_ref_sha(remote, salvage_ref) is None
+    assert _events(repo, config) == []
+
+
+def test_tip_already_on_a_pr_head_skips_the_push_and_reports_it(wt_scratch: Path) -> None:
+    """A closed PR's commits live on ``refs/pull/<n>/head`` after its branch is
+    deleted: the tip is already durable, so no salvage push is made -- but the
+    rescue event still names where it was found."""
+    remote, repo, branch, tip = _stranded_branch(wt_scratch)
+    _git(repo, "push", "origin", f"{tip}:refs/pull/7/head")
+    config = OrchestratorConfig()
+
+    info = create_worktree(repo, branch, base_ref="HEAD", issue_number=ISSUE, config=config)
+
+    assert info.rescue_capture == RescueCapture(ref_name="refs/pull/7/head", commit_sha=tip)
+    assert _remote_ref_sha(remote, _salvage_ref(branch)) is None
+    events = _events(repo, config)
+    assert [e["payload"]["rescue_ref"] for e in events] == ["refs/pull/7/head"]
+    assert info.path.exists()
+
+
+def test_present_worktree_still_uses_the_working_tree_capture(
+    wt_scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Acceptance 3 guard: with the directory present the rescue is the
+    unchanged ``git add``/``write-tree`` capture, never the stranded-tip push."""
+    remote = wt_scratch / "remote"
+    _init_repo(remote, bare=True)
+    repo = wt_scratch / "repo"
+    _clone_repo(remote, repo)
+    branch = f"agent/issue-{ISSUE}-present"
+    info1 = create_worktree(repo, branch, base_ref="origin/main")
+    (info1.path / "wip.txt").write_text("dirty\n", encoding="utf-8")
+
+    def _must_not_run(*args: object, **kwargs: object) -> None:
+        raise AssertionError("stranded-tip push ran for a present worktree directory")
+
+    monkeypatch.setattr("charlie_work.worktree.preserve_stranded_branch_tip", _must_not_run)
+
+    info2 = create_worktree(repo, branch, base_ref="origin/main", issue_number=ISSUE)
+
+    assert info2.rescue_capture is not None
+    assert info2.rescue_capture.ref_name is not None
+    assert info2.rescue_capture.ref_name.startswith(RESCUE_REF_PREFIX)
+
+
+# --- preserve_stranded_branch_tip: the helper's own contract -----------------
+
+
+def _tip_inside_a_remote_branch(wt_scratch: Path) -> tuple[Path, Path, str, str]:
+    """A branch tip that is an ANCESTOR of ``origin/other`` (not equal to it).
+
+    Returns ``(remote, repo, branch, tip)``. The remote advertises no ref AT
+    the tip, so only the local remote-tracking containment proof can find it.
+    """
+    remote = wt_scratch / "remote"
+    _init_repo(remote)
+    repo = wt_scratch / "repo"
+    _clone_repo(remote, repo)
+    branch = f"agent/issue-{ISSUE}-contained"
+    _git(repo, "checkout", "-b", branch)
+    (repo / "a.txt").write_text("a\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "tip")
+    tip = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    _git(repo, "checkout", "-b", "other")
+    (repo / "b.txt").write_text("b\n", encoding="utf-8")
+    _git(repo, "add", "b.txt")
+    _git(repo, "commit", "-m", "on top of the tip")
+    _git(repo, "push", "origin", "other")
+    return remote, repo, branch, tip
+
+
+def test_tip_contained_in_an_advertised_remote_branch_skips_the_push(wt_scratch: Path) -> None:
+    remote, repo, branch, tip = _tip_inside_a_remote_branch(wt_scratch)
+
+    outcome = _direct(repo, branch)
+
+    assert outcome.error is None
+    assert (outcome.ref_name, outcome.commit_sha, outcome.pushed) == (
+        "refs/heads/other",
+        tip,
+        False,
+    )
+    assert _remote_ref_sha(remote, _salvage_ref(branch)) is None
+
+
+def test_stale_tracking_ref_does_not_vouch_for_a_branch_the_remote_dropped(
+    wt_scratch: Path,
+) -> None:
+    """``refs/remotes/origin/other`` still contains the tip locally, but the
+    remote deleted ``other``: it is not proof of anything, so the tip is pushed."""
+    remote = wt_scratch / "remote"
+    _init_repo(remote)
+    repo = wt_scratch / "repo"
+    _clone_repo(remote, repo)
+    branch = f"agent/issue-{ISSUE}-stale"
+    _git(repo, "checkout", "-b", branch)
+    (repo / "a.txt").write_text("a\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "tip")
+    tip = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    _git(repo, "push", "origin", f"{tip}:refs/heads/other")
+    _git(repo, "fetch", "origin")
+    _git(remote, "branch", "-D", "other")
+    assert "refs/remotes/origin/other" in _git(repo, "for-each-ref", "refs/remotes").stdout
+
+    outcome = _direct(repo, branch)
+
+    salvage_ref = _salvage_ref(branch)
+    assert outcome.error is None
+    assert (outcome.ref_name, outcome.pushed) == (salvage_ref, True)
+    assert _remote_ref_sha(remote, salvage_ref) == tip
+
+
+def test_second_preserve_of_the_same_tip_reports_the_existing_salvage_ref(
+    wt_scratch: Path,
+) -> None:
+    remote, repo, branch, tip = _stranded_branch(wt_scratch)
+    salvage_ref = _salvage_ref(branch)
+
+    first = _direct(repo, branch)
+    second = _direct(repo, branch)
+
+    assert (first.ref_name, first.pushed) == (salvage_ref, True)
+    assert (second.ref_name, second.pushed) == (salvage_ref, False)
+    assert second.error is None
+    assert _remote_ref_sha(remote, salvage_ref) == tip
+
+
+def test_existing_salvage_ref_at_another_tip_is_never_overwritten(wt_scratch: Path) -> None:
+    """A plain push, never forced: an earlier salvage of different work is
+    kept, and the rescue fails closed instead of replacing it."""
+    remote, repo, branch, _tip = _stranded_branch(wt_scratch)
+    salvage_ref = _salvage_ref(branch)
+    # An unrelated earlier salvage: a root commit sharing no history with the tip.
+    _git(repo, "checkout", "--orphan", "unrelated")
+    (repo / "old.txt").write_text("earlier salvage\n", encoding="utf-8")
+    _git(repo, "add", "old.txt")
+    _git(repo, "commit", "-m", "earlier salvage")
+    earlier = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    _git(repo, "push", "origin", f"{earlier}:{salvage_ref}")
+
+    outcome = _direct(repo, branch)
+
+    assert outcome.ref_name is None
+    assert outcome.error is not None
+    assert f"push to {salvage_ref} failed" in outcome.error
+    assert _remote_ref_sha(remote, salvage_ref) == earlier
+
+
+def test_repo_without_origin_returns_an_error_value(wt_scratch: Path) -> None:
+    """No remote means nothing can be made durable: the helper reports that as
+    a value (it never raises), so the caller keeps its refusal."""
+    repo = wt_scratch / "repo"
+    _init_repo(repo)
+    branch = f"agent/issue-{ISSUE}-no-origin"
+    info = create_worktree(repo, branch, base_ref="HEAD", issue_number=ISSUE)
+    tip = _commit_in(info.path)
+
+    outcome = _direct(repo, branch)
+
+    assert outcome.ref_name is None
+    assert outcome.commit_sha == tip
+    assert outcome.error is not None
+    assert "push to refs/heads/salvage/" in outcome.error
+
+
+def test_unresolvable_branch_returns_an_error_value(wt_scratch: Path) -> None:
+    repo = wt_scratch / "repo"
+    _init_repo(repo)
+
+    outcome = _direct(repo, "agent/issue-2904-never-existed")
+
+    assert (outcome.ref_name, outcome.commit_sha) == (None, None)
+    assert outcome.error is not None
+    assert "refs/heads/agent/issue-2904-never-existed" in outcome.error
+
+
+def test_invalid_branch_name_is_rejected_before_any_git_command_runs(
+    wt_scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The name is validated before it is interpolated into any ref or argv:
+    neither the local runner (``rev-parse``/``for-each-ref``/``push``) nor the
+    remote runner is invoked at all."""
+    repo = wt_scratch / "repo"
+    _init_repo(repo)
+    local_calls = _spy_run_captured(monkeypatch)
+    remote = _RecordingRemote()
+
+    outcome = preserve_stranded_branch_tip(repo, "bad branch;rm -rf", remote)
+
+    assert (outcome.ref_name, outcome.commit_sha, outcome.pushed) == (None, None, False)
+    assert outcome.error is not None
+    assert "stranded-tip branch" in outcome.error
+    assert local_calls == []
+    assert remote.commands == []
+
+
+def test_salvage_ref_spelling_is_the_one_the_refusal_message_names() -> None:
+    """Pinned to the literal string, not re-derived: operators copy the push
+    command out of the refusal message, so this spelling is a contract."""
+    assert salvage_ref_for_branch("agent/issue-1-x") == "refs/heads/salvage/agent/issue-1-x"
+
+
+# --- the salvage push is a remote mutation: never behind the retry runner -----
+
+
+def test_no_push_is_ever_routed_through_run_remote(wt_scratch: Path) -> None:
+    """``run_remote`` is ``_run_remote_captured``: a transient-error retry loop
+    sized (20s) for read-only ``ls-remote``/``fetch``. A command that mutates
+    the remote must not be handed to it, even though the push still lands."""
+    remote, repo, branch, tip = _stranded_branch(wt_scratch)
+    spy = _RecordingRemote()
+
+    outcome = preserve_stranded_branch_tip(repo, branch, spy)
+
+    # The push really happened -- through the helper's own non-retrying runner.
+    assert (outcome.ref_name, outcome.pushed, outcome.error) == (_salvage_ref(branch), True, None)
+    assert _remote_ref_sha(remote, _salvage_ref(branch)) == tip
+    # And ``run_remote`` only ever saw read-only probes. The non-empty check
+    # keeps the "no push" assertion below from passing against an unused spy.
+    assert spy.commands, "run_remote was never used, so this test proves nothing"
+    assert all(cmd[:2] == ["git", "ls-remote"] for cmd in spy.commands), spy.commands
+    assert not any("push" in cmd for cmd in spy.commands), spy.commands
+
+
+def test_dispatch_never_pushes_through_the_production_remote_chokepoint(
+    wt_scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same property at the wiring: ``create_worktree`` hands the helper
+    ``worktree._run_remote_captured``, and nothing it runs there is a push."""
+    remote, repo, branch, tip = _stranded_branch(wt_scratch)
+    seen: list[list[str]] = []
+
+    def recording_chokepoint(command: list[str], cwd: Path, **kwargs: Any) -> RunResult:
+        seen.append(list(command))
+        return _run_remote_captured(command, cwd, **kwargs)
+
+    monkeypatch.setattr("charlie_work.worktree._run_remote_captured", recording_chokepoint)
+
+    info = create_worktree(repo, branch, base_ref="HEAD", issue_number=ISSUE)
+
+    assert _remote_ref_sha(remote, _salvage_ref(branch)) == tip
+    assert info.rescue_capture == RescueCapture(ref_name=_salvage_ref(branch), commit_sha=tip)
+    assert any(cmd[:2] == ["git", "ls-remote"] for cmd in seen), "chokepoint saw no probe"
+    assert not any("push" in cmd for cmd in seen), seen
+
+
+def test_push_runs_once_with_the_default_timeout_even_if_the_failure_looks_transient(
+    wt_scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One attempt, not a retry loop, and the module's 60s budget rather than
+    the 20s read timeout -- even when stderr is what the transient-network
+    classifier retries. Whether the push landed is settled by the next call's
+    probe (see the idempotence test), not by repeating it here."""
+    _remote, repo, branch, _tip = _stranded_branch(wt_scratch)
+    calls = _spy_run_captured(
+        monkeypatch,
+        lambda cmd: TRANSIENT_PUSH_FAILURE if cmd[:2] == ["git", "push"] else None,
+    )
+
+    outcome = _direct(repo, branch)
+
+    pushes = [(cmd, kwargs) for cmd, kwargs in calls if cmd[:2] == ["git", "push"]]
+    assert len(pushes) == 1, pushes
+    assert pushes[0][1]["timeout_seconds"] == _DEFAULT_TIMEOUT_SECONDS
+    assert pushes[0][1]["timeout_seconds"] > _REMOTE_TIMEOUT_SECONDS
+    # A failed push stays a value the caller turns into the refusal.
+    assert outcome.ref_name is None
+    assert outcome.error is not None
+    assert f"push to {_salvage_ref(branch)} failed" in outcome.error
+
+
+# --- fail-closed: durability is only claimed on positive evidence ------------
+
+
+def _readback_empty(_salvage_ref_name: str) -> RunResult:
+    return RunResult(returncode=0, stdout="", stderr="")
+
+
+def _readback_other_sha(salvage_ref_name: str) -> RunResult:
+    return RunResult(returncode=0, stdout=f"{'0' * 40}\t{salvage_ref_name}\n", stderr="")
+
+
+def _readback_failed(_salvage_ref_name: str) -> RunResult:
+    return FAILED_REMOTE_READ
+
+
+@pytest.mark.parametrize(
+    "make_readback",
+    [_readback_empty, _readback_other_sha, _readback_failed],
+    ids=["empty", "different-sha", "probe-failed"],
+)
+def test_push_ok_but_readback_does_not_show_the_tip_is_not_durable(
+    wt_scratch: Path, make_readback: Callable[[str], RunResult]
+) -> None:
+    """A push that reports success is not proof: the work counts as durable
+    only if the remote then advertises the tip at the salvage ref. Anything
+    else -- nothing, another sha, or a read-back that itself failed -- is an
+    error with no ref, so the caller keeps its refusal."""
+    remote, repo, branch, tip = _stranded_branch(wt_scratch)
+    salvage_ref = _salvage_ref(branch)
+    spy = _RecordingRemote(
+        lambda cmd: make_readback(salvage_ref) if _is_readback(cmd, salvage_ref) else None
+    )
+
+    outcome = preserve_stranded_branch_tip(repo, branch, spy)
+
+    assert outcome.error is not None
+    assert "reported success" in outcome.error
+    assert outcome.ref_name is None
+    assert outcome.pushed is False
+    assert outcome.commit_sha == tip
+    # The push did land and the read-back was really requested: what failed is
+    # the verification, which is exactly the case being pinned.
+    assert _remote_ref_sha(remote, salvage_ref) == tip
+    assert any(_is_readback(cmd, salvage_ref) for cmd in spy.commands)
+
+
+def test_unverifiable_readback_keeps_dispatch_refusing_and_the_branch_intact(
+    wt_scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The consequence at dispatch: a rescue that cannot prove durability must
+    not let ``create_worktree`` reset the branch or claim a rescue."""
+    remote, repo, branch, tip = _stranded_branch(wt_scratch)
+    salvage_ref = _salvage_ref(branch)
+    config = OrchestratorConfig()
+    unverifiable = _RecordingRemote(
+        lambda cmd: _readback_empty(salvage_ref) if _is_readback(cmd, salvage_ref) else None
+    )
+
+    def chokepoint(command: list[str], cwd: Path, **kwargs: Any) -> RunResult:
+        return unverifiable(command, cwd)
+
+    monkeypatch.setattr("charlie_work.worktree._run_remote_captured", chokepoint)
+
+    with pytest.raises(WorktreeUnsafeError) as excinfo:
+        create_worktree(repo, branch, base_ref="HEAD", issue_number=ISSUE, config=config)
+
+    assert excinfo.value.kind == WORKTREE_UNSAFE_KIND_LOCAL_COMMITS
+    assert "rescue capture failed" in str(excinfo.value)
+    assert "reported success" in str(excinfo.value)
+    assert _git(repo, "rev-parse", branch).stdout.strip() == tip
+    assert _events(repo, config) == []
+
+
+def test_failed_already_on_remote_probe_forfeits_the_shortcut_and_still_pushes(
+    wt_scratch: Path,
+) -> None:
+    """The first ``ls-remote`` failing proves nothing about the remote, so the
+    "already durable" shortcut is forfeited -- not read as "remote holds
+    nothing" and not an error. The push is still attempted."""
+    remote, repo, branch, tip = _stranded_branch(wt_scratch)
+    salvage_ref = _salvage_ref(branch)
+    _git(repo, "push", "origin", f"{tip}:refs/pull/7/head")
+    # Positive control: with a working probe the shortcut IS taken here, so a
+    # different outcome below is attributable to the failed probe alone.
+    control = preserve_stranded_branch_tip(repo, branch, _RecordingRemote())
+    assert (control.ref_name, control.pushed) == ("refs/pull/7/head", False)
+    assert _remote_ref_sha(remote, salvage_ref) is None
+    spy = _RecordingRemote(lambda cmd: FAILED_REMOTE_READ if _is_remote_probe(cmd) else None)
+
+    outcome = preserve_stranded_branch_tip(repo, branch, spy)
+
+    assert any(_is_remote_probe(cmd) for cmd in spy.commands), "the probe was never run"
+    assert outcome.error is None
+    assert (outcome.ref_name, outcome.commit_sha, outcome.pushed) == (salvage_ref, tip, True)
+    assert _remote_ref_sha(remote, salvage_ref) == tip
+
+
+def test_failed_already_on_remote_probe_and_rejected_push_is_not_durable(
+    wt_scratch: Path,
+) -> None:
+    """With the probe unavailable the push is the only way to durability; when
+    it is rejected the outcome is an error, never a ref the tip is not on."""
+    remote, repo, branch, tip = _stranded_branch(wt_scratch)
+    _reject_pushes(remote)
+    spy = _RecordingRemote(lambda cmd: FAILED_REMOTE_READ if _is_remote_probe(cmd) else None)
+
+    outcome = preserve_stranded_branch_tip(repo, branch, spy)
+
+    assert outcome.ref_name is None
+    assert outcome.pushed is False
+    assert outcome.commit_sha == tip
+    assert outcome.error is not None
+    assert f"push to {_salvage_ref(branch)} failed" in outcome.error
+    assert REJECTED_PUSH_MESSAGE in outcome.error
+    assert _remote_ref_sha(remote, _salvage_ref(branch)) is None
+
+
+def test_failed_containing_ref_probe_forfeits_the_shortcut_and_still_pushes(
+    wt_scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``git for-each-ref --contains`` failing leaves the containment proof
+    unavailable. The tip IS inside ``origin/other``, so the same probe that
+    just failed would have returned ``refs/heads/other``; it is forfeited, and
+    the salvage push still runs."""
+    remote, repo, branch, tip = _tip_inside_a_remote_branch(wt_scratch)
+    salvage_ref = _salvage_ref(branch)
+    # Positive control: unpatched, the containing branch is found and no push is made.
+    control = _direct(repo, branch)
+    assert (control.ref_name, control.pushed) == ("refs/heads/other", False)
+    assert _remote_ref_sha(remote, salvage_ref) is None
+    calls = _spy_run_captured(
+        monkeypatch,
+        lambda cmd: FAILED_REMOTE_READ if cmd[:2] == ["git", "for-each-ref"] else None,
+    )
+
+    outcome = _direct(repo, branch)
+
+    assert any(cmd[:2] == ["git", "for-each-ref"] for cmd, _kwargs in calls), (
+        "the containing-ref probe was never run"
+    )
+    assert outcome.error is None
+    assert (outcome.ref_name, outcome.commit_sha, outcome.pushed) == (salvage_ref, tip, True)
+    assert _remote_ref_sha(remote, salvage_ref) == tip
