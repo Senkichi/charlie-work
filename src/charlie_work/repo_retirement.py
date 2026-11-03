@@ -29,7 +29,7 @@ import yaml
 
 from . import host as _host
 from . import layout
-from .config import find_config_path
+from .config import OrchestratorConfig, find_config_path
 from .live_session_count import REVIEW_LANE, WORKER_LANE, count_live_sessions
 from .local_suite_runner import RUNNER_STATUS_FILENAME, _GATE_DIR_NAME
 
@@ -289,6 +289,31 @@ def retired_pass_disposition(
     retired = config_is_retired(config)
     retired_by_key[repo_key] = retired
     return retired and repo_live_work(repo_root, config, state_dir).quiescent
+
+
+def retired_repo_is_quiescent(repo_root: Path, config: Any, state_dir: Path) -> bool:
+    """Whether a retired repo has nothing left to wind down (the drain rule).
+
+    Issue #2754: ``fleet stop --drain`` exits when ``fleet_live_worker_count``
+    reaches zero, and that sums the supervisor snapshot. A retired repo that
+    still has live workers, reviewers or gate suites must therefore stay in
+    the snapshot until it is quiescent, or the supervisor can exit (and stop
+    reaping) while a wind-down repo still has workers running. Only a
+    quiescent retired repo is omitted. This is the same ``repo_live_work``
+    test ``retired_pass_disposition`` uses to choose wind-down over skipping,
+    so the snapshot and ``fleet_loop`` can never disagree about a repo.
+
+    ``config`` is ``None`` when the repo's layered config failed to load; the
+    default config then supplies the default session/review dirs, matching
+    what ``_repo_state_dirs`` does. Any error reading live work reads as NOT
+    quiescent: wrongly keeping a repo in the snapshot costs a no-op poll,
+    wrongly dropping one lets a drain exit under a running worker.
+    """
+    try:
+        return repo_live_work(repo_root, config or OrchestratorConfig(), state_dir).quiescent
+    except Exception as exc:  # noqa: BLE001 - fail toward keeping the drain alive
+        logger.warning("repo retirement: could not read live work for %s (%s)", repo_root, exc)
+        return False
 
 
 def active_registry_repos(repos: Mapping[str, Any]) -> dict[str, Any]:

@@ -87,7 +87,11 @@ from .notify_freshness import (
 )
 from .paths import runtime_paths, worktree_roots
 from .pending_sync import heal_pending_sync_at_boot
-from .repo_retirement import entry_is_retired, retired_pass_disposition
+from .repo_retirement import (
+    entry_is_retired,
+    retired_pass_disposition,
+    retired_repo_is_quiescent,
+)
 from .venv_anchor import verify_interpreter_anchored_editables
 from .ci_fleet_anchor import ci_fleet_provenance_payload, ci_fleet_provenance_snapshot
 from .supervise import (
@@ -2586,8 +2590,7 @@ def _take_fleet_snapshot(
 
     repo_snapshots: set[tuple[str, LocalSnapshot]] = set()
     for repo_key, entry in repos.items():
-        if entry_is_retired(entry):
-            continue
+        retired = entry_is_retired(entry)
         state_dir_str = entry.get("state_dir")
         if not state_dir_str:
             continue
@@ -2606,6 +2609,10 @@ def _take_fleet_snapshot(
                 )
             except Exception:  # noqa: BLE001 - match count_fleet_live_sessions containment
                 config = None
+        # Issue #2754 drain rule: a retired repo leaves the snapshot only once
+        # quiescent, so `fleet stop --drain` waits for its wind-down workers.
+        if retired and retired_repo_is_quiescent(repo_root, config, state_dir):
+            continue
         sessions_dir, prs_dir, worktrees_dir = _repo_state_dirs(repo_root, state_dir, config)
         repo_snapshots.add((repo_key, take_snapshot(sessions_dir, prs_dir, worktrees_dir)))
 
