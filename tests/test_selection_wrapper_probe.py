@@ -26,6 +26,7 @@ import yaml
 from _prompt_sections_fixtures import ISSUE_VALUES
 from charlie_work import selection_wrapper
 from charlie_work.config import DispatchConfig, OrchestratorConfig, build_config_from_data
+from charlie_work.instrumentation import correlation_context
 from charlie_work.paths import runtime_paths
 from charlie_work.prompt_test_command import _selected_contract, prompt_test_command_values
 from charlie_work.prompts import (
@@ -441,3 +442,182 @@ def test_the_merge_gate_never_runs_select(
     )
     assert selection.mode == selection_wrapper.SHADOW
     assert runner.subcommands() == ["nightly"]
+
+
+# ---------------------------------------------------------------------------
+# 9. One probe per pass per repo, one row per change (issue #2921)
+# ---------------------------------------------------------------------------
+#
+# ``worker_selection`` runs for every candidate on every pass, including candidates the
+# concurrency cap defers. A *pass* is the ambient correlation id (``loop()`` wraps each
+# pass in ``correlation_context()``), so each ``with correlation_context():`` block below
+# is one pass.
+
+NO_MAP = json.dumps({"mode": "full", "reason": "no-map"})
+DISABLED_KIND = "worker_test_selection_disabled"
+
+
+def _rows(state_file: Path, kind: str) -> list[tuple[str, dict]]:
+    """``(level, payload)`` of every ``kind`` row, oldest first."""
+    db = state_file.parent / "events.db"
+    if not db.exists():
+        return []
+    conn = sqlite3.connect(str(db))
+    try:
+        rows = conn.execute(
+            "SELECT level, payload FROM events WHERE kind = ? ORDER BY id", (kind,)
+        ).fetchall()
+    finally:
+        conn.close()
+    return [(level, json.loads(payload)) for level, payload in rows]
+
+
+@pytest.fixture(autouse=True)
+def _empty_pass_memo() -> None:
+    """Tests must not share the module-level once-per-pass memo."""
+    from charlie_work import selection_answer
+
+    selection_answer._memo.clear()
+
+
+@pytest.mark.parametrize(
+    ("answer", "rows"), [(FULL_MAP_STALE, 1), (SELECTED_EMPTY, 0)], ids=["full", "selected"]
+)
+def test_n_prompts_in_one_pass_run_select_once(
+    tmp_path: Path,
+    widget: Path,
+    answering: Callable[[RunResult], ExeCalls],
+    answer: str,
+    rows: int,
+) -> None:
+    runner = answering(_ok(answer))
+    state_file = _state_file(tmp_path)
+    with correlation_context():
+        results = [_worker_selection(widget, state_file) for _ in range(6)]
+    assert runner.subcommands() == ["select"]
+    assert len(set(results)) == 1, "every prompt of the pass gets the same answer"
+    assert len(_rows(state_file, UNAVAILABLE)) == rows
+
+
+def test_every_prompt_writer_shares_the_one_probe_of_a_pass(
+    tmp_path: Path, answering: Callable[[RunResult], ExeCalls]
+) -> None:
+    """The worker and rework writers both reach ``worker_selection``; one pass, one probe."""
+    runner = answering(_ok(FULL_MAP_STALE))
+    app = _app(tmp_path, probe=True)
+    with correlation_context():
+        app._write_worker_prompt(ISSUE)
+        app._write_worker_prompt({**ISSUE, "number": 2})
+        text = _render_rework(app)
+        app._write_worker_prompt({**ISSUE, "number": 3})
+    assert f"{RUNNER} <impacted test files> -q --tb=short" in text
+    assert runner.subcommands() == ["select"]
+    assert len(_rows(app.paths.state_file, UNAVAILABLE)) == 1
+
+
+def test_a_new_pass_probes_again_but_an_unchanged_full_writes_no_new_row(
+    tmp_path: Path, widget: Path, answering: Callable[[RunResult], ExeCalls]
+) -> None:
+    runner = answering(_ok(FULL_MAP_STALE))
+    state_file = _state_file(tmp_path)
+    for _ in range(3):
+        with correlation_context():
+            for _ in range(4):
+                _worker_selection(widget, state_file)
+    assert runner.subcommands() == ["select"] * 3, "one probe per pass"
+    [(level, payload)] = _rows(state_file, UNAVAILABLE)
+    assert level == "warning", "the first selection-full stays a warning"
+    assert payload["reason"] == SELECTION_FULL
+    assert "map-stale" in payload["detail"]
+
+
+def test_a_changed_reason_writes_exactly_one_new_row(
+    tmp_path: Path, widget: Path, answering: Callable[[RunResult], ExeCalls]
+) -> None:
+    runner = answering(_ok(FULL_MAP_STALE))
+    state_file = _state_file(tmp_path)
+    for answer in (FULL_MAP_STALE, FULL_MAP_STALE, NO_MAP, NO_MAP, NO_MAP):
+        runner.answers["select"] = _ok(answer)
+        with correlation_context():
+            _worker_selection(widget, state_file)
+            _worker_selection(widget, state_file)
+    rows = _rows(state_file, UNAVAILABLE)
+    assert [("map-stale" in p["detail"], "no-map" in p["detail"]) for _, p in rows] == [
+        (True, False),
+        (False, True),
+    ]
+    assert {level for level, _ in rows} == {"warning"}
+
+
+def test_a_full_answer_that_recurs_after_a_usable_one_is_a_fresh_row(
+    tmp_path: Path, widget: Path, answering: Callable[[RunResult], ExeCalls]
+) -> None:
+    runner = answering(_ok(FULL_MAP_STALE))
+    state_file = _state_file(tmp_path)
+    for answer in (FULL_MAP_STALE, SELECTED_EMPTY, SELECTED_EMPTY, FULL_MAP_STALE):
+        runner.answers["select"] = _ok(answer)
+        with correlation_context():
+            _worker_selection(widget, state_file)
+    assert len(_rows(state_file, UNAVAILABLE)) == 2
+
+
+def test_the_probe_kill_switch_is_not_answered_from_a_probed_memo(
+    tmp_path: Path,
+    widget: Path,
+    fake_exe: Path,
+    answering: Callable[[RunResult], ExeCalls],
+) -> None:
+    """``probe=False`` is part of the memo key: it still turns the probe off entirely."""
+    runner = answering(_ok(FULL_MAP_STALE))
+    state_file = _state_file(tmp_path)
+    wrapper = SelectionTarget(fake_exe, "local/widget", "main")
+    with correlation_context():
+        assert _worker_selection(widget, state_file, probe=True) is None
+        assert _worker_selection(widget, state_file, probe=False) == wrapper
+        assert _worker_selection(widget, state_file, probe=True) is None
+    assert runner.subcommands() == ["select"]
+
+    runner.calls.clear()
+    with correlation_context():
+        assert _worker_selection(widget, state_file, probe=False) == wrapper
+        assert runner.calls == []
+        assert _worker_selection(widget, state_file, probe=True) is None
+    assert runner.subcommands() == ["select"]
+
+
+def test_each_repo_in_a_pass_probes_once(
+    tmp_path: Path, widget: Path, answering: Callable[[RunResult], ExeCalls]
+) -> None:
+    runner = answering(_ok(FULL_MAP_STALE))
+    gadget = _repo(tmp_path / "gadget")
+    with correlation_context():
+        for repo in (widget, gadget, widget, gadget):
+            _worker_selection(repo, _state_file(tmp_path / repo.name))
+    assert runner.subcommands() == ["select", "select"]
+    assert [argv[3] for argv, _ in runner.calls] == ["local/widget", "local/gadget"]
+    for repo in (widget, gadget):
+        assert len(_rows(_state_file(tmp_path / repo.name), UNAVAILABLE)) == 1
+
+
+def test_a_disabled_repo_reports_once_across_passes(tmp_path: Path, fake_exe: Path) -> None:
+    repo = _repo(tmp_path / "widget")
+    (repo / "ci-fleet.toml").write_text("[test_selection]\nenabled = false\n", encoding="utf-8")
+    state_file = _state_file(tmp_path)
+    for _ in range(3):
+        with correlation_context():
+            for _ in range(2):
+                assert _worker_selection(repo, state_file) is None
+    assert [level for level, _ in _rows(state_file, DISABLED_KIND)] == ["info"]
+    assert _rows(state_file, UNAVAILABLE) == []
+
+
+def test_outside_a_pass_every_call_resolves_but_the_row_is_still_written_once(
+    tmp_path: Path, widget: Path, answering: Callable[[RunResult], ExeCalls]
+) -> None:
+    """No correlation id, no memo (today's behaviour); the change baseline still holds."""
+    runner = answering(_ok(FULL_MAP_STALE))
+    state_file = _state_file(tmp_path)
+    for _ in range(3):
+        _worker_selection(widget, state_file)
+    assert runner.subcommands() == ["select"] * 3
+    assert len(_rows(state_file, UNAVAILABLE)) == 1
