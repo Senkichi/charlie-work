@@ -116,7 +116,8 @@ jobs:
           # The nightly runs in map mode (coverage on every test): its bound
           # is A2's 3x map-mode overhead ceiling over the PR bound. The plain
           # "Refresh test durations" pass spends about one PR run of that same
-          # budget (the map pass has run at ~1x, so both fit with room to spare).
+          # budget (the map pass has run at ~1.4x a PR run on the test ledger,
+          # so both fit with room to spare).
           if [ "${EVENT_NAME:-}" = "schedule" ] || [ "${MAP_INPUT:-}" = "true" ]; then t=$((t * 3)); fi
           {
             echo "shards=[$(seq -s, 1 "$n")]"
@@ -237,11 +238,13 @@ jobs:
         # runs unchanged. One shard only, so each run is one selection record.
         # The selector comes from PyPI, never from this checkout.
         #
-        # The nightly's map pass does NOT store durations: coverage, the
-        # file-read audit hook and traced children cost CPU-bound tests 2-3x
-        # and subprocess/git-bound tests ~nothing, so splitting pull requests
-        # on those timings loaded shard 4/6 with ~1.4x the mean shard's cost
-        # (#2924). "Refresh test durations" below is the one writer.
+        # The nightly's map pass does NOT store durations: its per-test
+        # timings do not predict a plain run's. Measured on the test ledger
+        # (#2924): in-process tests (no git, no subprocess) take 2-3x longer
+        # under the tracer, while git-driven tests come out at 0.55-0.7x of
+        # their pull-request duration. Splitting pull requests on those
+        # timings loaded shard 4/6 with ~1.4x the mean shard's cost.
+        # "Refresh test durations" below is the one writer.
         shell: bash
         env:
           SPLITS: ${{ needs.coverage.outputs.splits }}

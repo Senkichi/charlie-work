@@ -3,11 +3,12 @@
 ``--splitting-algorithm duration_based_chunks`` balances the six ``Tests shard``
 jobs by the ``.test_durations`` the nightly saves. From #2349 the nightly ran in
 map mode (coverage tracer, file-read audit hook, traced children) and stored its
-durations from that pass. Map mode costs CPU-bound tests 2-3x and subprocess/git
-bound tests ~nothing, so every shard looked equally heavy to the splitter while
-shard 4/6 (the local-lane, main-sync and orphan-sweep files, all git-bound) cost
-~1.4x the mean in a plain pull-request run. The nightly now has one durations
-writer, the plain "Refresh test durations" pass; these tests pin that shape.
+durations from that pass. On the test ledger those per-test timings ran 2-3x a
+pull request's for in-process tests but 0.55-0.7x for git-driven ones, so every
+shard looked equally heavy to the splitter while shard 4/6 (the local-lane,
+main-sync and orphan-sweep files, which drive git) cost ~1.4x the mean in a plain
+pull-request run. The nightly now has one durations writer, the plain "Refresh
+test durations" pass; these tests pin that shape.
 Step bodies run under bash with a fake ``uv`` (``_ci_step_runner``).
 """
 
