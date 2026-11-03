@@ -34,6 +34,12 @@ class OpenCodeConfig:
     ``venv_source`` / ``worker_env``: same semantics as ``ClaudeCodeConfig``'s
     fields of the same name (``worker_env`` is merged after env sanitisation,
     so operator values win).
+
+    ``release_blocked_tool`` (issue #2794): kill switch for the stalled lane's
+    one-shot release of a STALLED worker's tool call blocked on an orphaned
+    process holding its output pipe (``pipe_holder_release``). ON by default;
+    ``False`` restores the pre-#2794 behaviour (a STALLED worker is reaped
+    outright).
     """
 
     command: Annotated[
@@ -41,5 +47,6 @@ class OpenCodeConfig:
     ] = ()
     provider: Annotated[str, Typed] = "opencode-go"
     variant: Annotated[str, Typed] = ""
+    release_blocked_tool: Annotated[bool, Typed] = True
     venv_source: str | None = None
     worker_env: Annotated[dict[str, str], Coerced] = field(default_factory=dict)

@@ -70,6 +70,11 @@ QUEUE_SYNC_COVERAGE_CACHE_FILENAME = "queue-sync-coverage-cache.json"
 # transport's REST-GET requests. Sibling of QUEUE_SYNC_COVERAGE_CACHE_FILENAME
 # -- same directory, same atomic-write contract.
 HTTP_ETAG_CACHE_FILENAME = "http-etag-cache.json"
+# Issue #2901: the numbers the batched issue-state query could not resolve and
+# ``github_issue_state_partial_fallback`` already reported -- the durable
+# once-only baseline. Sibling of HTTP_ETAG_CACHE_FILENAME (same directory, same
+# atomic-write contract).
+ISSUE_STATE_UNRESOLVED_FILENAME = "issue-state-unresolved.json"
 
 ISSUES_DIRNAME = "issues"
 PRS_DIRNAME = "prs"
@@ -234,6 +239,20 @@ def http_etag_cache_path(state_root: Path) -> Path:
     atomic-write contract.
     """
     return state_root / HTTP_ETAG_CACHE_FILENAME
+
+
+def issue_state_unresolved_path(state_root: Path) -> Path:
+    """Return the per-repo unresolved-issue-number baseline path under ``state_root``.
+
+    Issue #2901: ``Issues.are_issues_open`` reports each number the batched
+    issue-state query cannot resolve once, not once per pass. The fleet
+    supervisor rebuilds its ``GitHub`` client every pass, so the baseline that
+    makes "once" true has to outlive the client. A sidecar rather than a
+    ``state.json`` key because the writer is the GitHub client layer, which has
+    no ``WriteGate`` and must not take the state lock. Sibling of
+    :func:`http_etag_cache_path` -- same directory, same atomic-write contract.
+    """
+    return state_root / ISSUE_STATE_UNRESOLVED_FILENAME
 
 
 def worktrees_dir(state_root: Path) -> Path:

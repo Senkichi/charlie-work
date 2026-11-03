@@ -281,6 +281,7 @@ class WorkerView:
     inconclusive_probe_deferred_count: int = 0  # Signal-1 deferral counter (issue #338)
     session_id: str | None = None  # unique session id for worktree writer marker (issue #400)
     provider: str = ""  # api provider name (issue #484); empty for non-api adapters
+    tool_released_at: str | None = None  # stalled-lane pipe-holder release stamp (issue #2794)
 
     def is_alive(self) -> bool:
         """Check whether the process behind this worker is still running.
@@ -949,6 +950,7 @@ def _from_claude_record(record: ClaudeWorkerRecord, repo_key: str) -> WorkerView
         inconclusive_probe_deferred_count=record.inconclusive_probe_deferred_count,
         session_id=record.session_id,
         provider=record.provider,
+        tool_released_at=record.tool_released_at,
     )
 
 
@@ -1041,6 +1043,7 @@ def update_worker_log_stat(
     *,
     rate_limit_defer_until: str | None = None,
     inconclusive_probe_deferred_count: int | None = None,
+    tool_released_at: str | None = None,
 ) -> None:
     """Update last_activity_at and log_bytes fields on a worker's sidecar.
 
@@ -1059,6 +1062,10 @@ def update_worker_log_stat(
             sidecar. When provided, the defer field is set and not cleared.
         inconclusive_probe_deferred_count: Optional new Signal-1 deferral counter
             to persist on the sidecar (issue #338).
+        tool_released_at: Optional ISO stamp of the stalled lane's pipe-holder
+            release (issue #2794). Only the opencode profile asks for that
+            release, so in practice only its ``ClaudeWorkerRecord`` sidecar
+            carries the field.
     """
     import json
 
@@ -1110,6 +1117,9 @@ def update_worker_log_stat(
 
     if inconclusive_probe_deferred_count is not None:
         payload["inconclusive_probe_deferred_count"] = inconclusive_probe_deferred_count
+
+    if tool_released_at is not None:
+        payload["tool_released_at"] = tool_released_at
 
     # Write back atomically using the adapter-specific helper
     if worker.adapter_kind == "devin":

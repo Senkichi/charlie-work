@@ -12,9 +12,9 @@ exactly one of them, or to neither:
 
 With ``dispatch.host`` unset (the kill switch) or an empty ``labels.host_prefix``
 every issue is local, which is exactly the behaviour before host routing.
-Dispatch, the backlog classifier, reconcile, finalize, the review/merge lane and
-the unauthorized-merge tripwire all ask :func:`owned_here`, so the rule lives in
-one place.
+Intake, dispatch, the backlog classifier, reconcile, finalize, the review/merge
+lane and the unauthorized-merge tripwire all ask :func:`owned_here`, so the rule
+lives in one place.
 """
 
 from __future__ import annotations
