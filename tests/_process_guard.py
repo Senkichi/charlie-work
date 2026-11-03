@@ -30,11 +30,14 @@ import logging
 import os
 import sys
 import time
-from collections.abc import Iterator
-from typing import Any
+from collections.abc import Callable, Iterator
+from typing import Any, ParamSpec, TypeVar
 
 import psutil
 import pytest
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
 
 logger = logging.getLogger(__name__)
 
@@ -56,11 +59,57 @@ _job_handle: int | None = None
 # the current pid through it — so it must never be consulted at fixture time.
 _THIS_PID = os.getpid()
 
+# Captured at import for the same reason: a test may replace ``psutil.Process``
+# on the shared module with a fake (a constant ``create_time``, no ``children``),
+# and the guard's own teardown then runs under that fake (issue #2918).
+_REAL_PROCESS = psutil.Process
+
+
+@contextlib.contextmanager
+def _real_process_class() -> Iterator[None]:
+    """Hold the real ``psutil.Process`` on the module for the enclosed calls.
+
+    Constructing from ``_REAL_PROCESS`` is not enough: psutil resolves
+    ``Process`` through its own module globals, so a real instance's
+    ``children()``, ``kill()`` and ``is_running()`` build a ``Process`` of
+    whatever class is installed -- ``children`` -> ``_raise_if_pid_reused`` ->
+    ``is_running`` -> ``self != Process(self.pid)``. Under a fake that either
+    raises inside psutil or hands back fake children, which the guard would
+    then misreport or crash on. So the guard reads under the real class and puts
+    the test's own back afterwards (the finally covers a raising body). When
+    the real class is already installed -- every test but the ones that patch
+    it -- nothing is touched.
+
+    Held per psutil operation, never across the grace-period sleeps, so the
+    window in which the test's fake is absent is a few milliseconds.
+    """
+    installed = psutil.Process
+    if installed is _REAL_PROCESS:
+        yield
+        return
+    setattr(psutil, "Process", _REAL_PROCESS)
+    try:
+        yield
+    finally:
+        setattr(psutil, "Process", installed)
+
+
+def _on_real_process(fn: Callable[_P, _R]) -> Callable[_P, _R]:
+    """Run ``fn`` inside ``_real_process_class`` (see there)."""
+
+    @functools.wraps(fn)
+    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        with _real_process_class():
+            return fn(*args, **kwargs)
+
+    return wrapper
+
 
 def _this_process() -> psutil.Process:
-    return psutil.Process(_THIS_PID)
+    return _REAL_PROCESS(_THIS_PID)
 
 
+@_on_real_process
 def descendant_snapshot() -> dict[int, float]:
     """Map ``pid -> create_time`` for every live descendant of this process.
 
@@ -84,6 +133,7 @@ def descendant_snapshot() -> dict[int, float]:
     return snapshot
 
 
+@_on_real_process
 def leaked_descendants(before: dict[int, float]) -> list[psutil.Process]:
     """Live descendants of this process that are not in ``before``.
 
@@ -116,6 +166,7 @@ def _describe(proc: psutil.Process) -> str:
     return f"pid={proc.pid} cmdline={' '.join(cmdline)!r}"
 
 
+@_on_real_process
 def _kill_tree(proc: psutil.Process) -> None:
     """Kill ``proc`` and every descendant it still has, then reap them all."""
     try:
@@ -135,6 +186,7 @@ def _kill_tree(proc: psutil.Process) -> None:
             continue
 
 
+@_on_real_process
 def reap_pid(pid: int | None) -> None:
     """Kill ``pid`` and its descendants — but only while ``pid`` is a live
     descendant of this process.
@@ -147,7 +199,7 @@ def reap_pid(pid: int | None) -> None:
     if not pid or pid <= 0:
         return
     try:
-        proc = psutil.Process(pid)
+        proc = _REAL_PROCESS(pid)
         ours = any(child.pid == pid for child in _this_process().children(recursive=True))
     except psutil.NoSuchProcess:
         return
@@ -265,6 +317,7 @@ def job_process_ids() -> frozenset[int] | None:
     return None
 
 
+@_on_real_process
 def job_member_snapshot() -> dict[int, float] | None:
     """``{pid: create_time}`` for job members other than this process, or ``None``."""
     pids = job_process_ids()
@@ -273,7 +326,7 @@ def job_member_snapshot() -> dict[int, float] | None:
     snapshot: dict[int, float] = {}
     for pid in pids - {_THIS_PID}:
         try:
-            snapshot[pid] = psutil.Process(pid).create_time()
+            snapshot[pid] = _REAL_PROCESS(pid).create_time()
         except psutil.Error:
             continue
     return snapshot
