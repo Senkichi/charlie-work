@@ -35,8 +35,8 @@ from pathlib import Path
 
 from . import role_quota_ledger
 from .config import OrchestratorConfig
-from .process_utils import terminal_record_proves_completion
-from .throttle_signatures import match_throttle_tail
+from .process_utils import terminal_record_for_pid, terminal_record_proves_completion
+from .throttle_signatures import HARNESS_AUTH_FAILED_KIND, match_throttle_tail
 
 # Provider throttle signatures — matched against session log tails to classify
 # failure kinds. The defaults are sourced from RuntimeConfig so there is a single
@@ -174,6 +174,14 @@ def update_session_record_with_failure_classification(
     ``now`` is forwarded to ``worker_fate.classify_for`` (issue #822's
     injectable clock); defaults to ``datetime.now(UTC)`` there when omitted.
 
+    Harness-auth classification (issue #2810, ``harness_auth_failed``) is
+    withheld when ``fleet.harness_auth_block_enabled`` is off, and -- like the
+    throttle markers -- never fires on a log that is the model's own prose: a
+    terminal record for THIS pid proving completion already skips the log, and
+    any terminal record for the pid must show a non-zero ``exit_code`` (a CLI
+    that failed to authenticate exits non-zero; exit 0 means the log is a
+    transcript that merely quotes the message).
+
     Returns a tuple of (failure_kind, throttled_until_iso) for the caller to
     update runtime state if needed. ``throttled_until_iso`` is only non-None
     when log-tail classification actually matched a throttle signature.
@@ -223,6 +231,12 @@ def update_session_record_with_failure_classification(
         # Lazy: worker_fate reaches back into devin_shell (profile table).
         from . import worker_fate
 
+        # Omitted in the default case so the call is byte-identical to pre-#2810.
+        gate_kwargs = (
+            {}
+            if _harness_auth_allowed(sessions_dir, issue_number, payload.get("pid"), config)
+            else {"harness_auth": False}
+        )
         classified_kind, throttled_until = worker_fate.classify_for(
             "devin",
             Path(log_path_str),
@@ -230,6 +244,7 @@ def update_session_record_with_failure_classification(
             quota_error_markers=quota_markers,
             resume_margin_seconds=resume_margin_seconds,
             now=now,
+            **gate_kwargs,
         )
 
     resolved_kind = classified_kind or fallback_kind
@@ -240,7 +255,37 @@ def update_session_record_with_failure_classification(
     devin_shell._write_json(sidecar_path, payload)
     # Issue #2086: a quota/rate-limit death restricts the session's own
     # stamped (harness, model) fleet-wide. Best-effort, never raises.
+    # Issue #2810: a harness-auth death blocks the whole harness instead.
+    hook_kwargs: dict[str, str | None] = {}
+    if resolved_kind == HARNESS_AUTH_FAILED_KIND and log_path_str:
+        from . import harness_auth_block
+
+        hook_kwargs = harness_auth_block.death_hook_fields(
+            "devin", Path(log_path_str), payload, sessions_dir
+        )
     role_quota_ledger.record_classified_death(
-        payload, resolved_kind, throttled_until, source="devin_failure_classification"
+        payload,
+        resolved_kind,
+        throttled_until,
+        source="devin_failure_classification",
+        **hook_kwargs,
     )
     return resolved_kind, throttled_until
+
+
+def _harness_auth_allowed(
+    sessions_dir: Path, issue_number: int, pid: object, config: OrchestratorConfig | None
+) -> bool:
+    """Whether ``harness_auth_failed`` may be classified for this exited session.
+
+    False when the kill switch is off, or when a terminal record for ``pid``
+    exists without a non-zero ``exit_code`` (exit 0, or an unknown exit, cannot
+    vouch for "the CLI failed to authenticate").
+    """
+    if config is not None and not config.fleet.harness_auth_block_enabled:
+        return False
+    terminal = terminal_record_for_pid(sessions_dir, issue_number, "devin", pid)
+    if terminal is None:
+        return True
+    exit_code = terminal.get("exit_code")
+    return isinstance(exit_code, int) and not isinstance(exit_code, bool) and exit_code != 0

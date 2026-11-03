@@ -31,6 +31,13 @@ probe process is provably still alive after the survival period, and a probe
 that is dead with no window recorded is re-probed (``admit_one``), never
 treated as having survived. Survival is persisted (``survived_at``) so a probe
 that later finishes normally does not put the fleet back into probe mode.
+
+Harness auth (issue #2810) reuses this machinery rather than a second one: a
+dead harness credential is recorded as a harness-wide block in the quota ledger
+(``role_quota_ledger``), and :func:`decide_probe_gate` -- the admit-one /
+survival half of :func:`decide_launch`, now shared -- gates the resume under the
+probe key ``harness_auth:<harness>`` (``harness_auth_block.decide_for_harness``).
+:func:`decide_for_app` folds that decision into the per-repo one.
 """
 
 from __future__ import annotations
@@ -78,6 +85,12 @@ class ResumeDecision:
     #: The adapter the gate was evaluated for (the launch's selected role-chain
     #: entry); the probe stamp reuses it so gate and stamp can never disagree.
     adapter_kind: str | None = None
+    #: Issue #2810: True when this decision comes from the harness-auth gate
+    #: (a dead harness credential), not a provider quota window.
+    harness_auth: bool = False
+    #: Extra probe-marker keys a launch admitted under ``admit_one`` must also
+    #: stamp (the harness-auth gate's ``harness_auth:<harness>``).
+    probe_keys: tuple[str, ...] = ()
 
     @property
     def deferred(self) -> bool:
@@ -87,7 +100,9 @@ class ResumeDecision:
     def deferred_reason(self) -> str | None:
         """Stable ``deferred_reason`` for a deferred decision, else ``None``."""
         if self.action == "defer_throttled":
-            return "provider_throttled_fleet"
+            from .role_selection import REASON_HARNESS_AUTH_BLOCKED
+
+            return REASON_HARNESS_AUTH_BLOCKED if self.harness_auth else "provider_throttled_fleet"
         if self.action == "defer_probe":
             return "provider_resume_staggered"
         return None
@@ -191,13 +206,30 @@ def decide_launch(
     now: datetime | None = None,
 ) -> ResumeDecision:
     """Decide whether a launch for ``adapter_kind`` may proceed fleet-wide."""
-    resolved_now = now if now is not None else datetime.now(UTC)
     latest = latest_fleet_throttle(state_files, adapter_kind, selection=selection)
     if latest is None:
         return ResumeDecision("open")
+    return decide_probe_gate(latest, adapter_kind, fleet_dir_override=fleet_dir_override, now=now)
+
+
+def decide_probe_gate(
+    latest: datetime,
+    probe_key: str,
+    *,
+    fleet_dir_override: str | None = None,
+    now: datetime | None = None,
+) -> ResumeDecision:
+    """The window / admit-one / survival decision for a window ending at ``latest``.
+
+    ``probe_key`` names the probe marker in ``provider_resume_probe.json``: an
+    adapter kind for a provider throttle, ``harness_auth:<harness>`` for a dead
+    harness credential (issue #2810). Shared so both gates admit exactly one
+    probe and reopen only on a probe that provably outlived the survival period.
+    """
+    resolved_now = now if now is not None else datetime.now(UTC)
     if latest > resolved_now:
         return ResumeDecision("defer_throttled", throttled_until=latest)
-    probe = _read_json(resume_probe_path(fleet_dir_override)).get(adapter_kind)
+    probe = _read_json(resume_probe_path(fleet_dir_override)).get(probe_key)
     if not isinstance(probe, dict):
         return ResumeDecision("admit_one", throttled_until=latest)
     probe_at = _parse_iso(probe.get("launched_at"))
@@ -292,11 +324,11 @@ def note_probe_from_results(app: Any, resume: ResumeDecision, results: Iterable[
         return
     probes = [(r.pid, r.process_start_time) for r in results if r.ok and r.pid is not None]
     if probes:
-        note_probe_launch(
+        for key in (
             resume.adapter_kind or worker_adapter_kind(app.config.worker.harness),
-            probes,
-            fleet_dir_override=app.fleet_dir_override,
-        )
+            *resume.probe_keys,
+        ):
+            note_probe_launch(key, probes, fleet_dir_override=app.fleet_dir_override)
 
 
 def worker_adapter_kind(harness: str) -> str:
@@ -348,4 +380,51 @@ def decide_for_app(
     )
     if decision.probe_survived:
         note_probe_survived(adapter_kind, fleet_dir_override=override, now=now)
+    return _with_harness_auth_gate(app, decision, selection=selection, now=now)
+
+
+#: How binding each action is when two gates disagree: the most restrictive wins.
+_ACTION_SEVERITY: dict[str, int] = {
+    "open": 0,
+    "admit_one": 1,
+    "defer_probe": 2,
+    "defer_throttled": 3,
+}
+
+
+def _with_harness_auth_gate(
+    app: Any, decision: ResumeDecision, *, selection: Any, now: datetime | None
+) -> ResumeDecision:
+    """Fold the harness-auth gate (issue #2810) into ``decision``.
+
+    The launch runs on the selected chain entry's harness (the configured
+    primary without a selection). With the kill switch off, or no open
+    harness-auth episode for that harness, ``decision`` is returned untouched.
+    Otherwise the more restrictive of the two wins, and an ``admit_one`` from the
+    harness gate also stamps its own probe key, so the one admitted launch is the
+    probe for both gates.
+    """
+    from . import harness_auth_block
+
+    config = app.config
+    if not config.fleet.harness_auth_block_enabled:
+        return decision
+    entry = getattr(selection, "entry", None)
+    harness = entry.harness if entry is not None else config.worker.harness
+    auth = harness_auth_block.decide_for_harness(
+        harness, fleet_dir_override=app.fleet_dir_override, now=now
+    )
+    if auth is None:
+        return decision
+    outranks = _ACTION_SEVERITY[auth.action] - _ACTION_SEVERITY[decision.action]
+    # A tie between two deferrals reports the dead credential: it is the cause
+    # the operator can act on, and the quota window would expire on its own.
+    if outranks > 0 or (outranks == 0 and auth.deferred):
+        return replace(
+            auth,
+            adapter_kind=decision.adapter_kind,
+            probe_survived=decision.probe_survived,
+        )
+    if auth.action == "admit_one":
+        return replace(decision, probe_keys=(*decision.probe_keys, *auth.probe_keys))
     return decision

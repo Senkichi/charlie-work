@@ -16,6 +16,7 @@ from typing import Any
 
 from .config import OrchestratorConfig
 from .failure_classifier import classify_failure
+from .throttle_signatures import devin_harness_auth_evidence
 from .worker import WorkerView
 
 
@@ -50,6 +51,12 @@ class AdapterFateProfile:
     # for the classifier's fixed 24h -- for a provider whose quota windows are
     # not 24h (opencode Go: opencode_limits.go_quota_reset). None = 24h.
     quota_reset: Callable[[str], timedelta | None] | None = None
+    # Issue #2810: (log tail) -> the evidence line when the harness CLI itself
+    # could not authenticate (``harness_auth_failed``), else None. A fleet-wide
+    # harness fault, distinct from the api harness's ``provider_auth``. None =
+    # no detection: a harness declares one only once a real log line has been
+    # captured (devin-shell today), never a guessed string.
+    harness_auth_evidence: Callable[[str], str | None] | None = None
 
 
 _PROFILES: dict[str, AdapterFateProfile] | None = None
@@ -131,6 +138,7 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
             record_failure=_devin_record_failure,
             over_budget=None,
             writes_terminal_record=True,
+            harness_auth_evidence=devin_harness_auth_evidence,
         ),
         "claude-code": AdapterFateProfile(
             harness="claude-code",
@@ -253,6 +261,7 @@ def classify_for(
     quota_error_markers: Sequence[str] | None = None,
     resume_margin_seconds: int = 0,
     now: datetime | None = None,
+    harness_auth: bool = True,
 ) -> tuple[str | None, str | None]:
     """Classify a session failure for ``adapter_kind`` (a ``WorkerView``
     spelling: ``"devin"``, ``"claude-code"``, ``"api"``, ...).
@@ -263,6 +272,11 @@ def classify_for(
     longer carry their own ``_classify_session_failure`` wrappers that
     hard-code them. An unknown ``adapter_kind`` returns ``(None, None)`` --
     the same graceful "nothing classified" ``profile_for`` gives its callers.
+
+    ``harness_auth`` is the issue #2810 kill switch
+    (``fleet.harness_auth_block_enabled``): False withholds the profile's
+    ``harness_auth_evidence`` matcher so a disabled feature classifies exactly
+    as before it existed.
     """
     profile = profile_for(adapter_kind)
     if profile is None:
@@ -277,4 +291,5 @@ def classify_for(
         now=now,
         log_digest=profile.log_digest,
         quota_reset=profile.quota_reset,
+        harness_auth_evidence=profile.harness_auth_evidence if harness_auth else None,
     )

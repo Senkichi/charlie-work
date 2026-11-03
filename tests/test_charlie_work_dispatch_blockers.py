@@ -644,8 +644,13 @@ def test_dispatch_cross_repo_gate_escalates_when_all_paths_absent(tmp_path: Path
     fake_gh.prs[0]["state"] = "CLOSED"
     # Every referenced path is absent from tmp_path (the repo root); one of
     # them is positively present under a registered sibling repo's root.
+    # The sibling root therefore lives OUTSIDE the repo root: the same-repo
+    # suffix fallback (issue #1757) matches the referenced path against
+    # every file under repo_root, so a sibling planted inside it would make
+    # `src/ci_fleet/suite_coverage.py` resolve as in-repo evidence and the
+    # escalation never fire.
     fake_gh.issues[0]["body"] = _cross_repo_issue_body()
-    sibling_root = tmp_path / "sibling-ci-runners"
+    sibling_root = tmp_path.parent / "sibling-ci-runners"
     _write_sibling_repo_file(sibling_root, "src/ci_fleet/suite_coverage.py")
     _write_fleet_registry(
         tmp_path / "fleet",
@@ -716,7 +721,10 @@ def test_dispatch_cross_repo_override_label_skips_both_gates(tmp_path: Path) -> 
     fake_gh.prs[0]["state"] = "CLOSED"
     fake_gh.issues[0]["body"] = _cross_repo_issue_body()
     fake_gh.issues[0]["labels"].append({"name": config.labels.cross_repo_override})
-    sibling_root = tmp_path / "sibling-ci-runners"
+    # Same outside-repo-root sibling placement as the escalation test above:
+    # the same-repo suffix fallback (issue #1757) must not find this path
+    # under the repo root, so the "escalates without the label" premise holds.
+    sibling_root = tmp_path.parent / "sibling-ci-runners"
     _write_sibling_repo_file(sibling_root, "src/ci_fleet/suite_coverage.py")
     _write_fleet_registry(
         tmp_path / "fleet",
