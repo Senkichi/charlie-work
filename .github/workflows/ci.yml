@@ -114,7 +114,9 @@ jobs:
           [ "$n" -le 20 ] || n=20
           if [ "$n" -le 2 ]; then t=30; else t=15; fi
           # The nightly runs in map mode (coverage on every test): its bound
-          # is A2's 3x map-mode overhead ceiling over the PR bound.
+          # is A2's 3x map-mode overhead ceiling over the PR bound. The plain
+          # "Refresh test durations" pass spends about one PR run of that same
+          # budget (the map pass has run at ~1x, so both fit with room to spare).
           if [ "${EVENT_NAME:-}" = "schedule" ] || [ "${MAP_INPUT:-}" = "true" ]; then t=$((t * 3)); fi
           {
             echo "shards=[$(seq -s, 1 "$n")]"
@@ -214,9 +216,10 @@ jobs:
         shell: bash
         run: uv pip install "ci-fleet[map]"
       - name: Restore test durations
-        # Saved by the nightly `schedule` run on main (ubuntu), restored here
-        # on windows: enableCrossOsArchive on both sides. A miss is fine:
-        # pytest-split weighs unknown tests equally (balance, not correctness).
+        # Saved by the nightly `schedule` run on main from its plain-mode
+        # "Refresh test durations" pass (never from the map pass, #2924);
+        # enableCrossOsArchive on both sides. A miss is fine: pytest-split
+        # weighs unknown tests equally (balance, not correctness).
         uses: actions/cache/restore@v4
         with:
           path: .test_durations
@@ -227,12 +230,18 @@ jobs:
         # duration_based_chunks keeps collection order, so each shard is a
         # contiguous run of files (module/class fixtures stay local).
         # -n auto / --dist=load as before (2 workers on windows-latest).
-        # The nightly stores durations and runs in map mode (`map prepare` is
+        # The nightly runs in map mode (`map prepare` is
         # idempotent and prints the pytest arguments, CRLF under Git Bash; a
         # failure there costs tonight's map, never the run). Shard 1 of a PR
         # (and of a merge-queue draft) records a shadow selection: the suite
         # runs unchanged. One shard only, so each run is one selection record.
         # The selector comes from PyPI, never from this checkout.
+        #
+        # The nightly's map pass does NOT store durations: coverage, the
+        # file-read audit hook and traced children cost CPU-bound tests 2-3x
+        # and subprocess/git-bound tests ~nothing, so splitting pull requests
+        # on those timings loaded shard 4/6 with ~1.4x the mean shard's cost
+        # (#2924). "Refresh test durations" below is the one writer.
         shell: bash
         env:
           SPLITS: ${{ needs.coverage.outputs.splits }}
@@ -253,7 +262,6 @@ jobs:
             --junit-xml="pytest-junit-$GROUP.xml")
           if [ "$EVENT_NAME" = "schedule" ] || [ "${MAP_INPUT:-}" = "true" ]; then
             export CI_FLEET_LEDGER_CONTEXT=nightly
-            cmd+=(--store-durations)
             if prep="$(uv run --no-sync ci-fleet map prepare)"; then
               export CI_FLEET_MAP=1 COVERAGE_CORE=ctrace
               while IFS= read -r arg; do
@@ -267,6 +275,34 @@ jobs:
               --context ci --shadow -- "${cmd[@]}")
           fi
           exec "${cmd[@]}"
+      - name: Refresh test durations
+        # The nightly's one durations writer (#2924). The shards split pull
+        # requests by these timings, so they must be measured the way a pull
+        # request runs: plain, not under the map pass's tracer. This reruns
+        # THIS shard's tests with no map env, solely to record how long they
+        # take. It splits from the same restored .test_durations as the map
+        # pass (which no longer writes it), so it runs the same tests.
+        #   - No success() override: a failed map pass means a `fail` verdict,
+        #     which never saves the cache, so the rerun would be wasted.
+        #   - Schedule only: the only event whose "Save test durations" runs.
+        #   - CI_FLEET_LEDGER=off: the ledger must not see a second run for
+        #     this job (the bisect workflow uses the same switch).
+        #   - No --junit-xml: the verdict reads the map pass's junit.
+        #   - continue-on-error: refreshing a cache never fails the nightly; a
+        #     failure leaves the restored baseline for the merge to carry on.
+        if: github.event_name == 'schedule'
+        continue-on-error: true
+        shell: bash
+        env:
+          SPLITS: ${{ needs.coverage.outputs.splits }}
+          GROUP: ${{ matrix.group }}
+          CI_FLEET_LEDGER: "off"
+        run: |
+          set -uo pipefail
+          exec uv run --no-sync pytest --tb=short -n auto --dist=load \
+            --splits "$SPLITS" --group "$GROUP" \
+            --splitting-algorithm duration_based_chunks \
+            --durations-path .test_durations --store-durations
       - name: Upload junit
         if: always()
         uses: actions/upload-artifact@v4
