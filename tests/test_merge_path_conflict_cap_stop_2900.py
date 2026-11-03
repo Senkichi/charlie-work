@@ -174,4 +174,51 @@ def test_conflict_cap_escalated_pr_stays_quiescent_until_head_moves(
     assert gh.pr_update_branch_calls == []
 
 
+def test_legacy_cap_escalated_pr_without_escalated_head_skips_on_last_head_anchor(
+    tmp_path: Path,
+) -> None:
+    """Issue #2900: a PR escalated by the pre-#2900 code carries the cap reason
+    in ``escalation_reasons_seen`` and the lane's routing baseline
+    (``conflict_rework_attempts_last_head``) but NO
+    ``conflict_rework_attempts_escalated_head`` -- the shape the issue's
+    observed record had. ``gather.persisted_from`` must map the baseline so
+    the stop still arms on the unchanged head; without the mapping the anchor
+    is empty and the PR silently re-enters the per-pass merge_ready loop."""
+
+    def pre(_app: OrchestratorApp, paths: Any, _gh: FakeGitHub) -> None:
+        _seed_conflict_cap_escalation(
+            paths,
+            {
+                "escalation_reasons_seen": [_LEVEL],
+                "conflict_rework_attempts": 3,
+                # Equals the live head (``_conflict_pr``'s headRefOid); the
+                # legacy writer stamped no ``..._escalated_head``.
+                "conflict_rework_attempts_last_head": "sha-abc123",
+            },
+        )
+
+    pair = _pair(tmp_path, _cfg(alarm=1), _conflicted_gh, pre=pre, merge=False)
+
+    live, dry = pair.live, pair.dry
+    # Pin the shape: the legacy anchor is the only head field on the record.
+    assert "conflict_rework_attempts_escalated_head" not in live.state_before["prs"]["456"]
+    assert live.state_before["prs"]["456"]["conflict_rework_attempts_last_head"] == "sha-abc123"
+    assert live.gh.prs[0]["headRefOid"] == "sha-abc123"
+
+    assert live.result.ok is True
+    assert live.result.message == _CAP_STOP_MSG
+    assert set(live.data) == _CAP_STOP_KEYS
+    assert live.data["conflict_cap_stop"] is True
+    # Zero new events: no per-pass merge_ready row, no rework routing, no alarm.
+    assert live.new_event_kinds() == []
+    assert live.state_after["prs"]["456"]["conflict_rework_attempts"] == 3
+    assert live.gh.merged == []
+    assert live.gh.pr_update_branch_calls == []
+
+    # Dry-run parity on the same legacy record.
+    assert dry.result.message == _CAP_STOP_PREVIEW_MSG
+    assert dry.data["conflict_cap_stop"] is True
+    _assert_dry_run_inert(dry)
+
+
 # ===========================================================================
