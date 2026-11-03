@@ -58,6 +58,7 @@ from .github import (
     parse_blockers,  # noqa: F401  (deliberate re-export; used by moved delegates via _wf.)
 )
 from .host_routing import local_prs as host_local_prs  # noqa: F401  (reap_loop seam)
+from .fleet_ownership import pr_fleet_owned
 from .issue_linking import linked_issue_number
 from .pr_body_closing_autofix_flow import autofix_body_closing_kw
 from .pr_unlinked_visibility import summarize_unlinked_prs
@@ -2277,6 +2278,40 @@ class OrchestratorApp:
             branch_prefix=self.config.dispatch.branch_prefix,
             branch_issue_validator=self._make_branch_issue_validator(),
         )
+
+        # Issue #2763: the defence-in-depth backstop for the ownership gate.
+        # `_loop_body` and `review_queue` already route a PR the fleet does not
+        # own to `pr_unlinked_skipped`, so reaching here means an operator-
+        # invoked review or a caller that bypassed them. Refuse before ANY
+        # packet write, label transition or state mutation -- a PR that merely
+        # names an issue with a closing keyword is a human's work, not the
+        # pipeline's. A PR with no resolvable linked issue is out of scope
+        # (it has no issue to own it and keeps its existing behaviour).
+        if issue_number is not None and not pr_fleet_owned(
+            self.gh,
+            self.config,
+            pr,
+            issue_number,
+            load_state_locked(self.paths.state_file),
+        ):
+            if not self.dry_run:
+                log_event(
+                    self.paths.state_file,
+                    # event-consumer: audit-only -- operator-visible refusal; the
+                    # actionable signal for the same PR is the edge-triggered
+                    # `pr_unlinked_skipped` (reason: not_fleet_owned), which the
+                    # merge lane emits on every pass.
+                    "review_refused_not_fleet_owned",
+                    {"pr_number": pr_number, "issue_number": issue_number},
+                    repo=self.repo_root.name,
+                )
+            return _CommandResult(
+                False,
+                f"PR #{pr_number} is not fleet-owned (issue #{issue_number} was never "
+                "dispatched, is not automated-ready, and the PR is off the dispatch "
+                "branch namespace); review refused",
+                {"pr": pr_number, "issue": issue_number, "not_fleet_owned": True},
+            )
 
         # Issue #617: dry-run must short-circuit before the escalation check,
         # the packet writes (pr.json, checks.json, diff.patch, review-prompt.md,

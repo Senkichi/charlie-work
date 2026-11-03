@@ -25,6 +25,7 @@ from .gather import (
     gather_revert,
     holds_from_snapshot,
     readiness_facts,
+    with_human_block,
 )
 from .model import BranchStop, PlanKind
 from .ports import MergePathPorts, ports_from_workflow
@@ -131,6 +132,9 @@ def preview_merge_ready(
         holds = replace(
             holds, merge_hold=merge_hold, merge_hold_unavailable=merge_hold_unavailable
         )
+    # Issue #2763: the same lazy human-block read the live shell makes, through
+    # the shared helper, so the projection below sees the facts decide_merge sees.
+    holds = with_human_block(app, opening.pr, pr_number, readiness, holds)
     # The preview runs no accounting, so report the projection decide_merge
     # would see through its own ``requeue_gate`` (issue #2743): the ledger
     # climbs only when the shared ``mergequeue_re_add_pending`` predicate
@@ -152,6 +156,8 @@ def preview_merge_ready(
             merge_hold=merge_hold,
             merge_hold_unavailable=merge_hold_unavailable,
             merge_hold_label=app.config.labels.merge_hold,
+            human_block=holds.human_block is True,
+            human_block_unavailable=holds.human_block_unavailable,
             failed_attempts=persisted.failed_attempts,
             stale_base_deferrals=persisted.stale_base_deferrals,
             mergequeue_requeues=requeue.requeues,

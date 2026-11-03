@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import charlie_work.workflow as _wf
 from charlie_work.command_result import CommandResult
+from charlie_work.fleet_ownership import pr_fleet_owned
 from typing import Any
 from charlie_work.no_op_rework_body import _request_changes_body_drifted
 from charlie_work.state import StateLockBusy
@@ -35,6 +36,10 @@ def review_queue(self) -> CommandResult:
     A PR is queued when:
 
     - It has a linked issue (same as ``review()``).
+    - The fleet owns it (issue #2763, ``fleet_ownership.pr_fleet_owned``): a
+      same-repo PR that merely names an issue with a closing keyword is not
+      review work unless it is on the dispatch branch namespace, its issue is
+      ``automated-ready``, or ``state.issues`` records a dispatch for it.
     - ``prs/pr-N/review-prompt.md`` exists.
     - The recorded decision is ``missing``/``pending`` and the stored packet
       head OID matches the PR's live ``headRefOid``.
@@ -80,6 +85,17 @@ def review_queue(self) -> CommandResult:
     # (cached within the pass on the real GitHub client) is shared across
     # every PR in this queue.
     branch_validator = self._make_branch_issue_validator()
+    # Issue #2763: a PR the fleet does not own is not review work. Read
+    # state.json once for the dispatch-provenance leg of the ownership test,
+    # and only when the gate is on. An unreadable (lock-busy) state is an
+    # empty snapshot: ownership must then be proven by branch or label, so a
+    # contended read never ADOPTS a PR (fail closed).
+    ownership_state: dict[str, Any] = {}
+    if prs and self.config.review.require_fleet_ownership:
+        try:
+            ownership_state = _wf.load_state_locked(self.paths.state_file)
+        except StateLockBusy:
+            ownership_state = {}
     for pr in prs:
         issue_number = _wf.linked_issue_number(
             pr,
@@ -88,6 +104,8 @@ def review_queue(self) -> CommandResult:
             branch_issue_validator=branch_validator,
         )
         if issue_number is None:
+            continue
+        if not pr_fleet_owned(self.gh, self.config, pr, issue_number, ownership_state):
             continue
 
         pr_number = int(pr["number"])

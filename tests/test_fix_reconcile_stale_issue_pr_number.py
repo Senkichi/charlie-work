@@ -11,6 +11,12 @@ Reuses the lightweight ``FakeGitHub``/``_pr``/``_issue`` fixtures defined in
 ``test_reconcile.py``'s shared fixture module ``_reconcile_fixtures.py``
 (pytest's rootless import mode makes this a plain top-level import, the same
 pattern ``test_fix_reconcile.py`` itself uses).
+
+Issue #2763: every linked issue here carries ``labels.ready``. These PRs sit on
+``fix/*`` branches and bind to the issue by closing keyword only, so the fleet
+owns the binding solely through the issue's ready label (``fleet_owns_pr``).
+Without it the PR is correctly ignored by ``detect_drift`` and the
+"does not fire" cases below would pass for the wrong reason.
 """
 
 from __future__ import annotations
@@ -101,7 +107,7 @@ def test_stale_issue_pr_number_picks_lowest_open_linked_pr() -> None:
             _pr(1501, "OPEN", head_ref="fix/b", body="Closes #1068"),
             _pr(1405, "OPEN", head_ref="fix/a", body="Closes #1068"),
         ],
-        issues=[_issue(1068, [config.labels.pr_open])],
+        issues=[_issue(1068, [config.labels.ready, config.labels.pr_open])],
     )
     state = empty_state()
     state["issues"]["1068"] = {
@@ -127,7 +133,7 @@ def test_stale_issue_pr_number_populates_missing_key() -> None:
     config = OrchestratorConfig()
     gh = FakeGitHub(
         prs=[_pr(1405, "OPEN", head_ref="fix/janitor-gate", body="Closes #1068")],
-        issues=[_issue(1068, [config.labels.pr_open])],
+        issues=[_issue(1068, [config.labels.ready, config.labels.pr_open])],
     )
     state = empty_state()
     state["issues"]["1068"] = {"number": 1068, "status": "open_passive"}
@@ -147,7 +153,7 @@ def test_stale_issue_pr_number_does_not_fire_when_cache_matches_open_pr() -> Non
     config = OrchestratorConfig()
     gh = FakeGitHub(
         prs=[_pr(1405, "OPEN", head_ref="fix/janitor-gate", body="Closes #1068")],
-        issues=[_issue(1068, [config.labels.pr_open])],
+        issues=[_issue(1068, [config.labels.ready, config.labels.pr_open])],
     )
     state = empty_state()
     state["issues"]["1068"] = {

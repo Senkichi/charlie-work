@@ -34,6 +34,8 @@ import charlie_work.workflow as _wf
 from charlie_work.command_result import CommandResult
 from charlie_work.dead_worker_sweep.effects_sessions import _detect_stalled_sessions
 from charlie_work.escalation import _stale_template_warning_suppressed
+from charlie_work.fleet_ownership import NOT_FLEET_OWNED_REASON, pr_fleet_owned
+from charlie_work.loop_outcome import loop_pass_outcome
 from charlie_work.github import (
     GitHub,
     GitHubError,
@@ -316,6 +318,7 @@ def _loop_body(
     # per-PR call site at the point of `continue` below could abort every
     # other PR's review/merge work in the same pass on lock contention.
     unlinked_pr_entries: list[tuple[dict[str, Any], int]] = []
+    unlinked_pr_reasons: dict[int, str] = {}  # #2763: PR number -> non-default skip reason
     # Issue #1781: the complement of unlinked_pr_entries -- every PR that DID
     # resolve an issue number this pass, mapped to that issue number --
     # so `_record_unlinked_pr_skips` can evict standing `unlinked_pr_notice`
@@ -353,6 +356,13 @@ def _loop_body(
             unlinked_pr_entries.append((pr, int(pr["number"])))
             continue
         pr_number = int(pr["number"])
+        if not pr_fleet_owned(self.gh, self.config, pr, issue_number, state_snapshot):
+            # Issue #2763: names an issue the fleet never dispatched (see
+            # fleet_ownership.py): visibility path with its own `reason`, and
+            # deliberately NOT in `linked_prs` (that map evicts unlinked markers).
+            unlinked_pr_entries.append((pr, pr_number))
+            unlinked_pr_reasons[pr_number] = NOT_FLEET_OWNED_REASON
+            continue
         linked_prs[pr_number] = issue_number
         parked = (state_snapshot["prs"].get(str(pr_number)) or {}).get("foreign_issue_ref") or {}
         if parked.get("issue") == issue_number:
@@ -655,7 +665,12 @@ def _loop_body(
     # ahead of this loop could abort that work on lock contention. The
     # `linked_prs` complement (issue #1781) lets the same call evict stale
     # `unlinked_pr_notice` markers for PRs that resolved an issue this pass.
-    self._record_unlinked_pr_skips(unlinked_pr_entries, now=loop_now, linked_prs=linked_prs)
+    self._record_unlinked_pr_skips(
+        unlinked_pr_entries,
+        now=loop_now,
+        linked_prs=linked_prs,
+        reasons=unlinked_pr_reasons,
+    )
     self._flush_pass_tracker_writes()  # issue #2434: pass-end tracker flush (no-op off local backend)
     warnings: list[str] = []
     merge_alert_transitions: dict[int, dict[str, Any]] = {}
@@ -711,27 +726,9 @@ def _loop_body(
             ),
         )
 
-    ok = (
-        intake.ok
-        and dispatch.ok
-        and dispatch_rework.ok
-        and dispatch_reviews.ok
-        and local_lane_result.ok
-        and not errors
+    ok, message = loop_pass_outcome(
+        intake, dispatch, dispatch_rework, dispatch_reviews, local_lane_result, errors
     )
-    message = "loop complete"
-    if errors:
-        message = f"loop completed with {len(errors)} PR error(s)"
-    elif not intake.ok:
-        message = "loop completed with intake failures"
-    elif not dispatch.ok:
-        message = dispatch.message
-    elif not dispatch_rework.ok:
-        message = dispatch_rework.message
-    elif not dispatch_reviews.ok:
-        message = "loop completed with review dispatch failures"
-    elif not local_lane_result.ok:
-        message = "loop completed with local-lane failures"
     data = {
         "intake": intake.data,
         "dispatch": dispatch.data,
