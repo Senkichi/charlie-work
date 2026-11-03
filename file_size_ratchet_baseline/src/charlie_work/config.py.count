@@ -1,4 +1,4 @@
-3000
+3200
 # Issue #1934: +25 lines for SupervisorConfig.fleet_lane_concurrency and
 # SupervisorConfig.reap_sweep_interval_seconds (fields + _SUPERVISOR_INT_KEYS
 # validation entries). Dataclass fields cannot be extracted into a domain
@@ -15,3 +15,9 @@
 # change's growth, not merged #2757 work. A config field cannot be
 # extracted into a domain module, so this is a deliberate mark raise to
 # the next MARK_QUANTUM multiple above the live count (2800 -> 3000).
+# Issue #2763: auto_merge.honor_human_block, its two verdict patterns and
+# review.require_fleet_ownership took config.py from 2961 to 2995 lines
+# (+34); origin/main's concurrent #2666 field (+8) and the rework's +1 then
+# put the merge result at 3004, past the 3000 mark. Config fields cannot be
+# extracted into a domain module, so this is a deliberate reviewed mark
+# raise to the next MARK_QUANTUM multiple above the live count (3004 -> 3200).
