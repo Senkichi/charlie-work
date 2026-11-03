@@ -19,8 +19,10 @@ reconcile pass.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -31,9 +33,32 @@ from charlie_work.state import PASSIVE_OPEN_STATUS, load_state, save_state, stat
 from charlie_work.workflow import _detect_and_handle_stalled_reviews
 from charlie_work.write_gate import WriteGate
 
-from _helpers import _init_git_repo
-
 _THROTTLE_LINE = "You've hit your session limit · resets 4:40pm (America/Los_Angeles)\n"
+
+
+@pytest.fixture(autouse=True)
+def remove_review_checkout_double(
+    monkeypatch: pytest.MonkeyPatch, autospec: Callable[..., Any]
+) -> Any:
+    """Fake the sweeps' one git seam, ``remove_review_checkout``.
+
+    Issue #3011: every test here asserts on how the sweep merges its state onto
+    a concurrent writer's commit, never on a git checkout, yet ``_seed`` used to
+    build a real git repo (``tests/_helpers._init_git_repo``) and the sweep ran
+    a real ``git worktree list`` against it. The repo came from the per-process
+    ``plain`` git template, whose five-spawn build is paid by whichever test
+    first needs it in a worker -- so this file's first test took the whole
+    build as its own time whenever xdist's chunking put it first. With this
+    double no test in the file spawns a process or touches the template, so its
+    duration no longer depends on where it lands in a worker.
+
+    ``True`` is what the real function returns for a PR with no checkout
+    ("removed or already absent"), which is every PR these tests seed.
+    Returned so a test can pin that the sweep actually reached the seam.
+    """
+    return autospec(
+        monkeypatch, cw_stalled_review_reap, "remove_review_checkout", return_value=True
+    )
 
 
 # Issue #1264 (W6 PR2): every WriteGate constructed below must carry THAT
@@ -66,8 +91,10 @@ def _write_throttled_reviewer(reviews_dir: Path, pr_number: int, tmp_path: Path)
 
 
 def _seed(tmp_path: Path) -> tuple[Path, Path, OrchestratorConfig, Path]:
+    # A plain directory, not a git repo: the sweeps only hand ``repo_root`` to
+    # ``remove_review_checkout``, which ``remove_review_checkout_double`` fakes.
     repo_root = tmp_path / "repo"
-    _init_git_repo(repo_root)
+    repo_root.mkdir()
     reviews_dir = tmp_path / "reviews"
     reviews_dir.mkdir(parents=True, exist_ok=True)
     config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=True))
@@ -101,7 +128,7 @@ def _seed(tmp_path: Path) -> tuple[Path, Path, OrchestratorConfig, Path]:
 
 
 def test_stalled_sweep_does_not_clobber_concurrent_unescalate(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, remove_review_checkout_double: Any
 ) -> None:
     """Issue #594: the sweep must merge its changes onto fresh state at save
     time rather than restoring its stale entry-pass snapshot wholesale.
@@ -147,6 +174,8 @@ def test_stalled_sweep_does_not_clobber_concurrent_unescalate(
     # back and the global quota backoff was applied.
     assert state["prs"]["100"].get("review_dispatch_status") is None
     assert state.get("reviewer_quota", {}).get("consecutive_probe_failures") == 1
+    # ...and it reached the faked git seam for that PR (see the autouse double).
+    remove_review_checkout_double.assert_any_call(repo_root, 100, reviews_dir=reviews_dir)
 
     # The untouched PR 200 retains the concurrent unescalate -- NOT the stale
     # snapshot's escalated value. This is the bug: every field unescalate
@@ -167,7 +196,7 @@ def test_stalled_sweep_does_not_clobber_concurrent_unescalate(
 
 
 def test_stalled_sweep_events_survive_merge_when_ring_is_at_cap(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, remove_review_checkout_double: Any
 ) -> None:
     """Issue #594 follow-up: the merge-on-write save must not silently drop the
     sweep's own events when the bounded ``state.json`` event ring is already at
@@ -223,6 +252,7 @@ def test_stalled_sweep_events_survive_merge_when_ring_is_at_cap(
 
     # The sweep's real work still happened...
     assert state["prs"]["100"].get("review_dispatch_status") is None
+    remove_review_checkout_double.assert_any_call(repo_root, 100, reviews_dir=reviews_dir)
     # ...and its own event must be present in the merged ring, not silently
     # dropped by an eviction-blind length slice.
     kinds = [e.get("kind") for e in state.get("events", [])]
@@ -233,7 +263,7 @@ def test_stalled_sweep_events_survive_merge_when_ring_is_at_cap(
 
 
 def test_orphaned_reap_sweep_does_not_clobber_concurrent_unescalate(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, remove_review_checkout_double: Any
 ) -> None:
     """Issue #594, sibling site: ``_reap_orphaned_review_checkouts`` has the
     exact same load-snapshot / do-slow-work / bare-``save_state`` shape as
@@ -265,10 +295,6 @@ def test_orphaned_reap_sweep_does_not_clobber_concurrent_unescalate(
             "state": "MERGED",
         }
     ]
-
-    monkeypatch.setattr(
-        "charlie_work.stalled_review_reap.remove_review_checkout", lambda *a, **k: True
-    )
 
     # Inject the concurrent unescalate commit the first time the sweep calls
     # gh.pr_view (after its snapshot load, before its save) -- the exact
@@ -307,6 +333,7 @@ def test_orphaned_reap_sweep_does_not_clobber_concurrent_unescalate(
     pr100 = state["prs"]["100"]
     assert pr100.get("status") == "merged"
     assert pr100.get("review_dispatch_status") is None
+    remove_review_checkout_double.assert_any_call(repo_root, 100, reviews_dir=reviews_dir)
 
     # The sweep's own event made it into the merged ring via
     # ``_append_sweep_events`` -- the only event path this sweep uses (unlike
