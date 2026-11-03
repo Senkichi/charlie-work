@@ -15,7 +15,9 @@ import sys
 from pathlib import Path
 
 from _fakes_github import FakeGitHub
+from charlie_work import adapters
 from charlie_work.host.fakes import FakeSessionCounter
+from charlie_work.subprocess_runner import RunResult
 from charlie_work.config import (
     DevinConfig,
     DispatchConfig,
@@ -425,12 +427,26 @@ def test_concurrency_governor_clamps_only_issues_dry_run(
 
 
 def test_concurrency_governor_clamps_only_issues_rework_dispatch(
-    tmp_path: Path, monkeypatch, fake_host
+    tmp_path: Path, monkeypatch, fake_host, autospec
 ) -> None:
     """Issue #105: dispatch_rework with --issues should also respect concurrency governor."""
 
     # Fake the live-session count to return 0 live sessions
     fake_host(sessions=FakeSessionCounter(workers=0))
+
+    # Issue #3006: this test asserts on the governor's report fields only, never
+    # on what the dispatch command prints, so it must not pay for a real
+    # interpreter start per launched issue (the command adapter runs its argv
+    # synchronously through ``adapters.run_captured``). Fake that one seam.
+    # ``selected_count`` counts SUCCESSFUL launches, so the double reports a
+    # clean exit; ``autospec`` keeps its signature tied to the real runner.
+    spawned: list[str] = []
+
+    def fake_run_captured(command, **kwargs) -> RunResult:
+        spawned.append(command[-1])  # the argv ends in the rendered {issue_number}
+        return RunResult(returncode=0, stdout="", stderr="")
+
+    autospec(monkeypatch, adapters, "run_captured", side_effect=fake_run_captured)
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
@@ -559,6 +575,9 @@ def test_concurrency_governor_clamps_only_issues_rework_dispatch(
     assert result.data["live_session_count"] == 0
     assert result.data["available_slots"] == 2
     assert result.data["deferred_by_concurrency"] == [103]
+    # Only the two admitted issues reached the spawn seam: the deferred third
+    # was never launched, and a launch path that skipped the seam cannot pass.
+    assert spawned == ["101", "102"]
 
 
 def test_concurrency_governor_result_unclamped() -> None:
