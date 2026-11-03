@@ -13,6 +13,10 @@ chain by PID without a tree kill, prove it stayed down):
   request, like a pending stop marker.
 - ``scripts/fleet-pass.ps1`` refuses to start while the flag exists, so the
   scheduled task stays enabled and a pause survives reboot/logon.
+- The one-shot pass entrypoints (``fleet work|bash-rats``, ``work``,
+  ``bash-rats``) are gated once, in ``cli.main``, before ``self_deploy()`` or
+  any dispatch (issue #2660): they exit ``EXIT_FLEET_PAUSED`` unless given
+  ``--ignore-pause``. A command opts in via ``mark_pass_running``.
 
 Unlike the one-shot stop marker (``fleet_stop``) the flag is never consumed by
 the supervisor; only ``resume`` removes it. The flag is read from disk every
@@ -139,6 +143,92 @@ def fleet_pause_status(fleet_dir_override: str | None) -> dict[str, Any] | None:
         "flag": str(layout.fleet_pause_path(fleet_dir_override)),
         "consequence": PAUSE_CONSEQUENCE,
     }
+
+
+#: argparse default a pass-running command carries (set by ``mark_pass_running``).
+#: ``cli.main`` gates on it, so the pause check has one enforcement point and a
+#: command cannot be pass-running without also being guarded (issue #2660).
+PASS_RUNNING_DEST = "runs_pass"
+
+
+def mark_pass_running(parser: argparse.ArgumentParser) -> None:
+    """Declare ``parser``'s command pass-running (issue #2660).
+
+    One call does both halves, so neither can be forgotten alone: it sets the
+    ``runs_pass`` default ``refuse_pass_while_paused`` keys on, and adds the
+    ``--ignore-pause`` override that gate honours.
+    """
+    parser.add_argument(
+        "--ignore-pause",
+        action="store_true",
+        default=False,
+        dest="ignore_pause",
+        help=(
+            f"Run even though the fleet is paused ({layout.FLEET_PAUSE_FILENAME} present, #1776). "
+            "For a deliberate operator one-shot; logged as an override."
+        ),
+    )
+    parser.set_defaults(**{PASS_RUNNING_DEST: True})
+
+
+def _command_label(args: argparse.Namespace) -> str:
+    fleet_command = getattr(args, "fleet_command", None)
+    parts = [str(args.command)] + ([str(fleet_command)] if fleet_command else [])
+    return " ".join(parts)
+
+
+def refuse_pass_while_paused(args: argparse.Namespace) -> CommandResult | None:
+    """Pass-entry gate: ``None`` to proceed, else the ``fleet_paused`` refusal.
+
+    ``fleet supervise`` reads the flag at its own loop boundary and
+    ``fleet-pass.ps1`` before launching; this covers the one-shot entrypoints
+    (``fleet work|bash-rats``, ``work``, ``bash-rats``), which previously ran
+    ``self_deploy()`` and a full pass into a paused fleet. Runs before any of
+    that, from ``cli.main``, so a refused call moves no HEAD and dispatches
+    nothing.
+
+    The refusal's ``data["fleet_paused"]`` makes ``main`` exit
+    ``EXIT_FLEET_PAUSED``, like the supervisor; ``ok`` is True for the same
+    reason (the pause is the operator's own act, not a failure). Commands that
+    are not marked pass-running are never gated.
+    """
+    if not getattr(args, PASS_RUNNING_DEST, False):
+        return None
+    fleet_dir_override = getattr(args, "fleet_dir", None)
+    flag = read_fleet_pause(fleet_dir_override)
+    if flag is None:
+        return None
+    command = _command_label(args)
+    flag_path = layout.fleet_pause_path(fleet_dir_override)
+    reason = flag.get("reason")
+    if getattr(args, "ignore_pause", False):
+        logger.warning(
+            "--ignore-pause: running `charlie %s` although the fleet is paused (%s present, "
+            "paused_at=%s, reason=%s)",
+            command,
+            flag_path,
+            flag.get("paused_at"),
+            reason,
+        )
+        return None
+    message = (
+        f"fleet paused ({layout.FLEET_PAUSE_FILENAME} present at {flag_path}); "
+        f"`charlie {command}` not started -- no self-deploy, no dispatch. "
+        "`charlie fleet resume` clears the pause; --ignore-pause forces a one-shot."
+    )
+    logger.warning(message)
+    return CommandResult(
+        True,
+        message,
+        {
+            "fleet_paused": True,
+            "exit_reason": FLEET_PAUSED,
+            "command": command,
+            "flag": str(flag_path),
+            "paused_at": flag.get("paused_at"),
+            "reason": reason,
+        },
+    )
 
 
 def _supervisor_live(fleet_dir_override: str | None) -> bool:
