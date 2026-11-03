@@ -32,6 +32,14 @@ dispatch:
   # queues or merges the PR — it transitions the issue to agent:operator-queue
   # and posts a PR comment asking a human to merge. Default empty (off).
   # human_merge_labels: [needs-design]
+  # Required checks that only the operator can clear (an approval label, a
+  # sign-off). When every failed required check on a PR is listed here, that
+  # failure is the PR's sole janitor failure, and its bound issue carries a
+  # human_merge_labels label, review parks the issue on agent:operator-queue
+  # instead of recording request_changes and sending a worker to rework a
+  # failure no push can fix. A name only matters if it is also in
+  # auto_merge.required_checks. Default empty (off).
+  # operator_gated_checks: [Tests passed]
   # Claude Code workers use the direct-shell loop (no Devin session skills).
   worker_template: worker_claude_code.md
   # Runner prefix the worker/rework prompts tell workers to run (the prompt adds

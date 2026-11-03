@@ -401,6 +401,19 @@ _NO_COUNTER_ALLOWLIST: dict[str, str] = {
         "review_dispatch_attempt_count (an empty diff is not a review "
         "attempt), so there is nothing to re-arm."
     ),
+    # --- review operator-gated-check route, issue #2920 ---
+    "operator_gated_check_failed": (
+        "Fires when the only failed required checks are in "
+        "``dispatch.operator_gated_checks`` on an issue carrying a "
+        "``human_merge_labels`` label; condition-driven, no counter. The "
+        "re-entry guard is the sink-status check inside the route itself "
+        "(an already-escalated PR is never re-routed), the failed check is "
+        "a janitor blocker so this sweep cannot clear it while the "
+        "operator has not cleared the check, and it clears once the check "
+        "goes green, bounded by ``max_auto_deescalations``. The route does "
+        "not touch review_dispatch_attempt_count (parking a PR is not a "
+        "review attempt), so there is nothing to re-arm."
+    ),
 }
 
 # Dynamic ``reason`` domains that cannot be reduced to a finite literal

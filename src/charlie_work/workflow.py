@@ -249,6 +249,7 @@ from .review_empty_diff_route import (  # noqa: F401  (deliberate re-export)
     route_empty_diff_prs,
 )
 from .no_op_rework_body import _body_content_sha256  # noqa: F401  (deliberate re-export; reached via _wf. by orchestration/state_record_review.py)
+from .operator_gated_route import park_operator_gated_review
 
 # LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
 # below marks a deliberate re-export, not a lint concession.
@@ -2887,6 +2888,21 @@ class OrchestratorApp:
             autofixed = autofix_body_closing_kw(self, pr, issue_number, verdict, checks)
             if autofixed is not None:  # #2108: body-only Lint failure, workers can't edit it
                 return autofixed
+            # Issue #2920: a check only the operator can clear is not a code failure --
+            # no rerun, request_changes or worker round can change it. Park it.
+            parked = park_operator_gated_review(
+                config=self.config,
+                state_file=self.paths.state_file,
+                write_gate=self.write_gate,
+                gh=self.gh,
+                pr=pr,
+                pr_number=pr_number,
+                issue=issue,
+                issue_number=issue_number,
+                verdict=verdict,
+            )
+            if parked is not None:
+                return _CommandResult(False, parked.message, parked.data)
             # Flake-aware debounce (issue #391): if the only blocker is a failed
             # required check and we have not yet retried the Actions run for this
             # head, trigger one automatic `gh run rerun --failed` and defer rework
