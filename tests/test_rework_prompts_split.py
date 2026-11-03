@@ -65,7 +65,7 @@ import ast
 from pathlib import Path
 
 import pytest
-from _src_ast import parsed, parsed_source
+from _src_ast import parsed, parsed_source, source_text
 from _workflow_consumer_scan import consumer_referenced_names
 
 _REPO_ROOT = Path(__file__).parents[1]
@@ -699,6 +699,46 @@ def _write_event_call_sites(source: str, *, filename: str = "<string>") -> list[
     return hits
 
 
+def _scan_until_covered(corpus: list[Path], names: set[str]) -> tuple[set[str], list[Path]]:
+    """Run ``_write_event_call_sites`` over only as much of ``corpus`` as it
+    takes to see a real call site for every name in ``names``.
+
+    Returns ``(found, scanned)``: every call name the scanner reported in the
+    files it ran on, and those files in scan order. Issue #2967: the positive
+    control below used to parse and AST-walk all ~63 orchestrator files to
+    prove four names each appear somewhere; the walk is pure-Python and its
+    cold parse lands on whichever xdist worker reaches the tree first, so the
+    call phase swung ~0.25 s -> ~0.85 s on CI. A superset check needs one
+    confirmed site per name, not every site.
+
+    For each still-uncovered name, only files whose text contains it are
+    scanned, in corpus order, stopping at the first file where the scanner
+    confirms a ``Call`` node. A file that merely *mentions* the name in prose
+    (docstring, comment) is scanned and found empty, and the search moves on
+    -- the text needle selects candidates, it never counts as a hit.
+
+    Fail direction: the needle is a plain substring test, and the parser
+    NFKC-normalizes identifiers, so a name spelled with compatibility
+    characters (fullwidth ``ｗrite_text``) would be matched by the scanner but
+    not selected here. That can only leave a name uncovered -- the control
+    then fails loudly -- never cover one that has no real call site, so
+    unlike a guard that must find *every* bypass this needs no NFKC fold.
+    """
+    texts = {path: source_text(path) for path in corpus}
+    found: set[str] = set()
+    scanned: list[Path] = []
+    for name in sorted(names):
+        for path in corpus:
+            if name in found:
+                break
+            if path in scanned or name not in texts[path]:
+                continue
+            scanned.append(path)
+            hits = _write_event_call_sites(texts[path], filename=str(path))
+            found |= {str(hit["name"]) for hit in hits}
+    return found, scanned
+
+
 def test_rework_prompts_write_event_surface_is_exactly_the_two_known_atomic_writes() -> None:
     """AC9 (post-move, corrected): re-confirms, against the FINAL moved spans
     in rework_prompts.py (not just the pre-move workflow.py spans the recon
@@ -777,20 +817,98 @@ def test_write_event_call_scanner_has_a_positive_control() -> None:
     archive-copy call sites -- moved to ``orchestration/state_record_review``,
     so the corpus spans the delegate modules; dropping a name from
     ``expected_broad_coverage`` instead would be the weakening this prevents.
+
+    issue #2967: the assertion is a superset check, so it is evaluated by
+    ``_scan_until_covered`` -- which scans only the files that can supply each
+    name instead of walking the whole corpus. The claim is unchanged: every
+    expected name has a real ``Call`` node somewhere in the corpus.
     """
-    found_names = {
-        hit["name"]
-        for path in [_WORKFLOW_PATH, *sorted(_ORCHESTRATION_DIR.glob("*.py"))]
-        for hit in _write_event_call_sites(path.read_text(encoding="utf-8"), filename=str(path))
-    }
-    assert found_names, "the scanner found zero call sites in the corpus -- the scanner is broken"
+    corpus = [_WORKFLOW_PATH, *sorted(_ORCHESTRATION_DIR.glob("*.py"))]
     expected_broad_coverage = {"_write_json", "_write_text_atomic", "append_event", "log_event"}
+    found_names, _scanned = _scan_until_covered(corpus, expected_broad_coverage)
+    assert found_names, "the scanner found zero call sites in the corpus -- the scanner is broken"
     missing = expected_broad_coverage - found_names
     assert missing == set(), (
         f"scanner found zero call sites for {sorted(missing)} across the orchestrator corpus, "
         "which is known to contain calls to all of them -- the scanner's Call-node matching "
         "is broken"
     )
+
+
+def _write_corpus(tmp_path: Path, sources: dict[str, str]) -> list[Path]:
+    paths: list[Path] = []
+    for filename, source in sources.items():
+        path = tmp_path / filename
+        path.write_text(source, encoding="utf-8")
+        paths.append(path)
+    return paths
+
+
+_PROSE_ONLY = 'def f():\n    """Mentions log_event and append_event in prose only."""\n'
+_CALLS_LOG_EVENT = "def g(x):\n    log_event(x)\n"
+_CALLS_APPEND_EVENT = "def h(x):\n    append_event(x)\n"
+
+
+def test_scan_until_covered_skips_prose_mentions_and_stops_once_covered(tmp_path: Path) -> None:
+    """Issue #2967: the needle only SELECTS candidate files; a prose-only
+    mention is scanned, found empty, and the search moves on; and once the
+    name is covered no further file is scanned (the walk is what was slow)."""
+    prose, real, later_real, no_needle = _write_corpus(
+        tmp_path,
+        {
+            "a_prose.py": _PROSE_ONLY,
+            "b_real.py": _CALLS_LOG_EVENT,
+            "c_later_real.py": _CALLS_LOG_EVENT,
+            "d_no_needle.py": "def k():\n    return 1\n",
+        },
+    )
+    # Measured, not labelled: the real scanner agrees with how the files are named.
+    assert _write_event_call_sites(prose.read_text(encoding="utf-8")) == []
+    assert [h["name"] for h in _write_event_call_sites(real.read_text(encoding="utf-8"))] == [
+        "log_event"
+    ]
+
+    found, scanned = _scan_until_covered([prose, real, later_real, no_needle], {"log_event"})
+
+    assert "log_event" in found
+    assert scanned == [prose, real]
+
+
+def test_scan_until_covered_fails_closed_on_a_name_with_no_real_call(tmp_path: Path) -> None:
+    """A name that appears only in prose (or nowhere) stays uncovered: the
+    needle never counts as a hit, so the positive control cannot pass vacuously."""
+    prose, no_needle = _write_corpus(
+        tmp_path, {"a_prose.py": _PROSE_ONLY, "b_none.py": "def k():\n    return 1\n"}
+    )
+
+    found, scanned = _scan_until_covered([prose, no_needle], {"append_event"})
+    assert found == set()
+    assert scanned == [prose]
+
+    found, scanned = _scan_until_covered([prose, no_needle], {"_write_json"})
+    assert (found, scanned) == (set(), [])
+
+
+def test_scan_until_covered_never_rescans_a_file_and_covers_every_name(tmp_path: Path) -> None:
+    """Two names, three files: the prose file is a candidate for BOTH names
+    (its text mentions each) but is scanned once -- the second name finds it
+    already scanned and moves on -- and each name is covered by the first file
+    that really calls it."""
+    prose, append_real, log_real = _write_corpus(
+        tmp_path,
+        {
+            "a_prose.py": _PROSE_ONLY,
+            "b_append_real.py": _CALLS_APPEND_EVENT,
+            "c_log_real.py": _CALLS_LOG_EVENT,
+        },
+    )
+
+    found, scanned = _scan_until_covered(
+        [prose, append_real, log_real], {"append_event", "log_event"}
+    )
+
+    assert {"append_event", "log_event"} <= found
+    assert scanned == [prose, append_real, log_real]
 
 
 def test_write_event_call_scanner_ignores_docstring_mentions() -> None:

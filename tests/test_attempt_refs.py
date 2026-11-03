@@ -13,6 +13,9 @@ import subprocess
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
+import _git_templates
 from _worktree_fixtures import _init_repo as _init_repo_templated
 from charlie_work.attempt_refs import (
     ATTEMPT_REF_PREFIX,
@@ -39,6 +42,58 @@ def _init_repo(repo_root: Path) -> None:
     _init_repo_templated(repo_root)
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _warm_plain_git_template(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> _git_templates.EnvKey | None:
+    """HS-CW-4: charge the ``plain`` git-template cold build to module setup.
+
+    ``_init_repo`` materializes from a per-process template whose first use in
+    an xdist worker runs the five-spawn ``git`` build (``init``/``config``/
+    ``commit``); every later use is a spawn-free ``copytree``. Whichever test
+    reaches ``_init_repo`` first on a worker pays the build inside its own
+    ``call`` phase -- and ``test_init_repo_goes_through_the_git_template`` is
+    this module's first consumer, so when the module is the first ``plain``
+    user on its worker (the common case in the ledger's selected runs) the
+    whole build landed in that test's ``call``. At the ~113 ms/spawn the
+    Windows CI host pays, five spawns are ~0.56 s: the ledger's 0.387 s -> 0.944 s
+    median (issue #2968). The first slow SHA touches only claude-adapter
+    fixtures, so this is the cold share of the sample window moving, not a
+    change to this code path (same mechanism as #2565 and #2577).
+
+    The ledger alerts on ``call_us`` and reports ``setup_us`` separately
+    (``slow-fixtures``), so resource acquisition belongs here: materializing
+    one scratch repo at module setup moves the build into the ``setup`` column
+    and leaves every ``call`` a copy. When the template is already warm the
+    warm-up is one extra ~10 ms copy.
+
+    ``TemplateRegistry`` keys templates by ``(shape, env_fingerprint())``, which
+    covers every ``GIT_*`` variable except ``GIT_CEILING_DIRECTORIES``. The
+    function-scoped autouse ``conftest._isolate_git_env`` sets the
+    ``GIT_CONFIG_*`` trio only *after* module fixtures run, so a warm-up
+    without it would register a template under a fingerprint no ``call`` ever
+    looks up and the build would still land in a test. The trio is therefore
+    applied through ``_git_templates.GIT_CONFIG_ENV`` -- the mapping conftest
+    itself reads, so the two cannot drift -- in a ``MonkeyPatch`` context.
+
+    Returns the fingerprint under which a ``plain`` template is *verifiably
+    registered* when setup ends, not the one merely assumed: ``None`` under
+    ``CI_FLEET_TEST_REUSE=off`` (no registry to warm) or when the build failed
+    and the shape fell back to the fresh path. That keeps
+    ``test_plain_git_template_warmed_by_module_setup`` from passing on a
+    warm-up that never built anything.
+    """
+    if not _git_templates.reuse_enabled():
+        return None
+    with pytest.MonkeyPatch.context() as mp:
+        for key, value in _git_templates.GIT_CONFIG_ENV.items():
+            mp.setenv(key, value)
+        _init_repo(tmp_path_factory.mktemp("plain-template-warmup") / "repo")
+        if _git_templates._REGISTRY.lookup("plain") is None:
+            return None
+        return _git_templates.env_fingerprint()
+
+
 def test_init_repo_goes_through_the_git_template(tmp_path: Path) -> None:
     """Issue #2462 regression pin: ``_init_repo`` must materialize through the
     per-process ``plain`` git template (``_git_templates``) instead of
@@ -48,7 +103,6 @@ def test_init_repo_goes_through_the_git_template(tmp_path: Path) -> None:
     baseline because each of this module's tests paid the full spawn cost on
     the Windows CI host. Mirrors ``test_local_issues_loop_gates``'s #2425 pin.
     """
-    import _git_templates
     from _worktree_fixtures import _git as wt_git
 
     before = _git_templates._REGISTRY.materialized["plain"]
@@ -56,6 +110,55 @@ def test_init_repo_goes_through_the_git_template(tmp_path: Path) -> None:
     _init_repo(repo)
     assert _git_templates._REGISTRY.materialized["plain"] == before + 1
     assert wt_git(repo, "rev-parse", "--verify", "main").stdout.strip()
+
+
+@pytest.mark.skipif(
+    not _git_templates.reuse_enabled(),
+    reason="CI_FLEET_TEST_REUSE=off forces the fresh path; there is no template to pin",
+)
+def test_plain_git_template_warmed_by_module_setup(
+    _warm_plain_git_template: _git_templates.EnvKey | None, tmp_path: Path
+) -> None:
+    """Issue #2968 regression pin: the ``plain`` template is built at module
+    setup, under the fingerprint the ``call`` phase looks up, so no test in
+    this module pays the five-spawn cold build.
+
+    Three independent ways for that to break, each caught here:
+
+    * the warm-up is missing or its build failed -- the fixture returns ``None``
+      (it only returns a fingerprint once ``lookup("plain")`` hits), so this is
+      checked even when an earlier test in the module already built the
+      template and a ``lookup`` made here would still hit;
+    * the warm-up runs under a different environment than a test does (the
+      ``GIT_CONFIG_*`` trio ``conftest._isolate_git_env`` injects per test) --
+      the fingerprints differ and the template can never be looked up;
+    * the ``call`` phase builds or spawns anyway -- ``_init_repo`` must be a
+      spawn-free copy that adds no registry key.
+    """
+    warmed_env = _warm_plain_git_template
+    assert warmed_env is not None, (
+        "module setup did not leave a plain template registered (warm-up missing "
+        "or its build fell back to the fresh path)"
+    )
+    call_env = _git_templates.env_fingerprint()
+    assert warmed_env == call_env, (
+        "module warm-up ran under a different env fingerprint than the call "
+        "phase; its template can never be looked up"
+    )
+    registry = _git_templates._REGISTRY
+    keys_before = set(registry._templates)
+    copies_before = registry.materialized["plain"]
+
+    with mock.patch.object(subprocess, "Popen", wraps=subprocess.Popen) as popen:
+        _init_repo(tmp_path / "probe")
+
+    assert popen.call_count == 0, (
+        "the call phase spawned a process instead of copying the template"
+    )
+    assert registry.materialized["plain"] == copies_before + 1
+    assert set(registry._templates) == keys_before, (
+        "the call phase built a new plain template instead of copying the warmed one"
+    )
 
 
 def _commit(repo_root: Path, name: str, content: str) -> str:
