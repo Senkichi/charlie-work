@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypedDict
@@ -276,6 +277,7 @@ def run_captured(
     shell: bool = False,
     stdin: str | None = None,
     extra_env: dict[str, str] | None = None,
+    base_env: Mapping[str, str] | None = None,
 ) -> RunResult:
     """Run ``command`` and capture output. Never raises for runtime failures —
     timeouts, missing binaries, and non-zero exits all come back as a result.
@@ -285,6 +287,12 @@ def run_captured(
     break the child's ability to even find ``git``. ``_NON_INTERACTIVE_ENV``
     is always layered between the two, so ``extra_env`` can still override it.
 
+    ``base_env`` (issue #2810) replaces ``os.environ`` as the base layer, for a
+    caller that must run the child in a *sanitized* environment -- layering can
+    only add variables, never remove an ambient one such as ``ACP_BACKEND``.
+    It must be a complete environment (``env_sanitize.sanitize_env`` returns
+    one), since nothing from ``os.environ`` is merged back in.
+
     ``timeout_seconds`` bounds the whole call, descendants included: on
     timeout the process *tree* is killed and the pipe drain is itself bounded
     (issue #2139). ``stdin=None`` gives the child ``DEVNULL`` -- never the
@@ -292,7 +300,11 @@ def run_captured(
     ``cwd=None`` inherits the current directory -- it must reach ``Popen`` as
     ``None``, never as ``str(None)`` (issue #2450).
     """
-    env = {**os.environ, **_NON_INTERACTIVE_ENV, **(extra_env or {})}
+    env = {
+        **(os.environ if base_env is None else base_env),
+        **_NON_INTERACTIVE_ENV,
+        **(extra_env or {}),
+    }
     # POSIX: a new session puts the child in its own process group so
     # ``kill_process_tree``'s ``killpg`` can reach its descendants (it refuses
     # the caller's own group), and drops the controlling terminal.

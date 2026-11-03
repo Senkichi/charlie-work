@@ -68,7 +68,7 @@ from .fleet_stop import (
     fleet_stop_pending,
     supervise_loop_interrupted_result,
 )
-from . import launchd_probe, layout
+from . import harness_auth_block, launchd_probe, layout
 from .github import GitHub, GitHubError
 from .global_config import (
     describe_config_file,
@@ -1939,6 +1939,9 @@ def fleet_loop(
     # Allocation first: moving an idle slot to a starved repo is free, so it
     # runs before autoscale decides the host needs more runners registered.
     if not work_only:
+        harness_auth_block.run_fleet_pass(  # issue #2810 episode step; no-op w/o a block
+            global_config, fleet_dir_override, notify_config, dry_run
+        )
         allocation_lane_start = pass_clock()
         attention_events.extend(
             _run_fleet_allocation_prologue(fleet_dir_override, global_config, dry_run)

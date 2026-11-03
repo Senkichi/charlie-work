@@ -12,7 +12,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import psutil
 import pytest
+from _process_guard import reap_pid
 from _src_ast import source_text
 
 import charlie_work.fleet_dispatch as fleet_dispatch
@@ -41,6 +43,8 @@ _LABEL = "com.senkichi.hosts.charlie-fleet"
 # Bound at import, before conftest's autouse stub replaces the module attribute
 # for every test (the test_host_load.py idiom).
 _REAL_LIST_HOST_PROCESSES = host_load.list_host_processes
+# Bound at import, before any test can fake ``psutil.Process``.
+_REAL_PSUTIL_PROCESS = psutil.Process
 
 
 def _rows() -> tuple[ProcessInfo, ...]:
@@ -156,18 +160,52 @@ def test_child_pids_without_procfs_come_from_ps(monkeypatch: pytest.MonkeyPatch)
 class _FakeProcess:
     def __init__(self, pid: int) -> None:
         if pid == 404:
-            raise process_utils.psutil.NoSuchProcess(pid)
+            raise psutil.NoSuchProcess(pid)
         self.pid = pid
 
     def create_time(self) -> float:
         return 1_760_000_000.25
 
 
-def test_start_time_on_macos_comes_from_psutil(monkeypatch: pytest.MonkeyPatch) -> None:
+def _fake_macos_psutil(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force the macOS start-time branch onto a fake ``psutil.Process``.
+
+    The fake is bound on ``process_utils``' own ``psutil`` name, never on the
+    shared ``psutil`` module: ``process_utils.psutil`` *is* that module, so
+    ``setattr(process_utils.psutil, "Process", ...)`` swaps ``Process`` for every
+    caller in the interpreter -- including ``tests/conftest.py``'s autouse
+    ``_reap_launched_worker_pids`` teardown, which runs while the patch is still
+    active and calls ``psutil.Process(pid).children()`` for any pid a launcher
+    returned. That is the ``AttributeError: '_FakeProcess' object has no
+    attribute 'children'`` teardown failure seen in PR #2844's "Tests shard 4/6".
+    """
     monkeypatch.setattr(process_utils, "sys", SimpleNamespace(platform="darwin"))
-    monkeypatch.setattr(process_utils.psutil, "Process", _FakeProcess)
+    monkeypatch.setattr(
+        process_utils,
+        "psutil",
+        SimpleNamespace(Process=_FakeProcess, Error=psutil.Error),
+    )
+
+
+def test_start_time_on_macos_comes_from_psutil(monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_macos_psutil(monkeypatch)
     assert process_utils.get_process_start_time(777) == 1_760_000_000.25
     assert process_utils.get_process_start_time(404) is None
+
+
+def test_macos_start_time_fake_does_not_reach_the_teardown_helpers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fake must stay local to ``process_utils``.
+
+    ``reap_pid`` is what the autouse ``_reap_launched_worker_pids`` fixture runs
+    for every pid a launcher returned, *before* ``monkeypatch`` is undone. Run
+    it here, with the fake installed, as the teardown would: it must still see
+    the real ``psutil.Process`` (a fabricated pid is declined, never killed).
+    """
+    _fake_macos_psutil(monkeypatch)
+    reap_pid(4242)
+    assert psutil.Process is _REAL_PSUTIL_PROCESS
 
 
 def test_host_load_on_macos_lists_processes_with_ps(monkeypatch: pytest.MonkeyPatch) -> None:
