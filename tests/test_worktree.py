@@ -19,6 +19,7 @@ from _worktree_fixtures import (
     _git,
     _init_repo,
     _seed_staged_addition_bubble,
+    _seed_tracked_venv_branch,
 )
 from charlie_work.config import (
     DevinConfig,
@@ -296,27 +297,13 @@ def test_create_worktree_rejects_existing_venv_link_target(tmp_path: Path) -> No
     _init_repo(repo_root)
     venv_source = tmp_path / "shared-venv"
     venv_source.mkdir()
+    # The base ref tracks ``.venv/``, so the fresh worktree already holds the
+    # link target (a hand-made stale dir would die earlier, in ``git worktree
+    # add``, and never reach the guard -- issue #2915). ``match`` pins the guard.
+    base_ref = _seed_tracked_venv_branch(repo_root)
 
-    # First creation succeeds and leaves a worktree at the deterministic slug path.
-    info = create_worktree(
-        repo_root, "agent/issue-6-dup", base_ref="HEAD", venv_source=venv_source
-    )
-    remove_worktree(repo_root, info.path)
-
-    # Recreate the directory structure manually with a pre-existing .venv to
-    # simulate stale state that create_worktree must not silently clobber.
-    stale_path = info.path
-    stale_path.mkdir(parents=True)
-    (stale_path / ".venv").mkdir()
-
-    with pytest.raises(RuntimeError):
-        create_worktree(
-            repo_root,
-            "agent/issue-6-dup",
-            base_ref="HEAD",
-            worktrees_dir=info.path.parent,
-            venv_source=venv_source,
-        )
+    with pytest.raises(RuntimeError, match="venv link target already exists"):
+        create_worktree(repo_root, "agent/issue-6-dup", base_ref=base_ref, venv_source=venv_source)
 
 
 def test_list_worktrees_parses_porcelain_output(tmp_path: Path) -> None:
