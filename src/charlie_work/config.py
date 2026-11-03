@@ -2312,6 +2312,10 @@ class FleetConfig:
     back. ON by default; ``false`` restores the pre-#2810 behaviour exactly
     (no classification, no block, no probe, no alert), and an already-recorded
     block stops being honored the moment it is flipped.
+
+    ``retired`` (issue #2754) is read from the repo's own config file only.
+    ``global_config.load_layered_config`` strips it from the fleet-wide
+    layer, so a global value cannot retire every repo in the fleet.
     """
 
     global_max_concurrent_sessions: Annotated[int, Typed, BoolTolerant] = 0
@@ -2321,6 +2325,9 @@ class FleetConfig:
     launch_lock_wait_seconds: Annotated[float, Typed, NonNeg, Finite] = 10.0
     max_concurrent_sessions_by_harness: Mapping[str, int] = field(default_factory=dict)
     harness_auth_block_enabled: Annotated[bool, Typed] = True
+    # Issue #2754: per-repo retirement. The layered loader removes this key
+    # from the user-global layer; see repo_retirement.
+    retired: Annotated[bool, Typed] = False
 
     def __post_init__(self) -> None:  # validate + freeze: one point for parsed and hand-built
         key = "max_concurrent_sessions_by_harness"

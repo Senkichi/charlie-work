@@ -50,7 +50,7 @@ from . import layout
 from .config import ConfigError
 from .fleet_dispatch import compute_api_worker_fleet_report
 from .fleet_pause import fleet_pause_status
-from .fleet_registry import _load_registry
+from .fleet_registry import _load_registry, _select_repos
 from .github import GitHub, GitHubError
 from .global_config import load_layered_config
 from .local_issues import github_client_for
@@ -115,10 +115,18 @@ def run_fleet_status(args: argparse.Namespace) -> CommandResult:
     # joins the same list -- a slow lane, like a dead one, must not pin the
     # aggregate against the heartbeat's 120s subprocess cap.
     stale: list[dict[str, str]] = []
+    # Issue #2754: a retired repo is reported as retired, never as stale or
+    # errored, and its status is not recomputed. ``_select_repos`` derives
+    # the flag from the repo's own config, so a fresh flip shows up without
+    # waiting for the supervisor.
+    retired: list[dict[str, str]] = []
 
     live: dict[str, Path] = {}
-    for repo_key, entry in sorted(registry.get("repos", {}).items()):
+    for repo_key, entry in _select_repos(registry, None):
         repo_root = Path(entry.get("repo_root") or "")
+        if entry.get("retired"):
+            retired.append({"repo_key": repo_key, "repo_root": str(repo_root)})
+            continue
         if not repo_root.exists():
             # Issue #1372: a stale entry is not a live failing lane —
             # report it separately so it does not affect the exit code.
@@ -194,13 +202,14 @@ def run_fleet_status(args: argparse.Namespace) -> CommandResult:
         ok=not errors,
         message=(
             f"fleet status: {len(per_repo)} repo(s), {len(errors)} error(s), "
-            f"{len(stale)} stale(s){paused_note}"
+            f"{len(stale)} stale(s), {len(retired)} retired(s){paused_note}"
         ),
         data={
             "pause": pause,
             "repos": per_repo,
             "errors": errors,
             "stale": stale,
+            "retired": retired,
             "api_worker_report": api_worker_report.to_dict()
             if api_worker_report is not None
             else None,
