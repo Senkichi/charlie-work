@@ -92,9 +92,13 @@ def _supervise(
     heal: Callable[..., BootSyncRepair],
     *,
     watchdog: WatchdogProbe = _WATCHDOG_UNKNOWN,
+    run: _Run | None = None,
 ) -> tuple[CommandResult, _Run]:
-    """Run ``run_fleet_supervise`` for one pass with ``heal`` as the boot repair."""
-    run = _Run(tmp_path / "fleet", watchdog)
+    """Run ``run_fleet_supervise`` for one pass with ``heal`` as the boot repair.
+
+    Pass ``run`` to keep a handle on the seams when the call is expected to raise.
+    """
+    run = run or _Run(tmp_path / "fleet", watchdog)
     for name, replacement in (
         ("try_acquire_supervisor_lock", lambda *_a, **_k: run.lock),
         ("load_layered_config", run.load_config),
@@ -321,6 +325,27 @@ def test_disarmed_watchdog_is_alerted_on_a_boot_sync_restart(
     assert len(events) == 1
     assert events[0]["payload"]["exit_reason"] == BOOT_SYNC_EXIT_REASON
     run.emit.assert_not_called()
+
+
+def test_watchdog_probe_failure_still_releases_the_supervisor_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A raise between the repair and the restart exit must not strand the lock.
+
+    The probe runs inside ``boot_sync_restart_result`` *before* it releases the lock,
+    so on a raise the release comes from ``run_fleet_supervise``'s startup handler.
+    Without it a duplicate launch would see "already running" for the life of this
+    process. The error still propagates: the supervisor does not swallow it.
+    """
+    run = _Run(tmp_path / "fleet", _WATCHDOG_UNKNOWN)
+    run.probe.side_effect = RuntimeError("schtasks exploded")
+    outcome = BootSyncRepair(detected_via="probe", synced=True)
+
+    with pytest.raises(RuntimeError, match="schtasks exploded"):
+        _supervise(tmp_path, monkeypatch, _stub_repair(outcome), run=run)
+
+    run.lock.release.assert_called_once_with()
+    run.load_config.assert_not_called()
 
 
 def test_unknown_watchdog_raises_no_alert(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

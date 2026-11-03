@@ -86,7 +86,11 @@ from .notify_freshness import (
     resolve_fleet_notify,
 )
 from .paths import runtime_paths, worktree_roots
-from .pending_sync import BOOT_SYNC_EXIT_REASON, heal_pending_sync_at_boot
+from .pending_sync import (
+    BOOT_SYNC_EXIT_REASON,
+    boot_sync_restart_result,
+    heal_pending_sync_at_boot,
+)
 from .repo_retirement import (
     entry_is_retired,
     retired_pass_disposition,
@@ -2960,24 +2964,13 @@ def run_fleet_supervise(
                 # exit for a relaunch before loading config. Keyed on ``synced`` alone: a
                 # failed, deferred or no-op repair changed nothing and must not restart.
                 logger.info("Boot pending-sync repair: synced via %s", boot_repair.detected_via)
-                watchdog = probe_fleet_watchdog()  # #604: same check as the other restarts
-                if watchdog.armed is False:
-                    _alert_watchdog_not_armed(
-                        watchdog,
-                        exit_reason=BOOT_SYNC_EXIT_REASON,
-                        notify_config=None,  # config is not loaded yet
-                        notify_enabled=False,
-                        fleet_dir_override=fleet_dir_override,
-                        now_str=datetime.datetime.now().strftime("%H:%M:%S"),
-                    )
-                lock.release()
-                return CommandResult(
-                    True,
-                    f"boot repair synced via {boot_repair.detected_via}; restarting for new deps",
-                    {
-                        "exit_reason": BOOT_SYNC_EXIT_REASON,
-                        "restart_requested": BOOT_SYNC_EXIT_REASON in RESTART_EXIT_REASONS,
-                    },
+                return boot_sync_restart_result(
+                    boot_repair,
+                    lock=lock,
+                    fleet_dir_override=fleet_dir_override,
+                    restart_exit_reasons=RESTART_EXIT_REASONS,
+                    probe_watchdog=probe_fleet_watchdog,
+                    alert_watchdog_not_armed=_alert_watchdog_not_armed,
                 )
 
         def _report_global_load_failure(exc: Exception) -> None:

@@ -29,10 +29,11 @@ import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from . import layout
 from .atomic_write import write_json_atomic
+from .command_result import CommandResult
 from .instrumentation import log_event
 from .state import utc_now
 from .subprocess_runner import RunResult, command_failure_message, run_captured
@@ -522,3 +523,65 @@ def _boot_sync_repair(
         },
     )
     return BootSyncRepair(detected_via=detected_via, synced=True)
+
+
+class _Releasable(Protocol):
+    """The slice of the supervisor lock the restart exit needs."""
+
+    def release(self) -> None: ...
+
+
+class _WatchdogProbeLike(Protocol):
+    """The slice of ``fleet_dispatch.WatchdogProbe`` the restart exit reads."""
+
+    @property
+    def armed(self) -> bool | None: ...
+
+
+def boot_sync_restart_result(
+    repair: BootSyncRepair,
+    *,
+    lock: _Releasable,
+    fleet_dir_override: str | None,
+    restart_exit_reasons: frozenset[str],
+    probe_watchdog: Callable[[], _WatchdogProbeLike],
+    alert_watchdog_not_armed: Callable[..., None],
+) -> CommandResult:
+    """Build the supervisor's exit for a boot repair that synced (issue #2919).
+
+    The sync replaced packages this process had already imported, so it exits
+    for a relaunch before loading config. In order: probe the watchdog (#604, the
+    same armed-check the other two restart exits make) and alert only on a
+    confirmed ``armed=False``; release the fleet-supervisor lock so the relaunched
+    process can take it; return the restart ``CommandResult``.
+
+    The watchdog probe, its alert, and ``RESTART_EXIT_REASONS`` all live in
+    ``fleet_dispatch``, which imports this module -- so the caller passes them in
+    rather than this module importing them back. ``run_fleet_supervise`` resolves
+    them from its own globals at call time, which is also what keeps the
+    ``charlie_work.fleet_dispatch.*`` monkeypatches effective. ``restart_requested``
+    is derived from ``restart_exit_reasons``, never set by hand.
+
+    Raising before ``lock.release()`` is safe: the caller's startup ``try`` releases
+    the lock on any ``BaseException``. Config is not loaded yet, so the alert has
+    no notify sink and goes to the console and the fleet ``events.db`` only.
+    """
+    watchdog = probe_watchdog()
+    if watchdog.armed is False:
+        alert_watchdog_not_armed(
+            watchdog,
+            exit_reason=BOOT_SYNC_EXIT_REASON,
+            notify_config=None,
+            notify_enabled=False,
+            fleet_dir_override=fleet_dir_override,
+            now_str=datetime.datetime.now().strftime("%H:%M:%S"),
+        )
+    lock.release()
+    return CommandResult(
+        True,
+        f"boot repair synced via {repair.detected_via}; restarting for new deps",
+        {
+            "exit_reason": BOOT_SYNC_EXIT_REASON,
+            "restart_requested": BOOT_SYNC_EXIT_REASON in restart_exit_reasons,
+        },
+    )
