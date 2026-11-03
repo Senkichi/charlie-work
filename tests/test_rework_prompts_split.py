@@ -62,11 +62,11 @@ documents for its own family):
 from __future__ import annotations
 
 import ast
-import re
 from pathlib import Path
 
 import pytest
-from _src_ast import parsed, parsed_source, source_files, source_text
+from _src_ast import parsed, parsed_source
+from _workflow_consumer_scan import consumer_referenced_names
 
 _REPO_ROOT = Path(__file__).parents[1]
 _REWORK_PROMPTS_PATH = _REPO_ROOT / "src" / "charlie_work" / "rework_prompts.py"
@@ -396,61 +396,10 @@ def _display_path(path: Path) -> str:
 def _consumer_referenced_names(candidates: set[str], search_roots: list[Path]) -> dict[str, str]:
     """name -> one file that reaches it through ``charlie_work.workflow``.
 
-    Walks every ``.py`` file under ``search_roots`` for three reference forms
-    (confirmed to be the only forms in use for this family by a direct grep
-    sweep during preflight):
-
-    1. ``from charlie_work.workflow import <name>`` / ``from .workflow import
-       <name>`` (AST ``ImportFrom``, so a multi-line parenthesized import
-       block is caught the same as a single-line one).
-    2. ``workflow.<name>`` / ``workflow_module.<name>`` / ``wf.<name>``
-       attribute access (regex, word-bounded so e.g.
-       ``_render_required_changes_section`` cannot partially match a longer
-       name).
-    3. The string-dotted monkeypatch form
-       ``monkeypatch.setattr("charlie_work.workflow.<name>", ...)`` -- matched
-       only when the token is quote-delimited, so a prose/docstring
-       cross-reference like ```` ``charlie_work.workflow._write_rework_prompt`` ````
-       (backtick-quoted, not a real string literal) is not mistaken for a
-       real monkeypatch target.
+    The three reference forms and the scan's cost model live in
+    ``_workflow_consumer_scan`` (one scan shared by every facade-split family).
     """
-    attr_patterns = {
-        name: re.compile(
-            rf"(?<![.\w])(?:workflow|workflow_module|cw_workflow|wf)\.{re.escape(name)}\b"
-        )
-        for name in candidates
-    }
-    string_patterns = {
-        name: re.compile(rf"""(['"])charlie_work\.workflow\.{re.escape(name)}\b""")
-        for name in candidates
-    }
-
-    found: dict[str, str] = {}
-    for root in search_roots:
-        if not root.is_dir():
-            continue
-        for path in source_files(root):
-            source = source_text(path)
-            try:
-                tree = parsed(path)
-            except SyntaxError:  # pragma: no cover - a broken tree is a different failure
-                continue
-            for node in ast.walk(tree):
-                if isinstance(node, ast.ImportFrom):
-                    module_is_workflow = node.module == "charlie_work.workflow" or (
-                        node.level == 1 and node.module == "workflow"
-                    )
-                    if not module_is_workflow:
-                        continue
-                    for alias in node.names:
-                        if alias.name in candidates:
-                            found.setdefault(alias.name, _display_path(path))
-            for name in candidates:
-                if name in found:
-                    continue
-                if attr_patterns[name].search(source) or string_patterns[name].search(source):
-                    found[name] = _display_path(path)
-    return found
+    return consumer_referenced_names(candidates, search_roots, display=_display_path)
 
 
 def test_facade_reexports_every_name_consumers_reach_through_workflow() -> None:
