@@ -65,6 +65,7 @@ from .config_validation import (
     unknown_sections_error,
     validate_section,
 )
+from .test_adequacy_globs import DEFAULT_TEST_PATH_GLOBS
 
 # Re-exported from the domain module (issue #763) for the same reason
 # ``RunnerAllocationConfig`` is re-exported from ``ci_fleet.config`` above:
@@ -2226,12 +2227,9 @@ class TestAdequacyConfig:
 
     enabled: Annotated[bool, Typed] = False
     min_product_lines: Annotated[int, Typed, BoolTolerant] = 10
-    test_path_globs: Annotated[tuple[str, ...], Typed] = (
-        "tests/**",
-        "test_*.py",
-        "*_test.py",
-        "conftest.py",
-    )
+    # Issue #1707: root- and nested-layout, multi-language defaults live in
+    # ``test_adequacy_globs`` (one definition shared with ``CoverageProbeConfig``).
+    test_path_globs: Annotated[tuple[str, ...], Typed] = DEFAULT_TEST_PATH_GLOBS
     exempt_path_globs: Annotated[tuple[str, ...], Typed] = (
         "*.md",
         "docs/**",
@@ -2291,15 +2289,12 @@ class CoverageProbeConfig:
     enabled: Annotated[bool, Typed] = False
 
     # -- W3: branch-token-vs-test-add heuristic ------------------------------
-    # Path-classification defaults mirror TestAdequacyConfig's own, kept as
-    # an independent copy (not a shared reference) so the two gates can be
-    # configured separately without coupling.
-    test_path_globs: Annotated[tuple[str, ...], Typed] = (
-        "tests/**",
-        "test_*.py",
-        "*_test.py",
-        "conftest.py",
-    )
+    # Path-classification defaults mirror TestAdequacyConfig's own. The
+    # *default* is one shared immutable tuple (issue #1707: two hand-kept copies
+    # is how a fix to one silently missed the other); each config still
+    # overrides its own field independently, so the two gates stay separately
+    # configurable.
+    test_path_globs: Annotated[tuple[str, ...], Typed] = DEFAULT_TEST_PATH_GLOBS
     exempt_path_globs: Annotated[tuple[str, ...], Typed] = (
         "*.md",
         "docs/**",
