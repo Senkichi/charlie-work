@@ -563,7 +563,12 @@ def _route_janitor_gate_failure_to_rework(
                 reason=escalation_reason,
                 reason_class="mechanical",
                 pr_number=pr_number,
-                pr_extra=_wf._cap_escalation_pr_extra(attempts_key, attempts, worker_launched),
+                # Issue #2900: ``head_sha`` is the live head this very
+                # escalation fired at; the stamp is the merge lane's skip
+                # anchor for everything after this pass.
+                pr_extra=_wf._cap_escalation_pr_extra(
+                    attempts_key, attempts, worker_launched, head_sha=head_sha
+                ),
             )
             state = self._record_event(
                 state,

@@ -356,15 +356,21 @@ def test_merge_ready_conflict_rework_dispatch_bounded_by_cap_across_repeated_eva
     # evaluation of the same still-conflicting PR must not dispatch yet
     # another worker, must not burn the counter past what it already is, and
     # must not re-fire a duplicate escalation event on every pass ("X blocks
-    # retry of X") -- it simply leaves the already-escalated pair alone.
+    # retry of X"). Issue #2900 narrows that further for the merge lane: the
+    # escalation stamps the escalation-time head, and the branch gate stops
+    # evaluating the unchanged-head PR outright instead of re-logging it.
     for _ in range(3):
         result = app.merge_ready(456, merge=False)
         assert result.ok is True
-        assert result.data["merge_conflict"] is True
+        assert result.data["conflict_cap_stop"] is True
+        assert result.data.get("sync_failed") is None
 
     state = load_state(paths.state_file)
     assert state["issues"]["123"]["status"] == "escalated"
     assert state["issues"]["123"]["escalation_reason"] == "conflict_rework_attempts_cap_exceeded"
+    # Issue #2900: the escalation stamped its anchor -- the live head at the
+    # escalation pass, still the merge lane's skip anchor three passes later.
+    assert state["prs"]["456"]["conflict_rework_attempts_escalated_head"] == "sha-abc123"
     expected_final_attempts = config.review.max_conflict_rework_attempts + 1
     assert state["prs"]["456"]["conflict_rework_attempts"] == expected_final_attempts
     final_dispatch_events = sum(

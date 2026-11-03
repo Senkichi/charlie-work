@@ -187,6 +187,21 @@ def branch_precheck(f: BranchFacts) -> tuple[BranchGate | None, bool, bool]:
     sync_failed = False
     merge_conflict = False
 
+    # Issue #2900: past the conflict lane's rework cap on the head it
+    # escalated at, the pair is on agent:human-needed and nothing downstream
+    # is reachable without a head move or an operator act -- see rules.py.
+    if f.conflict_cap_stop:
+        return (
+            BranchGate(
+                kind=PlanKind.HOLD,
+                admission=adm,
+                stop=BranchStop.CONFLICT_CAP_EXCEEDED,
+                merge_conflict=f.merge_conflict,
+            ),
+            f.merge_conflict,
+            False,
+        )
+
     if f.merge_conflict:
         if f.issue_status in CONFLICT_REWORK_IN_FLIGHT_STATUSES:
             return (
