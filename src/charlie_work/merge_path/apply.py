@@ -52,6 +52,7 @@ from .ports import MergePathPorts, ports_from_workflow
 from .render import (
     LiveFinal,
     render_live_conflict_blocked,
+    render_live_conflict_cap_stop,
     render_live_conflict_in_flight,
     render_live_final,
     render_live_head_moved,
@@ -168,6 +169,12 @@ def _branch_result(
     issue_number = opening.issue_number
     decision = opening.decision
     failed_attempts = opening.facts.persisted.failed_attempts
+    if gate.stop is BranchStop.CONFLICT_CAP_EXCEEDED:
+        # Issue #2900: past the conflict lane's rework cap on an unchanged
+        # head -- idempotent hold, no per-pass merge_ready row.
+        return render_live_conflict_cap_stop(
+            ports, pr_number, issue_number, decision, failed_attempts
+        )
     if gate.stop is BranchStop.CONFLICT_IN_FLIGHT:
         return render_live_conflict_in_flight(
             ports, pr_number, issue_number, decision, failed_attempts

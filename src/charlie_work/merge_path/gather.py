@@ -55,6 +55,7 @@ from .model import (
     VerdictFact,
 )
 from .ports import MergePathPorts
+from .rules import CONFLICT_REWORK_CAP_EXCEEDED, conflict_cap_stop
 
 if TYPE_CHECKING:
     from ..config import OrchestratorConfig
@@ -107,6 +108,18 @@ def persisted_from(entry: dict[str, Any] | None) -> PersistedPr:
         mergequeue_checked_at=entry.get("mergequeue_checked_at"),
         mergequeue_requeues=entry.get("consecutive_mergequeue_requeues", 0),
         mergequeue_requeues_head_sha=entry.get("mergequeue_requeues_head_sha"),
+        # Issue #2900: the conflict lane's cap-escalation facts. The flag maps
+        # the PR record's escalation history; escalation_reason is ignored
+        # (issue #1461 keeps the list the reliable record across cross-lane
+        # clobbers -- the same guard ``_route_janitor_gate_failure_to_rework``
+        # re-reads). Unknown keys survive every spread-copy state write.
+        conflict_cap_escalated=(
+            CONFLICT_REWORK_CAP_EXCEEDED in frozenset(entry.get("escalation_reasons_seen") or ())
+        ),
+        conflict_rework_attempts_escalated_head=(
+            entry.get("conflict_rework_attempts_escalated_head")
+        ),
+        conflict_rework_attempts_last_head=(entry.get("conflict_rework_attempts_last_head")),
     )
 
 
@@ -277,6 +290,10 @@ def gather_branch(
         merge_conflict=False,
         issue_status=None,
         train_head_param=train_head_param,
+        # Issue #2900: armed once, so both precheck calls (before and after a
+        # train-head pr_list) stop at the conflict cap, and the shared facts
+        # cannot drift between them.
+        conflict_cap_stop=conflict_cap_stop(persisted, f0.live_head_sha),
     )
     if not adm.approved:
         return BranchRead(facts, decide_branch(facts))

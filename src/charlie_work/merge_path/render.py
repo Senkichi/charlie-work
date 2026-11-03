@@ -361,6 +361,49 @@ def render_live_conflict_blocked(
     )
 
 
+def render_live_conflict_cap_stop(
+    ports: MergePathPorts,
+    pr_number: int,
+    issue_number: int | None,
+    decision: Mapping[str, Any],
+    failed_attempts: int,
+) -> Any:
+    """Issue #2900: past the conflict lane's rework cap on an unchanged head.
+
+    Mirrors the conflict-in-flight/blocked stop shapes (no ``merge_ready``
+    accounting, no further reads); the ``conflict_cap_stop`` key is the one
+    shape-test handle.
+    """
+    return ports.command_result(
+        True,
+        f"PR #{pr_number} conflict-rework cap exceeded; escalated — "
+        f"merge lane skipping until the head moves or the operator unescalates",
+        {
+            **_conflict_data(pr_number, issue_number, decision, failed_attempts),
+            "conflict_cap_stop": True,
+        },
+    )
+
+
+def render_preview_conflict_cap_stop(
+    ports: MergePathPorts,
+    pr_number: int,
+    issue_number: int | None,
+    decision: Mapping[str, Any],
+    failed_attempts: int,
+) -> Any:
+    return ports.command_result(
+        True,
+        f"PR #{pr_number} conflict-rework cap exceeded; escalated — "
+        f"merge lane would skip until the head moves or the operator unescalates",
+        {
+            **_conflict_data(pr_number, issue_number, decision, failed_attempts),
+            "conflict_cap_stop": True,
+            "dry_run": True,
+        },
+    )
+
+
 def render_live_stall(
     ports: MergePathPorts,
     pr_number: int,

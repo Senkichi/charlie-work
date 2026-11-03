@@ -836,6 +836,12 @@ anything; `scripts/fleet-pass.ps1` refuses to launch while the flag exists, so
 the scheduled task stays enabled and the pause survives reboot/logon. No
 `Disable-ScheduledTask`, no PID kills. `charlie fleet resume` removes the flag
 and the next tick relaunches. `fleet status` reports the pause while it is set.
+The one-shot pass entrypoints (`fleet bash-rats`, `fleet work`, per-repo
+`bash-rats` and `work`) honour the same flag (#2660): while it exists they run
+no `self_deploy()` and dispatch nothing, log a warning naming `fleet-pause.json`,
+and exit 5 (`EXIT_FLEET_PAUSED`), so an external scheduler cannot launch work
+into a paused fleet. A deliberate operator one-shot passes `--ignore-pause`
+(`charlie fleet bash-rats --ignore-pause`), which runs and logs the override.
 **A pause also freezes runner allocation** (same supervisor pass) at the last
 converged parked floor. To verify a pause, check that no new supervisor starts
 for one full watchdog window, not just that the process is gone.

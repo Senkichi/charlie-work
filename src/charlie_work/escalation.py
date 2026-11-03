@@ -563,19 +563,29 @@ def _worker_launched_before_cap_escalation(state: dict[str, Any], issue_number: 
 
 
 def _cap_escalation_pr_extra(
-    attempts_key: str, attempts: int, worker_launched: bool
+    attempts_key: str, attempts: int, worker_launched: bool, head_sha: str | None = None
 ) -> dict[str, Any]:
     """Build the ``pr_extra`` dict for a rework-attempts-cap escalation.
 
     Issue #1106: clears startup-death flags on escalate. Issue (this fix):
     adds ``worker_launched`` -- see ``_worker_launched_before_cap_escalation``.
+    Issue #2900: also stamps ``<attempts_key>_escalated_head`` -- the head the
+    PR carries at escalation time -- as the merge lane's skip anchor. Without
+    it the pre-#2900 code left only ``<attempts_key>_last_head`` from the last
+    routing pass, which can lag the live head at this very escalation (the
+    settled-cycle burn path escalates AFTER the head moved). A falsy head
+    stamps nothing; the merge lane treats a missing stamp the same, via the
+    routing-baseline fallback.
     """
-    return {
+    extra: dict[str, Any] = {
         attempts_key: attempts,
         "last_rework_failure_kind": None,
         "last_rework_was_startup_death": False,
         "worker_launched": worker_launched,
     }
+    if head_sha:
+        extra[f"{attempts_key}_escalated_head"] = head_sha
+    return extra
 
 
 def _reset_linked_pr_status_to_passive_open(fresh_state: dict[str, Any], pr_number: int) -> None:

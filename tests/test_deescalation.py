@@ -1000,6 +1000,9 @@ def test_skip_reason_vocabulary_is_derived_from_the_branches() -> None:
     # `if not (... and ... and ...)` is what made "0 cleared" unreadable, and
     # only `janitor_blocked` means "the sweep works but the PR is not ready".
     assert {"janitor_blocked", "pr_not_open", "pr_conflicting", "no_open_pr"} <= set(reasons)
+    # Issue #2899: the durable-exit skip for an unchanged empty-diff head is
+    # its own histogram bucket, distinct from every health-based skip.
+    assert "empty_diff_head_unchanged" in reasons
 
 
 # --- Issue #807: worktree_unsafe split — local commits must NOT auto-de-escalate ---
@@ -1478,6 +1481,10 @@ def test_sweep_resets_conflict_rework_attempts_lane(tmp_path: Path) -> None:
             "escalation_reason": "conflict_rework_attempts_cap_exceeded",
             "conflict_rework_attempts": 3,
             "conflict_rework_attempts_last_head": "sha-conflict-baseline",
+            # Issue #2900: the merge lane's skip anchor, stamped at the cap
+            # escalation. The clear must pop it or the skip would keep the
+            # re-armed PR out of the merge lane.
+            "conflict_rework_attempts_escalated_head": "sha-conflict-baseline",
             "conflict_rework_attempts_stall_since": "2026-08-14T11:00:00Z",
             "conflict_rework_attempts_stall_head": "sha-conflict-baseline",
             # Unrelated lane counters -- must NOT be reset by a conflict clear.
@@ -1499,6 +1506,8 @@ def test_sweep_resets_conflict_rework_attempts_lane(tmp_path: Path) -> None:
     pr_456 = state["prs"]["456"]
     assert pr_456["conflict_rework_attempts"] == 0
     assert "conflict_rework_attempts_last_head" not in pr_456
+    # Issue #2900: the skip anchor clears with the episode.
+    assert "conflict_rework_attempts_escalated_head" not in pr_456
     assert "conflict_rework_attempts_stall_since" not in pr_456
     assert "conflict_rework_attempts_stall_head" not in pr_456
     # Unrelated lanes untouched.
