@@ -52,7 +52,13 @@ from .supervise_loop import (
     EXIT_RESTART_REQUESTED,
     PREFLIGHT_REFUSAL_EXIT_CODE,
 )
-from .fleet_pause import register_fleet_pause_subparsers, run_fleet_pause, run_fleet_resume
+from .fleet_pause import (
+    mark_pass_running,
+    refuse_pass_while_paused,
+    register_fleet_pause_subparsers,
+    run_fleet_pause,
+    run_fleet_resume,
+)
 from .control_plane_priority import raise_supervisor_to_normal
 from .fleet_paths import fleet_dir
 from .dashboard_command import (
@@ -243,6 +249,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_dry_run(reap_reviews)
 
     dispatch = subparsers.add_parser("work")
+    mark_pass_running(dispatch)  # #2660: refused while the fleet is paused
     dispatch.add_argument("--limit", type=int, default=None)
     dispatch.add_argument(
         "--issues",
@@ -373,6 +380,7 @@ def build_parser() -> argparse.ArgumentParser:
     merge_ready.set_defaults(merge=None)
 
     loop = subparsers.add_parser("bash-rats")
+    mark_pass_running(loop)  # #2660: refused while the fleet is paused
     loop.add_argument("--limit", type=int, default=None)
     loop.add_argument(
         "--once",
@@ -421,6 +429,7 @@ def build_parser() -> argparse.ArgumentParser:
     fleet_sub.add_parser("operator-queue")
 
     fleet_work = fleet_sub.add_parser("work")
+    mark_pass_running(fleet_work)  # #2660: refused while the fleet is paused
     fleet_work.add_argument("--limit", type=int, default=None)
     fleet_work.add_argument(
         "--repos",
@@ -433,6 +442,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     fleet_bash_rats = fleet_sub.add_parser("bash-rats")
+    mark_pass_running(fleet_bash_rats)  # #2660: refused while the fleet is paused
     fleet_bash_rats.add_argument("--limit", type=int, default=None)
     fleet_bash_rats.add_argument(
         "--repos",
@@ -2590,6 +2600,12 @@ def main(argv: list[str] | None = None) -> int:
     args.json_output = json_output or args.json_output
 
     configure_logging(verbose=getattr(args, "verbose", False))
+    # Issue #2660: the one pause gate for the one-shot pass entrypoints. It runs
+    # before any handler, so a paused fleet sees no self_deploy() and no dispatch.
+    refusal = refuse_pass_while_paused(args)
+    if refusal is not None:
+        print_result(refusal, json_output=args.json_output)
+        return EXIT_FLEET_PAUSED
     try:
         if args.command == "doctor":
             result = run_doctor_command(args)
