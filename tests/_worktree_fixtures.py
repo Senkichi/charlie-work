@@ -357,6 +357,25 @@ def _push_sibling_commit(remote: Path, tmp_path: Path, branch: str, filename: st
     return pushed_sha
 
 
+REJECTED_PUSH_MESSAGE = "push refused by test pre-receive hook"
+
+
+def _reject_pushes(remote: Path) -> None:
+    """Install a ``pre-receive`` hook on ``remote`` that refuses every push.
+
+    Lets a test keep reads (``ls-remote``, ``fetch``) working while making the
+    write fail with a known stderr line (``REJECTED_PUSH_MESSAGE``) -- the
+    only way to fail a push and not the refuse-to-reset probe that precedes it.
+    Written as bytes so the shebang line keeps LF endings on Windows (a CRLF
+    ``#!/bin/sh`` fails to exec).
+    """
+    hooks = (remote / _git(remote, "rev-parse", "--git-path", "hooks").stdout.strip()).resolve()
+    hooks.mkdir(parents=True, exist_ok=True)
+    hook = hooks / "pre-receive"
+    hook.write_bytes(f"#!/bin/sh\necho '{REJECTED_PUSH_MESSAGE}' >&2\nexit 1\n".encode())
+    hook.chmod(0o755)
+
+
 def _setup_completed_worktree(
     repo_root: Path, issue_number: int, dirty: bool = False
 ) -> tuple[Path, str]:
