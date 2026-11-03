@@ -64,6 +64,54 @@ def autospec() -> Callable[..., Any]:
     return autospec_patch
 
 
+# Issue #2060: set once per session by pytest_configure below. The per-test
+# `_shared_repo_config_guard` fixture byte-compares this file around every
+# test. ``None`` when the run was not launched from inside a repository.
+_ENCLOSING_REPO_CONFIG_PATH: Path | None = None
+
+# Per-session scratch dir holding the GIT_CONFIG_GLOBAL/GIT_CONFIG_SYSTEM
+# copies installed at configure time; removed at sessionfinish.
+_GIT_ISOLATION_SCRATCH_DIR: Path | None = None
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_configure(config: pytest.Config) -> None:
+    """Issue #2060: session-scoped git containment for every test subprocess.
+
+    Installed in ``pytest_configure`` — not in a fixture — so module- and
+    session-scoped fixtures and collection-time subprocesses are covered
+    (the old function-scoped ``_isolate_git_env`` could not protect those),
+    and so the ceiling is derived from realpath'd paths before any test
+    creates a repo. Under xdist each worker process runs this hook for
+    itself, so the guard below watches the same enclosing config from every
+    worker.
+
+    This is the module's ONLY ``pytest_configure``: a second same-named
+    definition would silently replace this one (pluggy registers the module's
+    final binding), disabling the containment with no error. The short-basetemp
+    override therefore lives in ``_shorten_windows_basetemp`` and is called
+    first, so the ceiling is derived from the basetemp the run will use.
+    """
+    from _git_leak_guard import (
+        enclosing_repo_config_path,
+        install_session_git_isolation,
+    )
+
+    global _GIT_ISOLATION_SCRATCH_DIR, _ENCLOSING_REPO_CONFIG_PATH
+    _shorten_windows_basetemp(config)
+    basetemp = getattr(config.option, "basetemp", None)
+    _GIT_ISOLATION_SCRATCH_DIR = install_session_git_isolation(
+        basetemp=Path(basetemp) if basetemp else None
+    )
+    _ENCLOSING_REPO_CONFIG_PATH = enclosing_repo_config_path()
+
+
+def pytest_sessionfinish(session: pytest.Session) -> None:
+    """Remove the per-session git-isolation scratch dir (issue #2060)."""
+    if _GIT_ISOLATION_SCRATCH_DIR is not None:
+        shutil.rmtree(_GIT_ISOLATION_SCRATCH_DIR, ignore_errors=True)
+
+
 def patch_path_replace(
     monkeypatch: pytest.MonkeyPatch,
     fake: Callable[..., Path],
@@ -357,13 +405,19 @@ def _isolate_git_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     (``.git/objects/...`` paths past ``MAX_PATH`` fail with "Filename too
     long"); injected via the ``GIT_CONFIG_*`` env mechanism so it also
     covers ``git`` spawned by production code, not just tests' own calls.
+
+    Issue #2060 tightened the ceiling anchor: ``merge_ceiling_directories``
+    rebuilds the list from ``os.path.realpath`` of the basetemp and *every
+    parent above it* merged over the ambient (session-installed) value, so a
+    repo lookup that starts in any temp-dir shape — ``tmp_path``, an
+    ``mkdtemp`` sibling of basetemp, a dir under a basetemp parent — stops at
+    the nearest listed ancestor in the spelling git computes while
+    ascending, and can never reach the enclosing checkout.
     """
+    from _git_leak_guard import merge_ceiling_directories
     from _git_templates import GIT_CONFIG_ENV
 
-    monkeypatch.setenv(
-        "GIT_CEILING_DIRECTORIES",
-        os.pathsep.join([str(tmp_path.parent), _tempfile_module.gettempdir()]),
-    )
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", merge_ceiling_directories(tmp_path.parent))
     for key, value in GIT_CONFIG_ENV.items():
         monkeypatch.setenv(key, value)
 
@@ -468,13 +522,16 @@ def _no_real_pr_create_retry_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
 _SHORT_BASETEMP: Path | None = None
 
 
-def pytest_configure(config: pytest.Config) -> None:
+def _shorten_windows_basetemp(config: pytest.Config) -> None:
     """Keep pytest's temp root short on Windows so real ``git worktree add`` works.
 
     Under a deep checkout (worker worktrees) pytest's default
     ``pytest-of-<user>/pytest-N/<test-name>`` nesting pushes salvage-test paths
     past what git accepts (``fatal: '$GIT_DIR' too big``). Only applies when no
     ``--basetemp`` was given (xdist workers always get one).
+
+    Called from the module's single ``pytest_configure`` (top of file), before
+    the git-isolation install reads ``config.option.basetemp``.
     """
     global _SHORT_BASETEMP
     if os.name != "nt" or config.option.basetemp is not None:
@@ -685,3 +742,40 @@ def _no_real_ci_fleet(monkeypatch: pytest.MonkeyPatch) -> None:
     import charlie_work.selection_wrapper as selection_wrapper
 
     monkeypatch.setattr(selection_wrapper, "ci_fleet_executable", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def _shared_repo_config_guard(request: pytest.FixtureRequest) -> Iterator[None]:
+    """Issue #2060: fail a test during which the enclosing repo's shared git config mutates.
+
+    A ``git config`` (implicit ``--local``) run with ``cwd`` inside a
+    directory that is not itself a repository ascends into the enclosing
+    checkout; under a linked worktree that write lands on the *shared*
+    ``<git-common-dir>/config`` of the main repo — the 2026-09-30 leak that
+    stalled the fleet's ``git_identity`` preflight. This fixture
+    byte-compares that file before and after every test: a difference fails
+    the owning test with its nodeid and a unified diff of the change.
+
+    The guard is deliberately detect-only — it never writes the file.
+    Restoring the earlier bytes (the first cut of this fixture) cannot tell
+    the test's write apart from a legitimate concurrent write landing in
+    the same window — worktree-add tracking config, ``gh pr checkout``,
+    ``git push -u``, a sibling worker's repo setup — so a blind restore can
+    silently discard one, and a raw ``write_bytes`` bypasses the
+    ``config.lock`` protocol real git writers hold. A false attribution
+    under ``pytest -n auto`` is surfaced, not hidden: the diff shows whether
+    the named test leaked a ``user.email`` or merely overlapped an
+    unrelated write. See ``fail_on_shared_config_mutation``.
+
+    Defined last among the autouse fixtures so its teardown runs first: the
+    "after" snapshot brackets the test body as tightly as possible.
+    """
+    from _git_leak_guard import fail_on_shared_config_mutation
+
+    config_path = _ENCLOSING_REPO_CONFIG_PATH
+    if config_path is None:
+        yield
+        return
+    before = config_path.read_bytes() if config_path.is_file() else None
+    yield
+    fail_on_shared_config_mutation(config_path, before, request.node.nodeid)
