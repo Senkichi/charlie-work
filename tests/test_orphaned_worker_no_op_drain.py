@@ -707,3 +707,92 @@ def test_maintenance_lane_wires_no_op_drain_callbacks(tmp_path: Path, monkeypatc
     assert captured.get("review_callback") == app.review
     assert captured.get("record_review_callback") == app.record_review
     assert captured.get("enrich_checks_callback") == app._enrich_checks_infra_blocked
+
+
+def _stamp_death(paths, failure_kind: str | None) -> tuple[str, str]:
+    """Seed the dead epoch (issue #2783): ``redispatch_at`` = one older counted attempt plus
+    this dispatch's own stamp, and the ``failure_kind`` the dead-session lane stamped.
+    Times derive from the bed's ``dispatched_at``. Returns ``(older, own)``."""
+    state = load_state(paths.state_file)
+    entry = state["issues"]["207"]
+    dispatched = datetime.fromisoformat(entry["dispatched_at"].replace("Z", "+00:00"))
+    older = (dispatched - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    own = (dispatched + timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    state["issues"]["207"] = {
+        **entry,
+        "redispatch_at": [older, own],
+        **({"dead_worker_failure_kind": failure_kind} if failure_kind is not None else {}),
+    }
+    save_state(paths.state_file, state)
+    return older, own
+
+
+@pytest.mark.parametrize("failure_kind", ["quota_exhausted", "rate_limited"])
+def test_launcher_premerge_after_throttle_death_is_exempt_not_a_no_op(
+    tmp_path: Path, monkeypatch, failure_kind: str
+) -> None:
+    """Issue #2783: the launcher's base merge was salvaged after a turn-0 throttle death.
+
+    Head moved (a merge commit the LAUNCHER made), the patch-id is unchanged, so the real
+    ``review()`` refuses it as ``is_no_op_rework``; CI is green and there is no rebuttal,
+    so before the fix this escalated ``rework_no_op`` against a worker that never got to
+    work. The provider-throttle death must instead take the #1684/#2282 exemption.
+    """
+    config, paths, gh = _bed_lint(tmp_path, lint_red=False, live_head="def456")
+    older, _own = _stamp_death(paths, failure_kind)
+    app = OrchestratorApp(tmp_path, paths, config, gh)
+    _sweep(tmp_path, paths, config, gh, app, monkeypatch=monkeypatch)
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["207"]
+    kinds = [e["kind"] for e in state["events"]]
+    assert entry["status"] == "rework_requested"
+    assert entry["dispatched_at"] is None
+    assert entry["redispatch_at"] == [older]  # only this dispatch's own stamp was refunded
+    assert not entry.get("orphan_drift_fingerprint") and not entry.get("orphan_drift_at")
+    assert state["prs"]["100"]["last_rework_exemption"] == "provider_throttle"
+    assert state["prs"]["100"]["last_rework_was_startup_death"] is True
+    assert "rework_no_op_escalated" not in kinds
+    exempted = [
+        e for e in state["events"] if e["kind"] == "rework_attempt_exempted_provider_throttle"
+    ]
+    assert [e["payload"]["source"] for e in exempted] == ["orphan_sweep_no_op_drain"]
+    assert (207, config.labels.human_needed) not in gh.labels_added
+    assert (207, config.labels.needs_rework) in gh.labels_added  # the rework_requested edge
+
+
+@pytest.mark.parametrize("failure_kind", [None, "stalled"])
+def test_launcher_premerge_without_throttle_death_still_escalates_no_op(
+    tmp_path: Path, monkeypatch, failure_kind: str | None
+) -> None:
+    """Control for #2783: the identical head-move shape with no throttle stamp is a real no-op."""
+    config, paths, gh = _bed_lint(tmp_path, lint_red=False, live_head="def456")
+    older, own = _stamp_death(paths, failure_kind)
+    app = OrchestratorApp(tmp_path, paths, config, gh)
+    _sweep(tmp_path, paths, config, gh, app, monkeypatch=monkeypatch)
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["207"]
+    assert entry["status"] == "escalated"
+    assert entry["escalation_reason"] == "rework_no_op"
+    assert entry["redispatch_at"] == [older, own]  # nothing refunded
+    kinds = [e["kind"] for e in state["events"]]
+    assert "rework_no_op_escalated" in kinds
+    assert "rework_attempt_exempted_provider_throttle" not in kinds
+    assert (207, config.labels.human_needed) in gh.labels_added
+
+
+def test_throttle_death_is_exempt_before_ci_is_consulted(tmp_path: Path, monkeypatch) -> None:
+    """A throttle death never reaches the CI tiers: red CI would otherwise record a
+    ``ci_gate_auto_reject`` verdict, which re-arms the rework but leaves the dead session's
+    dispatch stamp counted as a no-op."""
+    config, paths, gh = _bed_lint(tmp_path, lint_red=True, live_head="def456")
+    older, _own = _stamp_death(paths, "quota_exhausted")
+    app = OrchestratorApp(tmp_path, paths, config, gh)
+    _sweep(tmp_path, paths, config, gh, app, monkeypatch=monkeypatch)
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["207"]["status"] == "rework_requested"
+    assert state["issues"]["207"]["redispatch_at"] == [older]
+    assert "rework_no_op_ci_rework_requested" not in [e["kind"] for e in state["events"]]
+    assert not any("failing step(s)" in c for c in _decision(paths).get("required_changes", []))

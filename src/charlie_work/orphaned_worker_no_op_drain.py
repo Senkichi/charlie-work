@@ -10,6 +10,17 @@ The orphan sweep now collects a :class:`NoOpReworkRoute` for each such finding a
 :func:`drain_no_op_rework_routes` gives it a consumer, outside the state lock (it does
 network I/O). In priority order:
 
+0. **The dead epoch was a provider-throttle death** (issue #2783) -> not a no-op at all.
+   The rework worktree's launcher merges ``origin/main`` before the worker starts; a
+   worker the provider killed at turn 0 leaves that merge commit unpushed, the next
+   pass salvages it, and the moved head then looks like a worker-authored change whose
+   patch-id is unchanged -- exactly what ``review()`` refuses as ``is_no_op_rework``.
+   The stamped ``dead_worker_failure_kind`` says why the worker stopped, so the death
+   takes the #1684/#2282 exemption (``rework_attempt_exemption``: refund, PR flag,
+   audit event) and the issue returns to ``rework_requested`` -- the same disposition
+   the orphan sweep gives a same-head throttle death. It is decided before any CI
+   tier: those tiers dispose of a worker that chose to do nothing, and would leave the
+   dead session's dispatch stamp counted as a no-op.
 1. **Live CI red** on the head -> the CI-failure rework lane: a ``request_changes``
    verdict (``ci_gate_auto_reject``, the same provenance ``review()``'s CI gate uses)
    whose ``required_changes`` name the failing step and carry a log excerpt, because
@@ -44,8 +55,10 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 from .checks import _is_failing_run, summarize_checks
 from .ci_findings import _required_changes_from_checks
+from .labels import TransitionOutcome
 from .markdown_fence import fenced_block
 from . import worker_fate
+from .rework_attempt_exemption import exempt_provider_throttle_rework_death
 from .rework_outcome import _read_rework_outcome
 
 if TYPE_CHECKING:
@@ -58,6 +71,8 @@ logger = logging.getLogger(__name__)
 NO_OP_HANDLED_HEAD_KEY = "no_op_handled_head"
 NO_OP_DEFERRED_HEAD_KEY = "no_op_deferred_head"
 NO_OP_ESCALATION_REASON = "rework_no_op"
+THROTTLE_EXEMPTION_SOURCE = "orphan_sweep_no_op_drain"
+THROTTLE_RECOVERY_REASON = "dead_worker_no_op_provider_throttle"
 _LOG_EXCERPT_LINES = 40
 _LOG_EXCERPT_CHARS = 3000
 _COMMENT_CHARS = 2000
@@ -202,6 +217,10 @@ def _drain_one(
         entry = _wf.load_state(state_file)["issues"].get(str(issue_number), {})
     if not isinstance(entry, dict) or entry.get("status") != "dispatched":
         return  # a concurrent transition already resolved it
+    if _rearm_after_throttle_death(
+        route, gh=gh, config=config, state_file=state_file, write_gate=write_gate
+    ):
+        return  # a provider-throttle death is not a no-op (issue #2783)
     fates: dict[int, list[worker_fate.WorkerFate]] = {}
     comment = _worker_comment(
         route,
@@ -318,6 +337,99 @@ def _drain_one(
         )
         write_gate.save_state(state)
     escalations.append(issue_number)
+
+
+def _rearm_after_throttle_death(
+    route: NoOpReworkRoute,
+    *,
+    gh: GitHubLike,
+    config: OrchestratorConfig,
+    state_file: Path,
+    write_gate: WriteGate,
+) -> bool:
+    """Issue #2783: return a provider-throttle death to ``rework_requested``, not a no-op.
+
+    True when the dead epoch's stamped ``dead_worker_failure_kind`` is a provider
+    throttle and the issue was re-armed; False (nothing changed) otherwise, and the
+    caller carries on with the ordinary no-op tiers. The stamp is the only evidence
+    read: this lane never re-classifies the log, so prose that merely quotes a
+    throttle marker (the #656 class) cannot turn a real no-op into a free retry.
+
+    The exemption itself is ``exempt_provider_throttle_rework_death``, the single
+    point of enforcement every other throttle lane calls; it decides whether the
+    kind qualifies, refunds the dead session's own ``redispatch_at`` stamp, flags
+    the PR and emits its audit event. This function adds what the sweep's same-head
+    throttle death does after it: reset the entry to ``rework_requested`` (clearing
+    the drift markers that would otherwise suppress or anchor a later pass), then the
+    ``rework_requested`` label edge. An edge that returns a non-``APPLIED`` result is
+    recorded as ``label_error`` on the entry, as the sweep's other ``rework_requested``
+    edges do, so the failed write stays diagnosable; an exception out of the edge
+    itself is not handled here and reaches ``drain_no_op_rework_routes``' per-route
+    handler, which logs it (the entry is already ``rework_requested`` by then).
+    """
+    import charlie_work.workflow as _wf
+
+    issue_number = route.issue_number
+    with _wf.state_lock(state_file):
+        state = _wf.load_state(state_file)
+        cur = state["issues"].get(str(issue_number), {})
+        if not isinstance(cur, dict) or cur.get("status") != "dispatched":
+            return False
+        failure_kind = worker_fate.persisted_failure(cur).kind
+        if not exempt_provider_throttle_rework_death(
+            state,
+            issue_number,
+            cur,
+            failure_kind,
+            dispatched_at=cur.get("dispatched_at"),
+            pr_number=route.pr_number,
+            source=THROTTLE_EXEMPTION_SOURCE,
+            write_gate=write_gate,
+        ):
+            return False
+        state["issues"][str(issue_number)] = {
+            **cur,
+            "status": "rework_requested",
+            "dispatched_at": None,
+            "orphan_drift_fingerprint": None,
+            "orphan_drift_at": None,
+            NO_OP_DEFERRED_HEAD_KEY: None,
+        }
+        state = write_gate.append_event(
+            state,
+            # event-consumer: audit-only -- the actionable signal is the rework_requested
+            # status and label edge written here; this records why the no-op finding
+            # was exempted (its kind is the sweep's existing recovery record)
+            "orphaned_worker_recovered",
+            {
+                "issue_number": issue_number,
+                "pr_number": route.pr_number,
+                "previous_status": "dispatched",
+                "new_status": "rework_requested",
+                "reason": THROTTLE_RECOVERY_REASON,
+                "head_sha": route.live_head_sha,
+                "failure_kind": failure_kind,
+            },
+        )
+        write_gate.save_state(state)
+
+    result = write_gate.transition(gh, config.labels, issue_number, "rework_requested")
+    if result.outcome != TransitionOutcome.APPLIED:
+        with _wf.state_lock(state_file):
+            state = _wf.load_state(state_file)
+            latest = state["issues"].get(str(issue_number), {})
+            if isinstance(latest, dict):
+                state["issues"][str(issue_number)] = {
+                    **latest,
+                    "label_error": {
+                        "edge": "rework_requested",
+                        "outcome": result.outcome.value,
+                        "add_failures": result.add_failures,
+                        "remove_failures": result.remove_failures,
+                    },
+                }
+                write_gate.save_state(state)
+    return True
 
 
 def _defer_no_op(
