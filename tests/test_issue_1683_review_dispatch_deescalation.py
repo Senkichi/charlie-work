@@ -385,6 +385,17 @@ _NO_COUNTER_ALLOWLIST: dict[str, str] = {
         "attach, base-sync exception, unresolvable suite command, merge "
         "refusal); event-driven, no counter."
     ),
+    # --- review-dispatch empty-diff gate, issue #2899 ---
+    "empty_diff_zero_file": (
+        "Fires once per packet head when the review packet's diff.patch is "
+        "empty (zero-file PR). The re-entry guard is the head-scoped "
+        "``empty_diff_operator_queued_head_sha`` marker, not a counter: it "
+        "is deliberately absent from UNESCALATE_PR_RESET_FIELDS so a clear "
+        "(operator re-arm or this sweep) of a still-empty head never "
+        "re-fires the escalation, while a new head re-routes. The route "
+        "does not touch review_dispatch_attempt_count (an empty diff is "
+        "not a review attempt), so there is nothing to re-arm."
+    ),
 }
 
 # Dynamic ``reason`` domains that cannot be reduced to a finite literal
