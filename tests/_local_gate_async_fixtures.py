@@ -6,7 +6,6 @@ tests can reuse them -- test modules must never import each other.
 
 from __future__ import annotations
 
-import os
 import subprocess
 import time
 from collections.abc import Iterator
@@ -16,6 +15,7 @@ from typing import Any
 
 import pytest
 
+from _git_leak_guard import scrubbed_git_env
 from charlie_work import local_suite_runner
 from charlie_work.config import OrchestratorConfig, build_config_from_data
 from charlie_work.labels import transition
@@ -28,7 +28,9 @@ from charlie_work.workflow import OrchestratorApp
 
 
 def _git(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    # The scrub stops ambient GIT_DIR/GIT_CONFIG_* redirecting commands at the
+    # outer repo; the session's isolation vars (#2060) must survive it.
+    env = scrubbed_git_env()
     result = subprocess.run(["git", *args], cwd=repo_root, capture_output=True, text=True, env=env)
     assert result.returncode == 0, (args, result.stderr)
     return result

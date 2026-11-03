@@ -163,6 +163,10 @@ def _enumerate_layer_slots(
     ]
     blocked: list[dict[str, str]] = []
     for repo_key, entry in selected:
+        # Issue #2754: a retired repo is out of the fleet, so its config
+        # layers must not block (or arm) a deprecated-key retirement.
+        if entry.get("retired"):
+            continue
         repo_root_str = entry.get("repo_root")
         if not repo_root_str:
             blocked.append(

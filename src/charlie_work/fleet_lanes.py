@@ -29,6 +29,7 @@ from .instrumentation import log_event
 from .local_issues import github_client_for
 from .pass_deadline import PassDeadlineExceeded, set_pass_deadline_exceeded
 from .paths import runtime_paths
+from .repo_retirement import run_wind_down
 from .command_result import CommandResult
 from .budget_gates import budget_deferral
 from .workflow import OrchestratorApp
@@ -72,6 +73,7 @@ def _run_fleet_repo_lane(
     ensure_labels: bool,
     fleet_state_path: Path,
     deadline_exceeded: Callable[[], bool] | None = None,
+    retired: bool = False,
 ) -> CommandResult:
     """One repo's lane body, executed on a pool thread (issue #1934).
 
@@ -83,6 +85,12 @@ def _run_fleet_repo_lane(
     pass" invariant. A raised exception propagates to the collector future,
     which renders it into the same per-repo error result the serial loop
     produced.
+
+    ``retired`` (issue #2754) is set by ``fleet_loop`` when the repo's own
+    config says ``fleet.retired: true`` and it still has live work. The lane
+    then runs wind-down only (reap + verdict ingestion): it launches no
+    worker, rework, rescue, reviewer or merge-gate suite and makes no tracker
+    commit. A quiescent retired repo never reaches this function at all.
 
     ``deadline_exceeded`` (issue #1948) is ``fleet_loop``'s cooperative
     in-pass deadline predicate. Before #1948 it was only consulted between
@@ -109,6 +117,15 @@ def _run_fleet_repo_lane(
         # bound and is skipped the same way.
         if deadline_exceeded is not None and isinstance(app.gh, GitHub):
             set_pass_deadline_exceeded(app.gh, deadline_exceeded)
+
+        # Issue #2754: a retired repo's lane is wind-down only. It deliberately
+        # runs before label-ensure so a retired repo launches/labels nothing.
+        if retired:
+            return CommandResult(
+                True,
+                "retired repo: wind-down (reap and verdict ingestion only)",
+                run_wind_down(app),
+            )
 
         # Issue #1339: ensure every LabelConfig-derived label exists on the
         # repo before the lane runs. Idempotent and best-effort:
@@ -232,6 +249,11 @@ def _run_fleet_reap_sweep(
     resolved_now = now if now is not None else datetime.datetime.now(datetime.UTC)
     results: dict[str, Any] = {}
     for repo_key, entry in selected:
+        # Issue #2754: a retired repo is reaped by its own wind-down lane on
+        # the pass it still has live work; the out-of-band scheduler must not
+        # keep touching it (or emit per-repo events for it) after that.
+        if entry.get("retired"):
+            continue
         repo_root = Path(entry.get("repo_root") or "")
         if not repo_root.is_dir():
             # Stale-entry bookkeeping lives in the lane path (issue #1372);
