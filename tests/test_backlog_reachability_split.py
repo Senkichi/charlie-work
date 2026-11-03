@@ -43,7 +43,7 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
-from _src_ast import parsed, parsed_source
+from _src_ast import parsed, parsed_source, source_text
 from _workflow_consumer_scan import consumer_referenced_names
 
 _REPO_ROOT = Path(__file__).parents[1]
@@ -469,6 +469,34 @@ def test_backlog_reachability_write_event_surface_is_exactly_empty() -> None:
     )
 
 
+def _wanted_names_the_scanner_finds(paths: list[Path], wanted: set[str]) -> set[str]:
+    """The subset of ``wanted`` that ``_write_event_call_sites`` reports over ``paths``.
+
+    Issue #2965: the control used to run the scanner over every corpus file
+    (~63, workflow.py alone is 5k lines), which only looked cheap while some
+    unrelated scan had already filled the shared parse cache on the same xdist
+    worker. A file is now parsed only when its text spells a name that is still
+    unfound: a ``Call`` the scanner reports must spell that name in its source,
+    so a file without it cannot contribute it. Once every wanted name is found
+    nothing is left to look for, so no later file is read for a parse -- the
+    early stop falls out of the same gate.
+
+    Fail-closed: if the gate ever skipped a file it should have scanned (e.g. an
+    NFKC-normalized identifier, which the parser accepts but raw text does not
+    spell), the name just goes unfound and the control FAILS. That is the safe
+    direction for a positive control, unlike the zero-hits assertion it backs,
+    which is why this gate needs no normalization.
+    """
+    found: set[str] = set()
+    for path in paths:
+        unfound = wanted - found
+        source = source_text(path)
+        if not any(name in source for name in unfound):
+            continue
+        found |= {str(hit["name"]) for hit in _write_event_call_sites(source, filename=str(path))}
+    return found & wanted
+
+
 def test_write_event_call_scanner_has_a_positive_control() -> None:
     """Required positive control for the empty-result assertion above: runs
     the identical scanner over the orchestrator corpus (workflow.py plus its
@@ -484,14 +512,16 @@ def test_write_event_call_scanner_has_a_positive_control() -> None:
     keeps covering all four names as members relocate across batches without
     dropping any name from ``expected_broad_coverage`` (that drop would be the
     weakening this guard exists to prevent).
+
+    Issue #2965: the corpus is scanned lazily by
+    ``_wanted_names_the_scanner_finds`` -- same scanner, same corpus, same
+    four expected names, but only the files that can still contribute one are
+    parsed.
     """
-    found_names = {
-        hit["name"]
-        for path in [_WORKFLOW_PATH, *sorted(_ORCHESTRATION_DIR.glob("*.py"))]
-        for hit in _write_event_call_sites(path.read_text(encoding="utf-8"), filename=str(path))
-    }
-    assert found_names, "the scanner found zero call sites in the corpus -- the scanner is broken"
     expected_broad_coverage = {"_write_json", "_write_text_atomic", "append_event", "log_event"}
+    corpus = [_WORKFLOW_PATH, *sorted(_ORCHESTRATION_DIR.glob("*.py"))]
+    found_names = _wanted_names_the_scanner_finds(corpus, expected_broad_coverage)
+    assert found_names, "the scanner found zero call sites in the corpus -- the scanner is broken"
     missing = expected_broad_coverage - found_names
     assert missing == set(), (
         f"scanner found zero call sites for {sorted(missing)} across the orchestrator corpus, "
@@ -516,3 +546,66 @@ def test_write_event_call_scanner_ignores_docstring_mentions() -> None:
         f"scanner counted prose-only mentions as call sites: {hits} -- it must walk ast.Call "
         "nodes only, never search raw source text"
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #2965: pin the lazy corpus scan behind the positive control. Each probe
+# file that must NOT be parsed is a syntax error, so a scan that parses it
+# raises instead of quietly passing slower.
+# ---------------------------------------------------------------------------
+
+_UNPARSEABLE = "def (:\n"
+
+
+def test_wanted_name_scan_parses_only_files_that_spell_an_unfound_name(tmp_path: Path) -> None:
+    """A file with none of the unfound names is never parsed, and once every
+    wanted name is found no later file is parsed either (even one that spells
+    the name)."""
+    no_needle = tmp_path / "a_no_needle.py"
+    no_needle.write_text(_UNPARSEABLE, encoding="utf-8")
+    caller = tmp_path / "b_caller.py"
+    caller.write_text("append_event(1)\n", encoding="utf-8")
+    after_covered = tmp_path / "c_after_covered.py"
+    after_covered.write_text(_UNPARSEABLE + "# append_event\n", encoding="utf-8")
+
+    found = _wanted_names_the_scanner_finds([no_needle, caller, after_covered], {"append_event"})
+
+    assert found == {"append_event"}
+
+
+def test_wanted_name_scan_finds_a_name_only_a_later_file_calls(tmp_path: Path) -> None:
+    """A text mention that is not a call (a ``def``) must not stop the scan: the
+    name is unfound until the scanner reports a ``Call`` node."""
+    mention = tmp_path / "a_mention.py"
+    mention.write_text("def log_event():\n    return None\n", encoding="utf-8")
+    caller = tmp_path / "b_caller.py"
+    caller.write_text("log_event()\n", encoding="utf-8")
+
+    found = _wanted_names_the_scanner_finds([mention, caller], {"log_event"})
+
+    assert found == {"log_event"}
+
+
+def test_wanted_name_scan_does_not_report_names_that_are_never_called(tmp_path: Path) -> None:
+    """Fail closed: a corpus that only mentions or lacks the names reports
+    none of them, so the control cannot pass on a scan that found nothing."""
+    mention = tmp_path / "a_mention.py"
+    mention.write_text('"""append_event and log_event."""\nx = 1\n', encoding="utf-8")
+    empty = tmp_path / "b_empty.py"
+    empty.write_text("", encoding="utf-8")
+
+    found = _wanted_names_the_scanner_finds([mention, empty], {"append_event", "log_event"})
+
+    assert found == set()
+
+
+def test_wanted_name_scan_ignores_found_names_it_was_not_asked_for(tmp_path: Path) -> None:
+    """The result is limited to ``wanted``: the scanner also reports
+    ``_record_event``/``write_text`` and those must not leak into the control's
+    coverage set."""
+    caller = tmp_path / "a_caller.py"
+    caller.write_text("append_event(1)\nself._record_event(2)\n", encoding="utf-8")
+
+    found = _wanted_names_the_scanner_finds([caller], {"append_event"})
+
+    assert found == {"append_event"}
