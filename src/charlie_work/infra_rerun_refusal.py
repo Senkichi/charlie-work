@@ -27,6 +27,23 @@ REFUSED_ESCALATION_REASON = "infra_rerun_refused"
 _PERMANENT_REFUSAL_PHRASES: tuple[str, ...] = ("created over a month ago",)
 
 
+def is_rerun_already_running(error: str) -> bool:
+    """True if a ``gh run rerun`` error means the run is still in progress.
+
+    GitHub refuses to rerun a workflow while any job in the run is still
+    running. The CLI surfaces this with the phrase ``already running`` in the
+    error, e.g. ``run <id> cannot be rerun; This workflow is already running``
+    or ``The workflow run containing this job is already running``. Other
+    refusal reasons (expired run, broken workflow file, missing permissions,
+    ...) do not contain this phrase and should not be treated as retryable.
+
+    This is a retry-later race, not a failure: it clears by itself once the run
+    finishes. It is the single classifier shared by the infra-rerun driver, the
+    closing-keyword autofix and the aggregate-job heal lane (issue #2666).
+    """
+    return "already running" in error.lower()
+
+
 def is_permanent_rerun_refusal(error: str) -> bool:
     """True if a ``gh run rerun`` error is a refusal that retrying cannot fix."""
     lowered = error.lower()
