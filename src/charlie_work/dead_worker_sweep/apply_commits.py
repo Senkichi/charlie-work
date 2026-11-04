@@ -20,7 +20,7 @@ import logging
 from typing import Any
 
 from .. import worker_fate
-from . import effects_rework
+from . import effects_rework, pre_classification
 from ..escalation import _escalation_edge
 from ..labels import TransitionOutcome
 from .apply_context import SweepContext
@@ -91,6 +91,16 @@ def _escalate(ctx: SweepContext, commit: Escalate) -> None:
 
 def _route_pre_review_rework(ctx: SweepContext, commit: RoutePreReviewRework) -> None:
     enriched = ctx.pr_views.get(commit.pr_number) or ctx.pr_by_issue[commit.issue]
+    # Issue #3025: this route runs in the lock-free pre phase, before anything has
+    # classified an orphan that has a PR (the no-PR lane classifies in ``resolve_fate``; the
+    # PR lanes classify later, under the lock). A route that passed no kind could never
+    # recognise a provider-throttle death, so the route's exemption was skipped and an
+    # approved PR was escalated on the cap. Resolve the kind here, through the pre phase's
+    # classification seam: it reuses an existing stamp, else classifies the dead worker's
+    # log and queues the stamp + cooldown for the lock phase (``persist_pre_classified``).
+    classified = pre_classification.classify_before_fate(
+        ctx, commit.issue, ctx.issue_entry(commit.issue)
+    )
     effects_rework._route_dead_worker_to_pre_review_rework(
         ctx.state_file,
         ctx.gh,
@@ -98,7 +108,7 @@ def _route_pre_review_rework(ctx: SweepContext, commit: RoutePreReviewRework) ->
         enriched,
         commit.issue,
         commit.reason,
-        failure_kind=None,
+        failure_kind=worker_fate.persisted_failure(classified).kind,
         write_gate=ctx.write_gate,
     )
 
