@@ -59,6 +59,7 @@ unrelated processes; a relative path is refused outright for the same reason.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
 from pathlib import Path
 
 import psutil
@@ -120,12 +121,32 @@ def _is_orphan(proc: psutil.Process) -> bool:
         return False
 
 
+def _fresh_processes() -> Iterator[psutil.Process]:
+    """Every live process as a ``Process`` built now -- never one ``process_iter`` cached.
+
+    ``process_iter`` keeps one ``Process`` per pid in a module-global cache and evicts
+    a pid only when a sweep finds it absent. A pid freed and reborn between two
+    sweeps -- Windows recycles them freely, and ``process_chain`` sweeps the same
+    cache -- is served as the old instance, whose start time was snapshotted at
+    construction. Read through it, a holder that started after the
+    worker carries its predecessor's older start time, is judged to have predated the
+    worker, and is spared: the blocked tool call stays blocked. A ``Process``
+    constructed here takes its identity from the process that holds the pid *now*,
+    and ``kill`` is still pinned to that identity.
+    """
+    for pid in psutil.pids():
+        try:
+            yield psutil.Process(pid)
+        except (psutil.Error, OSError):
+            continue  # gone before it could be read, or unreadable: not a holder
+
+
 def _holders(
     worktree: Path, worker_pid: int, worker_start_time: float, exempt: frozenset[int]
 ) -> list[psutil.Process]:
     spared = exempt | {worker_pid}
     holders: list[psutil.Process] = []
-    for proc in psutil.process_iter():
+    for proc in _fresh_processes():
         if proc.pid in spared:
             continue
         try:

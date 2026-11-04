@@ -147,6 +147,40 @@ def worktree(tmp_path: Path) -> Path:
     return path.resolve()
 
 
+@pytest.fixture
+def stale_process_cache() -> Iterator[Callable[[int, float], psutil.Process]]:
+    """Plant, in psutil's own ``process_iter`` cache, a ``Process`` that remembers an older owner.
+
+    ``process_iter`` caches one ``Process`` per pid and evicts a pid only when it
+    is absent from a sweep. Windows recycles pids, so a pid an earlier sweep cached
+    can be reborn as a new process before the next sweep; the cached instance then
+    still carries the previous owner's start time. Which earlier sweep populated the
+    cache is test order, so the failure appears only in a full, shuffled run.
+
+    The cache is the process-global one, so teardown empties it (public
+    ``cache_clear``): a planted entry must not outlive the pid it names.
+    """
+
+    def plant(pid: int, created: float) -> psutil.Process:
+        stale = psutil.Process(pid)
+        # psutil caches a Process's identity at construction and exposes no way to
+        # age one; these two attributes are what a previous owner's instance holds.
+        stale._create_time = created  # type: ignore[attr-defined]
+        stale._ident = (pid, created)  # type: ignore[attr-defined]
+        psutil._pmap[pid] = stale  # type: ignore[attr-defined]
+        # Positive controls: the aging took, and the cache really serves the stale
+        # instance -- so a pass cannot mean the plant silently missed (a psutil
+        # upgrade that renames these internals fails here, not by passing).
+        assert stale.create_time() == created, "positive control: the instance must be aged"
+        assert any(p is stale for p in psutil.process_iter()), (
+            "positive control: process_iter must serve the planted instance"
+        )
+        return stale
+
+    yield plant
+    psutil.process_iter.cache_clear()
+
+
 def test_an_orphan_started_after_the_worker_is_killed_and_the_worker_is_spared(
     worktree: Path, spawned: list[subprocess.Popen[str]], orphans: list[psutil.Process]
 ) -> None:
@@ -213,6 +247,33 @@ def test_a_process_that_started_before_the_worker_is_spared(
 
     assert released == (holder.pid,)
     assert earlier.is_running()
+
+
+def test_a_stale_cached_process_for_the_holders_pid_does_not_hide_the_holder(
+    worktree: Path,
+    spawned: list[subprocess.Popen[str]],
+    orphans: list[psutil.Process],
+    stale_process_cache: Callable[[int, float], psutil.Process],
+) -> None:
+    """The holder's pid is one ``process_iter`` already cached for an older process (#3028).
+
+    Selecting from the cached instance reads the previous owner's start time, so a
+    holder that started *after* the worker looks like it started before it and is
+    spared: the call stays blocked and the lane falls through to its ordinary reap.
+    The holder's own start time, not the cache's, decides.
+    """
+    worker = _spawn(spawned, worktree)
+    holder = _spawn_orphan(orphans, worktree)
+    worker_started = _start_time(worker)
+    stale = stale_process_cache(holder.pid, worker_started - 3600)
+    assert stale.pid == holder.pid
+    assert holder.create_time() > worker_started, "positive control: it did start after the worker"
+
+    released = release_pipe_holders(worktree, worker.pid, worker_started)
+
+    assert released == (holder.pid,)
+    assert not holder.is_running()
+    assert _alive(worker)
 
 
 def test_a_live_descendant_of_the_worker_is_spared(
