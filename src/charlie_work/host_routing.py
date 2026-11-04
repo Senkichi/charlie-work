@@ -12,8 +12,9 @@ exactly one of them, or to neither:
 
 With ``dispatch.host`` unset (the kill switch) or an empty ``labels.host_prefix``
 every issue is local, which is exactly the behaviour before host routing.
-Intake, dispatch, the backlog classifier, reconcile, finalize and the review/merge
-lane all ask :func:`owned_here`, so the rule lives in one place.
+Intake, dispatch, the backlog classifier, reconcile, finalize, the review/merge
+lane and the unauthorized-merge tripwire all ask :func:`owned_here`, so the rule
+lives in one place.
 """
 
 from __future__ import annotations
@@ -125,3 +126,43 @@ def local_prs(app: Any, prs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if owned_here(labels_by_issue.get(number, set()), config):
             kept.append(pr)
     return kept
+
+
+def drop_foreign_findings(app: Any, findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """``findings`` without the ones whose linked issue another host provably owns (#2910).
+
+    For a control that audits merges that already happened, where the other
+    host did the reviewing and so left no evidence in this host's state. Each
+    finding names its linked issue under ``issue`` (``int | None``).
+
+    This is deliberately not :func:`local_prs`, for two reasons:
+
+    - **Closed issues count.** A merged PR's issue is normally closed by the
+      time the finding is made, so an open-only read never sees it and treats
+      it as unlabelled, which the default host would keep. The ``state="all"``
+      snapshot is what reconcile feeds :func:`foreign_issue_numbers` for the
+      same reason.
+    - **It fails towards reporting.** :func:`local_prs` answers "may this host
+      act on the PR?", so on an unreadable issue list a non-default host drops
+      every PR. A finding is evidence of a possible bypass, so it is dropped
+      only on positive proof: the issue was read and
+      :func:`foreign_issue_numbers` says another host owns it. A finding with
+      no linked issue, an issue outside the fetched window, or an unreadable
+      issue list all stay.
+
+    With ``dispatch.host`` unset (routing off) the list is returned untouched
+    and no issue read is made. The read is also skipped when no finding names
+    an issue.
+
+    Ownership is :func:`foreign_issue_numbers`' own rule, inherited as is: an
+    issue carrying two different host labels belongs to neither host, so it is
+    foreign to both, and a merge linked to one is audited by neither.
+    """
+    if app.config.dispatch.host is None or not any(f.get("issue") is not None for f in findings):
+        return findings
+    try:
+        issues = app.gh.issue_list(state="all")
+    except GitHubError:
+        return findings
+    foreign = foreign_issue_numbers(issues, app.config)
+    return [finding for finding in findings if finding.get("issue") not in foreign]
