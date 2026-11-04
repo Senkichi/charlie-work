@@ -126,6 +126,7 @@ KNOWN_IGNORED: dict[str, str] = {
     "runner_health_desktop_pressure": "host-health record",
     "runner_health_stuck_window": "host-health record",
     "runner_keepalive": "liveness heartbeat, not pipeline data",
+    "runner_keepalive_failed": "host-health record",
     "runner_unregistered": "provisioning record; slot state comes from runner_samples",
     "runner_allocation_refused": "allocation decision record; runner_samples carries the outcome",
     "runner_allocation_skipped": "allocation decision record; runner_samples carries the outcome",
