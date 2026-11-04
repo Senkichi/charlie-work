@@ -126,13 +126,27 @@ def _fresh_processes() -> Iterator[psutil.Process]:
 
     ``process_iter`` keeps one ``Process`` per pid in a module-global cache and evicts
     a pid only when a sweep finds it absent. A pid freed and reborn between two
-    sweeps -- Windows recycles them freely, and ``process_chain`` sweeps the same
-    cache -- is served as the old instance, whose start time was snapshotted at
-    construction. Read through it, a holder that started after the
-    worker carries its predecessor's older start time, is judged to have predated the
-    worker, and is spared: the blocked tool call stays blocked. A ``Process``
-    constructed here takes its identity from the process that holds the pid *now*,
-    and ``kill`` is still pinned to that identity.
+    sweeps (Windows recycles them freely) is served as the old instance, whose start
+    time was snapshotted at construction. Read through it, a holder that started
+    after the worker carries its predecessor's older start time, is judged to have
+    predated the worker, and is spared: the blocked tool call stays blocked. A
+    ``Process`` constructed here takes its identity from the process that holds the
+    pid *now*, and ``kill`` is still pinned to that identity.
+
+    The cache is seeded by any direct ``process_iter`` caller in the same process.
+    Before this function existed that included ``_holders`` itself, so every earlier
+    ``release_pipe_holders`` call left the next one a cache to read through (issue
+    #3028). ``process_chain`` is not a seeder on Windows: it reaches ``process_iter``
+    only in fallback branches, taken when psutil lacks ``ppid_map`` or
+    ``cext.proc_times``, and Windows ships both. The cache is therefore outside this
+    module's control, which is why selection avoids it rather than relying on nobody
+    having populated it.
+
+    A pid that exits between ``psutil.pids()`` and the ``Process`` constructor
+    (``NoSuchProcess``) or whose identity cannot be read (``AccessDenied``, ``OSError``)
+    is skipped, not raised: it cannot be a holder this sweep, and an exception escaping
+    this generator would be swallowed by ``release_pipe_holders`` and turn the whole
+    release into a silent no-op.
     """
     for pid in psutil.pids():
         try:

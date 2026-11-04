@@ -18,6 +18,7 @@ holder. The suite therefore runs on Windows, the fleet's host and CI's OS.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -27,7 +28,7 @@ from pathlib import Path
 import psutil
 import pytest
 from charlie_work import pipe_holder_release
-from charlie_work.pipe_holder_release import _is_orphan, release_pipe_holders
+from charlie_work.pipe_holder_release import _fresh_processes, _is_orphan, release_pipe_holders
 from charlie_work.process_utils import get_process_start_time
 
 pytestmark = pytest.mark.skipif(
@@ -374,6 +375,42 @@ def test_orphan_rule_on_the_parent_link(
     monkeypatch.setattr(pipe_holder_release.psutil, "Process", lookup)
 
     assert _is_orphan(_FakeProc(ppid=7, created=_CHILD_CREATED)) is expected  # type: ignore[arg-type]
+
+
+_UNREADABLE_PID = 4_000_001  # patched ``psutil.pids`` names it; no real process is asked about it
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(psutil.NoSuchProcess(_UNREADABLE_PID), id="vanished-mid-sweep"),
+        pytest.param(psutil.AccessDenied(_UNREADABLE_PID), id="identity-unreadable"),
+        pytest.param(OSError("handle could not be opened"), id="os-error"),
+    ],
+)
+def test_a_pid_that_cannot_be_read_is_skipped_and_the_sweep_goes_on(
+    error: Exception, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pid that vanishes or cannot be opened mid-sweep must not end the sweep (#3028).
+
+    ``_fresh_processes`` replaced ``process_iter``'s own handling of this with a
+    ``try``/``except``. Nothing else exercises it: a real sweep rarely meets an unreadable
+    pid, and an exception escaping the generator is swallowed by ``release_pipe_holders``'
+    outer ``except`` -- the lane would silently become a no-op. The unreadable pid comes
+    *first*, so a ``return`` or an uncaught raise in its place would lose the live pid.
+    """
+    live_pid = os.getpid()
+    real_process = psutil.Process
+
+    def process(pid: int) -> psutil.Process:
+        if pid == _UNREADABLE_PID:
+            raise error
+        return real_process(pid)
+
+    monkeypatch.setattr(pipe_holder_release.psutil, "pids", lambda: [_UNREADABLE_PID, live_pid])
+    monkeypatch.setattr(pipe_holder_release.psutil, "Process", process)
+
+    assert [proc.pid for proc in _fresh_processes()] == [live_pid]
 
 
 @pytest.mark.parametrize("ppid", [0, -1])
