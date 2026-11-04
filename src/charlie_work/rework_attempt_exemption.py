@@ -28,12 +28,16 @@ chooses an escalation edge:
   (``dead_worker_classification.classify_and_credit_dead_worker``) and its
   clean-exit arm (``exempt_clean_exit_throttle_death``);
 * the no-op drain (``orphaned_worker_no_op_drain``);
-* both of the dead-session lane's open-PR routes in
-  ``dead_worker_sweep.effects_rework``: ``_reap_restore_rework_requested`` and
+* both open-PR routes in ``dead_worker_sweep.effects_rework``:
+  ``_reap_restore_rework_requested`` and
   ``_route_dead_worker_to_pre_review_rework``. The second one resolved the kind
   and used it only to skip adding a stamp, so the dead session's own dispatch
   stamp stayed in ``redispatch_at`` and an approved PR was operator-queued on
-  the cap (issue #3025).
+  the cap (issue #3025). That route has two callers, and each must resolve the
+  ``failure_kind`` it passes (the parameter is required): the dead-session lane
+  (``dead_sessions_reclaim._route_open_pr``) and the orphan sweep
+  (``apply_commits._route_pre_review_rework``, which classifies in the pre
+  phase because nothing has stamped an orphan that has a PR by then).
 
 That list is enforced, not just documented:
 ``tests/test_dead_rework_exemption_guard.py`` walks every caller of the
