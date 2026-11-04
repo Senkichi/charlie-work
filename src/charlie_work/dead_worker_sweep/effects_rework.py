@@ -531,6 +531,13 @@ def _route_dead_worker_to_pre_review_rework(
 
     Enforces ``watchdog.max_auto_redispatch`` and escalates deterministic
     failures immediately, mirroring the existing redispatch-escalation logic.
+
+    Issue #3025: a provider-throttle death (``failure_kind`` in
+    ``rework_attempt_exemption.PROVIDER_THROTTLE_EXEMPT_KINDS``) goes through
+    ``exempt_provider_throttle_rework_death`` first, so the dead session's own
+    dispatch stamp is refunded before the cap check and the issue is restored to
+    ``rework_requested`` instead of escalating.
+    ``tests/test_dead_rework_exemption_guard.py`` fails if this lane stops doing so.
     """
     write_gate = require_write_gate(write_gate)
     pr_number = int(pr["number"])
@@ -566,13 +573,31 @@ def _route_dead_worker_to_pre_review_rework(
         if current_status in ("rework_requested", "escalated"):
             return None
 
+        # Issue #1684/#2282/#3025: a provider-throttle-classified death (the kinds
+        # that arm ``throttled_until``) is a global provider condition, not a
+        # worker-quality signal -- it must consume no cap. Not adding a stamp is
+        # only half of that: the dead session's own dispatch stamp is already in
+        # ``redispatch_at`` and the cap check below would count it. The single
+        # enforcement point refunds it (and flags the PR for the janitor's
+        # counters), so it must run BEFORE the cap is computed and before any
+        # escalation edge is chosen. Its return value, not a separate predicate,
+        # decides "throttle death" here, so this lane cannot learn that without
+        # also applying the refund (#3025: it used ``is_provider_throttle_failure``
+        # alone, skipped the refund, and escalated an approved PR at the cap).
+        throttle_exempt = exempt_provider_throttle_rework_death(
+            state,
+            issue_number,
+            entry,
+            failure_kind,
+            dispatched_at=entry.get("dispatched_at"),
+            pr_number=pr_number,
+            source="dead_pre_review_rework_route",
+            write_gate=write_gate,
+        )
         redispatch_at = _windowed_redispatch_at(
             entry, window_minutes=config.watchdog.redispatch_window_minutes
         )
-        # Issue #1684: a provider-throttle-classified death (the kinds that
-        # arm ``throttled_until``) is a global provider condition, not a
-        # worker-quality signal — it must not consume the redispatch cap.
-        if not is_provider_throttle_failure(failure_kind):
+        if not throttle_exempt:
             redispatch_at = redispatch_at + [
                 _host_current().clock.now().isoformat().replace("+00:00", "Z")
             ]
@@ -583,7 +608,12 @@ def _route_dead_worker_to_pre_review_rework(
         # never auto-clears it.
         deterministic_judgment = failure_kind in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
         immediate_escalation = terminal_failure or deterministic_judgment
-        if immediate_escalation or len(redispatch_at) > config.watchdog.max_auto_redispatch:
+        # A throttle death is never the one that escalates (the same rule the
+        # restore lane applies, #1993); the next non-throttle death re-evaluates
+        # the cap against the refunded history.
+        if immediate_escalation or (
+            not throttle_exempt and len(redispatch_at) > config.watchdog.max_auto_redispatch
+        ):
             # Issue #783: merge conflict / rework-branch conflict / stale-CI
             # redispatch cap are all process failures, not judgment calls.
             # Issue #807: a deterministic judgment failure (genuine local

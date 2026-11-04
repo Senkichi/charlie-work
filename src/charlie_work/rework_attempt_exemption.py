@@ -21,10 +21,25 @@ which is exactly what a no-op looks like. Three throttle waves escalated a
 healthy PR as ``no_op_rework_cap_exceeded`` (charlie-work #2254 / PR #2264).
 
 :func:`exempt_provider_throttle_rework_death` is the single point of
-enforcement. Every lane that resolves a dead rework session's ``failure_kind``
-calls it: the orphan sweep's credit seam
-(``dead_worker_classification.classify_and_credit_dead_worker``) and the
-dead-session restore lane (``dead_worker_sweep.effects_rework``). For a
+enforcement. Every lane that ends a dead rework session calls it before it
+chooses an escalation edge:
+
+* the orphan sweep's credit seam
+  (``dead_worker_classification.classify_and_credit_dead_worker``) and its
+  clean-exit arm (``exempt_clean_exit_throttle_death``);
+* the no-op drain (``orphaned_worker_no_op_drain``);
+* both of the dead-session lane's open-PR routes in
+  ``dead_worker_sweep.effects_rework``: ``_reap_restore_rework_requested`` and
+  ``_route_dead_worker_to_pre_review_rework``. The second one resolved the kind
+  and used it only to skip adding a stamp, so the dead session's own dispatch
+  stamp stayed in ``redispatch_at`` and an approved PR was operator-queued on
+  the cap (issue #3025).
+
+That list is enforced, not just documented:
+``tests/test_dead_rework_exemption_guard.py`` walks every caller of the
+``redispatch_escalated`` edge (and its operator-queue twin) and fails when one
+is neither a registered dead-rework-session lane that applies the exemption
+before its edge, nor a registered non-rework-death context. For a
 throttle death it:
 
 1. **refunds** the dead session's own dispatch stamp from ``redispatch_at``.
