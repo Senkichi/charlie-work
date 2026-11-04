@@ -520,7 +520,7 @@ def _route_dead_worker_to_pre_review_rework(
     issue_number: int,
     reason: str,
     *,
-    failure_kind: str | None = None,
+    failure_kind: str | None,
     write_gate: WriteGate,
 ) -> dict[str, Any] | None:
     """Route a dead worker's stuck pre-review PR to the rework pipeline.
@@ -538,6 +538,11 @@ def _route_dead_worker_to_pre_review_rework(
     dispatch stamp is refunded before the cap check and the issue is restored to
     ``rework_requested`` instead of escalating.
     ``tests/test_dead_rework_exemption_guard.py`` fails if this lane stops doing so.
+
+    ``failure_kind`` is required, with no default, and each caller must resolve it
+    (``None`` only for a death that really is unclassified). A defaulted parameter let the
+    orphan sweep's caller pass nothing, which this route cannot tell from "not a throttle
+    death"; the guard test also rejects a literal ``None`` at a call site.
     """
     write_gate = require_write_gate(write_gate)
     pr_number = int(pr["number"])

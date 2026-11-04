@@ -314,9 +314,24 @@ def test_conflict_rework_ordinary_deaths_still_escalate_at_the_cap(tmp_path: Pat
     assert bed.events(EXEMPTION_EVENT_KIND) == []
 
 
-@pytest.mark.parametrize(
-    "lane", ["dead_session_restore", "dead_session_pre_review", "orphan_sweep"]
-)
+# lane -> (the PR is approved + conflicting, ``source`` of the exemption event it must emit).
+# The ``source`` names the code that applied the exemption, so each row also records WHICH
+# phase of the lane did it:
+#   * ``orphan_sweep`` is a live ``request_changes`` PR. ``_pre_review_flow`` skips it, and the
+#     LOCK phase's ``classify_and_credit_dead_worker`` exempts it (``orphan_sweep_credit``).
+#   * ``orphan_sweep_pre_review`` is an approved + conflicting PR. ``_pre_review_flow`` routes
+#     it in the PRE phase (``RoutePreReviewRework`` -> ``apply_commits._route_pre_review_rework``
+#     -> ``_route_dead_worker_to_pre_review_rework``), which must resolve the kind itself
+#     because no earlier step has stamped it: the same route as ``dead_session_pre_review``.
+_LANES: dict[str, tuple[bool, str]] = {
+    "dead_session_restore": (False, "dead_rework_session_restore"),
+    "dead_session_pre_review": (True, "dead_pre_review_rework_route"),
+    "orphan_sweep": (False, "orphan_sweep_credit"),
+    "orphan_sweep_pre_review": (True, "dead_pre_review_rework_route"),
+}
+
+
+@pytest.mark.parametrize("lane", list(_LANES))
 def test_throttle_death_takes_no_escalation_edge_in_any_lane(
     tmp_path: Path, lane: str, monkeypatch
 ) -> None:
@@ -326,10 +341,13 @@ def test_throttle_death_takes_no_escalation_edge_in_any_lane(
     cap (so a death that kept its dispatch stamp would cross it).
 
     ``dead_session_restore`` is the ``request_changes`` PR route,
-    ``dead_session_pre_review`` the conflicting-PR route, and ``orphan_sweep`` the
-    state.json-keyed sweep that runs after the sidecar is reaped.
+    ``dead_session_pre_review`` the conflicting-PR route, ``orphan_sweep`` the
+    state.json-keyed sweep that runs after the sidecar is reaped, and
+    ``orphan_sweep_pre_review`` that sweep's route for an approved + conflicting PR (the
+    sweep's second caller of ``_route_dead_worker_to_pre_review_rework``).
     """
-    bed = _Bed(tmp_path, conflicting=lane == "dead_session_pre_review")
+    conflicting, expected_source = _LANES[lane]
+    bed = _Bed(tmp_path, conflicting=conflicting)
     # One earlier counted attempt: the cap is CAP, so this dispatch makes CAP.
     with state_lock(bed.paths.state_file):
         state = load_state(bed.paths.state_file)
@@ -340,7 +358,7 @@ def test_throttle_death_takes_no_escalation_edge_in_any_lane(
     assert bed.entry()["status"] == "dispatched"
     assert len(bed.entry()["redispatch_at"]) == CAP
 
-    if lane == "orphan_sweep":
+    if lane.startswith("orphan_sweep"):
         bed.die_in_orphan_sweep(DEVIN_FREE_MODEL_RATE_LIMIT_LOG, monkeypatch)
     else:
         bed.die_in_dead_session_lane(DEVIN_FREE_MODEL_RATE_LIMIT_LOG)
@@ -349,8 +367,12 @@ def test_throttle_death_takes_no_escalation_edge_in_any_lane(
     entry = bed.entry()
     assert entry["status"] == "rework_requested"
     assert len(entry["redispatch_at"]) == CAP - 1
-    assert len(bed.events(EXEMPTION_EVENT_KIND)) == 1
-    assert bed.state()["prs"][str(PR)]["last_rework_was_startup_death"] is True
+    (exempted,) = bed.events(EXEMPTION_EVENT_KIND)
+    assert exempted["payload"]["source"] == expected_source
+    assert exempted["payload"]["failure_kind"] == "rate_limited"
+    pr_state = bed.state()["prs"][str(PR)]
+    assert pr_state["last_rework_was_startup_death"] is True
+    assert pr_state["last_rework_exemption"] == "provider_throttle"
 
 
 def _seed_dispatched(bed: _Bed, *, prior_counted: int) -> None:
@@ -393,6 +415,32 @@ def test_pre_review_route_refunds_the_stamp_that_would_cross_the_cap(tmp_path: P
     (exempted,) = bed.events(EXEMPTION_EVENT_KIND)
     assert exempted["payload"]["source"] == "dead_pre_review_rework_route"
     assert exempted["payload"]["failure_kind"] == "rate_limited"
+
+
+def test_pre_review_route_throttle_death_is_never_the_one_that_escalates(tmp_path: Path) -> None:
+    """The route's cap gate is ``immediate_escalation or (not throttle_exempt and over_cap)``.
+    The refund alone cannot satisfy this: with ``CAP + 1`` genuinely counted attempts already
+    in the window, refunding the dead session's own stamp still leaves the history over the
+    cap. A throttle death must not be the one that escalates (the rule the restore lane
+    applies, #1993); the next ordinary death re-evaluates the cap against that history.
+
+    Removing the ``not throttle_exempt`` clause makes this escalate through
+    ``redispatch_operator_queued``; the refund-boundary test above cannot see that, since its
+    refunded history lands exactly on the cap."""
+    bed = _Bed(tmp_path, conflicting=True)
+    _seed_dispatched(bed, prior_counted=CAP + 1)
+    assert len(bed.entry()["redispatch_at"]) == CAP + 2
+
+    bed.die_in_dead_session_lane(DEVIN_FREE_MODEL_RATE_LIMIT_LOG)
+
+    bed.assert_not_escalated(1)
+    entry = bed.entry()
+    assert entry["status"] == "rework_requested"
+    assert entry.get("escalation_reason") is None
+    # Only the dead session's own stamp is refunded; the history is still over the cap.
+    assert len(entry["redispatch_at"]) == CAP + 1
+    (exempted,) = bed.events(EXEMPTION_EVENT_KIND)
+    assert exempted["payload"]["source"] == "dead_pre_review_rework_route"
 
 
 def test_pre_review_route_genuine_no_op_still_counts_toward_the_cap(tmp_path: Path) -> None:

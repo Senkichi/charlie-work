@@ -216,6 +216,85 @@ def test_dead_rework_session_lanes_apply_the_exemption_before_their_edge() -> No
     assert not violations, "; ".join(violations)
 
 
+# --- callers of the pre-review route must resolve the failure kind -------------------------
+#
+# The lane registry above proves ``_route_dead_worker_to_pre_review_rework`` applies the
+# exemption. It cannot prove a *caller* hands it anything to apply it to: the route decides
+# "throttle death" from its ``failure_kind`` argument, so a caller that passes ``None`` (the
+# orphan sweep's ``apply_commits._route_pre_review_rework`` did, #3025 review) turns the
+# exemption off while the registry stays green. These checks close that blind spot. The scan
+# is lexical like the one above: it sees a literal ``None`` or an omitted argument, not a
+# variable that happens to be ``None``, which is what the runtime tests are for
+# (``tests/test_rework_throttle_exemption_lanes.py``, one case per caller).
+
+PRE_REVIEW_ROUTE_FN = "_route_dead_worker_to_pre_review_rework"
+
+
+def route_call_sites(tree: ast.Module, rel: str) -> list[tuple[str, str | None]]:
+    """Every call of the pre-review route in ``tree`` as ``(where, violation | None)``.
+
+    A violation is a call that omits ``failure_kind`` or passes the literal ``None``. A
+    ``**kwargs`` spread does not count as passing it: the argument must be visible.
+    """
+    sites: list[tuple[str, str | None]] = []
+    for call in (n for n in ast.walk(tree) if isinstance(n, ast.Call)):
+        if _callee(call) != PRE_REVIEW_ROUTE_FN:
+            continue
+        where = f"{rel}:{call.lineno}"
+        passed = {kw.arg: kw.value for kw in call.keywords if kw.arg is not None}
+        if "failure_kind" not in passed:
+            sites.append((where, f"{where} passes no failure_kind to {PRE_REVIEW_ROUTE_FN}"))
+            continue
+        value = passed["failure_kind"]
+        if isinstance(value, ast.Constant) and value.value is None:
+            sites.append((where, f"{where} passes a literal failure_kind=None"))
+            continue
+        sites.append((where, None))
+    return sites
+
+
+def _scan_route_calls() -> list[tuple[str, str | None]]:
+    sites: list[tuple[str, str | None]] = []
+    for path in source_files(SRC_ROOT):
+        rel = path.relative_to(SRC_ROOT).as_posix()
+        sites.extend(route_call_sites(parsed(path), rel))
+    return sites
+
+
+def test_no_caller_passes_the_pre_review_route_a_literal_none_failure_kind() -> None:
+    sites = _scan_route_calls()
+    # Positive control: the scan must see the real callers, or an empty violation list below
+    # would only mean the scan matched nothing. Today: the dead-session lane and the orphan
+    # sweep's apply_commits.
+    callers = {where.split(":")[0] for where, _ in sites}
+    assert {
+        "dead_worker_sweep/dead_sessions_reclaim.py",
+        "dead_worker_sweep/apply_commits.py",
+    } <= callers, f"route_call_sites no longer finds the known callers: {sorted(callers)}"
+    violations = [v for _, v in sites if v]
+    assert not violations, (
+        "; ".join(violations)
+        + f". {PRE_REVIEW_ROUTE_FN} decides 'throttle death' from failure_kind, so a caller "
+        "must resolve the dead session's kind (stamp, else log classification) and pass it. "
+        "A literal None disables the provider-throttle exemption for that caller (#3025)."
+    )
+
+
+def test_pre_review_route_failure_kind_is_a_required_parameter() -> None:
+    """With a default, a new caller can forget the argument and get ``None``, silently."""
+    import inspect
+
+    from charlie_work.dead_worker_sweep import effects_rework
+
+    param = inspect.signature(getattr(effects_rework, PRE_REVIEW_ROUTE_FN)).parameters[
+        "failure_kind"
+    ]
+    assert param.kind is inspect.Parameter.KEYWORD_ONLY
+    assert param.default is inspect.Parameter.empty, (
+        f"{PRE_REVIEW_ROUTE_FN}(failure_kind=...) has a default again; callers must pass it"
+    )
+
+
 # --- detector controls: the guard above must be able to fail -------------------------------
 
 _LANE_OK = """
@@ -260,6 +339,60 @@ def test_detector_sees_a_literal_operator_queue_edge_in_a_method() -> None:
     """A caller that skips ``_escalation_edge`` and hands the edge literal to ``transition``
     is still found, keyed by its class-qualified name."""
     assert _only(_LANE_LITERAL_EDGE).key == "synthetic.py::Lane.end"
+
+
+_ROUTE_RESOLVED = """
+def caller(gh, config, pr, issue, reason, kind, gate):
+    _route_dead_worker_to_pre_review_rework(
+        "s", gh, config, pr, issue, reason, failure_kind=kind, write_gate=gate
+    )
+"""
+_ROUTE_LITERAL_NONE = """
+def caller(gh, config, pr, issue, reason, gate):
+    effects_rework._route_dead_worker_to_pre_review_rework(
+        "s", gh, config, pr, issue, reason, failure_kind=None, write_gate=gate
+    )
+"""
+_ROUTE_OMITTED = """
+def caller(gh, config, pr, issue, reason, gate):
+    _route_dead_worker_to_pre_review_rework("s", gh, config, pr, issue, reason, write_gate=gate)
+"""
+_ROUTE_SPREAD = """
+def caller(gh, config, pr, issue, reason, extra):
+    _route_dead_worker_to_pre_review_rework("s", gh, config, pr, issue, reason, **extra)
+"""
+
+
+def _route_violations(source: str, rel: str = "synthetic.py") -> list[str]:
+    return [v for _, v in route_call_sites(parsed_source(source), rel) if v]
+
+
+def test_route_detector_accepts_a_resolved_failure_kind() -> None:
+    assert _route_violations(_ROUTE_RESOLVED) == []
+
+
+def test_route_detector_flags_a_literal_none_through_an_attribute_call() -> None:
+    (violation,) = _route_violations(_ROUTE_LITERAL_NONE)
+    assert "literal failure_kind=None" in violation
+
+
+def test_route_detector_flags_an_omitted_or_spread_failure_kind() -> None:
+    assert "passes no failure_kind" in _route_violations(_ROUTE_OMITTED)[0]
+    assert "passes no failure_kind" in _route_violations(_ROUTE_SPREAD)[0]
+
+
+def test_reintroducing_the_orphan_sweep_none_trips_the_guard() -> None:
+    """Put the pre-#3025 ``failure_kind=None`` back into the real ``apply_commits`` source:
+    the route-caller scan must flag it. If this passes with the scan green, the scan is not
+    reading the orphan sweep's caller."""
+    rel = "dead_worker_sweep/apply_commits.py"
+    source = (SRC_ROOT / rel).read_text(encoding="utf-8")
+    resolved = "failure_kind=worker_fate.persisted_failure(classified).kind,"
+    assert resolved in source
+    assert _route_violations(source, rel) == []
+    reverted = source.replace(resolved, "failure_kind=None,")
+    (violation,) = _route_violations(reverted, rel)
+    assert "literal failure_kind=None" in violation
 
 
 def test_neutering_the_real_lanes_trips_the_guard() -> None:
