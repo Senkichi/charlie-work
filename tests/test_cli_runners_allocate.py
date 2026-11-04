@@ -6,6 +6,7 @@ verbatim relocations; shared fakes live in ``tests/_cli_fixtures.py``.
 
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -325,4 +326,50 @@ def test_run_runners_ensure_started_proceeds_when_allocation_disabled(
     (
         ensure_mock.assert_called_once(),
         ("ensure_runners_started must be called when allocation is disabled"),
+    )
+
+
+def test_run_runners_ensure_started_passes_github_client_to_launch_guard(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """ensure-started hands ci_fleet the context's GitHub client.
+
+    ci-fleet's R-16 guard reads each repo's visibility before a launch and
+    refuses when it cannot. With ``gh`` omitted it has nothing to read with,
+    so every start is refused.
+    """
+    managed_root = tmp_path / "runners"
+    managed_root.mkdir()
+    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False, **kw: tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "load_layered_config",
+        lambda *a, **k: _ensure_started_config(
+            allocation_enabled=False,
+            managed_root=str(managed_root),
+        ),
+    )
+    ensure_mock = MagicMock(return_value=(0, []))
+    monkeypatch.setattr(cli, "ensure_runners_started", ensure_mock)
+
+    args = cli.build_parser().parse_args(["runners", "ensure-started"])
+    cli.run_runners_ensure_started(args)
+
+    ensure_mock.assert_called_once()
+    passed = ensure_mock.call_args.kwargs.get("gh")
+    assert isinstance(passed, cli.GitHub), (
+        f"ensure_runners_started must get the command's GitHub client, got {passed!r}"
+    )
+
+
+def test_ci_fleet_ensure_runners_started_accepts_github_client() -> None:
+    """The installed ci_fleet takes the ``gh`` that ensure-started passes.
+
+    ``gh`` arrived with ci-fleet 0.8.4. An older install raises TypeError on
+    the call above, which the mocked test cannot see.
+    """
+    parameters = inspect.signature(cli.ensure_runners_started).parameters
+    assert "gh" in parameters, (
+        f"installed ci_fleet's ensure_runners_started has no gh parameter: {sorted(parameters)}"
     )
