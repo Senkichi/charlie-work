@@ -224,6 +224,7 @@ def test_strip_fenced_blocks_pins_line_anchored_behaviour() -> None:
 # --- outbound example-secret mask ----------------------------------------------------
 
 _KEY = corpus.KEY
+_AWS = corpus.AWS
 _OUTBOUND_CORPUS = corpus.outbound_corpus()
 
 
@@ -291,6 +292,51 @@ def test_outbound_agreeing_split_token_is_refused_control() -> None:
     assert {m.rule_id for m in scan_outbound_text(body, part="body")} == {"jwt-base64"}
 
 
+# (md-r4 #3036) the shared fixture of the two scans: a mask pair that agrees
+# byte for byte (both parsers blank the same lines) and one that does not.
+_AGREEING_BODY = f"a\n{_AWS}\n```example-secret\n{_KEY}\n```\nb\n"
+_DISAGREEING_BODY = f"{_SPLIT_TOKEN_HEAD}\n\t```example-secret\n\n```\n{_SPLIT_TOKEN_TAIL}\n"
+
+
+def test_outbound_scan_skips_the_legacy_pass_for_byte_identical_masks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3036: an agreeing mask pair makes the legacy scan a no-op rerun.
+
+    ``_scan_masked`` is a pure function of its input string, so when
+    ``_legacy_masked_text(text) == _mask_example_secret_fences(text)`` the
+    second rules pass over the legacy text returns exactly the composed
+    matches, the ``extra`` union is empty, and the scan is skipped. One rules
+    pass per agreeing document; two still pay when the two masks differ.
+    """
+    assert _legacy_masked_text(_AGREEING_BODY) == _mask_example_secret_fences(
+        _AGREEING_BODY, on_disagreement=lambda _d: None
+    )
+    assert _legacy_masked_text(_DISAGREEING_BODY) != _mask_example_secret_fences(
+        _DISAGREEING_BODY, on_disagreement=lambda _d: None
+    )
+    from charlie_work import outbound_body_guard as guard
+
+    calls = 0
+    real = guard._scan_masked
+
+    def counting(masked: str, *, part: str) -> tuple[SecretMatch, ...]:
+        nonlocal calls
+        calls += 1
+        return real(masked, part=part)
+
+    monkeypatch.setattr(guard, "_scan_masked", counting)
+    agreeing = scan_outbound_text(_AGREEING_BODY, part="body")
+    disagreeing = scan_outbound_text(_DISAGREEING_BODY, part="body")
+    # The agreeing document pays one rules pass (the composed one); the
+    # disagreeing one still pays both, so its union is unchanged.
+    assert calls == 3
+    # ...and the agreeing case's result is the real composed-side matches.
+    assert {m.rule_id for m in agreeing} == {"aws-access-token"}
+    # ...and the disagreeing one's union still carries main's lone match.
+    assert [m.rule_id for m in disagreeing] == ["jwt-base64"]
+
+
 def test_outbound_scan_reports_every_match_main_reports_over_the_corpus() -> None:
     """Compared against origin/main's LITERAL match keys, not the branch's own legacy scan.
 
@@ -345,9 +391,6 @@ def test_outbound_bare_cr_document_reports_the_line_model_disagreement() -> None
     body = f"x\r```example-secret\r{_KEY}\r```\r"
     assert _mask_example_secret_fences(body, on_disagreement=events.append) == body
     assert len(events) == 1 and events[0].chosen == "-"
-
-
-_AWS = corpus.AWS
 
 
 @pytest.mark.parametrize(
