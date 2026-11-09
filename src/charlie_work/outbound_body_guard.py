@@ -319,15 +319,24 @@ def scan_outbound_text(
     because a multi-line rule can match across a block main blanked. Both
     texts keep every LF, so line numbers agree.
 
+    When the two masks agree byte for byte (the common case -- most documents
+    either carry no ``example-secret`` fence or one both parsers blank
+    identically), the legacy text IS the composed text, so the second rules
+    pass is the same pure function over the same string and cannot add a
+    match: the union is, by construction, the composed side itself, and the
+    pass is skipped (#3036). Only genuinely differing masks pay for it.
+
     legacy path: delete the main-text scan after soak when
     markdown_guard_disagreement stays at zero (follow-up issue).
     """
     if not text:
         return ()
-    composed = _scan_masked(
-        _mask_example_secret_fences(text, on_disagreement=on_disagreement), part=part
-    )
-    legacy = _scan_masked(_legacy_masked_text(text), part=part)
+    legacy_masked = _legacy_masked_text(text)
+    composed_masked = _mask_example_secret_fences(text, on_disagreement=on_disagreement)
+    composed = _scan_masked(composed_masked, part=part)
+    if legacy_masked == composed_masked:
+        return composed
+    legacy = _scan_masked(legacy_masked, part=part)
     # Dedup ONLY against the composed matches: a legacy-only match is never
     # collapsed against another legacy match, so the union's count is never
     # below main's own (`match_count` in the refusal event stays >= main's).
