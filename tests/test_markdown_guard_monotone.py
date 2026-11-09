@@ -82,13 +82,30 @@ _GUARD_IDS = sorted(_GUARDS)
 
 _VERDICT_CORPUS = corpus.verdict_corpus()
 
+# Per-(guard, side) labels for the whole frozen corpus. The extractors are
+# pure, so these label tuples can never change between call sites: both
+# property loops below used to recompute them per corpus text even though the
+# composed extractor they call has already run the same legacy and scan sides
+# internally on every text, doubling the loop's CPU (ledger #3034).
+_SIDE_LABELS: dict[tuple[str, int], tuple[str, ...]] = {}
+
+
+def _cached_side_labels(guard: str, side: int) -> tuple[str, ...]:
+    labels = _SIDE_LABELS.get((guard, side))
+    if labels is None:
+        labels = tuple(_label(_GUARDS[guard][side](text)) for text in _VERDICT_CORPUS)
+        _SIDE_LABELS[(guard, side)] = labels
+    return labels
+
 
 @pytest.mark.parametrize("guard", _GUARD_IDS)
 def test_composed_verdict_is_never_less_severe_than_legacy(guard: str) -> None:
-    composed, legacy, scan = _GUARDS[guard]
+    composed = _GUARDS[guard][0]
     seen_stricter = seen_equal = False
-    for text in _VERDICT_CORPUS:
-        c, lg, sc = _label(composed(text)), _label(legacy(text)), _label(scan(text))
+    for text, lg, sc in zip(
+        _VERDICT_CORPUS, _cached_side_labels(guard, 1), _cached_side_labels(guard, 2), strict=True
+    ):
+        c = _label(composed(text))
         assert decision_severity(c) >= decision_severity(lg), (text, c, lg)
         assert decision_severity(c) >= decision_severity(sc), (text, c, sc)
         if c == "approved":
@@ -102,12 +119,13 @@ def test_composed_verdict_is_never_less_severe_than_legacy(guard: str) -> None:
 
 @pytest.mark.parametrize("guard", _GUARD_IDS)
 def test_disagreement_event_fires_only_on_disagreement(guard: str) -> None:
-    composed, legacy, scan = _GUARDS[guard]
+    composed = _GUARDS[guard][0]
     fired = quiet = 0
-    for text in _VERDICT_CORPUS:
+    for text, lg, sc in zip(
+        _VERDICT_CORPUS, _cached_side_labels(guard, 1), _cached_side_labels(guard, 2), strict=True
+    ):
         events: list[Disagreement] = []
         result = composed(text, on_disagreement=events.append)
-        lg, sc = _label(legacy(text)), _label(scan(text))
         if lg == sc:
             assert events == [], text
             quiet += 1
