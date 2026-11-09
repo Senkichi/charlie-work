@@ -48,7 +48,7 @@ import ast
 import inspect
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import pytest
 
@@ -284,14 +284,61 @@ def test_ac8_mutation_i_always_next_breaks_retry_idempotency(
         _assert_retry_reuses_round(app, paths)
 
 
-def test_ac8_mutation_ii_head_only_compare_breaks_distinct_verdict_isolation(
+class _HeadOnlyCompareMutationDrive(NamedTuple):
+    """The AC8(ii) drive's outcome, recorded at setup for the call-phase assertions.
+
+    ``captured`` is the ``AssertionError`` the AC2(b) helper raised under the
+    narrowed compare keys (``None`` when it passed, i.e. the mutation was NOT
+    caught). Deliberately a recorded value, not a live object: the drive is
+    charged to setup (issue #3032), so the call phase replays facts, never
+    production code.
+    """
+
+    captured: AssertionError | None
+
+
+@pytest.fixture
+def _driven_head_only_compare_mutation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> _HeadOnlyCompareMutationDrive:
+    """Drive AC8(ii)'s mutation scenario into a recorded ``AssertionError``.
+
+    Issue #3032 (ledger-regress): the test's ``call`` phase was paying the
+    whole drive -- app construction and both ``record_review`` verdicts (state
+    lock + save, the dual events write, the decision + prompt + archive
+    writes) whose per-writer cost is set by the runner, not by this repo's
+    code (nothing at the attributed SHA ``f10d87f35`` touched this path).
+    Charging the drive to setup follows the #2568/#2624/#2636 precedent; the
+    test body below asserts on the recorded outcome, and per-assertion costs
+    this shape stays visible under ``ci-fleet ledger report --section
+    slow-fixtures``.
+
+    The drive is the AC2(b) helper verbatim (issue #1283 Phase A composition
+    preserved), still under the narrowed compare keys this mutation test
+    exists to pin."""
+    monkeypatch.setattr(rework_prompts, "_ROUND_COMPARE_KEYS", ("reviewed_head_sha",))
+
+    app, paths = _round_archive_app(tmp_path)
+    captured: AssertionError | None = None
+    try:
+        _assert_distinct_same_head_mints_round_and_preserves_prior(app, paths)
+    except AssertionError as exc:
+        captured = exc
+    return _HeadOnlyCompareMutationDrive(captured=captured)
+
+
+def test_ac8_mutation_ii_head_only_compare_breaks_distinct_verdict_isolation(
+    _driven_head_only_compare_mutation: _HeadOnlyCompareMutationDrive,
 ) -> None:
     """Mutation (ii): narrow the compare keys to `reviewed_head_sha` only --
     reintroducing the rejected head-advanced-only rule. AC2(b) must fail
     specifically because round-1's archived content was overwritten/lost
     when a distinct verdict arrived on an unchanged head -- this is the
     mutation that reproduces the actual data-loss bug W11 exists to fix.
+
+    The drive (both verdict records under the mutation) is charged to setup
+    by ``_driven_head_only_compare_mutation`` (issue #3032); this body holds
+    only the recorded-outcome assertions.
 
     Issue #1283 Phase A (discovered during this PR's own hazard sweep, not
     in the dispatch prompt's 4-item list -- flagged by Preflight and fixed
@@ -301,11 +348,15 @@ def test_ac8_mutation_ii_head_only_compare_breaks_distinct_verdict_isolation(
     moved to charlie_work/rework_prompts.py, so `_next_round_number` now
     resolves the constant from rework_prompts's own module globals, not
     workflow.py's facade re-export."""
-    monkeypatch.setattr(rework_prompts, "_ROUND_COMPARE_KEYS", ("reviewed_head_sha",))
-
-    app, paths = _round_archive_app(tmp_path)
-    with pytest.raises(AssertionError, match="must survive a distinct"):
-        _assert_distinct_same_head_mints_round_and_preserves_prior(app, paths)
+    captured = _driven_head_only_compare_mutation.captured
+    assert captured is not None, (
+        "under the narrowed compare keys the AC2(b) helper must fail "
+        "-- a distinct verdict on an unchanged head must overwrite round-1's "
+        "archived content (the data-loss bug W11 exists to fix); any change "
+        "decoupling `_next_round_number` from `rework_prompts._ROUND_COMPARE_KEYS` "
+        f"defeats this pin: {captured}"
+    )
+    assert "must survive a distinct" in str(captured), str(captured)
 
 
 # ---------------------------------------------------------------------------
