@@ -94,7 +94,7 @@ def _outbound_mismatch(texts: list[str], table: dict[str, Any]) -> str | None:
     below rerun the same corpora under different constants and must observe
     the real scan.
     """
-    row_cache: dict[str, tuple[str, list[list[str]]]] = {}
+    row_cache: dict[str, tuple[str, list[list[str | int]]]] = {}
     for text, index in zip(texts, table["index"], strict=True):
         row = table["unique"][index]
         masked = _legacy_masked_text(text)
