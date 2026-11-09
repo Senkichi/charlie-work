@@ -84,14 +84,29 @@ def _changed_lines(original: str, masked: str) -> list[int]:
 
 
 def _outbound_mismatch(texts: list[str], table: dict[str, Any]) -> str | None:
-    """First text whose legacy masked text / line set / match keys differ from main's."""
+    """First text whose legacy masked text / line set / match keys differ from main's.
+
+    The (masked sha, match keys) pair depends only on the masked text, and the
+    corpus is heavily duplicate-masked (about half of the 6174 secret texts
+    mask to a string already seen), so the pair is memoized per masked text
+    within one call: with the cache the scan runs 3164 times, not 6174
+    (ledger #3037). Nothing is carried across calls -- the control tests
+    below rerun the same corpora under different constants and must observe
+    the real scan.
+    """
+    row_cache: dict[str, tuple[str, list[list[str]]]] = {}
     for text, index in zip(texts, table["index"], strict=True):
         row = table["unique"][index]
         masked = _legacy_masked_text(text)
-        sha = hashlib.sha256(masked.encode("utf-8", "surrogatepass")).hexdigest()[:16]
-        keys = sorted(
-            [m.rule_id, m.line, m.match_sha256[:12]] for m in _scan_masked(masked, part="body")
-        )
+        cached = row_cache.get(masked)
+        if cached is None:
+            sha = hashlib.sha256(masked.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+            keys = sorted(
+                [m.rule_id, m.line, m.match_sha256[:12]] for m in _scan_masked(masked, part="body")
+            )
+            cached = (sha, keys)
+            row_cache[masked] = cached
+        sha, keys = cached
         if (sha, _changed_lines(text, masked), keys) != (
             row["masked_sha"],
             row["masked_lines"],
