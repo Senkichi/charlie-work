@@ -145,6 +145,12 @@ def test_no_orchestrator_authored_text_contains_a_parseable_verdict() -> None:
     and prompts built in Python (``rescue.py`` constructs its own). Sweeping
     both by glob rather than naming files means a prompt added later is covered
     whichever way it is written.
+
+    A source needs a fence before it can end in a verdict -- both extraction
+    paths require an opening delimiter of 3+ backticks or 3+ tildes, so a
+    fence-less source is skipped by substring tests rather than paid for in
+    per-file regex and structure scans. Any parseable verdict keeps at least
+    one needle, so no offender can be skipped.
     """
     package_root = Path(__file__).resolve().parents[1] / "src" / "charlie_work"
     sources = sorted(package_root.joinpath("prompts").rglob("*.md")) + sorted(
@@ -152,11 +158,13 @@ def test_no_orchestrator_authored_text_contains_a_parseable_verdict() -> None:
     )
     assert sources, f"no orchestrator-authored sources found under {package_root}"
 
-    offenders = [
-        source.relative_to(package_root).as_posix()
-        for source in sources
-        if _extract_verdict_from_text(source.read_text(encoding="utf-8")) is not None
-    ]
+    offenders = []
+    for source in sources:
+        text = source.read_text(encoding="utf-8")
+        if "```" not in text and "~~~" not in text:
+            continue
+        if _extract_verdict_from_text(text) is not None:
+            offenders.append(source.relative_to(package_root).as_posix())
 
     assert not offenders, (
         f"orchestrator-authored file(s) contain a parseable verdict block: {offenders}. "
