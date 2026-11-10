@@ -204,7 +204,15 @@ def find_autospec_violations(
     test function (used for positive/negative controls).  Within an allowed
     file, every test function that uses the ``monkeypatch`` fixture is
     enforced, including nested helper functions defined inside the test.
+
+    A file outside ``enforced_files`` is returned before parsing: the scan
+    walks ~900 real test files and only the allowlist's entries can carry a
+    finding, so parsing every file to emit a no-op was the scan's dominant
+    cost (ledger #3045).  Unlike a skipped file, an unparseable *enforced*
+    file still fails closed as a ``<parse>`` violation below.
     """
+    if enforced_files is not None and filename not in enforced_files:
+        return []
     try:
         tree = parsed_source(source, filename)
     except SyntaxError as exc:
@@ -216,9 +224,6 @@ def find_autospec_violations(
     violations: list[AutospecViolation] = []
 
     for test_fn in test_nodes:
-        if enforced_files is not None and filename not in enforced_files:
-            continue
-
         fixture_names = _monkeypatch_fixture_names(test_fn)
         if not fixture_names:
             continue
@@ -252,10 +257,20 @@ def _format_violations(violations: list[AutospecViolation]) -> str:
 
 
 def _scan_enforced_test_files() -> list[AutospecViolation]:
+    """Scan only the allowlisted files (ledger #3045).
+
+    The walk still enumerates every top-level ``test_*.py`` so the scan's
+    file universe is derived at runtime, but a non-allowlisted file cannot
+    carry a finding, so it is skipped before its text is read.  An
+    allowlisted path that drifted out of existence is caught by
+    ``test_enforced_files_non_empty_and_real``, not here.
+    """
     violations: list[AutospecViolation] = []
     for path in sorted(TESTS_DIR.glob("test_*.py")):
-        source = path.read_text(encoding="utf-8")
         rel = path.relative_to(REPO_ROOT).as_posix()
+        if rel not in ENFORCED_FILES:
+            continue
+        source = path.read_text(encoding="utf-8")
         violations.extend(find_autospec_violations(source, rel))
     return violations
 
