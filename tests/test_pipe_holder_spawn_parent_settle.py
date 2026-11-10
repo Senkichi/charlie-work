@@ -10,10 +10,12 @@ precedes the child's, so psutil's parent() rule returns it, while
 rendered as ``status='terminated'``. The controls in ``_spawn_orphan`` must
 wait for the row to drop rather than read the table once.
 
-These rows live in their own module because ``test_pipe_holder_release.py`` sits
-near the module-size cap (issue #1442's file-size ratchet), so the shared
-helpers are imported from there rather than copied: the fakes stay pinned to the
-spawn helper whose parent control they stage.
+These rows live in their own module because ``test_pipe_holder_release.py`` sat
+at the issue #1442 file-size ratchet's cap once they landed there, and the
+shared spawn helpers follow the zero-cross-test-import guard
+(``tests/test_zero_cross_test_import_guard.py``, issue #1284) into the
+``tests/_pipe_holder_fixtures.py`` module: the fakes stay pinned to the spawn
+helper whose parent control they stage.
 """
 
 from __future__ import annotations
@@ -27,22 +29,17 @@ from types import SimpleNamespace
 import psutil
 import pytest
 
-from test_pipe_holder_release import (
-    _PYTHON,
-    _SLEEPER,
-    _SPAWN_ORPHAN_ATTEMPTS,
-    _spawn_orphan,
-)
+from _pipe_holder_fixtures import _PYTHON, _SLEEPER, _SPAWN_ORPHAN_ATTEMPTS, _spawn_orphan
 
 pytestmark = pytest.mark.skipif(
     sys.platform != "win32",
     reason="orphans are only parentless on Windows; POSIX reparents them to a live init",
 )
 
-# Same lifecycle guard the real-process rows use (test_pipe_holder_release's
-# ``orphans`` fixture: killed on teardown, pinned so no foreign pid is touched).
-# Declared here rather than re-exported, because a fixture import shadows the
-# parameter name and trips ruff's redefinition rules.
+# Same lifecycle guard the real-process rows under test_pipe_holder_release use:
+# killed on teardown, pinned so no foreign pid is touched. Declared here rather
+# than re-exported, because a fixture import shadows the parameter name and
+# trips ruff's redefinition rules.
 
 
 @pytest.fixture
