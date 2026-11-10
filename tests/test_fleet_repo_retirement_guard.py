@@ -29,9 +29,11 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+
 import charlie_work
 from charlie_work.fleet_registry import _iter_registered_repo_contexts, _select_repos
-from _src_ast import parsed, source_files
+from _src_ast import parsed, source_files, source_text
 
 PACKAGE_ROOT = Path(charlie_work.__file__).resolve().parent
 SELECTORS = {_select_repos.__name__, _iter_registered_repo_contexts.__name__}
@@ -146,9 +148,23 @@ def _has_retirement_evidence(node: ast.AST) -> bool:
 
 
 def _lane_scopes() -> list[tuple[str, str, ast.AST, int]]:
-    """``(module, qualname, node, line)`` for every app-building per-repo scope."""
+    """``(module, qualname, node, line)`` for every app-building per-repo scope.
+
+    A scope needs ``_load_registry`` *and* ``OrchestratorApp`` as direct
+    call names, and ``_direct_calls`` reads those names only off
+    ``ast.Name`` ids and ``ast.Attribute`` attrs -- every such identifier
+    appears verbatim in the file text. A file missing either token cannot
+    hold a matching scope, so it is skipped before ``parsed()`` (the
+    sibling-filter shape of issue #2606's family; the residual -- an
+    identifier assembled from adjacent string literals -- is out of scope:
+    this guard does tripwire duty for accidental bypasses, not
+    adversarial ones).
+    """
     found: list[tuple[str, str, ast.AST, int]] = []
     for path in source_files(PACKAGE_ROOT):
+        text = source_text(path)
+        if "_load_registry" not in text or "OrchestratorApp" not in text:
+            continue
         tree = parsed(path)
         module = _module_name(path)
 
@@ -201,16 +217,33 @@ def _scope_by_name(module: str, qualname: str) -> ast.AST:
     raise AssertionError(f"{module}:{qualname} not found -- update the guard's symbol")
 
 
-def test_scan_sees_the_known_lane() -> None:
+@pytest.fixture(scope="module")
+def lane_scopes() -> list[tuple[str, str, ast.AST, int]]:
+    """The app-building per-repo scope scan, shared by the module's consumers.
+
+    Scanning the package is the module's dominant cost and three of its
+    tests spend exactly the same scan, so they charge it to this module
+    fixture instead of repeating it per call (the accepted #2662/#2867/
+    #2875/#2882 remedy family; the scan now runs once per module instead
+    of up to three times). The scan's output is shared, read-only data:
+    the consumers only read/iterate it and never mutate the handed-out
+    trees (the ``_src_ast`` shared-tree discipline). The first consumer's
+    setup owns the scan; if it ever flags, ``ci-fleet ledger report
+    --section slow-fixtures`` is its owner.
+    """
+    return _lane_scopes()
+
+
+def test_scan_sees_the_known_lane(lane_scopes) -> None:
     """Positive control: the scan must find ``fleet_loop``'s app construction."""
-    scopes = {(module, scope) for module, scope, _node, _line in _lane_scopes()}
+    scopes = {(module, scope) for module, scope, _node, _line in lane_scopes}
     assert ("charlie_work.fleet_dispatch", "fleet_loop") in scopes
 
 
-def test_every_per_repo_lane_uses_retirement_aware_selection() -> None:
+def test_every_per_repo_lane_uses_retirement_aware_selection(lane_scopes) -> None:
     offenders = [
         f"{module}:{line} {scope}"
-        for module, scope, node, line in _lane_scopes()
+        for module, scope, node, line in lane_scopes
         if not (_direct_calls(node) & SELECTORS)
     ]
     assert not offenders, (
@@ -220,7 +253,7 @@ def test_every_per_repo_lane_uses_retirement_aware_selection() -> None:
     )
 
 
-def test_every_per_repo_lane_actually_checks_retirement() -> None:
+def test_every_per_repo_lane_actually_checks_retirement(lane_scopes) -> None:
     """Removing a lane's own skip/wind-down check must fail this guard.
 
     Selecting a retired repo through ``_select_repos`` only labels it; each
@@ -230,7 +263,7 @@ def test_every_per_repo_lane_actually_checks_retirement() -> None:
     """
     offenders = [
         f"{module}:{line} {scope}"
-        for module, scope, node, line in _lane_scopes()
+        for module, scope, node, line in lane_scopes
         if not _has_retirement_evidence(node)
     ]
     assert not offenders, (
