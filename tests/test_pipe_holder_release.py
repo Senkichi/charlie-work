@@ -24,6 +24,7 @@ import sys
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import psutil
 import pytest
@@ -125,9 +126,22 @@ def _spawn_orphan(orphans: list[psutil.Process], cwd: Path) -> psutil.Process:
     while not orphan.is_running() and time.monotonic() < deadline:
         time.sleep(0.05)
     assert orphan.is_running(), "positive control: the orphan must be running"
-    # psutil's own parent() rule (missing, or a recycled pid) as an independent
-    # control that the process really is parentless in the table.
-    assert orphan.parent() is None, "positive control: the orphan's parent must be gone"
+    # The launcher is dead (subprocess.run waited for it), but its row lingers
+    # in the process table for a few milliseconds, and reads of the identity it
+    # held can still succeed in that window: a create time that precedes the
+    # child's makes psutil's own parent() rule return the dead launcher, which
+    # failed this control (and, a moment later, release_pipe_holders'
+    # _is_orphan, sparing the holder) in the nightly's full shuffled run
+    # (issue #3047); the row drops within a few ms (`parent()` re-reads None).
+    # So wait for the parent link to settle until the rule says parentless.
+    deadline = time.monotonic() + 10
+    settled = False
+    while not settled and time.monotonic() < deadline:
+        if orphan.parent() is None:
+            settled = True
+            break
+        time.sleep(0.05)
+    assert settled, "positive control: the orphan's parent must be gone"
     return orphan
 
 
@@ -417,6 +431,123 @@ def test_a_pid_that_cannot_be_read_is_skipped_and_the_sweep_goes_on(
 def test_a_process_with_no_recorded_parent_is_not_an_orphan(ppid: int) -> None:
     """No parent on record is not the same as a dead one: spare it."""
     assert _is_orphan(_FakeProc(ppid=ppid, created=1.0)) is False  # type: ignore[arg-type]
+
+
+# The two fakes below stage the lingering-row window of issue #3047, which a real
+# process cannot produce on demand: ~1 in a few hundred orphan spawns met it under
+# churn, measured while fixing this (see the PR). ``subprocess.run`` has waited
+# for the launcher to exit, but its row can still answer ``Process(ppid)`` +
+# ``create_time()`` in the few milliseconds right after -- a create time that
+# precedes the child's, so psutil's parent() rule returns it, while
+# ``status()``/``ppid()`` already raise. That is what the nightly's annotation
+# rendered as ``status='terminated'``. The controls in ``_spawn_orphan`` must
+# wait for the row to drop rather than read the table once.
+_FAKE_ORPHAN_PID = 4_000_003
+_FAKE_LAUNCHER_PID = 4_000_004
+_FAKE_ORPHAN_CREATED = 1000.0
+
+
+class _FakeOrphan:
+    """A real-shaped orphan whose ``parent()`` is replayed through psutil's rule.
+
+    It mirrors ``psutil.Process.parent()``'s own two-part rule -- raise-backed
+    absence, and a holder created after the child read as a recycled pid, not a
+    parent -- against whatever ``psutil.Process(ppid)`` serves, so the fake stays
+    on psutil's rule instead of short-circuiting through a canned ``None``.
+    """
+
+    def is_running(self) -> bool:
+        return True
+
+    def parent(self) -> object | None:
+        try:
+            holder = psutil.Process(_FAKE_LAUNCHER_PID)
+        except psutil.NoSuchProcess:
+            return None
+        if holder.create_time() > _FAKE_ORPHAN_CREATED:
+            return None  # recycled pid, psutil's rule
+        return holder
+
+    def kill(self) -> None:
+        pass  # teardown hygiene: the fake holds no real process
+
+
+class _LingeringLauncherRow:
+    """The dead launcher's row in the window: identity readable, the rest gone."""
+
+    def __init__(self) -> None:
+        self._created = _FAKE_ORPHAN_CREATED - 100  # an older process, "the parent"
+
+    def create_time(self) -> float:
+        return self._created
+
+    def status(self) -> str:
+        raise psutil.NoSuchProcess(_FAKE_LAUNCHER_PID)
+
+
+def _canned_run(*args: object, **kwargs: object) -> SimpleNamespace:
+    """Stand-in for the launcher's ``subprocess.run``: no process is spawned."""
+    return SimpleNamespace(stdout=f"{_FAKE_ORPHAN_PID}\n")
+
+
+def test_the_orphan_control_waits_out_a_temporarily_readable_dead_parent_row(
+    monkeypatch: pytest.MonkeyPatch, orphans: list[psutil.Process]
+) -> None:
+    """The dead launcher's row is readable for a beat; the control waits it out (#3047).
+
+    Staged: psutil's ``parent()`` rule is exercised through exactly the reads the
+    rule makes (``Process(ppid)``, then ``create_time()``), so the lingering row
+    answers for the first two (the window) and is reported gone from the third
+    read on. The pre-fix control read the table once and failed inside such a
+    window; waiting must absorb it and return the settled orphan.
+    """
+    real_process = psutil.Process
+    seen: list[int] = []
+    built: list[object] = []
+
+    def process(pid: int) -> psutil.Process:
+        if pid == _FAKE_ORPHAN_PID:
+            fake = _FakeOrphan()
+            built.append(fake)
+            return fake  # type: ignore[return-value]
+        if pid == _FAKE_LAUNCHER_PID:
+            seen.append(pid)
+            if len(seen) <= 2:
+                return _LingeringLauncherRow()  # type: ignore[return-value]
+            raise psutil.NoSuchProcess(_FAKE_LAUNCHER_PID)
+        return real_process(pid)
+
+    monkeypatch.setattr(psutil, "Process", process)
+    monkeypatch.setattr(subprocess, "run", _canned_run)
+
+    orphan = _spawn_orphan(orphans, Path("."))
+    assert built == [orphan], "the control returned the settled orphan"
+    assert len(seen) == 3, "the settle-wait polled through the lingering row to its drop"
+
+
+def test_the_orphan_control_fails_when_a_dead_parent_row_never_drops(
+    monkeypatch: pytest.MonkeyPatch, orphans: list[psutil.Process]
+) -> None:
+    """The settle-wait is bounded: a parent link that never settles fails the control.
+
+    Without the deadline a pathological row (a handle held open somewhere)
+    would hang ``_spawn_orphan`` -- and, with it, every real-process row of this
+    module -- instead of failing loudly.
+    """
+    real_process = psutil.Process
+
+    def process(pid: int) -> psutil.Process:
+        if pid == _FAKE_ORPHAN_PID:
+            return _FakeOrphan()  # type: ignore[return-value]
+        if pid == _FAKE_LAUNCHER_PID:
+            return _LingeringLauncherRow()  # type: ignore[return-value]
+        return real_process(pid)
+
+    monkeypatch.setattr(psutil, "Process", process)
+    monkeypatch.setattr(subprocess, "run", _canned_run)
+
+    with pytest.raises(AssertionError, match="the orphan's parent must be gone"):
+        _spawn_orphan(orphans, Path("."))
 
 
 class TestRefusesWithoutAnAnchor:
