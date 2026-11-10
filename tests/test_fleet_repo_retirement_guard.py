@@ -174,6 +174,12 @@ def _scan_lane_scopes() -> list[tuple[str, str, ast.AST, int]]:
                     calls.add(func.id)
                 elif isinstance(func, ast.Attribute):
                     calls.add(func.attr)
+            elif isinstance(node, ast.ClassDef):
+                # ``_direct_calls`` never descends into a class scope: calls
+                # written directly in a nested class body belong to no def.
+                for child in ast.iter_child_nodes(node):
+                    visit(child, qualname, set())
+                return
             for child in ast.iter_child_nodes(node):
                 visit(child, qualname, calls)
 
