@@ -52,6 +52,18 @@ _ORPHAN_LAUNCHER = (
     "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
     "print(p.pid, flush=True)"
 )
+# How many times ``_spawn_orphan`` restarts when the host races it out from
+# under the test. The sleeper's pid is held by no handle the moment the
+# launcher that printed it exits, so a busy host (a CI shard running another
+# pytest worker that spawns and kills interpreters constantly) can recycle it
+# within milliseconds: between the launcher's print and the checks below, the
+# pid can be reborn as an unrelated python.exe whose recorded ppid names its
+# own *live* real parent (e.g. a pytest xdist worker). psutil's ``parent()``
+# then answers ``Process(that live parent)``, and the control below would fail
+# blaming the guard for a pid-recycling swap the guard never saw. Each attempt
+# verifies the pid still names the sleeper code before trusting the controls,
+# and restarts the spawn when it does not.
+_SPAWN_ORPHAN_ATTEMPTS = 3
 
 
 @pytest.fixture
@@ -110,25 +122,62 @@ def _spawn(
 
 
 def _spawn_orphan(orphans: list[psutil.Process], cwd: Path) -> psutil.Process:
-    """Start a sleeper in ``cwd`` whose parent has already exited -- a real orphan."""
-    launched = subprocess.run(
-        [_PYTHON, "-c", _ORPHAN_LAUNCHER],
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=True,
+    """Start a sleeper in ``cwd`` whose parent has already exited -- a real orphan.
+
+    Each attempt is identity-verified: the pid must still name the sleeper code
+    (its cmdline) before the controls below are trusted. A pid recycled under
+    the attempt names an unrelated process, which is not touched (it was never
+    ours); a sleeper verified but whose parent-control raced out (it died and
+    was recycled between the cmdline read and the lookup) is killed and the
+    spawn restarted. Exits with the last attempt's evidence, never silently.
+    """
+    last_look = ""
+    for _ in range(_SPAWN_ORPHAN_ATTEMPTS):
+        launched = subprocess.run(
+            [_PYTHON, "-c", _ORPHAN_LAUNCHER],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+        try:
+            orphan = psutil.Process(int(launched.stdout.strip()))
+        except psutil.Error as err:
+            # The pid printed by the launcher names no process now: the sleeper
+            # died and its pid was not reborn either. Nothing was ours to leak
+            # or touch; restart the spawn.
+            last_look = f"the printed pid was already gone: {err!r}"
+            continue
+        deadline = time.monotonic() + 10
+        while not orphan.is_running() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert orphan.is_running(), "positive control: the orphan must be running"
+        cmdline: list[str] = []
+        try:
+            cmdline = list(orphan.cmdline())
+        except psutil.Error as err:
+            last_look = f"pid {orphan.pid} unreadable: {err!r}"
+        if any(_SLEEPER in arg for arg in cmdline):
+            # psutil's own parent() rule (missing, or a recycled pid) as an
+            # independent control that the process really is parentless.
+            parent = orphan.parent()
+            if parent is None:
+                orphans.append(orphan)
+                return orphan
+            last_look = f"orphan {orphan!r} claimed parent {parent!r}"
+            try:
+                orphan.kill()  # ours: pinned to its (pid, create time)
+            except psutil.Error:
+                pass
+        else:
+            last_look = (
+                f"pid {orphan.pid} no longer names the sleeper code: {cmdline!r} ({orphan!r})"
+            )
+    raise AssertionError(
+        "positive control: the orphan's parent must be gone (the spawn raced "
+        f"out from under the test {_SPAWN_ORPHAN_ATTEMPTS} times): {last_look}"
     )
-    orphan = psutil.Process(int(launched.stdout.strip()))
-    orphans.append(orphan)
-    deadline = time.monotonic() + 10
-    while not orphan.is_running() and time.monotonic() < deadline:
-        time.sleep(0.05)
-    assert orphan.is_running(), "positive control: the orphan must be running"
-    # psutil's own parent() rule (missing, or a recycled pid) as an independent
-    # control that the process really is parentless in the table.
-    assert orphan.parent() is None, "positive control: the orphan's parent must be gone"
-    return orphan
 
 
 def _start_time(proc: subprocess.Popen[str]) -> float:
@@ -326,6 +375,75 @@ def test_no_holder_means_nothing_is_killed_and_an_empty_result(
 
     assert release_pipe_holders(worktree, worker.pid, _start_time(worker)) == ()
     assert _alive(worker)
+
+
+def _exited_interpreters_pid() -> int:
+    """A pid whose owner already exited: the recycling race, staged on demand.
+
+    Freed under no handle holders, exactly like the real sleeper's pid after the
+    launcher that printed it exits. Whether the pid is still free (psutil answers
+    ``NoSuchProcess``) or already reborn as an unrelated process (a foreign
+    cmdline), the identity check rejects it either way.
+    """
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait(timeout=10)
+    return child.pid
+
+
+def test_spawn_orphan_retries_when_the_printed_pid_never_names_the_sleeper(
+    monkeypatch: pytest.MonkeyPatch, worktree: Path, orphans: list[psutil.Process]
+) -> None:
+    """The pid-swap race is beaten by the identity check + spawn retry (shard CI).
+
+    The CI failure (shard 5/6): ``orphan.parent()`` returned a live unrelated
+    python.exe because the pid printed by the launcher had been recycled onto
+    that process by the time the checks ran -- the guard was honest, the object
+    was not. Staged here: the first launch attempt's launcher prints a dead
+    interpreter's pid instead of the sleeper's; ``_spawn_orphan`` must reject
+    it, retry the spawn for real, and record only the verified orphan.
+    """
+    real_run = subprocess.run
+    foreign_pid = _exited_interpreters_pid()
+    state = {"foreign": True}
+
+    def run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if state["foreign"]:
+            state["foreign"] = False
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{foreign_pid}\n", stderr="")
+        return real_run(cmd, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    holder = _spawn_orphan(orphans, worktree)
+
+    assert state == {"foreign": False}, "the retry must have re-run the real launcher"
+    assert [proc is holder for proc in orphans] == [True]
+    assert any(_SLEEPER in arg for arg in holder.cmdline()), "the retry must be ours"
+
+
+def test_spawn_orphan_never_touches_a_foreign_pid_and_fails_loudly_when_raced_out(
+    monkeypatch: pytest.MonkeyPatch, worktree: Path
+) -> None:
+    """A freed pid may be reborn with another owner: a stranger, never touched.
+
+    Every attempt is handed a pid that no longer names the sleeper. The helper
+    must (a) refuse to touch that pid whatever now owns it -- the stranger was
+    never ours -- and (b) raise with the evidence rather than an assert against
+    a phantom, so the failure names the race instead of blaming the guard under
+    test.
+    """
+    foreign_pid = _exited_interpreters_pid()
+    no_owners: list[psutil.Process] = []
+
+    def run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, 0, stdout=f"{foreign_pid}\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    with pytest.raises(AssertionError, match="raced out from under the test"):
+        _spawn_orphan(no_owners, worktree)
+
+    assert no_owners == [], "a foreign pid must not be recorded for teardown"
 
 
 class _FakeProc:
