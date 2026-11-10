@@ -147,6 +147,95 @@ def _has_retirement_evidence(node: ast.AST) -> bool:
     return bool(_direct_calls(node) & RETIREMENT_CALLS) or _branches_on_retired_field(node)
 
 
+def _app_building_scopes(module: str, tree: ast.AST) -> list[tuple[str, str, ast.AST, int]]:
+    """The app-building ``(module, qualname, node, line)`` scopes in one parsed tree.
+
+    One walk: attribute each Call to its innermost enclosing def. The
+    innermost-scope attribution is exactly what ``_direct_calls`` computes
+    for a def (a Call directly in the def, not inside a nested def), and
+    class scopes do not extend the qualname or swallow the calls in their
+    methods, so the reported ``(module, qualname, node, line)`` set matches
+    the previous two-walk-per-file version; see the #3040 ledger fix.
+    """
+    found: list[tuple[str, str, ast.AST, int]] = []
+
+    def visit(node: ast.AST, qualname: str, calls: set[str]) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            child_name = f"{qualname}.{node.name}" if qualname else node.name
+            inner: set[str] = set()
+            for child in ast.iter_child_nodes(node):
+                visit(child, child_name, inner)
+            if "_load_registry" in inner and "OrchestratorApp" in inner:
+                found.append((module, child_name, node, node.lineno))
+            return
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name):
+                calls.add(func.id)
+            elif isinstance(func, ast.Attribute):
+                calls.add(func.attr)
+        elif isinstance(node, ast.ClassDef):
+            # ``_direct_calls`` never descends into a class scope: calls
+            # written directly in a nested class body belong to no def.
+            for child in ast.iter_child_nodes(node):
+                visit(child, qualname, set())
+            return
+        for child in ast.iter_child_nodes(node):
+            visit(child, qualname, calls)
+
+    visit(tree, "", set())
+    return found
+
+
+def test_app_building_scopes_flags_only_the_innermost_def_and_never_a_class_body() -> None:
+    """Unit test of the single-pass walk: call attribution is per enclosing def.
+
+    The walk must attribute every ``Call`` to its innermost enclosing def --
+    a call inside a nested ``def`` belongs to that nested def alone and must
+    not leak into the enclosing ``def``'s call set (a leak would flag a lane
+    whose helpers only sit behind a nested helper); a call written directly
+    in a nested ``class`` body belongs to no ``def``; and a method inside a
+    class is still discovered as its own def, with the class name kept out
+    of the qualname -- the scope ``_direct_calls`` computes for the same
+    node must stay identical (#3040).
+    """
+    module = "unit_test_module"
+    tree = ast.parse(
+        "\n".join(
+            [
+                "def lane():",
+                "    _load_registry()",
+                "    OrchestratorApp(r)",
+                "",
+                "def owner():",
+                "    _load_registry()",
+                "    class Klass:",
+                "        OrchestratorApp(r)",
+                "",
+                "def outsider():",
+                "    def nested():",
+                "        _load_registry()",
+                "        OrchestratorApp(r)",
+                "",
+                "def host():",
+                "    class Prod:",
+                "        def build(self):",
+                "            _load_registry()",
+                "            OrchestratorApp(r)",
+            ]
+        )
+    )
+
+    found = _app_building_scopes(module, tree)
+
+    scopes = {(found_module, qualname) for found_module, qualname, _node, _line in found}
+    assert scopes == {
+        (module, "lane"),  # the plain positive: both helpers called directly
+        (module, "outsider.nested"),  # a nested def is its own scope, found there only
+        (module, "host.build"),  # methods inside a class are found, class names omitted
+    }, "call attribution leaked across a nested def or class boundary"
+
+
 def _scan_lane_scopes() -> list[tuple[str, str, ast.AST, int]]:
     """``(module, qualname, node, line)`` for every app-building per-repo scope.
 
@@ -160,12 +249,7 @@ def _scan_lane_scopes() -> list[tuple[str, str, ast.AST, int]]:
     this guard does tripwire duty for accidental bypasses, not
     adversarial ones).
 
-    One walk per file: attribute each Call to its innermost enclosing def.
-    The innermost-scope attribution is exactly what ``_direct_calls`` computes
-    for a def (a Call directly in the def, not inside a nested def), and
-    class scopes do not extend the qualname or swallow the calls in their
-    methods, so the reported ``(module, qualname, node, line)`` set matches
-    the previous two-walk-per-file version; see the #3040 ledger fix.
+    One walk per file: see ``_app_building_scopes`` for the attribution.
     """
     found: list[tuple[str, str, ast.AST, int]] = []
     for path in source_files(PACKAGE_ROOT):
@@ -173,33 +257,7 @@ def _scan_lane_scopes() -> list[tuple[str, str, ast.AST, int]]:
         if "_load_registry" not in text or "OrchestratorApp" not in text:
             continue
         tree = parsed(path)
-        module = _module_name(path)
-
-        def visit(node: ast.AST, qualname: str, calls: set[str]) -> None:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                child_name = f"{qualname}.{node.name}" if qualname else node.name
-                inner: set[str] = set()
-                for child in ast.iter_child_nodes(node):
-                    visit(child, child_name, inner)
-                if "_load_registry" in inner and "OrchestratorApp" in inner:
-                    found.append((module, child_name, node, node.lineno))
-                return
-            if isinstance(node, ast.Call):
-                func = node.func
-                if isinstance(func, ast.Name):
-                    calls.add(func.id)
-                elif isinstance(func, ast.Attribute):
-                    calls.add(func.attr)
-            elif isinstance(node, ast.ClassDef):
-                # ``_direct_calls`` never descends into a class scope: calls
-                # written directly in a nested class body belong to no def.
-                for child in ast.iter_child_nodes(node):
-                    visit(child, qualname, set())
-                return
-            for child in ast.iter_child_nodes(node):
-                visit(child, qualname, calls)
-
-        visit(tree, "", set())
+        found.extend(_app_building_scopes(_module_name(path), tree))
     return found
 
 
