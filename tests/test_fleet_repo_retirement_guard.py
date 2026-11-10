@@ -145,26 +145,56 @@ def _has_retirement_evidence(node: ast.AST) -> bool:
     return bool(_direct_calls(node) & RETIREMENT_CALLS) or _branches_on_retired_field(node)
 
 
-def _lane_scopes() -> list[tuple[str, str, ast.AST, int]]:
-    """``(module, qualname, node, line)`` for every app-building per-repo scope."""
+def _scan_lane_scopes() -> list[tuple[str, str, ast.AST, int]]:
+    """One walk per file: attribute each Call to its innermost enclosing def.
+
+    The innermost-scope attribution is exactly what ``_direct_calls`` computes
+    for a def (a Call directly in the def, not inside a nested def), and
+    class scopes do not extend the qualname or swallow the calls in their
+    methods, so the reported ``(module, qualname, node, line)`` set matches
+    the previous two-walk-per-file version; see the #3040 ledger fix.
+    """
     found: list[tuple[str, str, ast.AST, int]] = []
     for path in source_files(PACKAGE_ROOT):
         tree = parsed(path)
         module = _module_name(path)
 
-        def visit(node: ast.AST, scope: list[str]) -> None:
+        def visit(node: ast.AST, qualname: str, calls: set[str]) -> None:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                calls = _direct_calls(node)
-                if "_load_registry" in calls and "OrchestratorApp" in calls:
-                    found.append((module, ".".join([*scope, node.name]), node, node.lineno))
+                child_name = f"{qualname}.{node.name}" if qualname else node.name
+                inner: set[str] = set()
                 for child in ast.iter_child_nodes(node):
-                    visit(child, [*scope, node.name])
-            else:
-                for child in ast.iter_child_nodes(node):
-                    visit(child, scope)
+                    visit(child, child_name, inner)
+                if "_load_registry" in inner and "OrchestratorApp" in inner:
+                    found.append((module, child_name, node, node.lineno))
+                return
+            if isinstance(node, ast.Call):
+                func = node.func
+                if isinstance(func, ast.Name):
+                    calls.add(func.id)
+                elif isinstance(func, ast.Attribute):
+                    calls.add(func.attr)
+            for child in ast.iter_child_nodes(node):
+                visit(child, qualname, calls)
 
-        visit(tree, [])
+        visit(tree, "", set())
     return found
+
+
+_LANE_SCOPE_CACHE: list[tuple[str, str, ast.AST, int]] | None = None
+
+
+def _lane_scopes() -> list[tuple[str, str, ast.AST, int]]:
+    """``(module, qualname, node, line)`` for every app-building per-repo scope.
+
+    Scanned once per pytest process: the scan is one read-only walk per file
+    over the whole package, and three tests in this module consume the same
+    result (the trees come from ``_src_ast`` and are never mutated).
+    """
+    global _LANE_SCOPE_CACHE
+    if _LANE_SCOPE_CACHE is None:
+        _LANE_SCOPE_CACHE = _scan_lane_scopes()
+    return _LANE_SCOPE_CACHE
 
 
 def _scope_by_name(module: str, qualname: str) -> ast.AST:
