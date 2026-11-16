@@ -11,9 +11,13 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .opencode_log import OpencodeProgress
 
 from . import markdown_fence, markdown_guard
+from .claude_code import extract_event_text, iter_stream_json_events
 from .verdict_parsing import (
     _extract_verdict_from_stream_json,
     _extract_verdict_from_text,
@@ -103,3 +107,29 @@ def extract_verdict_from_log_text(log_text: str) -> dict[str, Any] | None:
 
     final_text = last_text_event(log_text)
     return _extract_verdict_from_text(final_text) if final_text else None
+
+
+def recover_review_log_texts(log_text: str) -> tuple[list[str], "OpencodeProgress | None"]:
+    """Assistant texts (and progress) recovered from a reviewer session log.
+
+    Tries the claude stream-json decode first. An opencode ``--format json``
+    log is JSONL too, but its ``text``/``step_start``/``tool_use``/``error``
+    shapes are invisible to the claude decoder -- without this leg the
+    caller's raw-prose fallback dumps raw JSONL into the PR comment and a
+    worked session misclassifies as launch_failed on 0/0 counts (the
+    ``_extract_review_session_summary`` consumer). Returns the decoded texts
+    plus ``OpencodeProgress`` for opencode logs, ``(texts, None)`` otherwise.
+    """
+    texts: list[str] = []
+    for event in iter_stream_json_events(log_text):
+        text = extract_event_text(event)
+        if text.strip():
+            texts.append(text.strip())
+    if texts:
+        return texts, None
+    from .opencode_log import session_progress
+
+    oc = session_progress(log_text)
+    if oc is not None:
+        texts.extend(oc.texts)
+    return texts, oc

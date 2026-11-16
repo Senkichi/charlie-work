@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 _EVENT_TYPE = re.compile(r'^\{"type":"([A-Za-z_]+)"')
 _PRINT_LOG_ERROR = re.compile(r'^timestamp=(\S+) level=ERROR .*?error\.error="((?:[^"\\]|\\.)*)"')
@@ -80,20 +82,94 @@ def last_text_event(log_text: str) -> str | None:
     never see it. Only the LAST text event is returned -- a mid-session draft
     or an echo of the prompt's own example verdict must not count (the same
     rule ``_extract_verdict_from_stream_json`` applies to claude events).
+
+    A ``step_start``, ``tool_use`` or ``error`` event after a text resets the
+    candidate: that text was mid-session output, not the final answer, so a
+    draft verdict it carried must not be reaped when the session dies before
+    producing its real one. ``step_finish`` does not reset -- text followed by
+    step_finish is a completed turn, exactly the shape a real verdict ends on.
     """
     last: str | None = None
     for line in log_text.splitlines():
         event = _EVENT_TYPE.match(line)
-        if event is None or event.group(1) != "text":
+        if event is None:
             continue
-        try:
-            payload = json.loads(line)
-        except ValueError:
-            continue
-        part = payload.get("part") if isinstance(payload, dict) else None
-        if isinstance(part, dict) and isinstance(part.get("text"), str):
-            last = part["text"]
+        kind = event.group(1)
+        if kind == "text":
+            try:
+                payload = json.loads(line)
+            except ValueError:
+                continue
+            part = payload.get("part") if isinstance(payload, dict) else None
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                last = part["text"]
+        elif kind in ("step_start", "tool_use", "error"):
+            last = None
     return last
+
+
+def event_text(event: dict[str, Any]) -> str:
+    """Assistant text of one parsed opencode event (``""`` when none)."""
+    if event.get("type") != "text":
+        return ""
+    part = event.get("part")
+    if isinstance(part, dict) and isinstance(part.get("text"), str):
+        return part["text"]
+    return ""
+
+
+@dataclass(frozen=True)
+class OpencodeProgress:
+    """Per-session metrics recovered from an opencode ``--format json`` log.
+
+    The opencode counterpart of ``claude_code.ClaudeProgress``: ``step_start``
+    events count turns, ``tool_use`` events count tool calls, ``text`` events
+    carry assistant analysis and ``error`` events carry the session's own
+    failure output (summarized via ``_error_event_summary``).
+    """
+
+    turn_count: int
+    tool_call_count: int
+    texts: tuple[str, ...]
+
+
+def session_progress(log_text: str) -> OpencodeProgress | None:
+    """Turn/tool-call counts and assistant texts of an opencode JSONL log.
+
+    Returns None when no opencode event is recognized -- a claude stream-json
+    or plaintext log -- so callers keep their existing fallback path rather
+    than misattributing the format. ``_extract_review_session_summary`` uses
+    this so a worked opencode reviewer is classified on real turn/tool
+    counts (not launch_failed) and its decoded text lands in the PR comment
+    instead of raw JSONL.
+    """
+    texts: list[str] = []
+    turns = tools = 0
+    seen = False
+    for line in log_text.splitlines():
+        event = _EVENT_TYPE.match(line)
+        if event is None:
+            continue
+        kind = event.group(1)
+        if kind == "step_start":
+            seen = True
+            turns += 1
+        elif kind == "tool_use":
+            seen = True
+            tools += 1
+        elif kind == "text":
+            seen = True
+            try:
+                payload = json.loads(line)
+            except ValueError:
+                continue
+            part = payload.get("part") if isinstance(payload, dict) else None
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                texts.append(part["text"])
+        elif kind == "error":
+            seen = True
+            texts.append(_error_event_summary(line))
+    return OpencodeProgress(turns, tools, tuple(texts)) if seen else None
 
 
 def provider_error_digest(log_text: str) -> str:

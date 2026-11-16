@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import textwrap
 import time
@@ -26,6 +27,7 @@ from charlie_work.config import OpenCodeConfig, OrchestratorConfig, WorkerRoleCo
 from charlie_work.doctor import run_doctor
 from charlie_work.harnesses import HARNESS_REGISTRY
 from charlie_work.opencode_worker import (
+    _REVIEWER_CONFIG,
     launch_opencode_worker,
     pin_flags,
     resolve_model,
@@ -276,6 +278,102 @@ def test_worker_env_for_review_deny_policy_cannot_be_overridden(tmp_path: Path) 
     assert json.loads(env["OPENCODE_CONFIG_CONTENT"])["permission"]["*"] == "deny"
 
 
+def test_worker_env_for_review_pins_every_opencode_control_env(tmp_path: Path) -> None:
+    """Every OPENCODE_* control surface is pinned after the worker_env merge:
+    opencode merges OPENCODE_PERMISSION after OPENCODE_CONFIG_CONTENT, and the
+    review checkout's .opencode/ dir, plugin list, or an ambient/extra config
+    file could otherwise override the deny policy or run code at startup."""
+    hostile_permission = json.dumps({"*": "allow"})
+    env = worker_env_for(
+        3,
+        tmp_path / "s",
+        {
+            "OPENCODE_PERMISSION": hostile_permission,
+            "OPENCODE_CONFIG": "/evil/opencode.json",
+            "OPENCODE_CONFIG_DIR": "/evil/.opencode",
+            "OPENCODE_DISABLE_PROJECT_CONFIG": "0",
+            "OPENCODE_PURE": "0",
+        },
+        environ={
+            "XDG_DATA_HOME": str(tmp_path / "h"),
+            # Ambient os.environ values flow through the sanitized base env --
+            # they must lose to the pins too, not just hostile worker_env.
+            "OPENCODE_PERMISSION": hostile_permission,
+        },
+        review=True,
+    )
+    # Pinned to the same deny policy the config content carries (pin, not
+    # strip: deleting it would leave whatever ambient value survives).
+    assert json.loads(env["OPENCODE_PERMISSION"])["*"] == "deny"
+    assert json.loads(env["OPENCODE_PERMISSION"])["edit"] == "deny"
+    # The untrusted review checkout's project config, agents and plugins never
+    # load; external plugins are off entirely.
+    assert env["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1"
+    assert env["OPENCODE_PURE"] == "1"
+    # Extra config sources neutralized (empty == falsy in opencode's loader).
+    assert env["OPENCODE_CONFIG"] == ""
+    assert env["OPENCODE_CONFIG_DIR"] == ""
+
+
+def _oc_match(command: str, pattern: str) -> bool:
+    """opencode's Wildcard.match: ^pattern$ anchored, * -> .*, ? -> ., case-insensitive."""
+    regex = re.escape(pattern).replace(r"\*", ".*").replace(r"\?", ".")
+    return re.match(f"^{regex}$", command, re.IGNORECASE | re.DOTALL) is not None
+
+
+def _oc_bash_effect(bash: dict[str, str], command: str) -> str:
+    """findLast semantics: the last matching rule decides."""
+    effect = "ask"
+    for pattern, action in bash.items():
+        if _oc_match(command, pattern):
+            effect = action
+    return effect
+
+
+def test_review_bash_trailing_denies_close_wildcard_write_escapes() -> None:
+    """The "verb *" allows are prefix-anchored; a command like "git diff > f"
+    still matches "git diff *" (opencode checks the whole redirected_statement
+    text), so the trailing deny patterns must win under findLast evaluation."""
+    bash = _REVIEWER_CONFIG["permission"]["bash"]
+    # Ordering is the enforcement mechanism: every entry after the last allow
+    # must be a deny, or findLast could hand a write escape back to "allow".
+    last_allow = max(i for i, v in enumerate(bash.values()) if v == "allow")
+    assert all(v == "deny" for v in list(bash.values())[last_allow + 1 :])
+
+    for attack in (
+        "git diff > hacked.txt",
+        "git diff --output=hacked.txt",
+        "git log --output=../evil",
+        "git show HEAD --output=/tmp/x",
+        "git diff --ext-diff",
+        "git log --exec=x",
+        "gh pr view 1 > notes.md",
+        "gh pr diff 1 > /tmp/pr.diff",
+        "pytest tests --junitxml=C:/evil/x.xml",
+        "pytest -o addopts=--junitxml=/tmp/x",
+        "uv run --extra dev pytest -o addopts=x",
+        "git push origin HEAD",
+        "git -c core.editor=sh rebase -i",
+        "sh -c 'rm -rf .'",
+        "rm -rf .",
+        "git commit -m x",
+        "gh pr merge 1",
+    ):
+        assert _oc_bash_effect(bash, attack) == "deny", attack
+    for allowed in (
+        "git status",
+        "git diff HEAD~1",
+        "git diff --stat",
+        "git log --oneline -20",
+        "git show HEAD:file.py",
+        "gh pr view 123 --json files",
+        "gh pr diff 123",
+        "pytest tests/test_x.py -x",
+        "uv run --extra dev pytest -q --tb=short",
+    ):
+        assert _oc_bash_effect(bash, allowed) == "allow", allowed
+
+
 def test_sanitize_review_command_template_strips_agent_flags() -> None:
     assert sanitize_review_command_template(
         ("opencode", "run", "--agent", "build", "--auto", "--agent=build")
@@ -313,6 +411,9 @@ def test_review_launch_pins_model_variant_and_deny_policy(
         assert bad not in argv
     env = _read_probe(record)["env"]
     assert json.loads(env["OPENCODE_CONFIG_CONTENT"])["permission"]["*"] == "deny"
+    assert json.loads(env["OPENCODE_PERMISSION"])["*"] == "deny"
+    assert env["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1"
+    assert env["OPENCODE_PURE"] == "1"
     assert env["XDG_DATA_HOME"] == str(sessions_dir / "opencode-data" / "issue-42")
     sidecar = sessions_dir / "issue-42.opencode.json"
     assert sidecar.exists()
@@ -456,6 +557,22 @@ def test_launch_empty_model_refused_without_popen(
     payload = json.loads(sidecar.read_text(encoding="utf-8"))
     assert payload["adapter_kind"] == "opencode"
     assert "worker.model is empty" in payload["error"]
+
+
+def test_review_launch_empty_model_refused_names_reviewer(tmp_path: Path) -> None:
+    """The refused-launch error names the role that owns the empty field --
+    a reviewer launch's model comes from the reviewer chain entry."""
+    record, sessions_dir = _launch(
+        tmp_path,
+        review=True,
+        head_sha="b" * 40,
+        model_override="",
+        config=_config_for(model=""),
+    )
+    assert not record.ok
+    assert "reviewer.model is empty" in (record.error or "")
+    payload = json.loads((sessions_dir / "issue-42.opencode.json").read_text(encoding="utf-8"))
+    assert "reviewer.model is empty" in payload["error"]
 
 
 def test_launch_never_raises_on_missing_binary(tmp_path: Path) -> None:

@@ -19,6 +19,7 @@ from .claude_code import (
 )
 from .api_worker import launch_api_worker  # noqa: F401  (deliberate re-export; see review_launch)
 from .devin_shell import launch_devin_session  # noqa: F401  (deliberate re-export; see review_launch)
+from .opencode_worker import launch_opencode_worker  # noqa: F401  (deliberate re-export; see review_launch)
 from .checks import (
     summarize_checks,
 )

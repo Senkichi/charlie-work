@@ -225,7 +225,10 @@ def _probe_adapter(add: Any, repo_root: Path, config: OrchestratorConfig) -> Non
         )
     # A fallback harness is only exercised on failover -- probe it now so a
     # missing binary surfaces here rather than as a launch failure mid-wave.
-    if adapter != "opencode" and any(e.harness == "opencode" for e in config.worker.chain):
+    # Reviewer chain too: an opencode review fallback launches the same CLI.
+    if adapter != "opencode" and any(
+        e.harness == "opencode" for e in (*config.worker.chain, *config.reviewer.chain)
+    ):
         _probe_opencode(add, repo_root, config)
 
 

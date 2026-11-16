@@ -157,9 +157,7 @@ def _launch_review_opencode(
     # effort flag); max_turns_override is ignored -- no such CLI concept,
     # same as devin-shell. The read-only posture lives in
     # opencode_worker._REVIEWER_CONFIG + the --agent strip, not argv.
-    from .opencode_worker import launch_opencode_worker
-
-    return launch_opencode_worker(
+    return _wf().launch_opencode_worker(
         pr_number,
         branch,
         prompt_text,

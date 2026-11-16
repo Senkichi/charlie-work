@@ -609,3 +609,126 @@ def test_detect_and_handle_stalled_reviews_aggregates_same_pass_events(
     assert len(sweep) == 1
     assert sweep[0]["payload"]["count"] == len(prs)
     assert set(sweep[0]["payload"]["pr_numbers"]) == set(prs)
+
+
+def _make_dead_opencode_review_sidecar(
+    reviews_dir: Path,
+    pr_number: int,
+    log_text: str,
+    *,
+    started_at: str | None = None,
+) -> Path:
+    """Create an opencode review sidecar + log for a dead reviewer."""
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    log_path = reviews_dir / f"issue-{pr_number}-review.claude.log"
+    log_path.write_text(log_text, encoding="utf-8")
+    sidecar = {
+        "issue_number": pr_number,
+        "branch": f"agent/issue-{pr_number}-fix",
+        "worktree_path": str(reviews_dir / f"issue-{pr_number}"),
+        "prompt_path": str(reviews_dir / f"issue-{pr_number}-review-prompt.md"),
+        "command": ["opencode", "run", "--auto", "--format", "json"],
+        "pid": 99999,
+        "started_at": started_at or "2026-07-06T12:00:00Z",
+        "log_path": str(log_path),
+        "error": None,
+        "process_start_time": 1.0,
+        "adapter_kind": "opencode",
+    }
+    sidecar_path = reviews_dir / f"issue-{pr_number}.opencode.json"
+    sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
+    return sidecar_path
+
+
+def _dispatched_state_file(tmp_path: Path, pr_number: int, started_at: str) -> Path:
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}), encoding="utf-8"
+    )
+    with state_lock(state_file):
+        state = load_state(state_file)
+        state["prs"][str(pr_number)] = {
+            "number": pr_number,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": started_at,
+            "reviewer_pid": 99999,
+            "reviewer_process_start_time": 1.0,
+        }
+        save_state(state_file, state)
+    return state_file
+
+
+def test_detect_and_handle_stalled_reviews_ignores_rate_limit_in_opencode_tool_output(
+    tmp_path: Path,
+) -> None:
+    """An opencode reviewer's log carries tool output: a reviewed file
+    quoting "rate limit" in the tail must not arm fleet-wide reviewer_quota.
+    The adapter's log_digest (provider_error_digest) narrows the classifier's
+    match surface to opencode's own provider-error records -- the same
+    narrowing the worker-side fate classifier applies."""
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    reviews_dir = tmp_path / "reviews"
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=True))
+
+    old_started = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    # "rate limit"/"usage limit" only ever appear inside tool_use output and
+    # assistant text (the reviewer read this repo's own quota code) -- no
+    # opencode provider-error record anywhere in the log.
+    _make_dead_opencode_review_sidecar(
+        reviews_dir,
+        100,
+        '{"type":"step_start"}\n'
+        '{"type":"tool_use","part":{"tool":"read","state":{"output":'
+        '"usage quota has been exhausted: rate limit handling lives here"}}}\n'
+        '{"type":"text","part":{"text":"this code matches on rate limit markers"}}\n',
+        started_at=old_started,
+    )
+    state_file = _dispatched_state_file(tmp_path, 100, old_started)
+
+    stalled = _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
+
+    assert not any(entry.get("reason") == "provider_throttled" for entry in stalled)
+    state = load_state(state_file)
+    assert not state.get("reviewer_quota", {}).get("throttled_until")
+    assert not any(
+        event.get("kind") == "review_quota_exhausted" for event in state.get("events", [])
+    )
+
+
+def test_detect_and_handle_stalled_reviews_throttles_opencode_on_own_error_record(
+    tmp_path: Path,
+) -> None:
+    """Positive control for the digest narrowing: a REAL opencode provider
+    error event still classifies THROTTLED and arms reviewer_quota -- the
+    narrowing must not swallow genuine quota deaths."""
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    reviews_dir = tmp_path / "reviews"
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=True))
+
+    old_started = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    # The terminal {"type":"error"} stdout event is opencode's own provider-
+    # error record (GoUsageLimitError in the response body); it must be the
+    # LAST event -- a later progress event resets the digest.
+    _make_dead_opencode_review_sidecar(
+        reviews_dir,
+        100,
+        '{"type":"step_start"}\n'
+        '{"type":"text","part":{"text":"starting review"}}\n'
+        '{"type":"error","error":{"name":"APIError","data":{"message":"Usage limit reached",'
+        '"statusCode":429,"isRetryable":true,"responseBody":"{\\"type\\":\\"error\\",'
+        '\\"error\\":{\\"type\\":\\"GoUsageLimitError\\"}}"}}}\n',
+        started_at=old_started,
+    )
+    state_file = _dispatched_state_file(tmp_path, 100, old_started)
+
+    stalled = _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
+
+    assert any(entry.get("reason") == "provider_throttled" for entry in stalled)
+    state = load_state(state_file)
+    assert state.get("reviewer_quota", {}).get("throttled_until")

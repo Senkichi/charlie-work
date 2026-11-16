@@ -140,6 +140,23 @@ _REVIEWER_CONFIG: dict[str, Any] = {
             "python -m pytest *": "allow",
             "uv run pytest *": "allow",
             "uv run --extra dev pytest *": "allow",
+            # findLast ordering: opencode's Permission.evaluate returns the
+            # LAST matching rule, so these denies sit after the allowlist and
+            # win over every "verb *" wildcard above. They close the write
+            # escapes a wildcarded read verb otherwise admits: output
+            # redirection (opencode matches the whole redirected_statement
+            # text, so "git diff > f" still matches "git diff *"), the
+            # --output flag on git diff/log/show, exec-capable flags
+            # (--ext-diff runs GIT_EXTERNAL_DIFF, --exec runs a shell), the
+            # pytest file writers, and a bare " -o " token that injects
+            # arbitrary flags into pytest's addopts.
+            "*>*": "deny",
+            "*--output*": "deny",
+            "*--ext-diff*": "deny",
+            "*--exec*": "deny",
+            "*--junitxml*": "deny",
+            "*--basetemp*": "deny",
+            "* -o *": "deny",
         },
     },
     "autoupdate": False,
@@ -222,10 +239,36 @@ def worker_env_for(
     if review:
         # Read-only invariant, the opencode counterpart of the
         # --permission-mode plan pin _sanitize_review_command_template applies
-        # for claude-code reviewers: no operator worker_env may grant a
-        # reviewer write access, so the deny policy is applied AFTER the
-        # merge, overriding any OPENCODE_CONFIG_CONTENT the caller supplied.
+        # for claude-code reviewers: no operator worker_env -- and no ambient
+        # OPENCODE_* the sanitized base env inherited from os.environ -- may
+        # grant a reviewer write access. Every control surface opencode reads
+        # is therefore pinned AFTER the worker_env merge, not stripped before
+        # it (ambient values would sail straight through a strip):
+        # - OPENCODE_CONFIG_CONTENT: the deny policy itself. opencode merges
+        #   it after global and project config files.
+        # - OPENCODE_PERMISSION: opencode merges this env AFTER
+        #   OPENCODE_CONFIG_CONTENT (verified against the 1.18.35 binary), so
+        #   pinning the same deny object here -- not deleting it -- is what
+        #   neutralizes an ambient or operator-supplied value.
+        # - OPENCODE_DISABLE_PROJECT_CONFIG: the review checkout holds
+        #   UNTRUSTED PR code; without this pin the PR's .opencode/
+        #   opencode.json (agent.*.permission, tools) and .opencode/plugin/
+        #   load ahead of the deny policy and can override it or run code at
+        #   startup. Also gates the project AGENTS.md/CLAUDE.md walk.
+        # - OPENCODE_PURE: skip external plugins entirely -- belt on the
+        #   project-config plugin vector, and no plugin install runs in the
+        #   review worktree.
+        # - OPENCODE_CONFIG / OPENCODE_CONFIG_DIR: emptied so ambient or
+        #   worker_env values cannot pull an extra config file/dir into the
+        #   merge ahead of the deny policy.
         env["OPENCODE_CONFIG_CONTENT"] = json.dumps(_REVIEWER_CONFIG, separators=(",", ":"))
+        env["OPENCODE_PERMISSION"] = json.dumps(
+            _REVIEWER_CONFIG["permission"], separators=(",", ":")
+        )
+        env["OPENCODE_DISABLE_PROJECT_CONFIG"] = "1"
+        env["OPENCODE_PURE"] = "1"
+        env["OPENCODE_CONFIG"] = ""
+        env["OPENCODE_CONFIG_DIR"] = ""
     return env
 
 
@@ -328,6 +371,7 @@ def launch_opencode_worker(
         model_override if model_override is not None else resolved_config.worker.model,
         opencode.provider,
     )
+    launch_role = "reviewer" if review else "worker"
     if not model:
         record = _error_record(
             issue_number=issue_number,
@@ -336,11 +380,11 @@ def launch_opencode_worker(
             prompt_path="",
             command=(),
             log_path=str(_log_path(sessions_dir, issue_number, review=review)),
-            error="opencode worker launch refused: worker.model is empty "
+            error=f"opencode {launch_role} launch refused: {launch_role}.model is empty "
             "(no ambient-model fallback)",
             adapter_kind="opencode",
             state_path=launch_events.state_path_for(repo_root, resolved_config),
-            role="reviewer" if review else "worker",
+            role=launch_role,
             error_class=launch_events.LAUNCH_ERR_CONFIG,
         )
         sessions_dir.mkdir(parents=True, exist_ok=True)

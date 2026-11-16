@@ -787,18 +787,19 @@ def _extract_review_session_summary(
             if text.strip():
                 assistant_texts.append(text.strip())
 
-    # Fallback: if no events.jsonl, try the log. When it is a stream-json
-    # tee, decode the events; otherwise keep the remaining prose lines with
-    # fenced code blocks stripped (those are verdict attempts, not analysis).
+    # Fallback: if no events.jsonl, try the log. recover_review_log_texts
+    # decodes stream-json tees AND opencode --format json logs (the cli_pins
+    # path never tees); the prose fallback strips fenced blocks.
+    oc_progress = None
     if not assistant_texts:
         try:
             log_text = log_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             log_text = ""
-        for event in iter_stream_json_events(log_text):
-            text = extract_event_text(event)
-            if text.strip():
-                assistant_texts.append(text.strip())
+        from .verdict_log_extraction import recover_review_log_texts
+
+        recovered, oc_progress = recover_review_log_texts(log_text)
+        assistant_texts.extend(recovered)
         if not assistant_texts:
             stripped = _strip_fenced_blocks(log_text)
             for line in stripped.splitlines():
@@ -809,8 +810,9 @@ def _extract_review_session_summary(
     if not assistant_texts:
         return None
 
-    turn_count = progress.turn_count if progress else 0
-    tool_call_count = progress.tool_call_count if progress else 0
+    metrics = progress or oc_progress
+    turn_count = metrics.turn_count if metrics else 0
+    tool_call_count = metrics.tool_call_count if metrics else 0
     tokens = progress.tokens if progress else None
     cost_usd = progress.cost_usd if progress else None
 
