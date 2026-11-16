@@ -18,7 +18,8 @@ from .config_validation import CommandTemplate, Coerced, Typed
 
 @dataclass(frozen=True)
 class OpenCodeConfig:
-    """Settings for ``worker.harness: opencode`` (or an ``opencode`` fallback entry).
+    """Settings for ``worker.harness: opencode`` / ``reviewer.harness: opencode``
+    (or an ``opencode`` fallback entry on either role).
 
     ``command``: empty means ``opencode_worker.DEFAULT_COMMAND_TEMPLATE``. The
     rendered worker prompt is fed via stdin unless the template names

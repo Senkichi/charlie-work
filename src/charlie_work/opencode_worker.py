@@ -1,4 +1,4 @@
-"""opencode worker adapter -- the opencode CLI (``opencode run``) as a worker harness.
+"""opencode adapter -- the opencode CLI (``opencode run``) as worker and reviewer.
 
 A headless ``opencode run`` session is launched through the same
 worktree/prompt/env-sanitisation/Popen/terminal-watcher/sidecar stack as a
@@ -9,8 +9,14 @@ the shared ``ClaudeWorkerRecord`` shape) and supplies its own CLI flag pins via
 argv. It owns only what is opencode-specific: the default command template, the
 ``provider/model`` resolution, and the permission posture env.
 
-Worker-only: the harness registry declares ``review=False`` for opencode, so
-this module never launches a reviewer.
+Review-capable since the harness registry flipped ``review=True``: a
+``review=True`` launch goes through the same ``launch_claude_worker`` review
+path as a claude-code reviewer (detached-HEAD checkout, ``-review``
+log/sidecar suffixes), but the claude plan-mode flag pin is replaced by two
+opencode equivalents -- the ``OPENCODE_CONFIG_CONTENT`` deny policy
+(``_REVIEWER_CONFIG``) and the ``--agent`` strip in
+``sanitize_review_command_template`` -- because a reviewer's read-only
+posture on this harness lives in env, not argv.
 """
 
 from __future__ import annotations
@@ -23,7 +29,13 @@ from pathlib import Path
 from typing import Any
 
 from . import launch_events
-from .claude_code import ClaudeWorkerRecord, _error_record, _write_record, launch_claude_worker
+from .claude_code import (
+    ClaudeWorkerRecord,
+    _error_record,
+    _log_path,
+    _write_record,
+    launch_claude_worker,
+)
 from .config import OrchestratorConfig
 from .opencode_log import opencode_data_dir
 
@@ -63,6 +75,73 @@ DEFAULT_COMMAND_TEMPLATE: tuple[str, ...] = (
 _WORKER_CONFIG: dict[str, Any] = {
     "$schema": "https://opencode.ai/config.json",
     "permission": {"*": "allow"},
+    "autoupdate": False,
+    "share": "disabled",
+    "snapshot": False,
+}
+
+# Reviewer posture (V1 ``permission`` object -- installed opencode is 1.x, so
+# the V2 ``permissions`` list does not apply). This is the read-only
+# counterpart of claude-code's ``--permission-mode plan``: ``edit`` covers
+# the edit/write/patch tools, ``bash`` is an exact-prefix allowlist of the
+# read-only git/gh verbs the review packet names plus the targeted single
+# pytest run the prompt permits, and every other action defaults to deny.
+# ``external_directory`` stays allow -- the packet artifacts ($diff_path,
+# $pr_json_path) live under .var outside the review checkout. A ``deny``
+# surfaces to the model as a tool error, not a session-ending rejection, so
+# straying outside the allowlist costs the reviewer a retry, not the review.
+_REVIEWER_CONFIG: dict[str, Any] = {
+    "$schema": "https://opencode.ai/config.json",
+    "permission": {
+        "*": "deny",
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "todowrite": "allow",
+        "webfetch": "allow",
+        "websearch": "allow",
+        "external_directory": "allow",
+        # Redundant with "*": "deny" but named explicitly: this key covers the
+        # edit/write/patch tools and is the whole point of the reviewer policy.
+        "edit": "deny",
+        "bash": {
+            "*": "deny",
+            "git status": "allow",
+            "git status *": "allow",
+            "git diff": "allow",
+            "git diff *": "allow",
+            "git log": "allow",
+            "git log *": "allow",
+            "git show": "allow",
+            "git show *": "allow",
+            "git blame *": "allow",
+            "git grep *": "allow",
+            "git ls-files *": "allow",
+            "git rev-parse *": "allow",
+            "git branch --show-current": "allow",
+            "git branch --list *": "allow",
+            "git remote -v": "allow",
+            "git remote show *": "allow",
+            "git describe *": "allow",
+            "gh pr view": "allow",
+            "gh pr view *": "allow",
+            "gh pr diff *": "allow",
+            "gh pr checks": "allow",
+            "gh pr checks *": "allow",
+            "gh issue view": "allow",
+            "gh issue view *": "allow",
+            "gh repo view *": "allow",
+            "gh run list": "allow",
+            "gh run list *": "allow",
+            "gh run view *": "allow",
+            "gh search *": "allow",
+            "pytest *": "allow",
+            "python -m pytest *": "allow",
+            "uv run pytest *": "allow",
+            "uv run --extra dev pytest *": "allow",
+        },
+    },
     "autoupdate": False,
     "share": "disabled",
     "snapshot": False,
@@ -115,6 +194,7 @@ def worker_env_for(
     environ: Mapping[str, str] | None = None,
     *,
     provider: str = "opencode-go",
+    review: bool = False,
 ) -> dict[str, str]:
     """The opencode-specific env layered under the operator's ``worker_env``.
 
@@ -138,7 +218,32 @@ def worker_env_for(
             env[_AUTH_CONTENT_ENV] = auth
     # Operator worker_env wins over the posture defaults (same merge order
     # launch_claude_worker applies to worker_env over the sanitised base env).
-    return {**env, **(worker_env or {})}
+    env = {**env, **(worker_env or {})}
+    if review:
+        # Read-only invariant, the opencode counterpart of the
+        # --permission-mode plan pin _sanitize_review_command_template applies
+        # for claude-code reviewers: no operator worker_env may grant a
+        # reviewer write access, so the deny policy is applied AFTER the
+        # merge, overriding any OPENCODE_CONFIG_CONTENT the caller supplied.
+        env["OPENCODE_CONFIG_CONTENT"] = json.dumps(_REVIEWER_CONFIG, separators=(",", ":"))
+    return env
+
+
+def sanitize_review_command_template(command: tuple[str, ...]) -> tuple[str, ...]:
+    """Strip ``--agent`` flags from a reviewer's command template.
+
+    ``--agent`` is the one opencode argv token that can move the permission
+    boundary (a ``--agent build``-style pin would evaluate the session against
+    that agent's own policy instead of the config's). The rest of the posture
+    lives in ``OPENCODE_CONFIG_CONTENT`` (``_REVIEWER_CONFIG``), which no argv
+    token overrides -- opencode has no ``--permission-mode``-style flag. No
+    agent is pinned in its place: the deny policy already supplies the
+    read-only invariant, and pinning ``plan`` would only matter if agent
+    policies replaced (rather than refined) config permissions, in which case
+    it could LOOSEN the bash allowlist -- strip-only is the deterministic
+    choice either way.
+    """
+    return _strip_flag(command, "--agent")
 
 
 def resolve_model(model: str, provider: str) -> str:
@@ -187,22 +292,42 @@ def launch_opencode_worker(
     worker_env: dict[str, str] | None = None,
     materialize_dirs: tuple[str, ...] = (),
     rework: bool = False,
+    review: bool = False,
+    head_sha: str | None = None,
     recovery: dict[str, Any] | None = None,
     base_ref: str = "",
+    model_override: str | None = None,
+    resolved_review_effort: str | None = None,
     config: OrchestratorConfig | None = None,
 ) -> ClaudeWorkerRecord:
-    """Launch a headless opencode worker for ``issue_number``. Never raises.
+    """Launch a headless opencode worker or reviewer for ``issue_number``. Never raises.
 
-    The model is ``config.worker.model`` -- for a role-chain fallback launch,
-    ``role_selection.worker_config_for`` has already substituted the selected
-    entry's model there -- resolved against ``config.opencode.provider``. An
-    empty model is refused as an error record rather than launched: opencode
-    would otherwise fall back to ambient CLI state (its last-used model), the
-    ambient-model outage class ``claude_code._apply_model_pin`` guards against.
+    The model is ``model_override`` when given (a review launch's selected
+    chain entry -- the reviewer role's model lives on ``config.reviewer``, not
+    ``config.worker``), else ``config.worker.model`` -- for a worker role-chain
+    fallback launch, ``role_selection.worker_config_for`` has already
+    substituted the selected entry's model there -- resolved against
+    ``config.opencode.provider``. An empty model is refused as an error record
+    rather than launched: opencode would otherwise fall back to ambient CLI
+    state (its last-used model), the ambient-model outage class
+    ``claude_code._apply_model_pin`` guards against.
+
+    On a ``review=True`` launch the command template passes through
+    ``sanitize_review_command_template`` (the ``--agent`` strip -- opencode's
+    only argv-level permission vector) and the env through
+    ``worker_env_for(review=True)`` (the ``_REVIEWER_CONFIG`` deny policy),
+    pairing with ``create_review_checkout`` exactly as the claude-code
+    plan-mode pin does. ``resolved_review_effort`` is pinned as ``--variant``
+    (opencode's reasoning-effort flag; empty falls back to
+    ``opencode.variant``); ``max_turns`` has no opencode equivalent and is
+    never pinned.
     """
     resolved_config = config or OrchestratorConfig()
     opencode = resolved_config.opencode
-    model = resolve_model(resolved_config.worker.model, opencode.provider)
+    model = resolve_model(
+        model_override if model_override is not None else resolved_config.worker.model,
+        opencode.provider,
+    )
     if not model:
         record = _error_record(
             issue_number=issue_number,
@@ -210,11 +335,12 @@ def launch_opencode_worker(
             worktree_path="",
             prompt_path="",
             command=(),
-            log_path=str(sessions_dir / f"issue-{issue_number}.claude.log"),
+            log_path=str(_log_path(sessions_dir, issue_number, review=review)),
             error="opencode worker launch refused: worker.model is empty "
             "(no ambient-model fallback)",
             adapter_kind="opencode",
             state_path=launch_events.state_path_for(repo_root, resolved_config),
+            role="reviewer" if review else "worker",
             error_class=launch_events.LAUNCH_ERR_CONFIG,
         )
         sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -223,7 +349,12 @@ def launch_opencode_worker(
     # A relaunch (rework, recovery) starts from a fresh data dir; the reap
     # removes it when the worker dies (WorkerView.reap_sidecar).
     shutil.rmtree(opencode_data_dir(sessions_dir, issue_number), ignore_errors=True)
-    env = worker_env_for(issue_number, sessions_dir, worker_env, provider=provider)
+    env = worker_env_for(issue_number, sessions_dir, worker_env, provider=provider, review=review)
+    template = command_template or opencode.command or DEFAULT_COMMAND_TEMPLATE
+    if review:
+        template = sanitize_review_command_template(template)
+    variant = (resolved_review_effort or "") if review else ""
+    variant = variant or opencode.variant
     return launch_claude_worker(
         issue_number,
         branch,
@@ -232,14 +363,16 @@ def launch_opencode_worker(
         sessions_dir=sessions_dir,
         worktrees_dir=worktrees_dir,
         venv_source=venv_source,
-        command_template=command_template or opencode.command or DEFAULT_COMMAND_TEMPLATE,
+        command_template=template,
         env=env,
         materialize_dirs=materialize_dirs,
         rework=rework,
+        review=review,
+        head_sha=head_sha,
         recovery=recovery,
         base_ref=base_ref,
         config=resolved_config,
         adapter_kind="opencode",
         provider=provider,
-        cli_pins=lambda command: pin_flags(command, model, opencode.variant),
+        cli_pins=lambda command: pin_flags(command, model, variant),
     )

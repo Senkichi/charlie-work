@@ -329,7 +329,7 @@ def test_build_config_from_data_reviewer_harness_accepts_any_registered_harness(
 
     with pytest.raises(
         ConfigError,
-        match=r"^reviewer\.harness: expected one of 'api', 'claude-code', 'devin-shell', got 'devin'$",
+        match=r"^reviewer\.harness: expected one of 'api', 'claude-code', 'devin-shell', 'opencode', got 'devin'$",
     ):
         build_config_from_data({"reviewer": {"harness": "devin"}})
 
@@ -368,6 +368,6 @@ def test_build_config_from_data_reviewer_harness_matches_registry() -> None:
 
     with pytest.raises(
         ConfigError,
-        match=r"^reviewer\.harness: expected one of 'api', 'claude-code', 'devin-shell', got 'not-a-real-harness'$",
+        match=r"^reviewer\.harness: expected one of 'api', 'claude-code', 'devin-shell', 'opencode', got 'not-a-real-harness'$",
     ):
         build_config_from_data({"reviewer": {"harness": "not-a-real-harness"}})

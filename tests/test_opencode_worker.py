@@ -29,6 +29,7 @@ from charlie_work.opencode_worker import (
     launch_opencode_worker,
     pin_flags,
     resolve_model,
+    sanitize_review_command_template,
     worker_env_for,
 )
 from charlie_work.paths import runtime_paths
@@ -134,10 +135,10 @@ def _read_probe(record) -> dict[str, Any]:
 # --- pure helpers -----------------------------------------------------------
 
 
-def test_registry_declares_opencode_worker_only() -> None:
+def test_registry_declares_opencode_worker_and_reviewer() -> None:
     caps = HARNESS_REGISTRY["opencode"]
     assert caps.worker is True
-    assert caps.review is False
+    assert caps.review is True
     assert caps.adapter_kind == "opencode"
     assert caps.skill_dirs == (".opencode/skills", ".claude/skills")
 
@@ -237,6 +238,93 @@ def test_worker_env_for_operator_env_overrides_posture(tmp_path: Path) -> None:
     )
     assert env["OPENCODE_DISABLE_CLAUDE_CODE_PROMPT"] == "0"
     assert env["XDG_DATA_HOME"] == "/custom"
+
+
+# --- review posture ---------------------------------------------------------
+
+
+def test_worker_env_for_review_denies_writes_and_allowlists_read_bash(
+    tmp_path: Path,
+) -> None:
+    env = worker_env_for(
+        3, tmp_path / "s", environ={"XDG_DATA_HOME": str(tmp_path / "h")}, review=True
+    )
+    permission = json.loads(env["OPENCODE_CONFIG_CONTENT"])["permission"]
+    assert permission["*"] == "deny"
+    assert permission["edit"] == "deny"
+    assert permission["read"] == "allow"
+    bash = permission["bash"]
+    assert bash["*"] == "deny"
+    assert bash["git diff *"] == "allow"
+    assert bash["gh pr view *"] == "allow"
+    # The paired write verbs stay denied: no git push/commit or gh pr merge/edit.
+    allowed = [pattern for pattern, effect in bash.items() if effect == "allow"]
+    assert not any("push" in p or "commit" in p or "merge" in p or "edit" in p for p in allowed)
+
+
+def test_worker_env_for_review_deny_policy_cannot_be_overridden(tmp_path: Path) -> None:
+    """The reviewer's read-only invariant wins over operator worker_env --
+    the OPENCODE_CONFIG_CONTENT counterpart of the --permission-mode plan pin."""
+    hostile = json.dumps({"permission": {"*": "allow"}})
+    env = worker_env_for(
+        3,
+        tmp_path / "s",
+        {"OPENCODE_CONFIG_CONTENT": hostile},
+        environ={"XDG_DATA_HOME": str(tmp_path / "h")},
+        review=True,
+    )
+    assert json.loads(env["OPENCODE_CONFIG_CONTENT"])["permission"]["*"] == "deny"
+
+
+def test_sanitize_review_command_template_strips_agent_flags() -> None:
+    assert sanitize_review_command_template(
+        ("opencode", "run", "--agent", "build", "--auto", "--agent=build")
+    ) == ("opencode", "run", "--auto")
+
+
+def _fake_review_checkout(
+    repo_root: Path, pr_number: int, head_sha: str, *, reviews_dir: Path
+) -> WorktreeInfo:
+    checkout = reviews_dir / f"pr-{pr_number}"
+    checkout.mkdir(parents=True, exist_ok=True)
+    return WorktreeInfo(path=checkout, branch=head_sha, venv_junction=None)
+
+
+def test_review_launch_pins_model_variant_and_deny_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A review=True launch: --model from model_override, --variant from
+    resolved_review_effort, --agent stripped, claude review pins absent,
+    env carries the deny permission policy."""
+    monkeypatch.setattr(claude_code, "create_review_checkout", _fake_review_checkout)
+    record, sessions_dir = _launch(
+        tmp_path,
+        review=True,
+        head_sha="b" * 40,
+        model_override="glm-5.3-flash",
+        resolved_review_effort="max",
+        command_template=(*_probe_script(tmp_path), "--agent", "build"),
+    )
+    assert record.ok, record.error
+    argv = _read_probe(record)["argv"]
+    assert argv[argv.index("--model") + 1] == "opencode-go/glm-5.3-flash"
+    assert argv[argv.index("--variant") + 1] == "max"
+    for bad in ("--agent", "--permission-mode", "--max-turns", "--effort", "--output-format"):
+        assert bad not in argv
+    env = _read_probe(record)["env"]
+    assert json.loads(env["OPENCODE_CONFIG_CONTENT"])["permission"]["*"] == "deny"
+    assert env["XDG_DATA_HOME"] == str(sessions_dir / "opencode-data" / "issue-42")
+    sidecar = sessions_dir / "issue-42.opencode.json"
+    assert sidecar.exists()
+    assert (sessions_dir / "issue-42-review.claude.log").exists()
+    assert not (sessions_dir / "issue-42.claude.log").exists()
+
+
+def test_review_launch_requires_head_sha(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(claude_code, "create_review_checkout", _fake_review_checkout)
+    record, _ = _launch(tmp_path, review=True)
+    assert not record.ok
+    assert "head_sha" in record.error
 
 
 # --- launch -----------------------------------------------------------------

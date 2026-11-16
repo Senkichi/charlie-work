@@ -84,8 +84,11 @@ def extract_verdict_from_plaintext_log(log_text: str) -> dict[str, Any] | None:
 def extract_verdict_from_log_text(log_text: str) -> dict[str, Any] | None:
     """Verdict from a reviewer sidecar log (plaintext or stream-json), else ``None``.
 
-    Order: the trailing well-formed block, the whole-text plaintext scan, then
-    stream-json event decoding.
+    Order: the trailing well-formed block, the whole-text plaintext scan,
+    stream-json event decoding, then opencode JSONL decoding (``--format
+    json`` emits the same JSON-escaped-in-a-string shape as stream-json, but
+    with ``{"type":"text","part":{"text":...}}`` events instead of claude's
+    assistant/result shapes).
     """
     verdict = extract_trailing_fenced_verdict(log_text)
     if verdict is not None:
@@ -93,4 +96,10 @@ def extract_verdict_from_log_text(log_text: str) -> dict[str, Any] | None:
     verdict = extract_verdict_from_plaintext_log(log_text)
     if verdict is not None:
         return verdict
-    return _extract_verdict_from_stream_json(log_text)
+    verdict = _extract_verdict_from_stream_json(log_text)
+    if verdict is not None:
+        return verdict
+    from .opencode_log import last_text_event
+
+    final_text = last_text_event(log_text)
+    return _extract_verdict_from_text(final_text) if final_text else None

@@ -71,6 +71,31 @@ def _error_event_summary(line: str) -> str:
     return "opencode error: " + " ".join(parts)
 
 
+def last_text_event(log_text: str) -> str | None:
+    """The final assistant ``text`` part of an opencode JSONL stream, else None.
+
+    ``opencode run --format json`` emits ``{"type":"text","part":{"text":...}}``
+    events for assistant output; a reviewer's verdict fence lives inside the
+    last one's ``part.text``, JSON-escaped, so the plaintext fence scan can
+    never see it. Only the LAST text event is returned -- a mid-session draft
+    or an echo of the prompt's own example verdict must not count (the same
+    rule ``_extract_verdict_from_stream_json`` applies to claude events).
+    """
+    last: str | None = None
+    for line in log_text.splitlines():
+        event = _EVENT_TYPE.match(line)
+        if event is None or event.group(1) != "text":
+            continue
+        try:
+            payload = json.loads(line)
+        except ValueError:
+            continue
+        part = payload.get("part") if isinstance(payload, dict) else None
+        if isinstance(part, dict) and isinstance(part.get("text"), str):
+            last = part["text"]
+    return last
+
+
 def provider_error_digest(log_text: str) -> str:
     """opencode's own provider-error records since the last progress event."""
     collected: list[str] = []

@@ -170,7 +170,16 @@ full hazard writeup and manual recovery steps.
 `worker.fallbacks` -- launches a headless `opencode run` session through the
 same worktree/sidecar/terminal-watcher stack as a claude-code worker
 (`opencode_worker.launch_opencode_worker`; sidecar `issue-<n>.opencode.json`).
-Worker-only: opencode is not a reviewer harness.
+Review-capable since 2026-11-16: an `opencode` entry in
+`reviewer.fallbacks` (or `reviewer.harness: opencode` itself) launches a
+reviewer through the same detached-HEAD review checkout as claude-code. The
+read-only posture is enforced in env, not argv — the launcher injects
+`OPENCODE_CONFIG_CONTENT` with a deny-default permission policy
+(`opencode_worker._REVIEWER_CONFIG`: read/grep/glob/list tools plus a
+prefix allowlist of read-only git/gh bash verbs and targeted pytest runs),
+and `--agent` is stripped from the template so no argv token can move the
+permission boundary. `resolved_review_effort` maps to opencode's
+`--variant`; `--max-turns` has no equivalent and is not pinned.
 
 ```yaml
 worker:
