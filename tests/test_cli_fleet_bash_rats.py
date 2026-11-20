@@ -338,7 +338,14 @@ def test_run_fleet_bash_rats_loud_on_absent_global_layer(
     monkeypatch.setattr(cli, "self_deploy", deploy_mock)
     fleet_loop_mock = MagicMock(return_value=CommandResult(True, "pass ok", {"repos": {}}))
     monkeypatch.setattr(cli, "fleet_loop", fleet_loop_mock)
-    # Deliberately NOT mocking cli.load_layered_config.
+    # Deliberately NOT mocking cli.load_layered_config. The per-repo fallback
+    # reload reads Path.cwd(), so the "cwd has no per-repo config" premise
+    # below is ENFORCED: on a host whose checkout carries an
+    # orchestrator.config.yaml that only validates with the global layer's
+    # provider merge (api_worker.providers), the cwd reload itself would
+    # ConfigError and the fallback would yield None -- a per-host
+    # environmental failure shaped like the bug this test guards.
+    monkeypatch.chdir(tmp_path)
 
     args = cli.build_parser().parse_args(
         ["--fleet-dir", str(tmp_path), "fleet", "bash-rats", "--limit", "1"]
