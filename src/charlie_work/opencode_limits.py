@@ -67,6 +67,17 @@ _RESET_IN = re.compile(
 _RESET_PART = re.compile(r"(\d+)\s*(day|hour|minute|second)")
 _LIMIT_HOURS = re.compile(r"(\d+)[- ]?hour", re.IGNORECASE)
 _LIMIT_WINDOWS = {"day": timedelta(days=1), "week": timedelta(days=7), "month": timedelta(days=30)}
+# opencode 2.x structured errors carry the retry-after the binary honours;
+# the provider_error_digest summary line stamps it as retry-after-ms=<int>.
+_RETRY_AFTER_MS = re.compile(r"\bretry-after-ms=(\d+)\b")
+# A retry-after hint is only accepted as the QUOTA WINDOW when it is long
+# enough to plausibly be one. The same field carries transport-level backoff
+# (a gateway's "retry in 1s/30s"), and using that as the reset would open the
+# fleet-wide cooldown seconds later while the subscription window is still
+# closed -- the exact hot-redispatch loop the quota ledger exists to prevent.
+# Shorter values are therefore IGNORED (not clamped: falling through to the
+# stated clock time / probe / configured default is the conservative answer).
+_RETRY_AFTER_WINDOW_FLOOR = timedelta(minutes=5)
 
 # The one network seam: tests replace it (conftest refuses real connections).
 _open = urllib.request.urlopen
@@ -213,6 +224,23 @@ def probe_go_reset() -> timedelta | None:
 def go_quota_reset(tail: str) -> timedelta | None:
     """``AdapterFateProfile.quota_reset`` for opencode: the reset the log states, else a probe."""
     stated = reset_from_text(tail)
+    if stated is None:
+        # opencode 2.x embeds the retry-after it itself honours in every
+        # structured provider error (``error.retryAfterMs``, summarized as
+        # ``retry-after-ms=`` in the provider_error_digest line). A quota
+        # error whose event carries it names the exact window -- prefer it
+        # over a probe (a 5h/weekly/monthly limit would otherwise be guessed
+        # by probe or defaulted to 24h). Only a window-scale value is
+        # accepted: see _RETRY_AFTER_WINDOW_FLOOR for why a short transport
+        # backoff must fall through to the conservative paths instead.
+        ms = _RETRY_AFTER_MS.search(tail)
+        if ms:
+            try:
+                delta = timedelta(milliseconds=int(ms.group(1)))
+            except (ValueError, OverflowError):
+                delta = None
+            if delta is not None and delta >= _RETRY_AFTER_WINDOW_FLOOR:
+                stated = delta
     if stated is not None:
         return stated
     if ZEN_FREE_LIMIT_MARKER in tail:

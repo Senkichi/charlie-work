@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from . import layout
+from . import opencode_log
 from .config import OrchestratorConfig
 from .github import GitHubLike
 from . import host as _host
@@ -512,14 +513,20 @@ def _detect_and_handle_stalled_reviews(
             # output (opencode) must match the classifiers against its own
             # provider-error records, not the raw tail -- a reviewed file
             # quoting "rate limit" in the last 2KB must not arm fleet-wide
-            # reviewer_quota. This is the same AdapterFateProfile.log_digest
-            # the worker-side fate classifier applies (dead_worker_reap).
+            # reviewer_quota. Same AdapterFateProfile.log_digest the
+            # worker-side fate classifier applies (dead_worker_reap).
+            #
+            # An EMPTY digest falls back to the raw tail only when the log
+            # carries no assistant text and no tool output (nothing that
+            # could quote a marker), so an unrecognized error shape still
+            # classifies instead of disabling throttle detection.
             profile = profile_for(w.adapter_kind)
-            surface = (
-                profile.log_digest(log_text)
-                if profile is not None and profile.log_digest is not None
-                else log_text
-            )
+            surface = log_text
+            if profile is not None and profile.log_digest is not None:
+                digest = profile.log_digest(log_text)
+                surface = digest or (
+                    "" if opencode_log.carries_work_output(log_text) else log_text
+                )
             tail = surface[-2048:] if len(surface) > 2048 else surface
             # Issue #1684: quota exhaustion is a throttle outcome too. The
             # structured "cognition.ai/errorKind": "resource_exhausted"

@@ -23,14 +23,17 @@ class OpenCodeConfig:
 
     ``command``: empty means ``opencode_worker.DEFAULT_COMMAND_TEMPLATE``. The
     rendered worker prompt is fed via stdin unless the template names
-    ``{prompt_path}``; the launcher appends ``--model``/``--variant`` pins.
+    ``{prompt_path}``; the launcher appends the ``--model`` pin.
 
     ``provider``: prefixed onto a bare ``worker.model`` (``glm-5.3-flash`` ->
     ``opencode-go/glm-5.3-flash``). A model that already names a provider
     (contains ``/``) is passed through unchanged.
 
     ``variant``: opencode's provider-specific reasoning-effort variant
-    (``--variant``); empty means the model default.
+    (``low`` | ``high`` | ``max`` for glm-5.3-flash); empty means the model
+    default. opencode 2.x has no ``--variant`` flag -- the launcher folds the
+    value into the model string as ``provider/model#variant`` (opencode 2.3.0
+    runtime-verified); a model that already carries ``#<variant>`` keeps it.
 
     ``venv_source`` / ``worker_env``: same semantics as ``ClaudeCodeConfig``'s
     fields of the same name (``worker_env`` is merged after env sanitisation,

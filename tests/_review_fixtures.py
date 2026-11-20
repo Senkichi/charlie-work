@@ -115,6 +115,35 @@ def _make_dead_review_sidecar(
     return sidecar_path
 
 
+def _make_dead_opencode_review_sidecar(
+    reviews_dir: Path,
+    pr_number: int,
+    log_text: str,
+    *,
+    started_at: str | None = None,
+) -> Path:
+    """Create an opencode review sidecar + log for a dead reviewer."""
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    log_path = reviews_dir / f"issue-{pr_number}-review.claude.log"
+    log_path.write_text(log_text, encoding="utf-8")
+    sidecar = {
+        "issue_number": pr_number,
+        "branch": f"agent/issue-{pr_number}-fix",
+        "worktree_path": str(reviews_dir / f"issue-{pr_number}"),
+        "prompt_path": str(reviews_dir / f"issue-{pr_number}-review-prompt.md"),
+        "command": ["opencode", "run", "--auto", "--format", "json"],
+        "pid": 99999,
+        "started_at": started_at or "2026-07-06T12:00:00Z",
+        "log_path": str(log_path),
+        "error": None,
+        "process_start_time": 1.0,
+        "adapter_kind": "opencode",
+    }
+    sidecar_path = reviews_dir / f"issue-{pr_number}.opencode.json"
+    sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
+    return sidecar_path
+
+
 def _set_review_dispatched_state(
     app: OrchestratorApp,
     pr_number: int,

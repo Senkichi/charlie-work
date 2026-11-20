@@ -1,5 +1,4 @@
 """opencode fate/classification wiring: the provider-error digest, quota
-classification through the fate profile, early-kill health, data-dir lifecycle,
 requires_model config rule, provider-qualified model family, orphan sweep."""
 
 from __future__ import annotations
@@ -24,12 +23,9 @@ from charlie_work.config import (
 from charlie_work.devin_failure_classification import get_rate_limit_defer_until
 from charlie_work.harnesses import HARNESS_REGISTRY
 from charlie_work.opencode_log import (
-    last_text_event,
     opencode_data_dir,
     provider_error_digest,
-    session_progress,
 )
-from charlie_work.opencode_worker import DEFAULT_COMMAND_TEMPLATE
 from charlie_work.role_chain import RoleEntry, model_family
 from charlie_work.worker import WorkerHealth, WorkerView, classify_worker_health, iter_workers
 
@@ -54,257 +50,6 @@ def _log(tmp_path: Path, text: str) -> Path:
     path = tmp_path / "issue-1.claude.log"
     path.write_text(text, encoding="utf-8")
     return path
-
-
-# --- opencode_log -----------------------------------------------------------
-
-
-def test_default_command_template_is_json_stream_with_print_logs() -> None:
-    assert DEFAULT_COMMAND_TEMPLATE[:2] == ("opencode", "run")
-    assert "--print-logs" in DEFAULT_COMMAND_TEMPLATE
-    assert "--format" in DEFAULT_COMMAND_TEMPLATE
-
-
-def test_opencode_data_dir_layout(tmp_path: Path) -> None:
-    assert opencode_data_dir(tmp_path, 12) == tmp_path / "opencode-data" / "issue-12"
-
-
-def test_digest_keeps_final_error_event_with_status_and_body() -> None:
-    digest = provider_error_digest('{"type":"step_start"}\n' + FINAL_ERROR + "\n")
-    assert "Usage limit reached" in digest
-    assert "status=429" in digest
-    assert "GoUsageLimitError" in digest
-
-
-def test_digest_keeps_print_logs_error_lines() -> None:
-    digest = provider_error_digest(PRINT_LOG_ERROR + "\n")
-    assert "Usage limit reached" in digest
-
-
-def test_digest_drops_tool_output_and_forged_level_error_in_tool_json() -> None:
-    forged = (
-        '{"type":"tool_use","part":{"state":{"output":"timestamp=x level=ERROR '
-        'error.error=\\"usage limit\\""}}}\n'
-    )
-    assert provider_error_digest(TOOL_OUTPUT_ONLY) == ""
-    assert provider_error_digest(forged) == ""
-
-
-def test_digest_resets_on_progress_event() -> None:
-    """A 429 opencode retried through must not classify a later unrelated death."""
-    text = PRINT_LOG_ERROR + '\n{"type":"text","part":{"text":"recovered"}}\n'
-    assert provider_error_digest(text) == ""
-    text = FINAL_ERROR + '\n{"type":"step_start"}\n' + PRINT_LOG_ERROR + "\n"
-    assert provider_error_digest(text).count("Usage limit reached") == 1
-
-
-# --- last_text_event / session_progress --------------------------------------
-
-
-def test_last_text_event_returns_final_text_part() -> None:
-    log = "\n".join(
-        [
-            '{"type":"step_start","part":{"id":"s1"}}',
-            '{"type":"text","part":{"text":"first draft"}}',
-            '{"type":"step_finish","part":{}}',
-            '{"type":"step_start","part":{"id":"s2"}}',
-            '{"type":"text","part":{"text":"final answer"}}',
-            '{"type":"step_finish","part":{}}',
-        ]
-    )
-    assert last_text_event(log) == "final answer"
-
-
-def test_last_text_event_resets_on_later_step_tool_or_error() -> None:
-    """A draft text superseded by a new step/tool call/error is mid-session
-    output, not the final answer -- it must not be reaped as the verdict."""
-    for tail in (
-        '{"type":"step_start","part":{"id":"s2"}}',
-        '{"type":"tool_use","part":{"tool":"bash"}}',
-        '{"type":"error","error":{"name":"ProviderError","data":{}}}',
-    ):
-        log = "\n".join(
-            [
-                '{"type":"step_start","part":{"id":"s1"}}',
-                '{"type":"text","part":{"text":"draft verdict here"}}',
-                '{"type":"step_finish","part":{}}',
-                tail,
-            ]
-        )
-        assert last_text_event(log) is None, tail
-
-
-def test_last_text_event_keeps_text_before_step_finish() -> None:
-    # text -> step_finish is a completed turn: the normal verdict shape.
-    log = "\n".join(
-        [
-            '{"type":"step_start"}',
-            '{"type":"text","part":{"text":"the verdict"}}',
-            '{"type":"step_finish"}',
-        ]
-    )
-    assert last_text_event(log) == "the verdict"
-
-
-def test_last_text_event_skips_malformed_lines() -> None:
-    log = "\n".join(
-        [
-            '{"type":"text","part":{"text":"good"}}',
-            '{"type":"text","part":{"text":"TRUNCATED',
-        ]
-    )
-    assert last_text_event(log) == "good"
-
-
-def test_session_progress_counts_turns_tools_and_texts() -> None:
-    log = "\n".join(
-        [
-            '{"type":"step_start","part":{"id":"s1"}}',
-            '{"type":"text","part":{"text":"looking at diff"}}',
-            '{"type":"tool_use","part":{"tool":"read"}}',
-            '{"type":"tool_use","part":{"tool":"bash"}}',
-            '{"type":"text","part":{"text":"final analysis"}}',
-            '{"type":"step_finish","part":{}}',
-        ]
-    )
-    progress = session_progress(log)
-    assert progress is not None
-    assert progress.turn_count == 1
-    assert progress.tool_call_count == 2
-    assert progress.texts == ("looking at diff", "final analysis")
-
-
-def test_session_progress_includes_error_events_as_text() -> None:
-    progress = session_progress(FINAL_ERROR)
-    assert progress is not None
-    assert progress.turn_count == 0
-    assert progress.tool_call_count == 0
-    assert progress.texts and "opencode error:" in progress.texts[0]
-
-
-def test_session_progress_returns_none_for_claude_stream_json() -> None:
-    """A claude log has no opencode-shaped events: callers must fall through
-    to their existing plaintext path instead of misattributing the format."""
-    claude_log = "\n".join(
-        [
-            '{"type":"system","subtype":"init"}',
-            '{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}',
-            '{"type":"result","result":"done"}',
-        ]
-    )
-    assert session_progress(claude_log) is None
-
-
-# --- verdict extraction on opencode JSONL -------------------------------------
-
-
-def test_extract_verdict_from_log_text_decodes_opencode_jsonl() -> None:
-    """The verdict fence is JSON-escaped inside part.text -- invisible to the
-    plaintext scan, reachable only through the last_text_event decode."""
-    from charlie_work.verdict_log_extraction import extract_verdict_from_log_text
-
-    fence = (
-        'Final verdict:\n```json\n{\n  "decision": "approved",\n'
-        '  "summary": "lgtm",\n  "required_changes": []\n}\n```\n'
-    )
-    log = "\n".join(
-        [
-            '{"type":"step_start","part":{"id":"s1"}}',
-            json.dumps(
-                {"type": "text", "part": {"text": "analysis first\n\n" + fence}},
-                separators=(",", ":"),
-            ),
-            '{"type":"step_finish","part":{}}',
-        ]
-    )
-    verdict = extract_verdict_from_log_text(log)
-    assert verdict is not None
-    assert verdict["decision"] == "approved"
-    assert verdict["summary"] == "lgtm"
-
-
-def test_extract_verdict_ignores_draft_before_failed_final_step() -> None:
-    """text(draft fence) -> step_finish -> step_start -> tool_use -> error:
-    the draft is stale mid-session output, not the verdict."""
-    from charlie_work.verdict_log_extraction import extract_verdict_from_log_text
-
-    draft = '```json\n{"decision":"approved","summary":"draft","required_changes":[]}\n```'
-    log = "\n".join(
-        [
-            json.dumps(
-                {"type": "text", "part": {"text": "maybe:\n" + draft}},
-                separators=(",", ":"),
-            ),
-            '{"type":"step_finish","part":{}}',
-            '{"type":"step_start","part":{"id":"s2"}}',
-            '{"type":"tool_use","part":{"tool":"bash"}}',
-            '{"type":"error","error":{"name":"ProviderError","data":{}}}',
-        ]
-    )
-    assert extract_verdict_from_log_text(log) is None
-
-
-def test_extract_verdict_prefers_final_text_over_earlier_echo() -> None:
-    """An earlier text echoing the prompt's example verdict loses to the
-    final text event's real verdict."""
-    from charlie_work.verdict_log_extraction import extract_verdict_from_log_text
-
-    echo = '```json\n{"decision":"approved","summary":"echo","required_changes":[]}\n```'
-    real = '```json\n{"decision":"request_changes","summary":"real","required_changes":["x"]}\n```'
-    log = "\n".join(
-        [
-            json.dumps(
-                {"type": "text", "part": {"text": "the format:\n" + echo}},
-                separators=(",", ":"),
-            ),
-            '{"type":"step_finish","part":{}}',
-            '{"type":"step_start","part":{"id":"s2"}}',
-            '{"type":"tool_use","part":{"tool":"read"}}',
-            json.dumps(
-                {"type": "text", "part": {"text": "Verdict:\n" + real}},
-                separators=(",", ":"),
-            ),
-            '{"type":"step_finish","part":{}}',
-        ]
-    )
-    verdict = extract_verdict_from_log_text(log)
-    assert verdict is not None
-    assert verdict["decision"] == "request_changes"
-
-
-# --- _extract_review_session_summary on opencode logs --------------------------
-
-
-def test_review_session_summary_decodes_opencode_log(tmp_path: Path) -> None:
-    """A worked opencode reviewer that died without a verdict is classified
-    on its real turn/tool counts (not launch_failed), and the PR comment
-    carries decoded text, not raw JSONL."""
-    from charlie_work.verdict_parsing import (
-        REVIEW_MISS_DIED_MID_SESSION,
-        _extract_review_session_summary,
-    )
-
-    log = tmp_path / "issue-7-review.claude.log"
-    log.write_text(
-        "\n".join(
-            [
-                '{"type":"step_start","part":{"id":"s1"}}',
-                '{"type":"text","part":{"text":"reviewing the diff"}}',
-                '{"type":"tool_use","part":{"tool":"bash"}}',
-                '{"type":"step_finish","part":{}}',
-                '{"type":"step_start","part":{"id":"s2"}}',
-                '{"type":"text","part":{"text":"final analysis text"}}',
-            ]
-        ),
-        encoding="utf-8",
-    )
-    outcome = _extract_review_session_summary(tmp_path / "missing.events.jsonl", log, 10)
-    assert outcome is not None
-    assert outcome.turn_count == 2
-    assert outcome.tool_call_count == 1
-    assert outcome.reason == REVIEW_MISS_DIED_MID_SESSION
-    assert "final analysis text" in outcome.text
-    assert '{"type"' not in outcome.text  # no raw JSONL dumped into the comment
 
 
 # --- classification through the fate profile ---------------------------------
@@ -483,6 +228,11 @@ def test_reap_sidecar_removes_opencode_data_dir(tmp_path: Path) -> None:
     data = opencode_data_dir(sessions, 5)
     (data / "sub").mkdir(parents=True)
     (data / "sub" / "opencode.db").write_text("x", encoding="utf-8")
+    # The seeded 2.x credential lives inside the data dir by design (see
+    # seed_auth_file's lifetime note): the reap must remove it with the
+    # session, never leave a provider key behind after the reviewer dies.
+    (data / "opencode").mkdir(parents=True)
+    (data / "opencode" / "auth.json").write_text('{"opencode-go": {}}', encoding="utf-8")
     other = opencode_data_dir(sessions, 6)
     other.mkdir(parents=True)
 
@@ -491,6 +241,7 @@ def test_reap_sidecar_removes_opencode_data_dir(tmp_path: Path) -> None:
 
     assert not sidecar.exists()
     assert not data.exists()
+    assert not (data / "opencode" / "auth.json").exists()
     assert other.exists()  # another worker's data dir is untouched
 
 

@@ -153,10 +153,12 @@ def _launch_review_opencode(
     api_worker_config: ApiWorkerConfig | None,
 ) -> Any:
     # opencode reads the prompt on stdin (prompt_text, like claude-code).
-    # resolved_review_effort is pinned as --variant (opencode's reasoning-
-    # effort flag); max_turns_override is ignored -- no such CLI concept,
-    # same as devin-shell. The read-only posture lives in
-    # opencode_worker._REVIEWER_CONFIG + the --agent strip, not argv.
+    # resolved_review_effort is folded into the --model pin as
+    # provider/model#variant (opencode 2.x has no --variant flag);
+    # max_turns_override is ignored -- no such CLI concept, same as
+    # devin-shell. The read-only posture lives in
+    # opencode_review_policy._REVIEWER_CONFIG + the --agent/--server strip and
+    # the --standalone pin, not argv.
     return _wf().launch_opencode_worker(
         pr_number,
         branch,

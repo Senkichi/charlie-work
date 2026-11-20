@@ -1081,10 +1081,14 @@ def launch_claude_worker(
     # Rotate the previous session's log before the new launch overwrites it.
     # This preserves the old log for post-mortem analysis on re-dispatch.
     _rotate_old_log(log_path)
-    # Also rotate the previous events.jsonl if it exists.
-    if tee_stream_json:
-        _events_path_old = _events_path(sessions_dir, issue_number, rework=rework, review=review)
-        _rotate_old_log(_events_path_old)
+    # Rotate the previous events.jsonl on EVERY launch, not just tee'd ones:
+    # adapters that leave tee_stream_json off (opencode) still route through
+    # this function, and the format-agnostic readers in verdict_parsing would
+    # otherwise misread an earlier round's claude/api transcript as this
+    # session's metrics and summary text. Same invariant devin_shell's
+    # unconditional rotation enforces for its launches (issue #2036).
+    _events_path_old = _events_path(sessions_dir, issue_number, rework=rework, review=review)
+    _rotate_old_log(_events_path_old)
     session_id = str(uuid.uuid4())
 
     # Issue #426: recovery probes carry a Signal-1-style deferral counter. Seed

@@ -173,13 +173,42 @@ same worktree/sidecar/terminal-watcher stack as a claude-code worker
 Review-capable since 2026-11-16: an `opencode` entry in
 `reviewer.fallbacks` (or `reviewer.harness: opencode` itself) launches a
 reviewer through the same detached-HEAD review checkout as claude-code. The
+review template always carries `--standalone` (a private server per session),
+and `sanitize_review_command_template` ADDS it when an operator
+`opencode.command` override omits it and strips `--server`: without a private
+server `run` connects to the operator's shared background service, whose own
+env would bypass the per-issue data dir, the deny policy and the seeded
+credential (verified against the installed 2.3.0 binary). The
 read-only posture is enforced in env, not argv — the launcher injects
 `OPENCODE_CONFIG_CONTENT` with a deny-default permission policy
-(`opencode_worker._REVIEWER_CONFIG`: read/grep/glob/list tools plus a
-prefix allowlist of read-only git/gh bash verbs and targeted pytest runs),
-and `--agent` is stripped from the template so no argv token can move the
-permission boundary. `resolved_review_effort` maps to opencode's
-`--variant`; `--max-turns` has no equivalent and is not pinned.
+(`opencode_review_policy._REVIEWER_CONFIG`: read/grep/glob/list tools plus a
+prefix allowlist of read-only git/gh verbs), and `--agent` (plus the 2.x
+session/server movers `--continue`/`--session`/`--worktree`/`--fork`/
+`--server`) are stripped from the template so no argv token can move the
+permission, checkout or server boundary. `resolved_review_effort` is folded
+into the model pin as `provider/model#variant` (opencode 2.x has no
+`--variant` flag; verified against the installed 2.3.0 binary); `--max-turns`
+has no equivalent and is not pinned.
+
+The reviewer is read-only in a narrow, explicit sense: no `edit`/`write`, no
+`webfetch`/`websearch`, no shell verb outside the read-only git/gh allowlist,
+and **no test runner**. Test execution is deliberately excluded even though
+the shared review prompt permits one targeted run: the checkout is the PR's
+code, so a test run imports the PR's `conftest.py` — turning prompt-injected
+PR text into arbitrary code execution. That is the worker's and CI's job
+(parity with the devin-shell reviewer, whose prompt forbids tests). Host
+`read`/`external_directory` stay allowed because the packet path is per-PR
+dynamic; the guarantee is that no allowed tool can *carry data off-host* and
+none can *execute PR code*, not that the reviewer cannot read a host file.
+
+One consequence, reported by `charlie doctor` (opencode review provider
+visibility) as a warning: a review launch pins `OPENCODE_CONFIG_DIR` to a
+per-issue empty directory, because the operator's global config is the
+agent-permission override vector the deny policy closes. A reviewer
+therefore sees only the providers/models built into the binary — a reviewer
+model whose provider is custom (declared only in
+`~/.config/opencode/opencode.json`) fails at launch with `provider.no-route`,
+and a host override of a built-in provider simply does not apply to reviewers.
 
 ```yaml
 worker:
@@ -191,7 +220,8 @@ worker:
 
 opencode:            # all optional
   provider: opencode-go   # prefixed onto a bare model -> opencode-go/glm-5.3-flash
-  variant: ""             # --variant (low | high | max for glm-5.3-flash)
+  variant: ""             # reasoning-effort variant, folded into the model
+                          # pin as provider/model#variant (low|high|max)
   release_blocked_tool: true   # kill switch for the stalled-lane release below
   worker_env: {}          # merged last; operator values win
 ```

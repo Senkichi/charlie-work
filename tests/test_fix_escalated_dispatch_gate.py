@@ -454,12 +454,12 @@ def test_reap_review_verdicts_session_limit_notice_is_launch_failure(
     reviews_dir = app._layout.reviews_dir
 
     old_dispatched = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
-    # Reviewer launches force tee_stream_json=True, so log_path and events_path
-    # are byte-identical in production (issue #652 review). Write the same JSONL
-    # to both: _make_dead_review_sidecar creates the .claude.json sidecar and
-    # writes log_text to the log, then _write_session_limit_events writes the
-    # events sidecar. Passing the JSONL as log_text makes the log byte-identical
-    # to the events file.
+    # A claude-code reviewer launch carries tee_stream_json=True, so log_path
+    # and events_path are byte-identical in production (issue #652 review).
+    # Write the same JSONL to both: _make_dead_review_sidecar creates the
+    # .claude.json sidecar and writes log_text to the log, then
+    # _write_session_limit_events writes the events sidecar. Passing the JSONL
+    # as log_text makes the log byte-identical to the events file.
     _make_dead_review_sidecar(reviews_dir, 100, _session_limit_jsonl())
     _write_session_limit_events(reviews_dir, 100)
     _set_review_dispatched_state(app, 100, 10, old_dispatched)
@@ -499,9 +499,10 @@ def test_extract_review_session_summary_session_limit_notice_no_substantial_work
     turn_count=1, tool_call_count=0 must report ``did_substantial_work=False``
     so the #583 rollback guard fires, regardless of turn_count.
 
-    Reviewer launches force ``tee_stream_json=True``, so log_path and
-    events_path are byte-identical in production (issue #652 review). This test
-    writes the same JSONL to both files, exercising the real code path.
+    A claude-code reviewer launch carries ``tee_stream_json=True``, so
+    log_path and events_path are byte-identical in production (issue #652
+    review). This test writes the same JSONL to both files, exercising the
+    real code path.
     """
     from charlie_work.workflow import _extract_review_session_summary
 
@@ -585,8 +586,9 @@ def test_extract_review_session_summary_generic_marker_in_review_commentary_not_
 
     The reclassification matches only the NARROW ``session_limit_markers``
     (specific CLI death-message phrasing like "hit your session limit"), NOT
-    the broad ``throttle_error_markers``. Reviewer launches force
-    ``tee_stream_json=True``, so log_path and events_path are byte-identical --
+    the broad ``throttle_error_markers``. A claude-code reviewer launch
+    carries ``tee_stream_json=True``, so log_path and events_path are
+    byte-identical --
     the raw log tail IS the events content, so matching the raw tail does not
     avoid matching the reviewer's own parsed assistant text (issue #652 review).
     The false-positive protection comes from the narrow marker list, not from

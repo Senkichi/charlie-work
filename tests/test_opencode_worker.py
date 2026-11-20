@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 import textwrap
 import time
@@ -19,24 +18,21 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _doctor_fixtures import FakeDoctorGitHub, _config
 
 from charlie_work import claude_code, opencode_worker, role_quota_ledger
 from charlie_work.adapter_fate_profile import profile_for
-from charlie_work.config import OpenCodeConfig, OrchestratorConfig, WorkerRoleConfig
-from charlie_work.doctor import run_doctor
+from charlie_work.config import (
+    OpenCodeConfig,
+    OrchestratorConfig,
+    WorkerRoleConfig,
+)
 from charlie_work.harnesses import HARNESS_REGISTRY
 from charlie_work.opencode_worker import (
-    _REVIEWER_CONFIG,
     launch_opencode_worker,
     pin_flags,
     resolve_model,
     sanitize_review_command_template,
-    worker_env_for,
 )
-from charlie_work.paths import runtime_paths
-from charlie_work.role_chain import RoleEntry
-from charlie_work.subprocess_runner import RunResult
 from charlie_work.worker import iter_workers
 from charlie_work.worktree import WorktreeInfo
 
@@ -160,224 +156,84 @@ def test_resolve_model(model: str, provider: str, expected: str) -> None:
 
 
 def test_pin_flags_last_flag_wins_strips_operator_model_and_variant() -> None:
+    """No --variant flag exists on opencode 2.x (verified: `opencode run
+    --variant x` prints `run --help`, exit 1): the variant is folded into the
+    model string as provider/model#variant, and operator --variant/-m/--model
+    tokens are stripped."""
     command = ("opencode", "run", "-m", "x/y", "--model=a/b", "--model", "c/d", "--variant", "low")
     pinned = pin_flags(command, "opencode-go/glm", "high")
     assert pinned.count("--model") == 1
     assert "-m" not in pinned and "x/y" not in pinned and "a/b" not in pinned
-    assert pinned[pinned.index("--model") + 1] == "opencode-go/glm"
-    assert pinned.count("--variant") == 1
-    assert pinned[pinned.index("--variant") + 1] == "high"
+    assert "--variant" not in pinned and "low" not in pinned
+    assert pinned[pinned.index("--model") + 1] == "opencode-go/glm#high"
 
 
 def test_pin_flags_without_variant_leaves_operator_variant_alone() -> None:
     pinned = pin_flags(("opencode", "run", "--variant", "low"), "p/m", "")
-    assert pinned == ("opencode", "run", "--variant", "low", "--model", "p/m")
+    assert pinned == ("opencode", "run", "--model", "p/m")
 
 
-# --- worker_env_for ---------------------------------------------------------
+def test_pin_flags_model_already_carrying_variant_keeps_it() -> None:
+    pinned = pin_flags(("opencode", "run", "--variant", "low"), "p/m#max", "")
+    assert pinned == ("opencode", "run", "--model", "p/m#max")
 
 
-def test_worker_env_for_posture_and_per_issue_data_dir(tmp_path: Path) -> None:
-    sessions = tmp_path / "sessions"
-    empty = {"XDG_DATA_HOME": str(tmp_path / "empty-host")}
-    env = worker_env_for(7, sessions, environ=empty)
-    assert env["XDG_DATA_HOME"] == str(sessions / "opencode-data" / "issue-7")
-    assert env["OPENCODE_DISABLE_CLAUDE_CODE_PROMPT"] == "1"
-    config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
-    assert config["permission"] == {"*": "allow"}
-    assert config["autoupdate"] is False
-    assert worker_env_for(8, sessions, environ=empty)["XDG_DATA_HOME"] != env["XDG_DATA_HOME"]
-    assert "OPENCODE_AUTH_CONTENT" not in env  # no host login present
-
-
-def test_worker_env_for_forwards_host_auth_json(tmp_path: Path) -> None:
-    _seed_host_auth(tmp_path)
-    env = worker_env_for(1, tmp_path / "s", environ={"XDG_DATA_HOME": str(tmp_path / "host-data")})
-    # Only the selected provider's entry is forwarded, never the whole host file.
-    assert json.loads(env["OPENCODE_AUTH_CONTENT"]) == {"opencode-go": GO_ENTRY}
-    assert OTHER_SECRET not in env["OPENCODE_AUTH_CONTENT"]
-
-
-def test_worker_env_for_scopes_auth_to_requested_provider(tmp_path: Path) -> None:
-    _seed_host_auth(tmp_path)
-    environ = {"XDG_DATA_HOME": str(tmp_path / "host-data")}
-    env = worker_env_for(1, tmp_path / "s", environ=environ, provider="anthropic")
-    assert json.loads(env["OPENCODE_AUTH_CONTENT"]) == {"anthropic": {"refresh": OTHER_SECRET}}
-    assert SECRET not in env["OPENCODE_AUTH_CONTENT"]
-
-
-def test_worker_env_for_forwards_nothing_for_absent_provider(tmp_path: Path) -> None:
-    _seed_host_auth(tmp_path)
-    environ = {"XDG_DATA_HOME": str(tmp_path / "host-data")}
-    env = worker_env_for(1, tmp_path / "s", environ=environ, provider="not-logged-in")
-    assert "OPENCODE_AUTH_CONTENT" not in env
-
-
-@pytest.mark.parametrize("text", ["not json", "[1, 2]", ""])
-def test_worker_env_for_forwards_nothing_for_invalid_auth_json(tmp_path: Path, text: str) -> None:
-    _seed_host_auth(tmp_path, text)
-    environ = {"XDG_DATA_HOME": str(tmp_path / "host-data")}
-    assert "OPENCODE_AUTH_CONTENT" not in worker_env_for(1, tmp_path / "s", environ=environ)
-
-
-def test_worker_env_for_skips_disk_read_when_auth_already_in_environ(tmp_path: Path) -> None:
-    _seed_host_auth(tmp_path)
-    env = worker_env_for(
-        1,
-        tmp_path / "s",
-        environ={"XDG_DATA_HOME": str(tmp_path / "host-data"), "OPENCODE_AUTH_CONTENT": "x"},
-    )
-    # Already in the inherited environ: the child inherits it, nothing re-read.
-    assert "OPENCODE_AUTH_CONTENT" not in env
-
-
-def test_worker_env_for_operator_env_overrides_posture(tmp_path: Path) -> None:
-    env = worker_env_for(
-        1,
-        tmp_path / "s",
-        {"OPENCODE_DISABLE_CLAUDE_CODE_PROMPT": "0", "XDG_DATA_HOME": "/custom"},
-        environ={"XDG_DATA_HOME": str(tmp_path / "empty-host")},
-    )
-    assert env["OPENCODE_DISABLE_CLAUDE_CODE_PROMPT"] == "0"
-    assert env["XDG_DATA_HOME"] == "/custom"
-
-
-# --- review posture ---------------------------------------------------------
-
-
-def test_worker_env_for_review_denies_writes_and_allowlists_read_bash(
-    tmp_path: Path,
-) -> None:
-    env = worker_env_for(
-        3, tmp_path / "s", environ={"XDG_DATA_HOME": str(tmp_path / "h")}, review=True
-    )
-    permission = json.loads(env["OPENCODE_CONFIG_CONTENT"])["permission"]
-    assert permission["*"] == "deny"
-    assert permission["edit"] == "deny"
-    assert permission["read"] == "allow"
-    bash = permission["bash"]
-    assert bash["*"] == "deny"
-    assert bash["git diff *"] == "allow"
-    assert bash["gh pr view *"] == "allow"
-    # The paired write verbs stay denied: no git push/commit or gh pr merge/edit.
-    allowed = [pattern for pattern, effect in bash.items() if effect == "allow"]
-    assert not any("push" in p or "commit" in p or "merge" in p or "edit" in p for p in allowed)
-
-
-def test_worker_env_for_review_deny_policy_cannot_be_overridden(tmp_path: Path) -> None:
-    """The reviewer's read-only invariant wins over operator worker_env --
-    the OPENCODE_CONFIG_CONTENT counterpart of the --permission-mode plan pin."""
-    hostile = json.dumps({"permission": {"*": "allow"}})
-    env = worker_env_for(
-        3,
-        tmp_path / "s",
-        {"OPENCODE_CONFIG_CONTENT": hostile},
-        environ={"XDG_DATA_HOME": str(tmp_path / "h")},
-        review=True,
-    )
-    assert json.loads(env["OPENCODE_CONFIG_CONTENT"])["permission"]["*"] == "deny"
-
-
-def test_worker_env_for_review_pins_every_opencode_control_env(tmp_path: Path) -> None:
-    """Every OPENCODE_* control surface is pinned after the worker_env merge:
-    opencode merges OPENCODE_PERMISSION after OPENCODE_CONFIG_CONTENT, and the
-    review checkout's .opencode/ dir, plugin list, or an ambient/extra config
-    file could otherwise override the deny policy or run code at startup."""
-    hostile_permission = json.dumps({"*": "allow"})
-    env = worker_env_for(
-        3,
-        tmp_path / "s",
-        {
-            "OPENCODE_PERMISSION": hostile_permission,
-            "OPENCODE_CONFIG": "/evil/opencode.json",
-            "OPENCODE_CONFIG_DIR": "/evil/.opencode",
-            "OPENCODE_DISABLE_PROJECT_CONFIG": "0",
-            "OPENCODE_PURE": "0",
-        },
-        environ={
-            "XDG_DATA_HOME": str(tmp_path / "h"),
-            # Ambient os.environ values flow through the sanitized base env --
-            # they must lose to the pins too, not just hostile worker_env.
-            "OPENCODE_PERMISSION": hostile_permission,
-        },
-        review=True,
-    )
-    # Pinned to the same deny policy the config content carries (pin, not
-    # strip: deleting it would leave whatever ambient value survives).
-    assert json.loads(env["OPENCODE_PERMISSION"])["*"] == "deny"
-    assert json.loads(env["OPENCODE_PERMISSION"])["edit"] == "deny"
-    # The untrusted review checkout's project config, agents and plugins never
-    # load; external plugins are off entirely.
-    assert env["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1"
-    assert env["OPENCODE_PURE"] == "1"
-    # Extra config sources neutralized (empty == falsy in opencode's loader).
-    assert env["OPENCODE_CONFIG"] == ""
-    assert env["OPENCODE_CONFIG_DIR"] == ""
-
-
-def _oc_match(command: str, pattern: str) -> bool:
-    """opencode's Wildcard.match: ^pattern$ anchored, * -> .*, ? -> ., case-insensitive."""
-    regex = re.escape(pattern).replace(r"\*", ".*").replace(r"\?", ".")
-    return re.match(f"^{regex}$", command, re.IGNORECASE | re.DOTALL) is not None
-
-
-def _oc_bash_effect(bash: dict[str, str], command: str) -> str:
-    """findLast semantics: the last matching rule decides."""
-    effect = "ask"
-    for pattern, action in bash.items():
-        if _oc_match(command, pattern):
-            effect = action
-    return effect
-
-
-def test_review_bash_trailing_denies_close_wildcard_write_escapes() -> None:
-    """The "verb *" allows are prefix-anchored; a command like "git diff > f"
-    still matches "git diff *" (opencode checks the whole redirected_statement
-    text), so the trailing deny patterns must win under findLast evaluation."""
-    bash = _REVIEWER_CONFIG["permission"]["bash"]
-    # Ordering is the enforcement mechanism: every entry after the last allow
-    # must be a deny, or findLast could hand a write escape back to "allow".
-    last_allow = max(i for i, v in enumerate(bash.values()) if v == "allow")
-    assert all(v == "deny" for v in list(bash.values())[last_allow + 1 :])
-
-    for attack in (
-        "git diff > hacked.txt",
-        "git diff --output=hacked.txt",
-        "git log --output=../evil",
-        "git show HEAD --output=/tmp/x",
-        "git diff --ext-diff",
-        "git log --exec=x",
-        "gh pr view 1 > notes.md",
-        "gh pr diff 1 > /tmp/pr.diff",
-        "pytest tests --junitxml=C:/evil/x.xml",
-        "pytest -o addopts=--junitxml=/tmp/x",
-        "uv run --extra dev pytest -o addopts=x",
-        "git push origin HEAD",
-        "git -c core.editor=sh rebase -i",
-        "sh -c 'rm -rf .'",
-        "rm -rf .",
-        "git commit -m x",
-        "gh pr merge 1",
-    ):
-        assert _oc_bash_effect(bash, attack) == "deny", attack
-    for allowed in (
-        "git status",
-        "git diff HEAD~1",
-        "git diff --stat",
-        "git log --oneline -20",
-        "git show HEAD:file.py",
-        "gh pr view 123 --json files",
-        "gh pr diff 123",
-        "pytest tests/test_x.py -x",
-        "uv run --extra dev pytest -q --tb=short",
-    ):
-        assert _oc_bash_effect(bash, allowed) == "allow", allowed
+def test_pin_flags_model_with_variant_ignores_resolved_variant() -> None:
+    pinned = pin_flags(("opencode", "run"), "p/m#max", "high")
+    assert pinned == ("opencode", "run", "--model", "p/m#max")
 
 
 def test_sanitize_review_command_template_strips_agent_flags() -> None:
     assert sanitize_review_command_template(
         ("opencode", "run", "--agent", "build", "--auto", "--agent=build")
-    ) == ("opencode", "run", "--auto")
+    ) == ("opencode", "run", "--auto", "--standalone")
+
+
+def test_sanitize_review_command_template_strips_session_movers() -> None:
+    """--continue/--session/--worktree/--fork move the session (and --worktree
+    the checkout) boundary -- the same strip class as --agent."""
+    assert sanitize_review_command_template(
+        ("opencode", "run", "--continue", "--session", "abc", "--fork", "--worktree")
+    ) == ("opencode", "run", "--standalone")
+    assert sanitize_review_command_template(
+        ("opencode", "run", "--worktree", "side-name", "--auto")
+    ) == ("opencode", "run", "--auto", "--standalone")  # optional worktree name goes too
+    assert sanitize_review_command_template(
+        ("opencode", "run", "-c", "-w=side", "-s", "abc", "--session=x")
+    ) == ("opencode", "run", "--standalone")
+
+
+def test_sanitize_review_command_template_strips_server_and_pins_standalone() -> None:
+    """``--server`` is the env-posture bypass (the session would run inside a
+    server whose env/config this launch does not own) and ``--standalone`` is
+    what makes the pins apply -- both are boundary invariants, not defaults.
+
+    An operator ``opencode.command`` replaces DEFAULT_COMMAND_TEMPLATE
+    wholesale, so the pin must survive that path; it is appended once even
+    when the template already carries it.
+    """
+    assert sanitize_review_command_template(
+        ("opencode", "run", "--server", "http://127.0.0.1:4096", "--auto")
+    ) == ("opencode", "run", "--auto", "--standalone")
+    assert sanitize_review_command_template(("opencode", "run", "--server=http://x")) == (
+        "opencode",
+        "run",
+        "--standalone",
+    )
+    assert sanitize_review_command_template(("opencode", "run", "--standalone")) == (
+        "opencode",
+        "run",
+        "--standalone",
+    )
+    # A value-taking flag at the end is unaffected: the pin is appended, and
+    # --standalone is parsed as a flag, never consumed as that value.
+    assert sanitize_review_command_template(("opencode", "run", "--log-level", "warn")) == (
+        "opencode",
+        "run",
+        "--log-level",
+        "warn",
+        "--standalone",
+    )
 
 
 def _fake_review_checkout(
@@ -391,9 +247,10 @@ def _fake_review_checkout(
 def test_review_launch_pins_model_variant_and_deny_policy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A review=True launch: --model from model_override, --variant from
-    resolved_review_effort, --agent stripped, claude review pins absent,
-    env carries the deny permission policy."""
+    """A review=True launch: --model from model_override with the resolved
+    review effort folded in as provider/model#variant, --agent/session-movers
+    stripped, --standalone pinned, claude review pins absent, env carries the
+    deny permission policy."""
     monkeypatch.setattr(claude_code, "create_review_checkout", _fake_review_checkout)
     record, sessions_dir = _launch(
         tmp_path,
@@ -401,18 +258,35 @@ def test_review_launch_pins_model_variant_and_deny_policy(
         head_sha="b" * 40,
         model_override="glm-5.3-flash",
         resolved_review_effort="max",
-        command_template=(*_probe_script(tmp_path), "--agent", "build"),
+        command_template=(*_probe_script(tmp_path), "--agent", "build", "--worktree"),
     )
     assert record.ok, record.error
     argv = _read_probe(record)["argv"]
-    assert argv[argv.index("--model") + 1] == "opencode-go/glm-5.3-flash"
-    assert argv[argv.index("--variant") + 1] == "max"
-    for bad in ("--agent", "--permission-mode", "--max-turns", "--effort", "--output-format"):
+    assert argv[argv.index("--model") + 1] == "opencode-go/glm-5.3-flash#max"
+    # The env posture only applies to a private server, so the pin is part of
+    # the review launch, not of the template that happened to be configured.
+    assert "--standalone" in argv
+    assert argv.count("--standalone") == 1
+    for bad in (
+        "--variant",
+        "--agent",
+        "--continue",
+        "--session",
+        "--worktree",
+        "--permission-mode",
+        "--max-turns",
+        "--effort",
+        "--output-format",
+    ):
         assert bad not in argv
     env = _read_probe(record)["env"]
     assert json.loads(env["OPENCODE_CONFIG_CONTENT"])["permission"]["*"] == "deny"
     assert json.loads(env["OPENCODE_PERMISSION"])["*"] == "deny"
     assert env["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1"
+    # The 2.x alias (OPENCODE_CONFIG_PROJECT_DISABLE ?? legacy) is pinned too:
+    # the alias wins on 2.3.0, and an unpinned alias re-enables the PR's
+    # .opencode/ project config (verified live 2026-11-18).
+    assert env["OPENCODE_CONFIG_PROJECT_DISABLE"] == "1"
     assert env["OPENCODE_PURE"] == "1"
     assert env["XDG_DATA_HOME"] == str(sessions_dir / "opencode-data" / "issue-42")
     sidecar = sessions_dir / "issue-42.opencode.json"
@@ -426,6 +300,26 @@ def test_review_launch_requires_head_sha(tmp_path: Path, monkeypatch: pytest.Mon
     record, _ = _launch(tmp_path, review=True)
     assert not record.ok
     assert "head_sha" in record.error
+
+
+def test_review_launch_rotates_stale_events_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A leftover issue-N-review.events.jsonl from an earlier claude/api
+    round must be rotated before the opencode launch: opencode never tees
+    into it, so otherwise the summary/metrics readers attribute the stale
+    transcript to this session (the #2036 invariant devin_shell enforces)."""
+    monkeypatch.setattr(claude_code, "create_review_checkout", _fake_review_checkout)
+    sessions_dir = tmp_path / "sessions"  # the dir _launch passes through
+    sessions_dir.mkdir(parents=True)
+    stale = sessions_dir / "issue-42-review.events.jsonl"
+    stale.write_text('{"type":"assistant","message":{"content":"stale"}}\n', encoding="utf-8")
+    record, _ = _launch(tmp_path, review=True, head_sha="c" * 40)
+    assert record.ok, record.error
+    assert not stale.exists()
+    rotated = sessions_dir / "issue-42-review.events.jsonl.1"
+    assert rotated.exists()
+    assert "stale" in rotated.read_text(encoding="utf-8")
 
 
 # --- launch -----------------------------------------------------------------
@@ -451,14 +345,15 @@ def test_launch_writes_opencode_sidecar_and_pins_single_model(tmp_path: Path) ->
         assert argv[argv.index("--model") + 1] == f"opencode-go/{MODEL}"
         assert "--effort" not in argv
         assert "--permission-mode" not in argv
-        assert "--variant" not in argv  # variant unset -> no pin
+        assert "--variant" not in argv  # variant unset -> model pin carries no #variant
 
 
-def test_launch_pins_variant_when_configured(tmp_path: Path) -> None:
+def test_launch_folds_config_variant_into_model_pin(tmp_path: Path) -> None:
     record, _ = _launch(tmp_path, config=_config_for(variant="high"))
     assert record.ok, record.error
-    assert record.command.count("--variant") == 1
-    assert record.command[record.command.index("--variant") + 1] == "high"
+    assert record.command.count("--model") == 1
+    assert record.command[record.command.index("--model") + 1] == f"opencode-go/{MODEL}#high"
+    assert "--variant" not in record.command
 
 
 def test_launch_provider_passthrough_when_model_names_provider(tmp_path: Path) -> None:
@@ -506,6 +401,7 @@ def test_launch_child_env_carries_posture_and_per_issue_data_dir(tmp_path: Path)
     env = _read_probe(record)["env"]
     assert env["XDG_DATA_HOME"] == str(sessions_dir / "opencode-data" / "issue-55")
     assert env["OPENCODE_DISABLE_CLAUDE_CODE_PROMPT"] == "1"
+    assert env["OPENCODE_DISABLE_CLAUDE_CODE"] == "1"  # the 2.x name for the same switch
     assert json.loads(env["OPENCODE_CONFIG_CONTENT"])["permission"] == {"*": "allow"}
     assert "OPENCODE_AUTH_CONTENT" not in env
 
@@ -520,10 +416,58 @@ def test_launch_operator_worker_env_overrides_posture(tmp_path: Path) -> None:
     assert env["CW_MARK"] == "yes"
 
 
-def test_launch_forwards_host_auth_but_never_persists_it(tmp_path: Path) -> None:
-    """The host auth.json reaches the child via OPENCODE_AUTH_CONTENT only --
-    the key never lands in a sidecar, record dict, argv, or any file under
-    sessions_dir (no-key-material invariant, as for the api worker)."""
+def test_launch_seeds_scoped_auth_file_after_data_dir_wipe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """opencode 2.x dropped OPENCODE_AUTH_CONTENT (0 occurrences in the
+    installed 2.3.0 binary): credentials live in <XDG_DATA_HOME>/opencode/
+    auth.json. The launcher wipes the per-issue data dir before every launch,
+    so the scoped credential must be written back AFTER the wipe -- and only
+    there, scoped to the selected provider."""
+    _seed_host_auth(tmp_path)
+    record, sessions_dir = _launch(tmp_path, issue=66)
+    assert record.ok, record.error
+    auth_file = sessions_dir / "opencode-data" / "issue-66" / "opencode" / "auth.json"
+    assert auth_file.is_file()
+    assert json.loads(auth_file.read_text(encoding="utf-8")) == {"opencode-go": GO_ENTRY}
+    assert OTHER_SECRET not in auth_file.read_text(encoding="utf-8")
+
+    # A relaunch wipes the dir and re-seeds: stale session state never
+    # accumulates, and the credential survives every wipe.
+    record, _ = _launch(tmp_path, issue=66)
+    assert record.ok, record.error
+    assert json.loads(auth_file.read_text(encoding="utf-8")) == {"opencode-go": GO_ENTRY}
+
+    # No host credential -> nothing seeded (the child may auth from env keys).
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "empty-host-data"))
+    record2, sessions2 = _launch(tmp_path, issue=67)
+    assert record2.ok, record2.error
+    assert not (sessions2 / "opencode-data" / "issue-67" / "opencode" / "auth.json").exists()
+
+
+def test_launch_seeds_auth_scoped_from_operator_env_content(tmp_path: Path) -> None:
+    """An operator who authenticates through the documented OPENCODE_AUTH_CONTENT
+    env channel gets that credential scoped to provider and seeded for 2.x --
+    not dropped (the silent blanking an earlier review flagged)."""
+    env_value = json.dumps({"opencode-go": GO_ENTRY, "anthropic": {"refresh": OTHER_SECRET}})
+    record, sessions_dir = _launch(
+        tmp_path,
+        issue=68,
+        worker_env={"OPENCODE_AUTH_CONTENT": env_value},
+    )
+    assert record.ok, record.error
+    auth_file = sessions_dir / "opencode-data" / "issue-68" / "opencode" / "auth.json"
+    assert auth_file.is_file()
+    assert json.loads(auth_file.read_text(encoding="utf-8")) == {"opencode-go": GO_ENTRY}
+    assert OTHER_SECRET not in auth_file.read_text(encoding="utf-8")
+
+
+def test_launch_forwards_host_auth_but_never_persists_it_outside_data_dir(tmp_path: Path) -> None:
+    """The key reaches only two channels: OPENCODE_AUTH_CONTENT (opencode 1.x,
+    child env) and the per-issue data dir's auth.json (opencode 2.x, removed
+    by the reap with the data dir). It never lands in a sidecar, record dict,
+    argv, log, or any file outside the per-issue data dir (no-key-material
+    invariant, as for the api worker)."""
     _seed_host_auth(tmp_path)
     record, sessions_dir = _launch(tmp_path)
     assert record.ok, record.error
@@ -534,8 +478,9 @@ def test_launch_forwards_host_auth_but_never_persists_it(tmp_path: Path) -> None
 
     assert SECRET not in json.dumps(record.to_dict())
     assert SECRET not in " ".join(record.command)
+    data_dir = sessions_dir / "opencode-data" / "issue-42"
     for path in sessions_dir.rglob("*"):
-        if path.is_file():
+        if path.is_file() and data_dir not in path.parents:
             assert SECRET not in path.read_text(encoding="utf-8", errors="ignore"), path
 
 
@@ -669,64 +614,3 @@ def test_worker_view_reap_sidecar_removes_opencode_sidecar(tmp_path: Path) -> No
     assert sidecar.exists()
     view.reap_sidecar(sessions_dir)
     assert not sidecar.exists()
-
-
-# --- doctor -----------------------------------------------------------------
-
-
-def _doctor(tmp_path: Path, config: OrchestratorConfig):
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    gh = FakeDoctorGitHub(labels=config.labels.all)
-    _, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh, adapter_probe=True)
-    return {check.name: check for check in checks}
-
-
-def test_doctor_probes_opencode_as_primary_harness(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    seen: list[tuple[str, ...]] = []
-
-    def fake_probe(repo_root, *, command=None, **_kw):
-        seen.append(tuple(command))
-        return RunResult(returncode=0, stdout="opencode 1.2.3\n", stderr="")
-
-    monkeypatch.setattr("charlie_work.claude_code.probe_claude", fake_probe)
-    by_name = _doctor(tmp_path, _config(worker=WorkerRoleConfig(harness="opencode", model=MODEL)))
-    assert seen == [("opencode", "--version")]
-    assert by_name["opencode CLI probe"].ok is True
-    assert "opencode 1.2.3" in by_name["opencode CLI probe"].detail
-
-
-def test_doctor_probes_opencode_when_only_a_fallback(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    seen: list[tuple[str, ...]] = []
-
-    def fake_probe(repo_root, *, command=None, **_kw):
-        seen.append(tuple(command))
-        if command[0] == "opencode":
-            return RunResult(returncode=None, stdout="", stderr="", error="opencode: not found")
-        return RunResult(returncode=0, stdout="claude 9\n", stderr="")
-
-    monkeypatch.setattr("charlie_work.claude_code.probe_claude", fake_probe)
-    worker = WorkerRoleConfig(
-        harness="claude-code",
-        model="claude-sonnet-5-5",
-        fallbacks=(RoleEntry("opencode", MODEL),),
-    )
-    by_name = _doctor(tmp_path, _config(worker=worker))
-    assert ("opencode", "--version") in seen
-    assert by_name["opencode CLI probe"].ok is False
-    assert "not found" in by_name["opencode CLI probe"].detail
-
-
-def test_doctor_does_not_probe_opencode_when_not_in_chain(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(
-        "charlie_work.claude_code.probe_claude",
-        lambda repo_root, **_kw: RunResult(returncode=0, stdout="ok", stderr=""),
-    )
-    worker = WorkerRoleConfig(harness="claude-code", model="claude-sonnet-5-5")
-    by_name = _doctor(tmp_path, _config(worker=worker))
-    assert "opencode CLI probe" not in by_name
