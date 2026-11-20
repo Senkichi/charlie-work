@@ -76,7 +76,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import sqlite3
 import threading
@@ -86,6 +85,23 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Generator, Mapping
+
+import charlie_work.events_db_safety as events_db_safety
+from charlie_work.events_db_safety import (  # noqa: F401  (deliberate re-export)
+    _db_key,
+    _db_memo_key,
+    _db_path,
+    _jsonl_path,
+    _resolved_db_keys,
+)
+
+# Monkeypatch seam note: the functions above are re-exported BY OBJECT, but
+# rebinding them on ``events_db_safety`` does NOT rebind the names this
+# module's own code calls -- ``_get_db``/``_quarantine_on_corruption`` resolve
+# ``_db_path``/``_db_key``/``_jsonl_path`` through THIS module's globals.
+# Patch ``charlie_work.instrumentation.<name>`` to affect internal behavior
+# (what every in-tree test does), and ``charlie_work.events_db_safety.<name>``
+# to affect only the safety module's own call sites.
 
 logger = logging.getLogger(__name__)
 
@@ -99,20 +115,15 @@ _correlation_local = threading.local()
 _db_locks: dict[str, threading.Lock] = {}
 _db_connections: dict[str, sqlite3.Connection] = {}
 _db_init_lock = threading.Lock()
-# Memoized ``state_path`` -> resolved ``events.db`` key. Every write primitive
-# used to re-resolve the db path with ``Path.resolve()`` on each call (two
-# resolves per ``log_event`` call: once in ``_get_db``, once for the lock key),
-# and ``nt._getfinalpathname`` is expensive on filesystems holding
-# ``tmp_path`` (network/junctioned volumes), so a burst of events paid it
-# 2N times per N events (issue #2566). Keys are absolute
-# (``os.path.abspath``): a relative ``state_path`` outliving a cwd change
-# keys a fresh entry against the new cwd instead of returning the previous
-# cwd's resolved form. While that holds, the only way the memo can go stale
-# without the cwd changing is the filesystem it names being re-linked
-# mid-process, which also invalidates the open sqlite handle ``_get_db``
-# would have returned — so the memo is invalidated exactly where the
-# connection cache is (``close_db``).
-_resolved_db_keys: dict[str, str] = {}
+# File identity of each cached connection's database, so a write-time
+# corruption quarantine moves that file and never a fresh rebuild.
+_db_identities: dict[str, events_db_safety.FileIdentity | None] = {}
+# Keys already warned about as unsafe to open (network path / MSIX fork).
+_unsafe_db_warned: set[str] = set()
+# DB keys whose corruption quarantine is currently emitting its
+# events_db_quarantined record -- guards the self-referential case where the
+# quarantine event's own write hits a second corrupt database.
+_quarantining: set[str] = set()
 
 # Tracks unknown event kinds we have already warned about once. A one-time
 # warning preserves the best-effort contract (log_event never raises) while
@@ -324,56 +335,6 @@ def correlation_context(correlation_id: str | None = None) -> Generator[str, Non
         yield cid
     finally:
         _set_correlation_id(prev)
-
-
-def _db_path(state_path: Path) -> Path:
-    """Derive the ``events.db`` SQLite path from a ``state.json`` path."""
-    return state_path.parent / "events.db"
-
-
-def _db_memo_key(state_path: Path) -> str:
-    """Return the memo/connection key spelling for a ``state_path``.
-
-    Relative paths are normalized against the current working directory at
-    lookup time (:func:`os.path.abspath`), so a relative ``state_path``
-    outliving a cwd change keys a fresh cache entry instead of colliding
-    with the previous cwd's.
-    """
-    return os.path.abspath(str(state_path))
-
-
-def _db_key(state_path: Path) -> str:
-    """Return the memoized resolved key for a ``state_path``'s ``events.db``.
-
-    The key identifies the per-path connection and lock entries. Resolution
-    is memoized, keyed on the ``state_path`` string normalized to its
-    absolute form via :func:`os.path.abspath`: ``Path.resolve()`` bottoms
-    out in ``nt._getfinalpathname``, which is a real syscall cost on
-    network / junctioned filesystems, and every event write used to pay it
-    twice per call. Keying on the absolute form keeps relative
-    ``state_path`` values correct across cwd changes — a cwd change yields
-    a different key (and a re-resolve) instead of serving the previous
-    cwd's memo — while the absolute-spelling lookup itself is a string
-    operation, not a syscall.
-
-    The memo is invalidated by ``close_db`` alongside the connection and
-    lock the key identifies. Within one open connection, the only way a
-    key's resolved form can change is the filesystem it names being
-    re-linked mid-process, which would invalidate the open sqlite handle
-    ``_get_db`` would have returned — so the memo cannot outlive a
-    connection the cache would still hand out under it.
-    """
-    key_input = _db_memo_key(state_path)
-    cached = _resolved_db_keys.get(key_input)
-    if cached is None:
-        cached = str(_db_path(state_path).resolve())
-        _resolved_db_keys[key_input] = cached
-    return cached
-
-
-def _jsonl_path(state_path: Path) -> Path:
-    """Derive the legacy ``events.jsonl`` path from a ``state.json`` path."""
-    return state_path.parent / "events.jsonl"
 
 
 def _classify_level(kind: str) -> str:
@@ -661,37 +622,109 @@ def _get_db(state_path: Path) -> sqlite3.Connection | None:
             return _db_connections[key]
 
     lock = _db_locks[key]
+    quarantined: tuple[Path, str] | None = None
     with lock:
         # Double-check after acquiring lock
         if key in _db_connections:
             return _db_connections[key]
+        unsafe = events_db_safety.wal_unsafe_reason(db_path)
+        if unsafe is not None:
+            if key not in _unsafe_db_warned:
+                _unsafe_db_warned.add(key)
+                logger.warning("Not opening event database (events dropped): %s", unsafe)
+            return None
         try:
-            db_path.parent.mkdir(parents=True, exist_ok=True)
-            conn = sqlite3.connect(
-                str(db_path),
-                check_same_thread=False,
-                isolation_level=None,  # autocommit mode; we manage transactions explicitly
+            conn, quarantined = events_db_safety.open_or_rebuild(
+                db_path, lambda: _open_db(state_path, db_path)
             )
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA busy_timeout=5000")
-            conn.row_factory = sqlite3.Row
-            conn.executescript(_SCHEMA_SQL)
-
-            # Run one-time migrations (e.g. historical duplicate cleanup).
-            _run_db_migrations(conn)
-
-            # Migrate legacy events.jsonl if it exists
-            jsonl = _jsonl_path(state_path)
-            if jsonl.exists():
-                _migrate_jsonl(conn, jsonl)
-
-            with _db_init_lock:
-                _db_connections[key] = conn
-            return conn
         except (sqlite3.Error, OSError) as exc:
             logger.warning("Failed to open event database at %s: %s", db_path, exc)
             return None
+        with _db_init_lock:
+            _db_connections[key] = conn
+            _db_identities[key] = events_db_safety.file_identity(db_path)
+    if quarantined is not None:
+        _emit_quarantine_record(
+            state_path,
+            key,
+            preserved=quarantined[0],
+            error=quarantined[1],
+        )
+    return conn
+
+
+def _open_db(state_path: Path, db_path: Path) -> sqlite3.Connection:
+    """Open, configure, and migrate ``events.db``; raise on any failure.
+
+    The connection is closed before re-raising so a caller can move a corrupt
+    file aside (Windows refuses to rename a file with an open handle).
+    """
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    # isolation_level=None: autocommit mode; we manage transactions explicitly.
+    conn = sqlite3.connect(str(db_path), check_same_thread=False, isolation_level=None)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(_SCHEMA_SQL)
+        # Run one-time migrations (e.g. historical duplicate cleanup).
+        _run_db_migrations(conn)
+        # Migrate legacy events.jsonl if it exists
+        jsonl = _jsonl_path(state_path)
+        if jsonl.exists():
+            _migrate_jsonl(conn, jsonl)
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
+def _emit_quarantine_record(state_path: Path, key: str, *, preserved: Path, error: str) -> None:
+    """Emit one ``events_db_quarantined`` record, re-entrancy-guarded.
+
+    Both the open-time path (a quarantine happened while opening) and the
+    write-time path (:func:`_quarantine_on_corruption`) funnel through here
+    so the record's own write hitting a second corrupt database cannot
+    recurse: the guard is set around the write, and a re-entrant
+    quarantine record is dropped (the rebuild it would describe has itself
+    just been quarantined and will be recorded by the outermost caller's
+    next successful write cycle).
+    """
+    if key in _quarantining:
+        return
+    _quarantining.add(key)
+    try:
+        log_event(
+            state_path,
+            "events_db_quarantined",
+            {"preserved_as": str(preserved), "error": error},
+        )
+    finally:
+        _quarantining.discard(key)
+
+
+def _quarantine_on_corruption(state_path: Path, exc: sqlite3.Error) -> None:
+    """Evict and move aside a database a write reported corrupt; next open rebuilds.
+
+    A write-time quarantine also emits ``events_db_quarantined`` itself: the
+    open-time path records the rebuild via ``open_or_rebuild``'s return
+    value, but by the time a write fails the file is already moved aside --
+    the next ``_get_db`` opens a fresh database with ``quarantined = None``
+    and the rebuild would otherwise go unrecorded.
+    """
+    if not events_db_safety.is_corruption_error(exc):
+        return
+    key = _db_key(state_path)
+    observed = _db_identities.get(key)
+    close_db(state_path)
+    moved = events_db_safety.quarantine_db(_db_path(state_path), observed=observed)
+    if moved is not None:
+        # log_event -> _get_db opens the fresh rebuild and caches it, so the
+        # record lands in the new database. The _quarantining guard inside
+        # _emit_quarantine_record bounds recursion if that write itself
+        # reports corruption.
+        _emit_quarantine_record(state_path, key, preserved=moved, error=str(exc))
 
 
 def log_event(
@@ -763,6 +796,7 @@ def log_event(
             )
     except sqlite3.Error as exc:
         logger.warning("Failed to write event to %s: %s", _db_path(state_path), exc)
+        _quarantine_on_corruption(state_path, exc)
 
 
 def record_loop_pass(
@@ -833,6 +867,7 @@ def record_loop_pass(
                 )
     except sqlite3.Error as exc:
         logger.warning("Failed to record loop pass: %s", exc)
+        _quarantine_on_corruption(state_path, exc)
 
 
 def _warn_unreadable_payload(kind: Any, ts: Any, raw_payload: Any) -> None:
@@ -1054,6 +1089,7 @@ def close_db(state_path: Path) -> None:
     with _db_init_lock:
         lock = _db_locks.get(key)
         conn = _db_connections.pop(key, None)
+        _db_identities.pop(key, None)
     # Invalidate the memo for this state_path alongside the connection/lock:
     # a path re-linked after this point must re-resolve on the next lookup.
     _resolved_db_keys.pop(_db_memo_key(state_path), None)

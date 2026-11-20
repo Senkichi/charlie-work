@@ -1,0 +1,7 @@
+warning
+# The event database failed to open as SQLite or reported SQLITE_CORRUPT and
+# was moved aside (with its -wal/-shm/-journal sidecars) as
+# events.db.corrupt-<stamp>, then rebuilt empty (charlie_work.events_db_safety).
+# Warning, not error: history is preserved in the named file, nothing is
+# deleted, and logging resumed; the operator should know older events now live
+# in the preserved copy and why the database had to be rebuilt.

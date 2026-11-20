@@ -37,6 +37,8 @@ KNOWN_IGNORED: dict[str, str] = {
     "main_sync_rolled_back": "local checkout hygiene; no per-issue rollup fact",
     "main_sync_rollback_refused": "local checkout hygiene; no per-issue rollup fact",
     "main_sync_alarm": "surfaced as a fleet attention entry, not a rollup fact",
+    # -- events.db self-repair (events_db_safety): storage health, no per-issue flow fact.
+    "events_db_quarantined": "event-store self-repair; no per-issue rollup fact",
     # -- ci-fleet host kinds (host I/O, leak drain): host-level signals with no per-issue flow fact.
     "host_reboot_due": "ci-fleet host-level event; no per-issue rollup fact",
     "host_leak_warn": "ci-fleet host-level event; no per-issue rollup fact",
