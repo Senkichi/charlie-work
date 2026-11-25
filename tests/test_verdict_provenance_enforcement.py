@@ -583,21 +583,22 @@ def test_every_record_review_call_site_and_review_decision_writer_supplies_prove
     # the exemption census -- so a silent drop (the _wf. form evading the
     # receiver-sensitive matcher) could not be caught. Pinning the total
     # means a future drop fails loudly instead of eroding coverage quietly.
-    # Today there are exactly 10 sites: 9 checked (two in review in
-    # workflow.py -- the #1695 archive-before-void write and the
-    # pending-stub write -- plus _update_approval_head in
-    # state_approval.py, record_review in state_record_review.py, two
-    # sites in unescalate() in state_operator_commands.py -- issue
-    # #1765 finding 1's own archive-before-void write and pending-stub
-    # write, the same two-call pattern review() already uses, applied here
-    # to void a still-valid terminal verdict before re-arming a PR -- and
-    # three in orchestration/local_lanes.py for issue #1844's local
-    # (no-remote) lane: _local_build_packet's archive-before-void write and
-    # pending-stub write (the same two-call pattern, applied to the local
-    # review packet) plus record_local_review's verdict write, which
-    # mirrors record_review's) + 1 exempted (merge_authorize in
-    # state_operator_commands.py).
-    assert len(scanned_write_sites) + len(exempted_write_sites) == 10, {
+    # Today there are exactly 9 sites: 8 checked (two in review() in workflow.py --
+    # the #1695 archive-before-void write and the pending-stub write -- plus
+    # _update_approval_head in state_approval.py, two sites in unescalate() in
+    # state_operator_commands.py -- issue #1765 finding 1's own archive-before-void
+    # write and pending-stub write, the same two-call pattern review() already uses,
+    # applied here to void a still-valid terminal verdict before re-arming a PR --
+    # _local_build_packet's two sites in orchestration/local_lanes.py for issue
+    # #1844's Local path, and the one verdict write in
+    # verdict_recording.write_decision_round) + 1 exempted (merge_authorize in
+    # state_operator_commands.py). Issue #3102 merged record_review's and
+    # record_local_review's verdict writes (previously one each, in
+    # state_record_review.py and local_lanes.py) into that single writer, so the
+    # census fell from 10 to 9; the new site is checked on the merits (its payload
+    # dict literally carries "verdict_provenance") and the exemption census above is
+    # unchanged.
+    assert len(scanned_write_sites) + len(exempted_write_sites) == 9, {
         "checked": scanned_write_sites,
         "exempted": exempted_write_sites,
     }
