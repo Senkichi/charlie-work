@@ -376,6 +376,17 @@ def _jsonl_path(state_path: Path) -> Path:
     return state_path.parent / "events.jsonl"
 
 
+def has_level_entry(kind: str) -> bool:
+    """True when ``kind`` has its own entry in the Event level registry.
+
+    Exact membership only: unlike ``_classify_level`` this does not inherit a
+    ``_sweep`` variant's base level and never defaults, so an unregistered kind is
+    ``False``. If the registry failed to load, ``_LEVEL_BY_KIND`` is empty and every
+    kind reports ``False`` (consumers see noise, not silence).
+    """
+    return kind in _LEVEL_BY_KIND
+
+
 def _classify_level(kind: str) -> str:
     """Classify an event kind into a log level for the ``level`` column.
 
