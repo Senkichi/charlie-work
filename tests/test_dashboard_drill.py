@@ -13,7 +13,7 @@ from charlie_work import instrumentation
 from charlie_work.config import LabelConfig
 from charlie_work.dashboard import drill, rollup, sources
 from charlie_work.dashboard.drill.loop_pass import MAX_PASS_EVENTS, payload_preview
-from charlie_work.dashboard.drill.repo import merges_for
+from charlie_work.dashboard.drill.repo import MAX_LIMIT, merges_for
 from charlie_work.dashboard.metrics_base import MetricQuery
 from charlie_work.dashboard.metrics_flow import BACKFILL_BURST, merges_per_day
 from charlie_work.dashboard.now_read_events import merged_24h
@@ -375,13 +375,13 @@ def test_history_drill_down_and_now_agree_on_a_repos_merges(fleet) -> None:
     db = fleet.db()
     q = MetricQuery(NOW - timedelta(hours=24), NOW, timedelta(hours=24))
     history = merges_per_day(db, q)
-    beta_total = sum(v for _, v in history.per_repo[BETA])
-    listed = merges_for(db, BETA, 20, TZ)
-    now_count = merged_24h(NOW, str(fleet.dir), 10**9)
-    assert len(listed) == 3
-    assert beta_total == len(listed)
-    fleet_wide = sum(v for _, v in history.points)
-    assert now_count == fleet_wide
+    listed = {r: merges_for(db, r, MAX_LIMIT, TZ) for r in (ALPHA, BETA)}
+    assert len(listed[BETA]) == 3
+    for repo, rows in listed.items():
+        assert sum(v for _, v in history.per_repo.get(repo, ())) == len(rows)
+    fleet_wide = sum(len(rows) for rows in listed.values())
+    assert fleet_wide == sum(v for _, v in history.points)
+    assert merged_24h(NOW, str(fleet.dir), 10**9) == fleet_wide
 
 
 # --- loop pass ------------------------------------------------------------------------------

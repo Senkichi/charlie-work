@@ -7,7 +7,7 @@ from dataclasses import replace
 from datetime import tzinfo
 from pathlib import Path
 
-from ..metrics_flow import drop_reconcile_backfill, first_merges
+from ..metrics_flow import drop_reconcile_backfill, first_merges, pr_links_max_issue
 from ..now_types import NowModel
 from ..rollup_common import _int
 from .types import (
@@ -57,7 +57,7 @@ def merges_for(db: sqlite3.Connection, slug: str, limit: int, tz: tzinfo | None)
     reconcile-backfill drop sees all firsts (its burst count is per repo-hour), and
     only after it does ``limit`` apply.
     """
-    rows = first_merges(db, source=slug)
+    rows = first_merges(db, pr_links_max_issue(db, slug), source=slug)
     kept = set(drop_reconcile_backfill([(ts, slug, kind) for ts, _, _, _, kind in rows]))
     out = [
         MergeRow(ts, local_text(ts, tz), issue, pr, kind, kind == "reconcile")

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from .metrics_base import MetricQuery, Sample, Series, SeriesSpec, make_series, parse_ts
@@ -114,13 +114,13 @@ def scan_intervals(
 
 
 # Lead time span: (start milestones, end milestones) per path. The one place the names live.
-LEAD_APPROX = (("dispatched",), ("merged",))
-LEAD_EXACT = (("ready", "ready_observed"), ("done",))
+_LEAD_APPROX = (("dispatched",), ("merged",))
+_LEAD_EXACT = (("ready", "ready_observed"), ("done",))
 
 
 def lead_span(events: Sequence[tuple[str, str]], *, exact: bool) -> tuple[str, str] | None:
     """The first closed first-signal -> done ``(start_ts, end_ts)``, or None (parked time counts)."""
-    starts, ends = LEAD_EXACT if exact else LEAD_APPROX
+    starts, ends = _LEAD_EXACT if exact else _LEAD_APPROX
     return next(iter(scan_intervals(events, starts, ends, restart=False)[0]), None)
 
 
@@ -204,34 +204,61 @@ MERGE_KINDS = (
 )
 
 
+# The milestones a merge reaches: the Lead time end of each path (approx, exact).
+_MERGE_MILESTONES = (_LEAD_APPROX[1][0], _LEAD_EXACT[1][0])
+
+
+def pr_links_last_row(db: sqlite3.Connection, end_iso: str) -> dict[tuple[str, int], int]:
+    """``(source, pr) -> issue`` for History: the last row of an unordered SELECT wins."""
+    return {
+        (s, pr): i
+        for s, i, pr in db.execute(
+            "SELECT source, issue, pr FROM issue_milestones"
+            " WHERE issue IS NOT NULL AND pr IS NOT NULL AND ts < ?",
+            (end_iso,),
+        )
+    }
+
+
+def pr_links_max_issue(db: sqlite3.Connection, source: str) -> dict[tuple[str, int], int]:
+    """``(source, pr) -> issue`` for the repo drill-down: the highest issue naming the PR."""
+    return {
+        (s, pr): i
+        for s, pr, i in db.execute(
+            "SELECT source, pr, MAX(issue) FROM issue_milestones"
+            " WHERE source = ? AND issue IS NOT NULL AND pr IS NOT NULL GROUP BY source, pr",
+            (source,),
+        )
+    }
+
+
 def first_merges(
-    db: sqlite3.Connection, *, end_iso: str | None = None, source: str | None = None
+    db: sqlite3.Connection,
+    link: Mapping[tuple[str, int], int],
+    *,
+    end_iso: str | None = None,
+    source: str | None = None,
 ) -> list[tuple[str, str, int | None, int | None, str]]:
     """Each merged issue (or PR with no linked issue) once, at its first merged/done signal.
 
-    Rows are ``(ts, source, issue, pr, evidence kind)`` in signal order. A PR-only row is
-    attached to its issue through any row naming both (as ``_load`` does). ``end_iso``
-    bounds the signals (exclusive), ``source`` restricts to one repo. This is the one
-    first-merge dedup: History, the repo drill-down and Now all read it.
+    Rows are ``(ts, source, issue, pr, evidence kind)`` in signal order, ``issue`` being
+    the row's own (None for a PR-only row). A PR-only row is attached to its issue through
+    ``link`` (``(source, pr) -> issue``), an explicit input: History and the drill-down
+    build it by different rules that disagree on a PR linked to several issues, on purpose,
+    pending an operator decision. ``end_iso`` bounds the signals (exclusive) and ``source``
+    restricts to one repo. This is the one first-merge dedup behind History, the repo
+    drill-down and Now.
     """
-    where, args = "", []
+    where, args = "", list(_MERGE_MILESTONES)
     if end_iso is not None:
         where += " AND ts < ?"
         args.append(end_iso)
     if source is not None:
         where += " AND source = ?"
         args.append(source)
-    link = {
-        (s, pr): i
-        for s, pr, i in db.execute(
-            "SELECT source, pr, MAX(issue) FROM issue_milestones"
-            f" WHERE issue IS NOT NULL AND pr IS NOT NULL{where} GROUP BY source, pr",
-            args,
-        )
-    }
     rows = db.execute(
         "SELECT ts, source, issue, pr, event_kind FROM issue_milestones"
-        f" WHERE milestone IN ('merged', 'done'){where} ORDER BY ts, src_id, seq",
+        f" WHERE milestone IN (?, ?){where} ORDER BY ts, src_id, seq",
         args,
     ).fetchall()
     seen: set = set()
@@ -241,7 +268,7 @@ def first_merges(
         key = (src, linked) if linked is not None else (src, "pr", pr)
         if key not in seen:
             seen.add(key)
-            firsts.append((ts, src, issue, pr, kind))  # the row's own issue, not the link's
+            firsts.append((ts, src, issue, pr, kind))
     return firsts
 
 
@@ -253,7 +280,12 @@ def merges_per_day(db: sqlite3.Connection, q: MetricQuery) -> Series:
     its issue through any row naming both (as ``_load`` does), so one merge reported by
     several kinds counts once per ``(repo, issue or PR)``.
     """
-    firsts = [(ts, source, kind) for ts, source, _, _, kind in first_merges(db, end_iso=q.end_iso)]
+    firsts = [
+        (ts, source, kind)
+        for ts, source, _, _, kind in first_merges(
+            db, pr_links_last_row(db, q.end_iso), end_iso=q.end_iso
+        )
+    ]
     firsts = drop_reconcile_backfill(firsts)
     samples: list[Sample] = [(ts, source, 1.0) for ts, source, _ in firsts]
     # A reconcile-detected merge is stamped when the reconciler noticed it, not when it happened.
