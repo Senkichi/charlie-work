@@ -69,9 +69,15 @@ class Scenario:
     comment: bool = False
     post_verdict_comment: bool = True
     allow_stale_head: bool = False
+    rescue_attempted: bool = False  # prs[7].rescue_attempted already set before the call
+    verdict_source: str | None = None
+    session_metrics: tuple[tuple[str, Any], ...] | None = None
     # (path, value) pairs asserted on BOTH outcomes, so a scenario cannot pass by
     # both entry points failing for a reason other than the one it names.
     expect: tuple[tuple[str, Any], ...] = ()
+    # Per-side pins, for scenarios where the two paths differ by declaration.
+    expect_remote: tuple[tuple[str, Any], ...] = ()  # record_review
+    expect_local: tuple[tuple[str, Any], ...] = ()  # record_local_review
 
 
 @dataclass(frozen=True)
@@ -95,7 +101,8 @@ class _Repo:
     root: Path
     older_head: str
     head: str
-    diff_text: str
+    diff_text: str  # the live head's diff against main
+    older_diff_text: str  # the older head's diff against main
 
 
 def _make_repo() -> _Repo:
@@ -112,8 +119,9 @@ def _make_repo() -> _Repo:
     head = _git(root, "rev-parse", "HEAD").stdout.strip()
     _git(root, "checkout", "main")
     diff = branch_diff(root, "main", head)
-    assert diff
-    return _Repo(root, older, head, diff)
+    older_diff = branch_diff(root, "main", older)
+    assert diff and older_diff and diff != older_diff
+    return _Repo(root, older, head, diff, older_diff)
 
 
 def _config_data(scenario: Scenario) -> dict[str, Any]:
@@ -135,6 +143,8 @@ def _seed(app: OrchestratorApp, scenario: Scenario, repo: _Repo, *, local: bool)
         "status": scenario.pr_status,
         "request_changes_count": scenario.prior_count,
     }
+    if scenario.rescue_attempted:
+        record["rescue_attempted"] = True
     prior = _prior_head_sha(scenario, repo)
     if prior is not None:
         record["reviewed_head_sha"] = prior
@@ -161,7 +171,9 @@ def _write_packet(app: OrchestratorApp, scenario: Scenario, repo: _Repo) -> None
     (pr_dir / "pr.json").write_text(
         json.dumps({"number": ISSUE, "headRefOid": packet_head}), encoding="utf-8"
     )
-    (pr_dir / "diff.patch").write_text(repo.diff_text, encoding="utf-8")
+    # The packet holds the diff of the head it was built for.
+    packet_diff = repo.diff_text if scenario.packet == "live-head" else repo.older_diff_text
+    (pr_dir / "diff.patch").write_text(packet_diff, encoding="utf-8")
 
 
 def _reviewed_head_arg(scenario: Scenario, repo: _Repo) -> str | None:
@@ -184,6 +196,8 @@ def _call_args(app: OrchestratorApp, scenario: Scenario, repo: _Repo) -> dict[st
         "required_changes": list(scenario.required_changes) or None,
         "verdict_provenance": scenario.provenance,
         "allow_stale_head": scenario.allow_stale_head,
+        "verdict_source": scenario.verdict_source,
+        "session_metrics": dict(scenario.session_metrics) if scenario.session_metrics else None,
     }
 
 
@@ -217,12 +231,18 @@ def _remote_app(scenario: Scenario, repo: _Repo, root: Path) -> tuple[Orchestrat
         }
     ]
     gh.diffs[ISSUE] = repo.diff_text
+    # The commit the external-findings window is bounded by (``before``); the
+    # external comment below is dated before it, so it falls inside the window.
+    gh.commits[repo.head] = {
+        "parents": [],
+        "commit": {"committer": {"date": "2020-06-01T00:00:00Z"}},
+    }
     if scenario.external_comment:
         gh.pr_external_issue_comments[ISSUE] = [
             {
                 "body": "Please also handle the empty-input case.",
                 "user": {"login": "reviewer-human", "type": "User"},
-                "created_at": "2099-01-01T00:00:00Z",
+                "created_at": "2020-01-01T00:00:00Z",
                 "author_association": "MEMBER",
             }
         ]
@@ -272,8 +292,8 @@ def _normalise(value: Any, *, root: Path, extra_roots: tuple[Path, ...] = ()) ->
     if isinstance(value, str):
         for prefix in (root, *extra_roots):
             text = str(prefix)
-            if text and text in value:
-                return "<path>"
+            if text:
+                value = value.replace(text, "<path>")
         return value
     return value
 
@@ -371,13 +391,14 @@ def _collect(
         data.pop(key, None)  # absolute path: transport
     data["rework_path"] = bool(data.get("rework_path"))
     out["result.ok"] = result.ok
+    out["result.message"] = _normalise(result.message, root=root, extra_roots=extra)
     _flatten("result.data", _normalise(data, root=root, extra_roots=extra), out)
 
     issue = _normalise(dict(state["issues"].get(str(ISSUE)) or {}), root=root, extra_roots=extra)
     _flatten("issue", issue, out)
     pr_record = dict(state["prs"].get(str(ISSUE)) or {})
-    for seed_only in ("local", "branch", "baseRefName"):
-        pr_record.pop(seed_only, None)  # seeded on the Local path only: not written by the call
+    for seed_only in ("branch", "baseRefName"):
+        pr_record.pop(seed_only, None)  # seeded on the Local path only; the call rewrites neither
     pr_record.pop("decision_path", None)
     _flatten("pr_record", _normalise(pr_record, root=root, extra_roots=extra), out)
 
@@ -413,6 +434,14 @@ def _collect(
     else:
         out["decision_file"] = MISSING
     out["rework_prompt"] = (pr_dir / "rework-prompt.md").is_file()
+    # The prompt itself is rendered from a per-path template and legitimately
+    # differs; the dispatch note is not.
+    note = pr_dir / "rework-dispatch-note.txt"
+    out["rework_dispatch_note"] = (
+        _normalise(note.read_text(encoding="utf-8"), root=root, extra_roots=extra)
+        if (pr_dir / "rework-prompt.md").is_file() and note.is_file()
+        else None
+    )
     out["rounds"] = _rounds_listing(pr_dir)
     body, channel = comment
     out["verdict_comment"] = body
