@@ -8,22 +8,22 @@ human-call reclassification, the terminal and escalated guards, head pinning and
 stale-review check, the patch-id and line-content signature, building and persisting
 the decision payload, and the verdict comment. It is step 1 of a chain; the decision
 rules (Rework cap, escalation, status and label-edge choice) and the Events stay in
-the two lanes and move in step 2 (issue #3103).
+the two paths and move in step 2 (issue #3103).
 
 It lives at the package root, not under ``orchestration/``, because every top-level
 function defined there is auto-installed on ``OrchestratorApp``.
 
 Shape. The module imports nothing from :mod:`charlie_work.workflow` at import time (it
 would be circular). Names defined there that tests replace by path are resolved at call
-time through :func:`_workflow`; a name the lane must resolve itself (``reviewed_at``,
+time through :func:`_workflow`; a name the caller must resolve itself (``reviewed_at``,
 the round-number function) is handed in as a value.
 
-The lanes keep the sequencing and call these steps in turn. Each lane describes the
+Each path keeps its own sequencing and calls these steps in turn. Each path describes the
 thing under review once, as a :class:`VerdictSubject` (its live head, how to refuse a
 terminal or escalated record, how to post the verdict comment), and states every
 difference between the two paths in a :class:`VerdictDifferences`; nothing is inferred
-from which lane is calling. Nothing here writes ``state.json``: each lane writes state
-through its own path (``_wf.save_state`` on the PR path, ``write_gate.save_state`` on
+from which path is calling. Nothing here writes ``state.json``: each path writes state
+through its own route (``_wf.save_state`` on the PR path, ``write_gate.save_state`` on
 the Local path).
 """
 
@@ -356,7 +356,7 @@ def write_decision_round(
 ) -> DecisionRound:
     """Build the decision payload and persist it (decision file plus the round archive).
 
-    Call under the lane's state lock: the read of a prior decision file below is atomic
+    Call under the calling function's state lock: the read of a prior decision file below is atomic
     against ``merge_authorize``, which holds the same lock. ``reviewed_at`` is the
     caller's own stamp, taken where it always was: it is the next round's ingestion lower
     bound when no ``before`` exists, so it must not be taken later.

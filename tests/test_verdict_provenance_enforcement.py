@@ -590,7 +590,7 @@ def test_every_record_review_call_site_and_review_decision_writer_supplies_prove
     # write and pending-stub write, the same two-call pattern review() already uses,
     # applied here to void a still-valid terminal verdict before re-arming a PR --
     # _local_build_packet's two sites in orchestration/local_lanes.py for issue
-    # #1844's local (no-remote) lane, and the one verdict write in
+    # #1844's Local path, and the one verdict write in
     # verdict_recording.write_decision_round) + 1 exempted (merge_authorize in
     # state_operator_commands.py). Issue #3102 merged record_review's and
     # record_local_review's verdict writes (previously one each, in
