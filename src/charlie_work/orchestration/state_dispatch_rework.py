@@ -17,11 +17,6 @@ from charlie_work.adapters import (
     manifest_adapter_label,
     write_session_results,
 )
-from charlie_work.config import (
-    DETERMINISTIC_ESCALATION_FAILURE_KINDS,
-    DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS,
-    PRE_LAUNCH_BLOCKED_ENVIRONMENT_FAILURE_KINDS,
-)
 import charlie_work.fleet_provider_throttle as fleet_provider_throttle
 from charlie_work.github import GitHubError
 from charlie_work.state import StateLockBusy
@@ -1474,170 +1469,45 @@ def _dispatch_rework_impl(
                         state, entry, result, request.issue_number, "rework_dispatched"
                     )
             else:
-                # Track every rework-dispatch attempt, successful or not,
-                # against the same redispatch window used on the success path.
-                # Failed attempts that repeat without ever succeeding
-                # eventually trip max_auto_redispatch and escalate instead of
-                # looping forever (issue #515).
+                # Issues #515 / #1393 / #1423: a failed launch is recorded by the
+                # launch-outcome module, blocked-environment and generic branches
+                # alike; the lane declares how it differs from fresh dispatch.
                 failed_result = next(
                     (r for r in dispatch_results if r.issue_number == request.issue_number),
                     None,
                 )
-                failure_kind = failed_result.failure_kind if failed_result else None
-                now = self.host.clock.now()
-                # Issue #1393: a pre-launch environment block (e.g.
-                # worktree_foreign_writer) never started a worker session,
-                # so it must NOT count against the redispatch cap (which
-                # measures worker output, not environment hygiene).  Use a
-                # separate blocked_environment_at counter and escalate with
-                # the correct reason + blocking path after the same cap.
-                blocked_environment = failure_kind in PRE_LAUNCH_BLOCKED_ENVIRONMENT_FAILURE_KINDS
-                if blocked_environment:
-                    blocked_environment_at = _wf._windowed_blocked_environment_at(
-                        entry,
-                        window_minutes=self.config.watchdog.redispatch_window_minutes,
-                    ) + [now.isoformat().replace("+00:00", "Z")]
-                    blocking_error = failed_result.error if failed_result else None
-                    if len(blocked_environment_at) > self.config.watchdog.max_auto_redispatch:
-                        # Issue #1423: before escalating a blocked-environment
-                        # cap exhaustion for a foreign writer, attempt to reap
-                        # it one more time. A writer that was active on earlier
-                        # passes but has since gone idle is reaped here instead
-                        # of escalating a zombie to a human. Escalation is
-                        # reserved for a writer that is alive *and* active.
-                        #
-                        # Review finding: bound the number of auto-reaps per
-                        # issue before falling back to escalation (see the
-                        # fresh-dispatch site for the full rationale).
-                        max_reaps = self.config.watchdog.max_foreign_writer_reaps
-                        prior_reaps = _wf._windowed_foreign_writer_reaps(
-                            entry,
-                            window_minutes=self.config.watchdog.redispatch_window_minutes,
-                        )
-                        reap_event = worker_launch_outcome.reap_blocked_foreign_writer_at_cap(
-                            entry,
-                            prior_reaps=prior_reaps,
-                            max_reaps=max_reaps,
-                            try_reap=lambda: _wf._try_reap_blocked_foreign_writer(
-                                failed_result,
-                                self.config,
-                                self.paths.state_file,
-                                request.issue_number,
-                                sessions_dir,
-                            ),
-                            now_iso=now.isoformat().replace("+00:00", "Z"),
-                            issue_number=request.issue_number,
-                            failure_kind=failure_kind,
-                            pid=failed_result.pid if failed_result else None,
-                            blocked_environment_count=len(blocked_environment_at),
-                        )
-                        if reap_event is not None:
-                            entry["status"] = "rework_requested"
-                            entry["dispatched_at"] = None
-                            state["issues"][str(request.issue_number)] = entry
-                            state = _wf.append_event(  # event-consumer: audit-only -- records a rework-dispatch foreign-writer reap (issue #1423) already enforced by the blocked_environment_at reset and foreign_writer_reaps counter; consumed by tests/test_charlie_work.py regression tests.
-                                state,
-                                "rework_dispatch_blocked_environment_reaped",
-                                reap_event,
-                                state_path=self.paths.state_file,
-                            )
-                            _wf.save_state(self.paths.state_file, state)
-                            continue
-                        # Escalate with the environment reason and the
-                        # blocking path so the operator sees "remove
-                        # C:\...\wt", not "worker quality cap exceeded."
-                        state = _wf._escalate_issue(
-                            state,
-                            request.issue_number,
-                            reason="dispatch_blocked_environment",
-                            reason_class="mechanical",
-                            issue_extra={
-                                "blocked_environment_at": blocked_environment_at,
-                                "dispatched_at": None,
-                            },
-                        )
-                        entry = state["issues"][str(request.issue_number)]
-                        state = _wf.append_event(
-                            state,
-                            "session_failed_escalated",
-                            {
-                                "issue_number": request.issue_number,
-                                "previous_status": "rework_requested",
-                                "reason": "dispatch_blocked_environment",
-                                "failure_kind": failure_kind,
-                                "blocking_error": blocking_error,
-                                "blocked_environment_count": len(blocked_environment_at),
-                            },
-                            state_path=self.paths.state_file,
-                        )
-                        _wf.save_state(self.paths.state_file, state)
-                        edge = _wf._escalation_edge("redispatch_escalated", "mechanical")
-                        result = _wf.transition(
-                            self.gh,
-                            self.config.labels,
-                            request.issue_number,
-                            edge,
-                            state_path=self.paths.state_file,
-                            repo=self.repo_root.name,
-                        )
-                        record_label_error(state, entry, result, request.issue_number, edge)
-                        continue
-                    # Cap not exceeded: restore to rework_requested without
-                    # incrementing redispatch_at, and emit a distinct event
-                    # so the operator can see the environment conflict
-                    # before it escalates.
-                    entry["status"] = "rework_requested"
-                    entry["dispatched_at"] = None
-                    entry["blocked_environment_at"] = blocked_environment_at
-                    state["issues"][str(request.issue_number)] = entry
-                    state = _wf.append_event(  # event-consumer: audit-only -- records a pre-launch environment block (issue #1393) already enforced by the blocked_environment_at counter and the dispatch_blocked_environment escalation; consumed by tests/test_charlie_work.py regression tests.
-                        state,
-                        "rework_dispatch_blocked_environment",
-                        {
-                            "issue_number": request.issue_number,
-                            "failure_kind": failure_kind,
-                            "blocking_error": blocking_error,
-                            "blocked_environment_count": len(blocked_environment_at),
-                        },
-                        state_path=self.paths.state_file,
-                        repo=self.repo_root.name,
-                    )
-                    _wf.save_state(self.paths.state_file, state)
-                    continue
-                redispatch_at = _wf._windowed_redispatch_at(
-                    entry, window_minutes=self.config.watchdog.redispatch_window_minutes
-                ) + [now.isoformat().replace("+00:00", "Z")]
-                terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
-                # Issue #807: a deterministic judgment failure escalates
-                # immediately but as ``reason_class="judgment"``.
-                deterministic_judgment = (
-                    failure_kind in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
-                )
-                immediate_escalation = terminal_failure or deterministic_judgment
-                if (
-                    immediate_escalation
-                    or len(redispatch_at) > self.config.watchdog.max_auto_redispatch
-                ):
-                    # Escalate to human review
-                    reason = failure_kind if immediate_escalation else "redispatch_cap_exceeded"
-                    # Issue #783: dead worker session / redispatch cap is a
-                    # process failure, not a judgment call -- mechanical.
-                    # Issue #807: a deterministic judgment failure (genuine
-                    # local commits) is a judgment call -- judgment.
-                    reason_class = "judgment" if deterministic_judgment else "mechanical"
-                    state = _wf._escalate_issue(
-                        state,
+                window_minutes = self.config.watchdog.redispatch_window_minutes
+                outcome = worker_launch_outcome.record_failed_launch(
+                    self.write_gate,
+                    state,
+                    entry,
+                    failed_result=failed_result,
+                    issue_number=request.issue_number,
+                    now=self.host.clock.now(),
+                    window_minutes=window_minutes,
+                    max_auto_redispatch=self.config.watchdog.max_auto_redispatch,
+                    max_reaps=self.config.watchdog.max_foreign_writer_reaps,
+                    try_reap=lambda: _wf._try_reap_blocked_foreign_writer(
+                        failed_result,
+                        self.config,
+                        self.paths.state_file,
                         request.issue_number,
-                        reason=reason,
-                        reason_class=reason_class,
-                        issue_extra={
-                            "redispatch_at": redispatch_at,
-                            "dispatched_at": None,
-                        },
-                    )
-                    entry = state["issues"][str(request.issue_number)]
-                    _wf.save_state(self.paths.state_file, state)
-                    edge = _wf._escalation_edge("redispatch_escalated", reason_class)
+                        sessions_dir,
+                    ),
+                    recent_attempts=None,
+                    rework=True,
+                    save_inline=True,
+                    clear_stale_escalation=False,
+                    escalation_carries_entry=False,
+                    z_stamps=True,
+                    restored_status="rework_requested",
+                    previous_status="rework_requested",
+                    cap_reason="redispatch_cap_exceeded",
+                )
+                state = outcome.state
+                entry = outcome.entry
+                if outcome.reason_class is not None:
+                    edge = _wf._escalation_edge("redispatch_escalated", outcome.reason_class)
                     result = _wf.transition(
                         self.gh,
                         self.config.labels,
@@ -1647,12 +1517,6 @@ def _dispatch_rework_impl(
                         repo=self.repo_root.name,
                     )
                     record_label_error(state, entry, result, request.issue_number, edge)
-                    continue
-                entry["status"] = "rework_requested"
-                entry["dispatched_at"] = None
-                entry["redispatch_at"] = redispatch_at
-                state["issues"][str(request.issue_number)] = entry
-                _wf.save_state(self.paths.state_file, state)
         rework_failure_map = _wf._build_failure_map(
             dispatch_results,
             failed_issue_numbers,

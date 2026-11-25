@@ -65,13 +65,15 @@ NOT_A_DEAD_REWORK_SESSION: Mapping[str, str] = {
         "kind is in neither set"
     ),
     "orchestration/dispatch_state.py::_dispatch_impl": (
-        "fresh implementer dispatch: the launch-result cap and the cross-repo pre-flight "
-        "gate. No rework session exists yet"
+        "fresh implementer dispatch: applies the escalation edge for the launch-result cap "
+        "(decided in worker_launch_outcome.record_failed_launch) and the cross-repo "
+        "pre-flight gate. No rework session exists yet"
     ),
     "orchestration/state_dispatch_rework.py::_dispatch_rework_impl": (
-        "rework DISPATCH, not death handling: the launch-result and blocked-environment "
-        "caps run before any session has started, and they only read the redispatch history "
-        "the exemption keeps clean"
+        "rework DISPATCH, not death handling: applies the escalation edge for the "
+        "launch-result and blocked-environment caps (decided in "
+        "worker_launch_outcome.record_failed_launch), which run before any session has "
+        "started and only read the redispatch history the exemption keeps clean"
     ),
     "orchestration/state_dispatch_rework.py::_apply_redispatch_escalated_edges": (
         "applies the label edge for issues dispatch_rework already escalated on the "
