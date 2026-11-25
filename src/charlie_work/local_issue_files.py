@@ -25,6 +25,7 @@ the file mid-write.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -292,3 +293,57 @@ def append_comment(text: str, comment: str, *, timestamp: str) -> str:
 def write_text_atomic(path: Path, text: str) -> None:
     """Temp file + ``replace``; bytes, so no newline translation on Windows."""
     write_bytes_atomic(path, text.encode("utf-8"))
+
+
+# The slug half of a new issue filename: lowercase alphanumeric runs joined by
+# hyphens. Non-ASCII and punctuation collapse to separators; a title with no
+# usable characters falls back to ``issue`` -- the number carries identity,
+# the slug is only a human-readable hint.
+_SLUG_RUN_RE = re.compile(r"[^a-z0-9]+")
+_SLUG_MAX = 60
+
+
+def new_issue_filename(number: int, title: str) -> str:
+    """``NNN_<slug>.md`` name for a freshly-created issue file."""
+    slug = _SLUG_RUN_RE.sub("-", title.lower()).strip("-")[:_SLUG_MAX].rstrip("-")
+    return f"{number:03d}_{slug or 'issue'}.md"
+
+
+def render_issue_text(*, title: str, body: str, labels: tuple[str, ...], created: str) -> str:
+    """The full text of a freshly-created issue file (LF newlines).
+
+    The title goes through ``json.dumps`` rather than f-string interpolation:
+    a JSON double-quoted string is also a valid YAML double-quoted scalar on
+    one line, so a title containing a colon, a quote, or a newline can never
+    break the frontmatter mapping. Labels render through the same
+    ``render_flow_list`` the label mutations use, so a later
+    ``rewrite_frontmatter_key`` sees the same shape everywhere.
+    """
+    lines = [
+        "---",
+        f"title: {json.dumps(title, ensure_ascii=False)}",
+        "state: open",
+        f"labels: {render_flow_list(labels)}",
+        f'created: "{created}"',
+        "---",
+    ]
+    return "\n".join(lines) + "\n" + body.strip() + "\n"
+
+
+def rewrite_body(text: str, body: str) -> str:
+    """Return ``text`` with the issue *body* replaced by ``body``.
+
+    Pure. Only the region between the closing frontmatter fence and the
+    comments marker is touched: frontmatter, the marker itself, and every
+    comment survive byte-for-byte, and the file's own newline convention is
+    reused. Raises ``IssueFileError`` when there is no frontmatter.
+    """
+    match = _FRONTMATTER_RE.match(text)
+    if match is None:
+        raise IssueFileError("no '---' fenced frontmatter block")
+    newline = match.group("nl")
+    tail = text[match.end() :]
+    marker_at = tail.find(COMMENTS_MARKER)
+    if marker_at < 0:
+        return text[: match.end()] + body.strip("\r\n") + newline
+    return text[: match.end()] + newline.join((body.strip("\r\n"), "", tail[marker_at:]))

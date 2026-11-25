@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -49,7 +49,11 @@ from .local_issue_files import (
     IssueScan,
     LocalIssue,
     append_comment,
+    issue_number_from_name,
+    new_issue_filename,
     render_flow_list,
+    render_issue_text,
+    rewrite_body,
     rewrite_frontmatter_key,
     scan_issues,
     write_text_atomic,
@@ -354,6 +358,108 @@ class LocalFileGitHub:
         for number in issue_numbers:
             self._list_cache.setdefault(("issue_dependencies", number), [])
         return {number: [] for number in issue_numbers}
+
+    def _next_issue_number(self) -> int:
+        """One past the largest issue-number prefix under ``issues_dir``.
+
+        Numbers are claimed by *filename*, so every ``NNN_*.md`` name counts
+        -- including files ``scan_issues`` dropped as unreadable or
+        duplicated: reusing one of those numbers would mint a third claimant
+        for a number the scan already refuses to serve.
+        """
+        used = [
+            number
+            for entry in self.issues_dir.iterdir()
+            if (number := issue_number_from_name(entry.name)) is not None
+        ]
+        return max(used, default=0) + 1
+
+    def create_issue(self, title: str, body: str, labels: Sequence[str] = ()) -> int | None:
+        """Create a local issue file; the new issue number, or ``None``.
+
+        The ``NNN_<slug>.md`` file is written atomically with the next free
+        number and the caller's labels rendered into frontmatter, verbatim.
+        ``None`` on a secret-guard refusal, on a write failure, or in
+        dry-run -- the same failure vocabulary the real client's
+        ``create_issue`` uses. A missing ``issues_dir`` raises
+        ``GitHubError`` exactly as every read does: that is a config error,
+        not a write failure.
+        """
+        # Raises GitHubError on a missing issues_dir, like every read and
+        # mutation: that is a config error, not a write failure -- even in
+        # dry-run (_mutate and issue_comment scan before their dry_run check).
+        self._scan()
+        if self.dry_run:
+            return None
+        try:
+            matches = check_outbound_write(
+                surface="create_issue",
+                parts=(("title", title), ("body", body)),
+                repo_root=self.repo_root,
+                state_dir=self.state_dir,
+            )
+        except OutboundBodyGuardError as exc:
+            logger.warning("local issue create refused: %s", exc)
+            return None
+        if matches:
+            logger.warning(
+                "local issue create refused: %s", refusal_summary("create_issue", matches)
+            )
+            return None
+        try:
+            number = self._next_issue_number()
+            path = self.issues_dir / new_issue_filename(number, title)
+            created = datetime.now(UTC).date().isoformat()
+            write_text_atomic(
+                path,
+                render_issue_text(title=title, body=body, labels=tuple(labels), created=created),
+            )
+        except OSError as exc:
+            logger.warning("local issue create failed: %s", exc)
+            return None
+        queue_issue_write(self.repo_root, self.issues_dir, path, "create")
+        return number
+
+    def edit_issue_body(self, number: int, body: str) -> bool:
+        """Rewrite only issue ``number``'s body. Returns False on failure.
+
+        Frontmatter, the comments block, and the file's newline convention
+        survive unchanged (``local_issue_files.rewrite_body``). ``False`` on
+        a missing issue, a secret-guard refusal, a write failure, or in
+        dry-run -- matching the real client's ``edit_issue_body``.
+        """
+        issue = self._scan().by_number().get(number)
+        if issue is None:
+            logger.warning("local issue #%d not found under %s", number, self.issues_dir)
+            return False
+        if self.dry_run:
+            return False
+        try:
+            matches = check_outbound_write(
+                surface="edit_issue_body",
+                parts=(("body", body),),
+                repo_root=self.repo_root,
+                state_dir=self.state_dir,
+                issue_number=number,
+            )
+        except OutboundBodyGuardError as exc:
+            logger.warning("local issue #%d body edit refused: %s", number, exc)
+            return False
+        if matches:
+            logger.warning(
+                "local issue #%d body edit refused: %s",
+                number,
+                refusal_summary("edit_issue_body", matches),
+            )
+            return False
+        try:
+            text = issue.path.read_bytes().decode("utf-8")
+            write_text_atomic(issue.path, rewrite_body(text, body))
+        except (OSError, UnicodeDecodeError, IssueFileError) as exc:
+            logger.warning("local issue #%d: could not edit body: %s", number, exc)
+            return False
+        queue_issue_write(self.repo_root, self.issues_dir, issue.path, "update")
+        return True
 
     # -- LabelsLike --------------------------------------------------------
 
