@@ -459,7 +459,7 @@ def _rescue_when(diff: Diff) -> bool:
 
 
 DECLARED_DIFFERENCES: tuple[DeclaredDifference, ...] = (
-    # --- the issue's eight rows: difference and reason exactly as its table gives them ---
+    # --- the issue's table rows (seven remain): difference and reason exactly as its table gives them ---
     DeclaredDifference(
         "No Rescue tier on the Local path",
         "stated in a comment in `record_local_review`; at the cap a local record escalates directly",

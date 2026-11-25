@@ -447,7 +447,6 @@ def post_verdict_comment(
     provenance_caveat: str | None,
     required_changes: list[str],
     findings_channel: str | None,
-    differences: VerdictDifferences,
 ) -> str | None:
     """Build the verdict comment and post it; returns the error text on failure."""
     body_parts = [f"## Fleet review - round {round_number} - {decision}"]

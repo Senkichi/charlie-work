@@ -418,7 +418,6 @@ def record_review(
             provenance_caveat=provenance_caveat,
             required_changes=effective_required_changes,
             findings_channel=findings_channel,
-            differences=_PR_DIFFERENCES,
         )
         if comment_error is not None:
             label_error = verdict_recording.with_comment_error(label_error, comment_error)
