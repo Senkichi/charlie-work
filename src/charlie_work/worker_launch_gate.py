@@ -115,6 +115,7 @@ from charlie_work.atomic_write import write_json_atomic
 from charlie_work.fleet_lock_holder import fleet_lock_held_extra
 from charlie_work.fleet_pause import FLEET_PAUSED, launch_pause_fields
 from charlie_work.fleet_registry import try_acquire_fleet_lock
+from charlie_work.host.clock import Clock
 from charlie_work.host.launch import worker_error_results
 
 if TYPE_CHECKING:
@@ -179,6 +180,9 @@ class FleetLaunchLock:
         "_fleet_dir_override",
         "_holder_repo",
         "_wrote_holder",
+        "_clock",
+        "_acquired_at",
+        "_released_at",
     )
 
     def __init__(
@@ -189,6 +193,7 @@ class FleetLaunchLock:
         acquire: FleetLockAcquirer | None = None,
         fleet_dir_override: str | None = None,
         holder_repo: str | None = None,
+        clock: Clock | None = None,
     ) -> None:
         self._lock = lock
         self._released = False
@@ -197,6 +202,9 @@ class FleetLaunchLock:
         self._fleet_dir_override = fleet_dir_override
         self._holder_repo = holder_repo
         self._wrote_holder = False
+        self._clock = clock
+        self._acquired_at: float | None = None
+        self._released_at: float | None = None
 
     @property
     def valid(self) -> bool:
@@ -232,8 +240,18 @@ class FleetLaunchLock:
             self._released = True
             return None
         self._lock = lock
+        if self._clock is not None:
+            self._acquired_at = self._clock.monotonic()
         self._write_holder()
         return time.monotonic() - start
+
+    def event_fields(self) -> dict[str, float]:
+        """Issue #3089: ``launch_lock_held_seconds`` (Host clock) for the aggregate
+        Event; empty when no lock was realized. Elapsed-so-far if not yet released."""
+        if self._acquired_at is None or self._clock is None:
+            return {}
+        end = self._released_at if self._released_at is not None else self._clock.monotonic()
+        return {"launch_lock_held_seconds": end - self._acquired_at}
 
     def _write_holder(self) -> None:
         """Record who holds the lock so a starved waiter can report it (issue #2055)."""
@@ -270,6 +288,8 @@ class FleetLaunchLock:
         self._released = True
         if self._lock is None:
             return
+        if self._acquired_at is not None and self._clock is not None:
+            self._released_at = self._clock.monotonic()
         # Drop our holder metadata BEFORE releasing the OS lock: done the
         # other way around, a successor could write its own sidecar between
         # the two steps and have it unlinked from under it.
@@ -411,6 +431,7 @@ def acquire_fleet_launch_lock(
         acquire=acquire,
         fleet_dir_override=app.fleet_dir_override,
         holder_repo=app.repo_root.name,
+        clock=app.host.clock,
     )
 
 
