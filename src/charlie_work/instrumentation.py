@@ -87,6 +87,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Generator, Mapping
 
+from .event_cursor import max_event_id  # noqa: F401  (deliberate re-export)
+
 logger = logging.getLogger(__name__)
 
 # Thread-local storage for the current correlation ID.
@@ -1071,26 +1073,6 @@ def event_counts_by_kind(state_path: Path, *, since: str | None = None) -> dict[
     except sqlite3.Error as exc:
         logger.warning("Failed to get event counts: %s", exc)
         return {}
-
-
-def max_event_id(state_path: Path) -> int:
-    """Return the largest ``id`` in the ``events`` table, or 0.
-
-    A new ``after_id`` consumer starts its cursor here to mean "now":
-    ``query_events(after_id=max_event_id(path))`` then yields every event
-    written from that point on. Returns 0 for an empty table, a missing or
-    unreadable database (best-effort, never raises), so a cursor of 0 pages
-    the whole log from the first row.
-    """
-    conn = _get_db(state_path)
-    if conn is None:
-        return 0
-    try:
-        row = conn.execute("SELECT MAX(id) FROM events").fetchone()
-    except sqlite3.Error as exc:
-        logger.warning("Failed to read max event id: %s", exc)
-        return 0
-    return int(row[0]) if row is not None and row[0] is not None else 0
 
 
 def close_db(state_path: Path) -> None:
