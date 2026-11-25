@@ -54,7 +54,6 @@ import charlie_work.workflow as _wf
 from charlie_work.command_result import CommandResult
 from charlie_work import worker_fate
 import charlie_work.worker_launch_outcome as worker_launch_outcome
-from charlie_work.worker_pid_stamp import stamp_worker_process
 from charlie_work.worker_launch_gate import (
     REASON_PROVIDER_THROTTLED,
     FleetLaunchLock,
@@ -1216,26 +1215,30 @@ def _dispatch_impl(
             # unconditionally, so a future arm that forgets to set one is a
             # possibly-unbound error at type-check time, not a silently
             # stale value copied from prev_entry.
-            entry = {
-                **prev_entry,
-                "number": request.issue_number,
-                "title": full_issue.get("title"),
-                "url": full_issue.get("url"),
-                "branch_name": request.branch_name,
-                "prompt_path": str(request.prompt_path),
-            }
-            # Clear the claim timestamp on successful upgrade
-            entry.pop("dispatch_pending_at", None)
-            entry.pop("label_error", None)
+            entry = worker_launch_outcome.launch_base_entry(
+                prev_entry,
+                issue_number=request.issue_number,
+                title=full_issue.get("title"),
+                url=full_issue.get("url"),
+                branch_name=request.branch_name,
+                prompt_path=request.prompt_path,
+            )
             if ok:
                 status = "manifest_written" if manual else "dispatched"
                 dispatched_at = _wf.utc_now()
-                # A successful recovery supersedes any previous orphan flag.
-                entry.pop("orphan_flagged_at", None)
-                entry.pop("orphan_drift_fingerprint", None)
-                entry.pop("orphan_drift_at", None)
+                # Store worker PID and process start time for state-based liveness
+                # detection (issue #207); the shared outcome also drops the orphan
+                # flags and the previous death's failure kind.
+                worker_launch_outcome.record_successful_launch(
+                    entry,
+                    status=status,
+                    dispatched_at=dispatched_at,
+                    result=next(
+                        (r for r in dispatch_results if r.issue_number == request.issue_number),
+                        None,
+                    ),
+                )
                 entry.pop("dispatch_failed_at", None)
-                _wf.clear_dead_worker_failure_kind(entry)
                 clear_escalation(entry)
                 clear_escalation_on_issue_prs(state, request.issue_number)
             elif is_live_worker:
@@ -1329,14 +1332,6 @@ def _dispatch_impl(
                 entry = dict(outcome.entry) if reason_class is not None else outcome.entry
             entry["status"] = status
             entry["dispatched_at"] = dispatched_at
-            # Store worker PID and process start time for state-based liveness detection
-            # This allows recovery even when session sidecar files are orphaned (issue #207)
-            if ok:
-                result = next(
-                    (r for r in dispatch_results if r.issue_number == request.issue_number),
-                    None,
-                )
-                stamp_worker_process(entry, result)
             # Issue #1000: stamp the citation-drift fingerprint computed in
             # the outside-lock loop. The comment was already posted there
             # (best-effort); this persists the dedup marker so a still-stale
