@@ -52,7 +52,8 @@ from typing import Any
 
 import charlie_work.workflow as _wf
 from charlie_work.command_result import CommandResult
-from charlie_work import worker_fate, worker_launch_outcome
+from charlie_work import worker_fate
+import charlie_work.worker_launch_outcome as worker_launch_outcome
 from charlie_work.worker_pid_stamp import stamp_worker_process
 from charlie_work.worker_launch_gate import (
     REASON_PROVIDER_THROTTLED,

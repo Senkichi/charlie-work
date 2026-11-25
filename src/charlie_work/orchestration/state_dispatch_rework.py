@@ -25,7 +25,7 @@ from charlie_work.config import (
 import charlie_work.fleet_provider_throttle as fleet_provider_throttle
 from charlie_work.github import GitHubError
 from charlie_work.state import StateLockBusy
-from charlie_work import worker_launch_outcome
+import charlie_work.worker_launch_outcome as worker_launch_outcome
 from charlie_work.worker_fate import persisted_failure
 from charlie_work.worktree import worktree_ahead_of_sha
 import charlie_work.superseded_worker_reap as superseded_worker_reap
