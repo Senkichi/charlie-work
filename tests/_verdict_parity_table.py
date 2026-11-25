@@ -204,7 +204,7 @@ SCENARIOS: tuple[Scenario, ...] = (
             (
                 "events.order",
                 (
-                    "worker_test_selection_unavailable",
+                    "worker_test_selection_disabled",
                     "record_review",
                     "rework_label_skipped_issue_closed",
                 ),
@@ -381,7 +381,7 @@ _RESCUE_PINNED: dict[str, tuple[Any, Any]] = {
     "events.lifecycle_transition#0.payload.to_state": ("needs_rework", "operator_queue"),
     "events.order": (
         (
-            "worker_test_selection_unavailable",
+            "worker_test_selection_disabled",
             "record_review",
             "rescue_dispatched",
             "lifecycle_transition",
@@ -393,10 +393,14 @@ _RESCUE_PINNED: dict[str, tuple[Any, Any]] = {
     "events.rescue_dispatched#0.payload.cause": ("rework_cycle_cap", MISSING),
     "events.rescue_dispatched#0.payload.issue_number": (7, MISSING),
     "events.rescue_dispatched#0.payload.pr_number": (7, MISSING),
-    "events.worker_test_selection_unavailable#0.level": ("warning", MISSING),
-    "events.worker_test_selection_unavailable#0.payload.issue_number": (7, MISSING),
-    "events.worker_test_selection_unavailable#0.payload.pr_number": (7, MISSING),
-    "events.worker_test_selection_unavailable#0.payload.reason": ("no-executable", MISSING),
+    "events.worker_test_selection_disabled#0.level": ("info", MISSING),
+    "events.worker_test_selection_disabled#0.payload.issue_number": (7, MISSING),
+    "events.worker_test_selection_disabled#0.payload.pr_number": (7, MISSING),
+    "events.worker_test_selection_disabled#0.payload.detail": (
+        "ci-fleet.toml sets enabled = false",
+        MISSING,
+    ),
+    "events.worker_test_selection_disabled#0.payload.reason": ("disabled", MISSING),
     "issue.escalation_reason": (MISSING, "max_rework_cycles_exceeded"),
     "issue.escalation_reasons_seen": (MISSING, ["max_rework_cycles_exceeded"]),
     "issue.no_op_checkpoint_at": ("<set>", MISSING),
@@ -445,8 +449,6 @@ _REFUSALS = frozenset(sc.name for sc in SCENARIOS if ("result.ok", False) in sc.
 def _rescue_when(diff: Diff) -> bool:
     if diff.scenario != _RESCUE_SCENARIO:
         return False
-    if diff.path == "events.worker_test_selection_unavailable#0.payload.detail":
-        return str(diff.remote).startswith("no ci-fleet beside") and diff.local is MISSING
     if diff.path == "rework_dispatch_note":
         return (
             isinstance(diff.remote, str)
@@ -473,7 +475,6 @@ DECLARED_DIFFERENCES: tuple[DeclaredDifference, ...] = (
         "stated in a comment in `record_local_review`; at the cap a local record escalates directly",
         (
             *_RESCUE_PINNED,
-            "events.worker_test_selection_unavailable#0.payload.detail",
             "rework_dispatch_note",
         ),
         _rescue_when,

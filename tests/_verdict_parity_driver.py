@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from _fakes_github import FakeGitHub
 from _local_lane_fixtures import (
     _app,
@@ -19,6 +21,7 @@ from _local_lane_fixtures import (
     _parked_issue,
     new_repo_root,
 )
+import charlie_work.selection_wrapper as selection_wrapper
 from charlie_work.config import build_config_from_data
 from charlie_work.instrumentation import query_events
 from charlie_work.labels import transition
@@ -452,6 +455,7 @@ def _collect(
 def _run_remote(scenario: Scenario, repo: _Repo, start_labels: frozenset[str]) -> dict[str, Any]:
     root = Path(tempfile.mkdtemp(prefix="cw-verdict-pr-"))
     app, gh = _remote_app(scenario, repo, root)
+    _pin_worker_selection(root)
     _seed(app, scenario, repo, local=False)
     _write_packet(app, scenario, repo)
     labels_before = start_labels
@@ -479,6 +483,7 @@ def _run_remote(scenario: Scenario, repo: _Repo, start_labels: frozenset[str]) -
 
 def _run_local(scenario: Scenario, repo: _Repo) -> tuple[dict[str, Any], frozenset[str]]:
     app = _local_app(scenario, repo)
+    _pin_worker_selection(repo.root)
     _seed(app, scenario, repo, local=True)
     _write_packet(app, scenario, repo)
     issue_file = next(app.gh.issues_dir.glob(f"{ISSUE:03d}_*.md"))
@@ -509,9 +514,29 @@ def _diffs(scenario: str, remote: dict[str, Any], local: dict[str, Any]) -> list
     return out
 
 
+_FAKE_CI_FLEET = Path("ci-fleet")
+
+
+def _pin_worker_selection(*roots: Path) -> None:
+    """Pin the worker test-selection answer so the Events carry no host detail.
+
+    ``selection_wrapper.worker_selection`` reports why it cannot wrap the test
+    command; with no executable the detail names ``sys.executable``, which differs
+    per host. An executable that exists (patched, as ``test_selection_wrapper.py``
+    does) plus the repo's own ``enabled = false`` kill switch gives the same
+    deterministic ``worker_test_selection_disabled`` answer everywhere.
+    """
+    for root in roots:
+        (root / "ci-fleet.toml").write_text(
+            "[test_selection]\nenabled = false\n", encoding="utf-8"
+        )
+
+
 def run_both(scenario: Scenario) -> tuple[dict[str, Any], dict[str, Any]]:
     """The scenario through ``record_review`` and ``record_local_review``."""
     repo = _make_repo()
-    local, start_labels = _run_local(scenario, repo)
-    remote = _run_remote(scenario, repo, start_labels)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(selection_wrapper, "ci_fleet_executable", lambda: _FAKE_CI_FLEET)
+        local, start_labels = _run_local(scenario, repo)
+        remote = _run_remote(scenario, repo, start_labels)
     return remote, local
