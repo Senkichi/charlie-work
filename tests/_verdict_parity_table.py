@@ -507,7 +507,14 @@ DECLARED_DIFFERENCES: tuple[DeclaredDifference, ...] = (
     ),
     DeclaredDifference(
         "`reviewed_body_sha256` not recorded locally",
-        "drift, tracked separately",
+        (
+            "the Local path has no PR body to hash (its packet `pr.json` and `local_pr_dict` "
+            "carry no `body`; `LocalFileGitHub.pr_view` returns `{}` and `pr_list` returns "
+            '`[]`), and every comparison of the stored hash requires `"body" in pr`, so a '
+            "recorded hash could never be compared. `_body_rework_escape_warning` does "
+            "execute for a Local path record in the mechanical de-escalation sweep, but with "
+            "`pr == {}` it fails closed; `_route_to_rework` only copies the stored value"
+        ),
         ("decision_file.reviewed_body_sha256", "pr_record.reviewed_body_sha256"),
         _local_missing,
     ),
