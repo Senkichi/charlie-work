@@ -17,8 +17,8 @@ Namespace rule (#1627). Two kinds of name are reached through the
   ``_detect_and_handle_stalled_sessions``,
   ``_try_reap_blocked_foreign_writer`` -- must resolve
   through ``_wf.`` so ``patch("charlie_work.workflow.<name>")`` still bites.
-- **Reached through workflow.py.** ``_build_failure_map``,
-  ``_label_error_reason`` and ``_recent_dispatch_failed_attempts`` are defined
+- **Reached through workflow.py.** ``_build_failure_map`` and
+  ``_recent_dispatch_failed_attempts`` are defined
   in ``workflow`` itself; ``_MergedPRListOutcome`` is a re-export
   (``backlog_reachability.py`` owns the definition), and so are the
   attention-digest emit tails ``_emit_stalled_session_digest`` /
@@ -47,11 +47,13 @@ module below.
 from __future__ import annotations
 
 from dataclasses import asdict
+from functools import partial
 from typing import Any
 
 import charlie_work.workflow as _wf
 from charlie_work.command_result import CommandResult
 from charlie_work import worker_fate
+import charlie_work.worker_launch_outcome as worker_launch_outcome
 from charlie_work.worker_pid_stamp import stamp_worker_process
 from charlie_work.worker_launch_gate import (
     REASON_PROVIDER_THROTTLED,
@@ -1168,6 +1170,12 @@ def _dispatch_impl(
     manual = self.config.worker.harness == "manual"
     label_errors: list[int] = []
     label_error_failures: dict[int, str] = {}
+    record_label_error = partial(
+        worker_launch_outcome.record_label_error,
+        self.write_gate,
+        label_errors=label_errors,
+        label_error_failures=label_error_failures,
+    )
     # B6: fates the phantom-worker lane resolves, reported (rule-1 stale
     # evidence) once the lock below is released.
     phantom_fates: dict[int, list[worker_fate.WorkerFate]] = {}
@@ -1325,31 +1333,30 @@ def _dispatch_impl(
                             entry,
                             window_minutes=self.config.watchdog.redispatch_window_minutes,
                         )
-                        if len(prior_reaps) < max_reaps and _wf._try_reap_blocked_foreign_writer(
-                            failed_result,
-                            self.config,
-                            self.paths.state_file,
-                            request.issue_number,
-                            sessions_dir,
-                        ):
-                            entry["blocked_environment_at"] = []
-                            entry["foreign_writer_reaps"] = prior_reaps + [
-                                now.isoformat().replace("+00:00", "Z")
-                            ]
+                        reap_event = worker_launch_outcome.reap_blocked_foreign_writer_at_cap(
+                            entry,
+                            prior_reaps=prior_reaps,
+                            max_reaps=max_reaps,
+                            try_reap=lambda: _wf._try_reap_blocked_foreign_writer(
+                                failed_result,
+                                self.config,
+                                self.paths.state_file,
+                                request.issue_number,
+                                sessions_dir,
+                            ),
+                            now_iso=now.isoformat().replace("+00:00", "Z"),
+                            issue_number=request.issue_number,
+                            failure_kind=failure_kind,
+                            pid=failed_result.pid if failed_result else None,
+                            blocked_environment_count=len(blocked_environment_at),
+                        )
+                        if reap_event is not None:
                             status = "dispatch_failed"
                             dispatched_at = None
                             clear_escalation(entry)
                             clear_escalation_on_issue_prs(state, request.issue_number)
                             state = self._record_event(  # event-consumer: audit-only -- records a foreign-writer reap (issue #1423) already enforced by the blocked_environment_at reset and foreign_writer_reaps counter; consumed by tests/test_charlie_work.py regression tests.
-                                state,
-                                "dispatch_blocked_environment_reaped",
-                                {
-                                    "issue_number": request.issue_number,
-                                    "failure_kind": failure_kind,
-                                    "pid": failed_result.pid if failed_result else None,
-                                    "blocked_environment_count": len(blocked_environment_at),
-                                    "foreign_writer_reap_count": len(prior_reaps) + 1,
-                                },
+                                state, "dispatch_blocked_environment_reaped", reap_event
                             )
                         else:
                             status = "escalated"
@@ -1529,19 +1536,7 @@ def _dispatch_impl(
                     state_path=self.paths.state_file,
                     repo=self.repo_root.name,
                 )
-                if result.outcome != TransitionOutcome.APPLIED:
-                    label_error = {
-                        "edge": target,
-                        "outcome": result.outcome.value,
-                        "add_failures": result.add_failures,
-                        "remove_failures": result.remove_failures,
-                    }
-                    entry["label_error"] = label_error
-                    label_errors.append(request.issue_number)
-                    label_error_failures[request.issue_number] = _wf._label_error_reason(
-                        label_error
-                    )
-                    _wf.save_state(self.paths.state_file, state)
+                record_label_error(state, entry, result, request.issue_number, target)
                 if is_live_worker:
                     result = next(
                         (r for r in dispatch_results if r.issue_number == request.issue_number),
@@ -1577,19 +1572,7 @@ def _dispatch_impl(
                     state_path=self.paths.state_file,
                     repo=self.repo_root.name,
                 )
-                if result.outcome != TransitionOutcome.APPLIED:
-                    label_error = {
-                        "edge": edge,
-                        "outcome": result.outcome.value,
-                        "add_failures": result.add_failures,
-                        "remove_failures": result.remove_failures,
-                    }
-                    entry["label_error"] = label_error
-                    label_errors.append(request.issue_number)
-                    label_error_failures[request.issue_number] = _wf._label_error_reason(
-                        label_error
-                    )
-                    _wf.save_state(self.paths.state_file, state)
+                record_label_error(state, entry, result, request.issue_number, edge)
 
         # Issue #1010: escalate issues blocked by the cross-repo pre-flight
         # gate. Their referenced file paths are all absent from the target
@@ -1654,18 +1637,9 @@ def _dispatch_impl(
                 repo=self.repo_root.name,
             )
             if result.outcome != TransitionOutcome.APPLIED:
-                label_error = {
-                    "edge": edge,
-                    "outcome": result.outcome.value,
-                    "add_failures": result.add_failures,
-                    "remove_failures": result.remove_failures,
-                }
                 escalated_entry = state["issues"].get(str(issue_number), {})
-                escalated_entry["label_error"] = label_error
                 state["issues"][str(issue_number)] = escalated_entry
-                label_errors.append(issue_number)
-                label_error_failures[issue_number] = _wf._label_error_reason(label_error)
-                _wf.save_state(self.paths.state_file, state)
+                record_label_error(state, escalated_entry, result, issue_number, edge)
 
         # Issue #1758: audit event for the cross-repo gate override valve.
         # The issue already skipped both gates during the network-call loop
