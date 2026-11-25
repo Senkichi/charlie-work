@@ -10,7 +10,7 @@ from __future__ import annotations
 import ast
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import pytest
 from _src_ast import parsed, source_files, source_text
@@ -292,20 +292,57 @@ def test_closing_issues_referenced_numbers_empty_on_malformed_field() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _local_names_aliased_from_pr_create_getattr(tree: ast.AST) -> set[str]:
-    """Names assigned from a reference to ``pr_create`` anywhere in ``tree``.
+class _FileFacts(NamedTuple):
+    """One scanned source file's verdicts, shared by both AC guards below.
 
-    Covers both indirect-call shapes:
+    ``has_raw_call`` -- a ``.pr_create(`` attribute call, or a call through a
+    name assigned from ``gh.pr_create`` / ``getattr(gh, "pr_create", ...)``,
+    outside a ``def pr_create`` body. ``has_wrapper_call`` -- a
+    ``create_pr_with_retry(`` call anywhere in the file (cw#1273).
+    ``uses_validator`` -- the file imports and calls
+    ``validate_closing_reference``.
+    """
+
+    has_raw_call: bool
+    has_wrapper_call: bool
+    uses_validator: bool
+
+
+def _call_site_facts(tree: ast.AST) -> tuple[bool, bool]:
+    """One pass over ``tree``: ``(raw .pr_create call site, create_pr_with_retry call site)``.
+
+    The first flag covers both indirect-call shapes without hardcoding which
+    module uses them:
     - ``pr_create = getattr(gh, "pr_create", None); pr_create(...)``
     - ``fn = gh.pr_create; fn(...)`` (an ``ast.Attribute`` bound to a name,
       no ``getattr`` involved)
 
-    without hardcoding which module uses it.
+    cw#1273 interposed ``pr_create_retry.create_pr_with_retry`` between every
+    caller and the raw ``gh.pr_create`` -- after that change, the raw
+    ``.pr_create(`` attribute call lives *only* inside ``pr_create_retry.py``
+    itself (see ``test_every_pr_create_call_site_routes_through_the_retry_wrapper``
+    below), so it is no longer where a PR actually gets created from the
+    perspective of "did this caller build/validate a body first". The second
+    flag follows that indirection the same way the first follows the
+    ``getattr(gh, "pr_create", None)`` alias indirection: both track *the
+    point closest to the caller* where a PR creation is actually requested.
+
+    A ``def pr_create(...)`` body (or an async equivalent) is not a call site
+    of itself, so calls inside it are not collected -- but an alias assigned
+    inside one still counts for calls elsewhere and a wrapper call inside one
+    still counts, matching the whole-tree reads the original helpers made.
+    Alias targets and called names are collected in the same DFS and joined
+    after the walk, which keeps the four separate whole-tree ``ast.walk``
+    passes (alias collection, the def-scope id-set over a materialized node
+    list, and the wrapper scan) the original helpers made per matched file
+    down to one.
     """
     aliases: set[str] = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign):
-            continue
+    name_calls: set[str] = set()
+    raw_call = False
+    wrapper_call = False
+
+    def collect_alias(node: ast.Assign) -> None:
         value = node.value
         is_getattr_alias = (
             isinstance(value, ast.Call)
@@ -316,67 +353,44 @@ def _local_names_aliased_from_pr_create_getattr(tree: ast.AST) -> set[str]:
             and value.args[1].value == "pr_create"
         )
         is_attribute_alias = isinstance(value, ast.Attribute) and value.attr == "pr_create"
-        if not (is_getattr_alias or is_attribute_alias):
-            continue
-        for target in node.targets:
-            if isinstance(target, ast.Name):
-                aliases.add(target.id)
-    return aliases
+        if is_getattr_alias or is_attribute_alias:
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    aliases.add(target.id)
 
-
-def _nodes_outside_pr_create_definitions(tree: ast.AST) -> list[ast.AST]:
-    """Every AST node in ``tree`` except those inside a ``def pr_create(...)``
-    body (or an async equivalent).
-
-    Excludes only the *definition* of ``pr_create`` itself (its own body,
-    where a call to ``self`` or an inner helper is not a call site the
-    validator needs to see), not the whole module -- a retry wrapper or any
-    other call to ``gh.pr_create`` living elsewhere in the same file (e.g.
-    ``github.py`` gaining call-site code alongside the definition) must still
-    be caught.
-    """
-    skip: set[int] = set()
-    for node in ast.walk(tree):
+    stack = [tree]
+    while stack:
+        node = stack.pop()
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "pr_create":
-            skip.update(id(child) for child in ast.walk(node))
-    return [node for node in ast.walk(tree) if id(node) not in skip]
-
-
-def _has_pr_create_call_site(tree: ast.AST) -> bool:
-    aliases = _local_names_aliased_from_pr_create_getattr(tree)
-    for node in _nodes_outside_pr_create_definitions(tree):
-        if not isinstance(node, ast.Call):
+            # Excludes only the *definition* of ``pr_create`` itself (its own
+            # body, where a call to ``self`` or an inner helper is not a call
+            # site the validator needs to see), not the whole module -- a
+            # retry wrapper or any other call to ``gh.pr_create`` living
+            # elsewhere in the same file must still be caught.
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Assign):
+                    collect_alias(inner)
+                elif (
+                    isinstance(inner, ast.Call)
+                    and isinstance(inner.func, ast.Name)
+                    and inner.func.id == "create_pr_with_retry"
+                ):
+                    wrapper_call = True
             continue
-        func = node.func
-        if isinstance(func, ast.Attribute) and func.attr == "pr_create":
-            return True
-        if isinstance(func, ast.Name) and func.id in aliases:
-            return True
-    return False
+        if isinstance(node, ast.Assign):
+            collect_alias(node)
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr == "pr_create":
+                raw_call = True
+            elif isinstance(func, ast.Name):
+                if func.id == "create_pr_with_retry":
+                    wrapper_call = True
+                else:
+                    name_calls.add(func.id)
+        stack.extend(ast.iter_child_nodes(node))
 
-
-def _has_create_pr_with_retry_call_site(tree: ast.AST) -> bool:
-    """True if ``tree`` calls ``create_pr_with_retry`` (cw#1273) anywhere.
-
-    cw#1273 interposed ``pr_create_retry.create_pr_with_retry`` between every
-    caller and the raw ``gh.pr_create`` -- after that change, the raw
-    ``.pr_create(`` attribute call lives *only* inside ``pr_create_retry.py``
-    itself (see ``test_every_pr_create_call_site_routes_through_the_retry_wrapper``
-    below), so it is no longer where a PR actually gets created from the
-    perspective of "did this caller build/validate a body first". This
-    helper follows that indirection the same way
-    ``_has_pr_create_call_site`` follows the ``getattr(gh, "pr_create",
-    None)`` alias indirection: both track *the point closest to the caller*
-    where a PR creation is actually requested.
-    """
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "create_pr_with_retry"
-        ):
-            return True
-    return False
+    return raw_call or bool(name_calls & aliases), wrapper_call
 
 
 def _imports_and_uses_validator(tree: ast.AST) -> bool:
@@ -400,36 +414,61 @@ def _imports_and_uses_validator(tree: ast.AST) -> bool:
     return False
 
 
-def test_every_pr_create_call_site_routes_through_the_validator() -> None:
+@pytest.fixture(scope="module")
+def pr_create_call_sites() -> dict[str, _FileFacts]:
+    """The one per-module scan of ``_SRC_ROOT`` both AC guards share.
+
+    rglob, not glob: a call site added under a subpackage in the future must
+    not be silently exempted by scanning only the top-level directory.
+
+    The detectors below need the literal token: a raw ``.pr_create``
+    attribute call, a ``"pr_create"`` constant (the getattr shape), the
+    ``def pr_create`` definition name, or a ``create_pr_with_retry`` call all
+    spell their identifier in the source text. Files with neither token are
+    skipped before parsed() (issue #2578; same filter shape as
+    #2422/#2548).
+
+    Both guard tests iterate the same files, run the same filter and walk
+    the same trees; the second to run used to re-pay every pass against an
+    already-parsed tree, and the first paid the whole-package cold
+    ``_src_ast`` fill inside its own ``call`` phase (issue #3065). Running
+    the scan once per module moves that cost here -- the first consumer's
+    ``setup`` -- so neither test's ``call`` measures it (the #3039 remedy
+    shape).
+    """
+    facts: dict[str, _FileFacts] = {}
+    for path in source_files(_SRC_ROOT):
+        text = source_text(path)
+        if "pr_create" not in text and "create_pr_with_retry" not in text:
+            continue
+        tree = parsed(path)
+        raw_call, wrapper_call = _call_site_facts(tree)
+        uses_validator = _imports_and_uses_validator(tree) if wrapper_call else False
+        facts[path.name] = _FileFacts(raw_call, wrapper_call, uses_validator)
+    return facts
+
+
+def test_every_pr_create_call_site_routes_through_the_validator(
+    pr_create_call_sites: dict[str, _FileFacts],
+) -> None:
     offenders: list[str] = []
     scanned_with_call_site: list[str] = []
 
-    # rglob, not glob: a call site added under a subpackage in the future
-    # must not be silently exempted by scanning only the top-level directory.
-    #
     # cw#1273 interposed create_pr_with_retry() between every caller and the
     # raw gh.pr_create -- the raw attribute call now lives only inside
     # pr_create_retry.py (see the AC6 retry-wrapper scan below), so
-    # "where does a caller request a PR creation" is now
-    # _has_create_pr_with_retry_call_site, not _has_pr_create_call_site.
-    # Using the pre-#1273 raw-attribute detector here would find zero call
-    # sites in workflow.py/reconcile.py (both now call the wrapper, not
-    # gh.pr_create directly) and instead flag pr_create_retry.py itself --
-    # a module that forwards an already-built body and has no closing-ref
-    # concern of its own.
-    for path in source_files(_SRC_ROOT):
-        # A call site of ``create_pr_with_retry`` requires the literal name
-        # in the file's source text; skip empty files before parsed() so the
-        # scan only fills the shared-cache parse for call-site candidates
-        # (issue #2578; same filter shape as #2422/#2548).
-        if "create_pr_with_retry" not in source_text(path):
+    # "where does a caller request a PR creation" is now the wrapper call,
+    # not the raw attribute call. Using the pre-#1273 raw-attribute detector
+    # here would find zero call sites in the consumers (both call the
+    # wrapper, not gh.pr_create directly) and instead flag pr_create_retry.py
+    # itself -- a module that forwards an already-built body and has no
+    # closing-ref concern of its own.
+    for name, facts in pr_create_call_sites.items():
+        if not facts.has_wrapper_call:
             continue
-        tree = parsed(path)
-        if not _has_create_pr_with_retry_call_site(tree):
-            continue
-        scanned_with_call_site.append(path.name)
-        if not _imports_and_uses_validator(tree):
-            offenders.append(path.name)
+        scanned_with_call_site.append(name)
+        if not facts.uses_validator:
+            offenders.append(name)
 
     # Positive control: this scan must actually find the two known call
     # sites (dead_worker_sweep/effects_pr.py, reconcile_salvage.py) or the
@@ -458,31 +497,22 @@ def test_every_pr_create_call_site_routes_through_the_validator() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_every_pr_create_call_site_routes_through_the_retry_wrapper() -> None:
-    bypass_offenders: list[str] = []
-    wrapper_consumers: list[str] = []
-
-    for path in source_files(_SRC_ROOT):
-        # Both detectors below need the literal token: a raw ``.pr_create``
-        # attribute call, a ``"pr_create"`` constant (the getattr shape), the
-        # ``def pr_create`` definition name, or a ``create_pr_with_retry``
-        # call all spell their identifier in the source text. Files with
-        # neither token are skipped before parsed() (issue #2578; same
-        # filter shape as #2422/#2548).
-        text = source_text(path)
-        if "pr_create" not in text and "create_pr_with_retry" not in text:
-            continue
-        tree = parsed(path)
-        # pr_create_retry.py's own body is the one legitimate place a raw
-        # `.pr_create(` call may live -- it *is* the routing target every
-        # other module must call instead, the same way the definition of
-        # `pr_create` itself (inside github.py) is excluded by
-        # `_nodes_outside_pr_create_definitions` rather than flagged as a
-        # call site of itself.
-        if path.name != "pr_create_retry.py" and _has_pr_create_call_site(tree):
-            bypass_offenders.append(path.name)
-        if _has_create_pr_with_retry_call_site(tree):
-            wrapper_consumers.append(path.name)
+def test_every_pr_create_call_site_routes_through_the_retry_wrapper(
+    pr_create_call_sites: dict[str, _FileFacts],
+) -> None:
+    # pr_create_retry.py's own body is the one legitimate place a raw
+    # `.pr_create(` call may live -- it *is* the routing target every other
+    # module must call instead, the same way the definition of `pr_create`
+    # itself (inside github.py) is excluded by `_call_site_facts` rather
+    # than flagged as a call site of itself.
+    bypass_offenders = [
+        name
+        for name, facts in pr_create_call_sites.items()
+        if name != "pr_create_retry.py" and facts.has_raw_call
+    ]
+    wrapper_consumers = [
+        name for name, facts in pr_create_call_sites.items() if facts.has_wrapper_call
+    ]
 
     # Positive control: the scan must actually find real wrapper usage, or
     # an empty `bypass_offenders` below would be indistinguishable from
