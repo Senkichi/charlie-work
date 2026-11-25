@@ -340,7 +340,7 @@ def _snapshot(case: Case, side: str, monkeypatch: pytest.MonkeyPatch) -> dict[st
             app, gh = _remote_app(scenario, repo, root)
             roots = (root,)
             if case.no_linked_issue:
-                gh.prs[0].update(headRefName="feature/x", body="No link.")
+                gh.prs[0].update(headRefName="feature/x", title="Thing", body="No link.")
         _pin_worker_selection(*roots[:1])
         _seed(app, scenario, repo, local=side == "local")
         _write_packet(app, scenario, repo)
@@ -574,6 +574,26 @@ def test_no_op_checkpoint_follows_content_advance(
         assert ("no_op_checkpoint_at" in outcome["issue_entry"]) is checkpoint
 
 
+@pytest.mark.parametrize(
+    "name", ["no_issue_request_changes", "no_issue_approved", "no_issue_blocked", "no_issue_cap"]
+)
+def test_pr_without_a_linked_issue_takes_no_issue_rules_and_no_label_edge(
+    snapshots: dict[str, Any], name: str
+) -> None:
+    outcome = snapshots[f"{name}|pr"]
+    assert outcome["pr_record"]["issue_number"] is None
+    assert outcome["result"]["data"]["label_error"] is None
+    assert not [c for c in outcome["calls"] if ".transition" in c]
+    # The seeded issue entry is untouched: no status write, no escalation, no merge_alert.
+    assert outcome["issue_entry"]["status"] == "dispatched"
+    assert "merge_alert" not in outcome["issue_entry"]
+    assert "escalation_reason" not in outcome["issue_entry"]
+    assert not [e for e in outcome["events"] if e["kind"] == "lifecycle_transition"]
+    # A stale escalation_reason on the PR record is not cleared without an issue.
+    if name != "no_issue_cap":
+        assert outcome["pr_record"]["escalation_reason"] in {"keep", "review_blocked"}
+
+
 def test_label_edges_per_decision(snapshots: dict[str, Any]) -> None:
     def edges(outcome: dict[str, Any]) -> list[str]:
         return [c.split(":")[1] for c in outcome["calls"] if ".transition:" in c]
@@ -583,8 +603,7 @@ def test_label_edges_per_decision(snapshots: dict[str, Any]) -> None:
     assert [edges(o) for o in _both(snapshots, "counter_first_verdict")] == [
         ["rework_requested"]
     ] * 2
-    escalated = [edges(o) for o in _both(snapshots, "cap_at")]
-    assert escalated == [["escalated"]] * 2 or all(len(e) == 1 for e in escalated)
+    assert [edges(o) for o in _both(snapshots, "cap_at")] == [["operator_queued"]] * 2
     for outcome in _both(snapshots, "issue_closed_request_changes"):
         assert edges(outcome) == []
         assert outcome["events"][-1]["kind"] == "rework_label_skipped_issue_closed"

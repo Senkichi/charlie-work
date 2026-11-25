@@ -62,7 +62,7 @@ _SANCTIONED_FUNCTIONS = frozenset(
         "_route_to_rework",
         "_update_approval_head",
         "_refresh_pr_decision_cache",
-        # Issue #1844: the local (no-remote) lane mirrors ``review`` --
+        # Issue #1844: the Local path mirrors ``review`` --
         # ``_local_build_packet`` seeds the fresh-cycle "pending" decision fields
         # from the same record_decision write the packet performs.
         "_local_build_packet",
