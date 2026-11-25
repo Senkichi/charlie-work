@@ -112,6 +112,7 @@ from .dashboard.config import DashboardConfig  # noqa: F401  (deliberate re-expo
 from .fleet_supervisor_config import (  # noqa: F401  (deliberate re-export)
     FleetSupervisorConfig,
 )
+from .foreman_config import ForemanConfig  # noqa: F401  (deliberate re-export)
 
 from . import layout
 from .fleet_harness_caps import freeze_harness_caps
@@ -311,6 +312,11 @@ class LabelConfig:
     model_tier_prefix: str = "model:"
     # Spec C2 (host_routing): ``<prefix><host>`` names the orchestrator that owns an issue.
     host_prefix: str = "host:"
+    # ADR-0010: ``<prefix><foreman>`` marks a foreman-owned (authored) issue —
+    # the GitHub-side truth of which foreman claims an issue; ``state.json``
+    # only caches it. A prefix, not a label: whoever authors the issue creates
+    # the label, so it is not a member of ``all`` or ``workflow_labels``.
+    foreman_prefix: str = "foreman:"
 
     @property
     def terminal(self) -> set[str]:
@@ -2816,6 +2822,11 @@ class OrchestratorConfig:
     test_slots: Annotated[SlotPoolConfig, HostWideOnly] = field(default_factory=SlotPoolConfig)
     # One dashboard per machine (ADR-0008): host-wide like the fleet supervisor.
     dashboard: Annotated[DashboardConfig, HostWideOnly] = field(default_factory=DashboardConfig)
+    # The foreman layer (ADR-0010): foremen live under fleet_dir()/foremen/,
+    # so its settings are fleet-wide — host-wide like the sections above.
+    foreman: Annotated[ForemanConfig, HostWideOnly, Check(check_role_chain)] = field(
+        default_factory=ForemanConfig
+    )
     post_mortem: PostMortemConfig = field(default_factory=PostMortemConfig)
     heartbeat: HeartbeatConfig = field(default_factory=HeartbeatConfig)
 

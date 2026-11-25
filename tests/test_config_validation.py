@@ -547,6 +547,7 @@ def test_host_wide_sections_are_derived_from_root_field_markers():
             "fleet_supervisor",
             "test_slots",
             "dashboard",
+            "foreman",
         }
     )
 
