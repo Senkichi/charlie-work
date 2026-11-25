@@ -8,8 +8,8 @@ on a PR's ``state["prs"][pr_number]`` entry:
 
 * ``review`` -- the new-dispatch placeholder write, immediately after (and
   sourced from) its own ``record_decision(..., archive_round=False)`` call.
-* ``record_review`` -- the reviewer-verdict writer, immediately after its own
-  ``record_decision(...)`` call.
+* ``verdict_rules.record_verdict`` -- the reviewer-verdict writer (issue #3103, moved
+  from ``record_review``), run right after the caller's own ``record_decision(...)`` call.
 * ``merge_path.apply_stages.carry_forward`` -- the carry-forward branch
   (extracted from ``merge_ready``), immediately after calling
   ``_update_approval_head`` (which itself calls ``record_decision``); and
@@ -59,18 +59,13 @@ _DECISION_KEYS = {"decision", "reviewed_head_sha", "decision_path"}
 _SANCTIONED_FUNCTIONS = frozenset(
     {
         "review",
-        "record_review",
         "_route_to_rework",
         "_update_approval_head",
         "_refresh_pr_decision_cache",
-        # Issue #1844: the local (no-remote) lane mirrors ``review`` /
-        # ``record_review`` -- ``_local_build_packet`` seeds the fresh-cycle
-        # "pending" decision fields from the same record_decision write the
-        # packet performs, and ``record_local_review`` ingests a verdict the
-        # same way ``record_review`` does (fresh record_decision call, never
-        # a stale re-read).
+        # Issue #1844: the local (no-remote) lane mirrors ``review`` --
+        # ``_local_build_packet`` seeds the fresh-cycle "pending" decision fields
+        # from the same record_decision write the packet performs.
         "_local_build_packet",
-        "record_local_review",
     }
 )
 
@@ -87,6 +82,12 @@ _SANCTIONED_MODULE_FUNCTIONS = frozenset(
     {
         ("merge_path/apply_stages.py", "carry_forward"),
         ("merge_path/apply_stages.py", "re_review"),
+        # Issue #3103: the PR-record merge of ``record_review`` (reviewer-verdict
+        # writer) and ``record_local_review`` moved here from those two functions.
+        # It stamps the decision fields from the
+        # verdict those two functions just persisted with a fresh ``record_decision``
+        # call (``verdict_recording.write_decision_round``), never a stale re-read.
+        ("verdict_rules.py", "record_verdict"),
     }
 )
 
