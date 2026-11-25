@@ -71,7 +71,7 @@ class SourceResult:
     rebuilt: bool  # source wiped and re-ingested from id 1
     error: str | None = None
     # kind -> row count, for every kind in this source's events table the rollup
-    # neither handles nor declares in KNOWN_IGNORED (issue #2269).
+    # neither handles, level-registers, nor lists in KNOWN_IGNORED (issues #2269, #3093).
     unclassified: dict[str, int] = field(default_factory=dict)
 
 

@@ -724,22 +724,6 @@ def _dispatch_failure_reason(result: SessionDispatchResult) -> str:
     return "dispatch failed"
 
 
-def _label_error_reason(label_error: dict[str, Any]) -> str:
-    """Format a persisted label_error dict into a short, human-readable reason."""
-    edge = label_error.get("edge", "unknown")
-    outcome = label_error.get("outcome", "unknown")
-    add_failures = label_error.get("add_failures") or []
-    remove_failures = label_error.get("remove_failures") or []
-    add_labels = [label for _issue, label in add_failures]
-    remove_labels = [label for _issue, label in remove_failures]
-    parts = [f"label transition '{edge}' {outcome}"]
-    if add_labels:
-        parts.append(f"add failures: {add_labels}")
-    if remove_labels:
-        parts.append(f"remove failures: {remove_labels}")
-    return "; ".join(parts)
-
-
 def _recent_dispatch_failed_attempts(
     entry: dict[str, Any], now: datetime, window_minutes: int
 ) -> list[str]:

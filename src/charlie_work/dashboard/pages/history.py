@@ -133,7 +133,7 @@ def _meta(views: list[HistoryView], range_key: str) -> str:
 
 def _unclassified_note(views: list[HistoryView]) -> str:
     """Coverage caveat naming the event kinds the rollup counted but has neither a
-    handler nor a known-ignored reason for (issue #2269): they dropped to no rows."""
+    handler, level-registry entry, nor known-ignored reason for (issues #2269, #3093): they dropped to no rows."""
     kinds = sorted({k for v in views for k in v.unclassified_kinds})
     if not kinds:
         return ""
