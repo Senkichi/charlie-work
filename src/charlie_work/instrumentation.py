@@ -888,6 +888,7 @@ def _row_to_event(row: sqlite3.Row) -> dict[str, Any]:
         _warn_unreadable_payload(row["kind"], row["ts"], raw_payload)
         payload = {}
     return {
+        "id": row["id"],
         "ts": row["ts"],
         "kind": row["kind"],
         "payload": payload,
@@ -965,6 +966,7 @@ def query_events(
     level: str | None = None,
     since: str | None = None,
     until: str | None = None,
+    after_id: int | None = None,
     limit: int | None = None,
 ) -> list[dict[str, Any]]:
     """Query events with structured filters against indexed columns.
@@ -982,7 +984,13 @@ def query_events(
         level: Filter by log level ('info', 'warning', 'error').
         since: ISO-8601 timestamp; only events at or after this time.
         until: ISO-8601 timestamp; only events at or before this time.
-        limit: Maximum number of events to return (most recent N).
+        after_id: Exact cursor; only events with ``id`` greater than this
+            row id. Unlike ``since`` (a timestamp filter), an id cursor can
+            neither repeat nor drop rows that share a timestamp.
+        limit: Maximum number of events to return. Without ``after_id``
+            this is the most recent N; with ``after_id`` it is the first
+            (oldest) N rows after the cursor, so a caller paging forward
+            visits each row exactly once.
 
     Returns:
         A list of event dicts, oldest first.
@@ -1016,12 +1024,21 @@ def query_events(
     if until is not None:
         conditions.append("ts <= ?")
         params.append(until)
+    if after_id is not None:
+        conditions.append("id > ?")
+        params.append(after_id)
 
     where_clause = " AND ".join(conditions) if conditions else "1=1"
-    sql = f"SELECT * FROM events WHERE {where_clause} ORDER BY id ASC"
-    if limit is not None:
+    if limit is not None and after_id is not None:
+        # Cursor paging: the first N rows after the cursor, oldest first —
+        # the next page resumes at the last returned row's id.
+        sql = f"SELECT * FROM events WHERE {where_clause} ORDER BY id ASC LIMIT ?"
+        params.append(limit)
+    elif limit is not None:
         sql = f"SELECT * FROM (SELECT * FROM events WHERE {where_clause} ORDER BY id DESC LIMIT ?) ORDER BY id ASC"
         params.append(limit)
+    else:
+        sql = f"SELECT * FROM events WHERE {where_clause} ORDER BY id ASC"
 
     try:
         cursor = conn.execute(sql, params)
@@ -1054,6 +1071,26 @@ def event_counts_by_kind(state_path: Path, *, since: str | None = None) -> dict[
     except sqlite3.Error as exc:
         logger.warning("Failed to get event counts: %s", exc)
         return {}
+
+
+def max_event_id(state_path: Path) -> int:
+    """Return the largest ``id`` in the ``events`` table, or 0.
+
+    A new ``after_id`` consumer starts its cursor here to mean "now":
+    ``query_events(after_id=max_event_id(path))`` then yields every event
+    written from that point on. Returns 0 for an empty table, a missing or
+    unreadable database (best-effort, never raises), so a cursor of 0 pages
+    the whole log from the first row.
+    """
+    conn = _get_db(state_path)
+    if conn is None:
+        return 0
+    try:
+        row = conn.execute("SELECT MAX(id) FROM events").fetchone()
+    except sqlite3.Error as exc:
+        logger.warning("Failed to read max event id: %s", exc)
+        return 0
+    return int(row[0]) if row is not None and row[0] is not None else 0
 
 
 def close_db(state_path: Path) -> None:
