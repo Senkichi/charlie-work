@@ -26,16 +26,21 @@ from _fakes_github import (
     FakeGitHub,
     FakeGitHubWithChecksAndAnnotations,
 )
+from charlie_work.adapters import SessionDispatchResult
 from charlie_work.config import (
     DevinConfig,
     OrchestratorConfig,
+    WatchdogConfig,
     WorkerRoleConfig,
 )
+from charlie_work.host.fakes import FakeWorkerLauncher
+from charlie_work.paths import runtime_paths
 from charlie_work.state import (
     load_state,
     save_state,
     state_lock,
 )
+from charlie_work.workflow import OrchestratorApp
 from charlie_work.write_gate import WriteGate
 
 
@@ -295,3 +300,69 @@ def _blocked_env_timestamps(n: int) -> list[str]:
         (datetime.now(UTC) - timedelta(minutes=i)).isoformat().replace("+00:00", "Z")
         for i in range(n)
     ]
+
+
+def _rework_launch_at_redispatch_cap_app(
+    tmp_path: Path, fake_host: Callable[..., Any], *, pid: int, process_start_time: float
+) -> tuple[OrchestratorApp, FakeWorkerLauncher]:
+    """A ``dispatch_rework`` fixture whose next launch succeeds and trips the cap.
+
+    Issue 123 is ``rework_requested`` with ``redispatch_at`` already at
+    ``max_auto_redispatch`` and no recorded ``reviewed_head_sha``, so the
+    pre-launch no-op check has nothing to compare and the launch goes ahead;
+    counting that launch puts the issue one over the cap. The record also
+    carries a previous dispatch epoch's Worker facts and prompt path, so a
+    test can tell this launch's values from leftovers. The scripted launcher
+    (installed as the ``worker_launch`` Host port) reports ``pid`` and
+    ``process_start_time`` for every request and logs the requests it saw.
+    """
+    config = OrchestratorConfig(
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "print('ok')")),
+        worker=WorkerRoleConfig(harness="command"),
+        watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+
+    now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+            "redispatch_at": [now_iso, now_iso],
+            "worker_pid": 11111,
+            "worker_process_start_time": 1.0,
+            "prompt_path": "previous-epoch/rework-prompt.md",
+        }
+        save_state(paths.state_file, state)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    (pr_dir / "rework-prompt.md").write_text("Fix the issues", encoding="utf-8")
+
+    def launched(_repo_root, _manifest, _results, settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter=settings.adapter,
+                ok=True,
+                pid=pid,
+                process_start_time=process_start_time,
+            )
+            for request in requests
+        ]
+
+    launcher = FakeWorkerLauncher([launched])
+    fake_host(worker_launch=launcher)
+    return OrchestratorApp(tmp_path, paths, config, ReworkGitHub()), launcher

@@ -1419,12 +1419,16 @@ def _dispatch_rework_impl(
                     # Escalate to human review
                     # Issue #783: rework dispatch redispatch cap is a
                     # process failure, not a judgment call -- mechanical.
+                    # Issue #3087: this launch succeeded, so its Worker is
+                    # live -- carry the built entry (process facts, branch,
+                    # prompt) onto the record. _escalate_issue re-asserts the
+                    # escalated status and reason over the entry's "dispatched".
                     state = _wf._escalate_issue(
                         state,
                         request.issue_number,
                         reason="redispatch_cap_exceeded",
                         reason_class="mechanical",
-                        issue_extra={"redispatch_at": redispatch_at},
+                        issue_extra={**entry, "redispatch_at": redispatch_at},
                     )
                     entry = state["issues"][str(request.issue_number)]
                     _wf.save_state(self.paths.state_file, state)
