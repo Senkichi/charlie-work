@@ -28,6 +28,7 @@ from charlie_work.checks import (
     summarize_checks,
     workflow_run_terminal_by_id,
 )
+from charlie_work.carry_forward_signature import stored_signature_matches
 from charlie_work.ci_backlog import defer_infra_rerun_for_backlog, infra_rerun_backlog
 import charlie_work.infra_rerun_refusal as _refusal
 from charlie_work.janitor import (
@@ -114,6 +115,7 @@ def _check_carry_forward(self, pr_number: int, decision: dict[str, Any]) -> Carr
         # computes a patch-id) — nothing to compare against.
         return CarryForwardCheck(None, live_patch_id, live_signature)
 
+    signature_matches = stored_signature_matches(decision, live_signature)
     if live_patch_id and live_patch_id == reviewed_patch_id:
         # Issue #1187: ``git patch-id --stable`` strips leading
         # whitespace from ``+``/``-`` content lines, so two diffs that
@@ -125,16 +127,12 @@ def _check_carry_forward(self, pr_number: int, decision: dict[str, Any]) -> Carr
         # verbatim) when one was recorded. The tier-2 binary gate does
         # NOT apply here — patch-id already proved binary content
         # identity, and tier-2 is consulted only for its text-line view.
-        reviewed_changed_lines = decision.get("reviewed_changed_lines")
-        reviewed_changed_files = decision.get("reviewed_changed_files")
-        if reviewed_changed_lines is None or reviewed_changed_files is None:
+        if signature_matches is None:
             # Decision predates tier-2 (no signature recorded) —
             # patch-id is the only available signal; preserve #412's
             # original carry-forward behavior for legacy decisions.
             return CarryForwardCheck("patch-id", live_patch_id, live_signature)
-        lines_match = tuple(reviewed_changed_lines) == live_signature.changed_lines
-        files_match = frozenset(reviewed_changed_files) == live_signature.changed_files
-        if lines_match and files_match:
+        if signature_matches:
             return CarryForwardCheck("patch-id", live_patch_id, live_signature)
         # Patch-id matched but tier-2 signatures differ — a
         # whitespace-only change that patch-id collapsed (issue #1187).
@@ -142,9 +140,7 @@ def _check_carry_forward(self, pr_number: int, decision: dict[str, Any]) -> Carr
         # verdict across a semantically different, unreviewed head.
         return CarryForwardCheck(None, live_patch_id, live_signature)
 
-    reviewed_changed_lines = decision.get("reviewed_changed_lines")
-    reviewed_changed_files = decision.get("reviewed_changed_files")
-    if reviewed_changed_lines is None or reviewed_changed_files is None:
+    if signature_matches is None:
         # Decision predates tier-2 (no signature recorded) — cannot
         # establish content identity; fail closed to stale.
         return CarryForwardCheck(None, live_patch_id, live_signature)
@@ -155,9 +151,7 @@ def _check_carry_forward(self, pr_number: int, decision: dict[str, Any]) -> Carr
         # never observed (issue #414 review follow-up).
         return CarryForwardCheck(None, live_patch_id, live_signature)
 
-    lines_match = tuple(reviewed_changed_lines) == live_signature.changed_lines
-    files_match = frozenset(reviewed_changed_files) == live_signature.changed_files
-    if lines_match and files_match:
+    if signature_matches:
         return CarryForwardCheck("line-content", live_patch_id, live_signature)
 
     return CarryForwardCheck(None, live_patch_id, live_signature)

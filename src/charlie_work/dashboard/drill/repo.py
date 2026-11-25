@@ -7,7 +7,7 @@ from dataclasses import replace
 from datetime import tzinfo
 from pathlib import Path
 
-from ..metrics_flow import drop_reconcile_backfill
+from ..metrics_flow import drop_reconcile_backfill, first_merges, pr_links_max_issue
 from ..now_types import NowModel
 from ..rollup_common import _int
 from .types import (
@@ -53,31 +53,15 @@ def _passes(db: sqlite3.Connection, slug: str, limit: int, tz: tzinfo | None):
 def merges_for(db: sqlite3.Connection, slug: str, limit: int, tz: tzinfo | None):
     """Newest merges, each issue (or PR) once at its first signal, as History's Merges counts.
 
-    The first-signal dedup runs in SQL: a PR-only row shares its linked issue's key
-    (``'i' || issue``) and a PR with no linked issue keeps its own (``'p' || pr``), so
-    the fetch returns one row per merged item — not every milestone row the repo has.
-    The reconcile-backfill drop still sees all firsts (its burst count is per repo-hour),
-    and only after it does ``limit`` apply.
+    The dedup is ``metrics_flow.first_merges``, the one History and Now use. The
+    reconcile-backfill drop sees all firsts (its burst count is per repo-hour), and
+    only after it does ``limit`` apply.
     """
-    rows = db.execute(
-        "WITH linked AS ("
-        " SELECT pr, MAX(issue) AS issue FROM issue_milestones"
-        " WHERE source = ? AND issue IS NOT NULL AND pr IS NOT NULL GROUP BY pr"
-        "), firsts AS ("
-        " SELECT m.ts, m.issue, m.pr, m.event_kind, m.src_id, m.seq,"
-        " ROW_NUMBER() OVER ("
-        "  PARTITION BY COALESCE('i' || m.issue, 'i' || linked.issue, 'p' || m.pr)"
-        "  ORDER BY m.ts, m.src_id, m.seq) AS rn"
-        " FROM issue_milestones m LEFT JOIN linked ON linked.pr = m.pr"
-        " WHERE m.source = ? AND m.milestone IN ('merged', 'done'))"
-        " SELECT ts, issue, pr, event_kind, src_id, seq FROM firsts"
-        " WHERE rn = 1 ORDER BY ts, src_id, seq",
-        (slug, slug),
-    ).fetchall()
-    kept = set(drop_reconcile_backfill([(ts, slug, kind) for ts, _, _, kind, _, _ in rows]))
+    rows = first_merges(db, pr_links_max_issue(db, slug), source=slug)
+    kept = set(drop_reconcile_backfill([(ts, slug, kind) for ts, _, _, _, kind in rows]))
     out = [
         MergeRow(ts, local_text(ts, tz), issue, pr, kind, kind == "reconcile")
-        for ts, issue, pr, kind, _sid, _seq in rows
+        for ts, _, issue, pr, kind in rows
         if (ts, slug, kind) in kept
     ]
     return tuple(reversed(out))[:limit]
