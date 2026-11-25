@@ -88,7 +88,7 @@ def _load(db: sqlite3.Connection, q: MetricQuery) -> list[_Ms]:
     return out
 
 
-def _scan(
+def scan_intervals(
     events: Sequence[tuple[str, str]],
     starts: Sequence[str],
     ends: Sequence[str],
@@ -111,6 +111,17 @@ def _scan(
             out.append((opened, ts))
             opened = None
     return out, opened
+
+
+# Lead time span: (start milestones, end milestones) per path. The one place the names live.
+LEAD_APPROX = (("dispatched",), ("merged",))
+LEAD_EXACT = (("ready", "ready_observed"), ("done",))
+
+
+def lead_span(events: Sequence[tuple[str, str]], *, exact: bool) -> tuple[str, str] | None:
+    """The first closed first-signal -> done ``(start_ts, end_ts)``, or None (parked time counts)."""
+    starts, ends = LEAD_EXACT if exact else LEAD_APPROX
+    return next(iter(scan_intervals(events, starts, ends, restart=False)[0]), None)
 
 
 def _hours(a: str, b: str) -> float:
@@ -142,12 +153,13 @@ def lead_time(db: sqlite3.Connection, q: MetricQuery) -> Series:
     ms = _load(db, q)
     samples: list[Sample] = []
     for (source, _), evs in _grouped(ms, False).items():
-        for start, end in _scan(evs, ("dispatched",), ("merged",), restart=False)[0][:1]:
+        if span := lead_span(evs, exact=False):
+            start, end = span
             if cut is None or end < cut:
                 samples.append((end, source, _hours(start, end)))
     for (source, _), evs in _grouped(ms, True).items():
-        for start, end in _scan(evs, ("ready", "ready_observed"), ("done",), restart=False)[0][:1]:
-            samples.append((end, source, _hours(start, end)))
+        if span := lead_span(evs, exact=True):
+            samples.append((span[1], source, _hours(*span)))
     spec = SeriesSpec(
         "lead_time", "Lead time", "hours", "duration", _LIFECYCLE_KINDS, any_kind=True
     )
@@ -166,14 +178,14 @@ def stage_time(db: sqlite3.Connection, q: MetricQuery, stage: str) -> Series:
     # issue has left the stage whenever it records any other milestone.
     ends = tuple({m.name for m in ms if not m.exact} - set(starts) - {"ready_observed"})
     for (source, _), evs in _grouped(ms, False).items():
-        spans, _ = _scan(evs, starts, ends)
+        spans, _ = scan_intervals(evs, starts, ends)
         if spans and (cut is None or spans[-1][1] < cut):
             samples.append((spans[-1][1], source, sum(_hours(a, b) for a, b in spans)))
     exact_names = {m.name for m in ms if m.exact} - {stage, "ready_observed"}
     for (source, _), evs in _grouped(ms, True).items():
         # lifecycle_transition rows name the stage entered, so a repeated start is a
         # data anomaly rather than a re-dispatch: keep the pre-#2473 first-start rule.
-        spans, _ = _scan(evs, (stage,), tuple(exact_names), restart=False)
+        spans, _ = scan_intervals(evs, (stage,), tuple(exact_names), restart=False)
         if spans:
             samples.append((spans[-1][1], source, sum(_hours(a, b) for a, b in spans)))
     spec = SeriesSpec(
@@ -192,6 +204,47 @@ MERGE_KINDS = (
 )
 
 
+def first_merges(
+    db: sqlite3.Connection, *, end_iso: str | None = None, source: str | None = None
+) -> list[tuple[str, str, int | None, int | None, str]]:
+    """Each merged issue (or PR with no linked issue) once, at its first merged/done signal.
+
+    Rows are ``(ts, source, issue, pr, evidence kind)`` in signal order. A PR-only row is
+    attached to its issue through any row naming both (as ``_load`` does). ``end_iso``
+    bounds the signals (exclusive), ``source`` restricts to one repo. This is the one
+    first-merge dedup: History, the repo drill-down and Now all read it.
+    """
+    where, args = "", []
+    if end_iso is not None:
+        where += " AND ts < ?"
+        args.append(end_iso)
+    if source is not None:
+        where += " AND source = ?"
+        args.append(source)
+    link = {
+        (s, pr): i
+        for s, pr, i in db.execute(
+            "SELECT source, pr, MAX(issue) FROM issue_milestones"
+            f" WHERE issue IS NOT NULL AND pr IS NOT NULL{where} GROUP BY source, pr",
+            args,
+        )
+    }
+    rows = db.execute(
+        "SELECT ts, source, issue, pr, event_kind FROM issue_milestones"
+        f" WHERE milestone IN ('merged', 'done'){where} ORDER BY ts, src_id, seq",
+        args,
+    ).fetchall()
+    seen: set = set()
+    firsts = []
+    for ts, src, issue, pr, kind in rows:
+        linked = issue if issue is not None else link.get((src, pr))
+        key = (src, linked) if linked is not None else (src, "pr", pr)
+        if key not in seen:
+            seen.add(key)
+            firsts.append((ts, src, issue, pr, kind))  # the row's own issue, not the link's
+    return firsts
+
+
 def merges_per_day(db: sqlite3.Connection, q: MetricQuery) -> Series:
     """Issues reaching Done per bucket, each counted once at its first Done signal.
 
@@ -200,27 +253,7 @@ def merges_per_day(db: sqlite3.Connection, q: MetricQuery) -> Series:
     its issue through any row naming both (as ``_load`` does), so one merge reported by
     several kinds counts once per ``(repo, issue or PR)``.
     """
-    link = {
-        (s, pr): i
-        for s, i, pr in db.execute(
-            "SELECT source, issue, pr FROM issue_milestones"
-            " WHERE issue IS NOT NULL AND pr IS NOT NULL AND ts < ?",
-            (q.end_iso,),
-        )
-    }
-    rows = db.execute(
-        "SELECT ts, source, issue, pr, event_kind FROM issue_milestones"
-        " WHERE milestone IN ('merged', 'done') AND ts < ? ORDER BY ts, src_id, seq",
-        (q.end_iso,),
-    ).fetchall()
-    seen: set = set()
-    firsts: list[tuple[str, str, str]] = []  # (ts, source, evidence kind) per merged issue
-    for ts, source, issue, pr, kind in rows:
-        issue = issue if issue is not None else link.get((source, pr))
-        key = (source, issue) if issue is not None else (source, "pr", pr)
-        if key not in seen:
-            seen.add(key)
-            firsts.append((ts, source, kind))
+    firsts = [(ts, source, kind) for ts, source, _, _, kind in first_merges(db, end_iso=q.end_iso)]
     firsts = drop_reconcile_backfill(firsts)
     samples: list[Sample] = [(ts, source, 1.0) for ts, source, _ in firsts]
     # A reconcile-detected merge is stamped when the reconciler noticed it, not when it happened.

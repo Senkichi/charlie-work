@@ -1,7 +1,7 @@
 """Per-item stage and lead time from one issue's milestones (spec: accumulated across visits).
 
 Same stage definitions and scan as the History metrics (``metrics_flow.APPROX_STAGES`` and
-``metrics_flow._scan``), with one addition the metric cannot make: a still-open visit is
+``metrics_flow.scan_intervals``), with one addition the metric cannot make: a still-open visit is
 counted up to ``now`` and flagged, because the drill-down is about one item that may be in a
 stage right now. An item is exact only when it has ``lifecycle_transition`` rows
 (issue #2226); until then every time here is reconstructed and flagged ``approx``.
@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import datetime
 
-from ..metrics_flow import APPROX_STAGES, STAGES, _scan
+from ..metrics_flow import APPROX_STAGES, STAGES, lead_span, scan_intervals
 from ..timeutil import parse_ts
 from .types import StageSpan, StageTime
 
@@ -39,7 +39,7 @@ def stage_spans(milestones: Sequence[Milestone], now: datetime) -> tuple[StageSp
         # approx path restarts on a repeated start (a re-dispatch); the exact path
         # keeps the pre-#2473 first-start rule for lifecycle_transition rows.
         starts = (stage,) if exact else APPROX_STAGES[stage]
-        spans, opened = _scan(evs, starts, tuple(names - set(starts)), restart=not exact)
+        spans, opened = scan_intervals(evs, starts, tuple(names - set(starts)), restart=not exact)
         out += [StageSpan(stage, a, b, _secs(a, b), False) for a, b in spans]
         if opened is not None:
             end = now.isoformat()
@@ -60,14 +60,6 @@ def stage_times(
         if mine:
             total = sum(s.seconds for s in mine)
             out.append(StageTime(stage, total, len(mine), any(s.open_now for s in mine)))
-    lead_starts, lead_ends = (
-        (("ready", "ready_observed"), ("done",))
-        if exact
-        else (
-            ("dispatched",),
-            ("merged",),
-        )
-    )
-    lead_spans, _ = _scan(evs, lead_starts, lead_ends, restart=False)
-    lead = _secs(*lead_spans[0]) if lead_spans else None
+    span = lead_span(evs, exact=exact)
+    lead = _secs(*span) if span else None
     return tuple(out), lead, not exact

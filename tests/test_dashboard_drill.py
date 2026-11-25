@@ -14,7 +14,9 @@ from charlie_work.config import LabelConfig
 from charlie_work.dashboard import drill, rollup, sources
 from charlie_work.dashboard.drill.loop_pass import MAX_PASS_EVENTS, payload_preview
 from charlie_work.dashboard.drill.repo import merges_for
-from charlie_work.dashboard.metrics_flow import BACKFILL_BURST
+from charlie_work.dashboard.metrics_base import MetricQuery
+from charlie_work.dashboard.metrics_flow import BACKFILL_BURST, merges_per_day
+from charlie_work.dashboard.now_read_events import merged_24h
 from charlie_work.dashboard.now_model import build_now_model
 from charlie_work.dashboard.now_types import RepoRead, SourcesRead
 from charlie_work.dashboard.sources import SnapshotRead
@@ -344,6 +346,42 @@ def test_merges_for_applies_limit_after_the_backfill_drop(fleet) -> None:
     # newest-first with limit=1: if the drop ran after the limit the only returned row
     # would be a burst reconcile, leaving nothing
     assert [(m.issue, m.pr, m.evidence) for m in got] == [(7, 8, "merge_succeeded")]
+
+
+def test_history_drill_down_and_now_agree_on_a_repos_merges(fleet) -> None:
+    """One dedup: History's merge count, the drill-down's list and Now's 24h count match."""
+    fleet.emit(  # merge reported by two kinds: one issue, one merge
+        fleet.beta, "2026-10-01T06:00:00Z", "merge_succeeded", {"issue_number": 1, "pr_number": 10}
+    )
+    fleet.emit(
+        fleet.beta,
+        "2026-10-01T06:30:00Z",
+        "reconcile",
+        {"kind": "merged_outside_orchestrator", "issue_number": 1, "pr_number": 10},
+    )
+    fleet.emit(  # PR-only row later linked to its issue by a second row
+        fleet.beta, "2026-10-01T07:00:00Z", "finalize_externally_merged", {"pr_numbers": [20]}
+    )
+    fleet.emit(
+        fleet.beta,
+        "2026-10-01T07:10:00Z",
+        "reconcile",
+        {"kind": "merged_outside_orchestrator", "issue_number": 2, "pr_number": 20},
+    )
+    fleet.emit(  # PR with no linked issue
+        fleet.beta, "2026-10-01T08:00:00Z", "finalize_externally_merged", {"pr_numbers": [30]}
+    )
+    assert rollup.run_rollup(fleet.sources(), NOW).errors == ()
+    db = fleet.db()
+    q = MetricQuery(NOW - timedelta(hours=24), NOW, timedelta(hours=24))
+    history = merges_per_day(db, q)
+    beta_total = sum(v for _, v in history.per_repo[BETA])
+    listed = merges_for(db, BETA, 20, TZ)
+    now_count = merged_24h(NOW, str(fleet.dir), 10**9)
+    assert len(listed) == 3
+    assert beta_total == len(listed)
+    fleet_wide = sum(v for _, v in history.points)
+    assert now_count == fleet_wide
 
 
 # --- loop pass ------------------------------------------------------------------------------
