@@ -224,9 +224,9 @@ def test_every_emitted_kind_is_rollup_classified() -> None:
 
     unclassified = sorted(k for k in kinds if not is_classified(k))
     assert not unclassified, (
-        "emitted event kind(s) the dashboard rollup neither handles nor declares in "
-        "KNOWN_IGNORED -- add a derive handler or a one-line ignore reason in "
-        "dashboard/rollup_derive.py: " + ", ".join(unclassified)
+        "emitted event kind(s) the dashboard rollup classifies as nothing -- register "
+        "a level file in event_levels/, add a derive handler, or add a one-line "
+        "KNOWN_IGNORED reason in dashboard/rollup_derive.py: " + ", ".join(unclassified)
     )
     assert all(reason.strip() for reason in KNOWN_IGNORED.values()), (
         "every KNOWN_IGNORED entry needs a non-empty one-line reason"

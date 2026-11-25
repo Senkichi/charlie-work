@@ -20,6 +20,7 @@ from _dashboard_rollup_fixtures import (  # noqa: F401  (fleet is a pytest fixtu
 )
 
 from charlie_work import instrumentation
+from charlie_work.instrumentation import has_level_entry
 from charlie_work.dashboard import history_data, metrics_coverage, rollup, sources
 from charlie_work.dashboard.rollup_derive import (
     HANDLERS,
@@ -435,7 +436,7 @@ def test_sweep_expansion_only_wraps_ref_only_handlers() -> None:
 
 
 def test_unhandled_kind_is_counted_unclassified_per_source(fleet) -> None:
-    """#2269: a kind with neither a handler nor a KNOWN_IGNORED entry must surface.
+    """#2269: a kind with no handler, level file, or KNOWN_IGNORED entry must surface.
 
     Emitted through the real ``log_event`` (the fixture's writer); before this
     change it produced no fact rows and no signal. Now the rollup counts it per
@@ -447,7 +448,7 @@ def test_unhandled_kind_is_counted_unclassified_per_source(fleet) -> None:
     assert result.errors == ()
     by = {s.source: s for s in result.sources}
     assert by[ALPHA].unclassified == {"brand_new_unclassified_kind": 2}
-    # known-ignored (supervisor_started, unauthorized_merge_queue_sync_covered) and
+    # ignored (supervisor_started, unauthorized_merge_queue_sync_covered: level files) and
     # handled kinds never land in the count
     assert by[BETA].unclassified == {}
     assert by["fleet"].unclassified == {}
@@ -591,7 +592,8 @@ def test_ignored_sweep_variant_inherits_its_sibling_classification() -> None:
         "salvage_push_failed",
         "orphaned_worker_recovered",
     ):
-        assert base in KNOWN_IGNORED
+        assert base not in HANDLERS
+        assert has_level_entry(base)  # ignored by default (issue #3093)
         assert base + "_sweep" not in KNOWN_IGNORED
         assert is_classified(base + "_sweep")
         assert base + "_sweep" not in HANDLERS  # ignored, not silently handled
@@ -645,7 +647,9 @@ def test_orchestrator_source_backfills_self_deploy_history(fleet, tmp_path) -> N
 
     assert result.errors == ()
     by = {s.source: s for s in result.sources}
-    assert by["orchestrator"].ingested == 2  # starved is KNOWN_IGNORED, not a fact
+    assert (
+        by["orchestrator"].ingested == 2
+    )  # starved has a level file and no handler: ignored, not a fact
     assert _all(
         fleet.db(),
         "SELECT source, ok, changed, from_sha, to_sha, error FROM deploys ORDER BY ts",
