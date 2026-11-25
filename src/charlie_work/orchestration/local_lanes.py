@@ -106,7 +106,6 @@ _LOCAL_DIFFERENCES = verdict_recording.VerdictDifferences(
     ),
     stringify_required_changes=True,
     local_decision_fields=True,
-    comment_repeats_derived_summary=True,
 )
 
 # The merge gate itself lives in ``orchestration/local_merge_gate.py``
@@ -1305,7 +1304,6 @@ def record_local_review(
             provenance_caveat=provenance_caveat,
             required_changes=effective_required_changes,
             findings_channel=findings_channel,
-            differences=_LOCAL_DIFFERENCES,
         )
         if comment_error is not None:
             label_error = verdict_recording.with_comment_error(label_error, comment_error)
