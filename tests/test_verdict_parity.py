@@ -39,6 +39,9 @@ from typing import Any
 
 import pytest
 
+from charlie_work.local_issues import LocalFileGitHub
+from charlie_work.local_lane import local_pr_dict
+
 from _verdict_parity_driver import MISSING, Diff, Scenario, _diffs, run_both
 from _verdict_parity_table import DECLARED_DIFFERENCES, SCENARIOS
 
@@ -77,7 +80,8 @@ _REQUIRED_SCENARIOS = {
     "already_closed",
 }
 
-# The issue's table, verbatim: (difference, reason).
+# The issue's table, verbatim: (difference, reason). Exception: the `reviewed_body_sha256` row's
+# reason differs by design (issue #3105 kept the difference and replaced "drift, tracked separately").
 _ISSUE_ROWS = (
     (
         "No Rescue tier on the Local path",
@@ -90,8 +94,17 @@ _ISSUE_ROWS = (
         "Local-only decision fields (`human_call_reclassified_from`, `human_call_marker`, `local: True`)",
         "local bookkeeping",
     ),
-    ("Local verdict comment repeats the summary", "drift, tracked separately"),
-    ("`reviewed_body_sha256` not recorded locally", "drift, tracked separately"),
+    (
+        "`reviewed_body_sha256` not recorded locally",
+        (
+            "the Local path has no PR body to hash (its packet `pr.json` and `local_pr_dict` "
+            "carry no `body`; `LocalFileGitHub.pr_view` returns `{}` and `pr_list` returns "
+            '`[]`), and every comparison of the stored hash requires `"body" in pr`, so a '
+            "recorded hash could never be compared. `_body_rework_escape_warning` does "
+            "execute for a Local path record in the mechanical de-escalation sweep, but with "
+            "`pr == {}` it fails closed; `_route_to_rework` only copies the stored value"
+        ),
+    ),
     ("Local lifecycle transitions omit the record number", "drift, tracked separately"),
 )
 
@@ -147,6 +160,18 @@ def test_declared_differences_start_with_the_issues_eight_rows_verbatim() -> Non
     assert [row.reason for row in DECLARED_DIFFERENCES[len(_ISSUE_ROWS) :]] == ["undecided"] * (
         len(DECLARED_DIFFERENCES) - len(_ISSUE_ROWS)
     )
+
+
+def test_local_path_has_no_body_to_hash_so_no_reviewed_body_sha256(tmp_path) -> None:
+    """Pins the reason on the `reviewed_body_sha256` declared difference: if the Local path
+    ever gains a PR body, this fails and the difference must be revisited (issue #3105)."""
+    gh = LocalFileGitHub(repo_root=tmp_path, issues_dir=tmp_path)
+    assert gh.pr_view(1) == {}
+    assert gh.pr_list() == []
+    assert "body" not in local_pr_dict({"number": 1, "branch": "b", "headRefOid": "0" * 40})
+    local = _outcomes(_scenario("approve"))[1]
+    assert local.get("decision_file.reviewed_body_sha256", MISSING) is MISSING
+    assert local.get("pr_record.reviewed_body_sha256", MISSING) is MISSING
 
 
 def test_patch_id_follows_the_pinned_head_not_the_packet() -> None:
