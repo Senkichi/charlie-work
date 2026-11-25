@@ -300,7 +300,9 @@ class _FileFacts(NamedTuple):
     outside a ``def pr_create`` body. ``has_wrapper_call`` -- a
     ``create_pr_with_retry(`` call anywhere in the file (cw#1273).
     ``uses_validator`` -- the file imports and calls
-    ``validate_closing_reference``.
+    ``validate_closing_reference``; only computed when ``has_wrapper_call``
+    is true and left False otherwise, because the validator guard below
+    only inspects wrapper consumers.
     """
 
     has_raw_call: bool
@@ -333,9 +335,9 @@ def _call_site_facts(tree: ast.AST) -> tuple[bool, bool]:
     still counts, matching the whole-tree reads the original helpers made.
     Alias targets and called names are collected in the same DFS and joined
     after the walk, which keeps the four separate whole-tree ``ast.walk``
-    passes (alias collection, the def-scope id-set over a materialized node
-    list, and the wrapper scan) the original helpers made per matched file
-    down to one.
+    passes (alias collection, the ``def pr_create`` skip-set walk, the
+    materialized outside-definition node list, and the wrapper scan) the
+    original helpers made per matched file down to one.
     """
     aliases: set[str] = set()
     name_calls: set[str] = set()
@@ -384,10 +386,9 @@ def _call_site_facts(tree: ast.AST) -> tuple[bool, bool]:
             if isinstance(func, ast.Attribute) and func.attr == "pr_create":
                 raw_call = True
             elif isinstance(func, ast.Name):
+                name_calls.add(func.id)
                 if func.id == "create_pr_with_retry":
                     wrapper_call = True
-                else:
-                    name_calls.add(func.id)
         stack.extend(ast.iter_child_nodes(node))
 
     return raw_call or bool(name_calls & aliases), wrapper_call
@@ -415,8 +416,13 @@ def _imports_and_uses_validator(tree: ast.AST) -> bool:
 
 
 @pytest.fixture(scope="module")
-def pr_create_call_sites() -> dict[str, _FileFacts]:
+def pr_create_call_sites() -> dict[Path, _FileFacts]:
     """The one per-module scan of ``_SRC_ROOT`` both AC guards share.
+
+    Keys are paths relative to ``_SRC_ROOT``, not basenames: two same-named
+    files in different packages (``__init__.py``, ``config.py``,
+    ``decide.py``) can never overwrite each other and mask a call site.
+    The guards below still exempt and report by basename, as before.
 
     rglob, not glob: a call site added under a subpackage in the future must
     not be silently exempted by scanning only the top-level directory.
@@ -436,7 +442,7 @@ def pr_create_call_sites() -> dict[str, _FileFacts]:
     ``setup`` -- so neither test's ``call`` measures it (the #3039 remedy
     shape).
     """
-    facts: dict[str, _FileFacts] = {}
+    facts: dict[Path, _FileFacts] = {}
     for path in source_files(_SRC_ROOT):
         text = source_text(path)
         if "pr_create" not in text and "create_pr_with_retry" not in text:
@@ -444,12 +450,12 @@ def pr_create_call_sites() -> dict[str, _FileFacts]:
         tree = parsed(path)
         raw_call, wrapper_call = _call_site_facts(tree)
         uses_validator = _imports_and_uses_validator(tree) if wrapper_call else False
-        facts[path.name] = _FileFacts(raw_call, wrapper_call, uses_validator)
+        facts[path.relative_to(_SRC_ROOT)] = _FileFacts(raw_call, wrapper_call, uses_validator)
     return facts
 
 
 def test_every_pr_create_call_site_routes_through_the_validator(
-    pr_create_call_sites: dict[str, _FileFacts],
+    pr_create_call_sites: dict[Path, _FileFacts],
 ) -> None:
     offenders: list[str] = []
     scanned_with_call_site: list[str] = []
@@ -463,12 +469,12 @@ def test_every_pr_create_call_site_routes_through_the_validator(
     # wrapper, not gh.pr_create directly) and instead flag pr_create_retry.py
     # itself -- a module that forwards an already-built body and has no
     # closing-ref concern of its own.
-    for name, facts in pr_create_call_sites.items():
+    for rel, facts in pr_create_call_sites.items():
         if not facts.has_wrapper_call:
             continue
-        scanned_with_call_site.append(name)
+        scanned_with_call_site.append(rel.name)
         if not facts.uses_validator:
-            offenders.append(name)
+            offenders.append(rel.name)
 
     # Positive control: this scan must actually find the two known call
     # sites (dead_worker_sweep/effects_pr.py, reconcile_salvage.py) or the
@@ -498,7 +504,7 @@ def test_every_pr_create_call_site_routes_through_the_validator(
 
 
 def test_every_pr_create_call_site_routes_through_the_retry_wrapper(
-    pr_create_call_sites: dict[str, _FileFacts],
+    pr_create_call_sites: dict[Path, _FileFacts],
 ) -> None:
     # pr_create_retry.py's own body is the one legitimate place a raw
     # `.pr_create(` call may live -- it *is* the routing target every other
@@ -506,13 +512,23 @@ def test_every_pr_create_call_site_routes_through_the_retry_wrapper(
     # itself (inside github.py) is excluded by `_call_site_facts` rather
     # than flagged as a call site of itself.
     bypass_offenders = [
-        name
-        for name, facts in pr_create_call_sites.items()
-        if name != "pr_create_retry.py" and facts.has_raw_call
+        rel.name
+        for rel, facts in pr_create_call_sites.items()
+        if rel.name != "pr_create_retry.py" and facts.has_raw_call
     ]
     wrapper_consumers = [
-        name for name, facts in pr_create_call_sites.items() if facts.has_wrapper_call
+        rel.name for rel, facts in pr_create_call_sites.items() if facts.has_wrapper_call
     ]
+
+    # Positive control for the raw-call detector itself: pr_create_retry.py
+    # must report has_raw_call (its `gh.pr_create(` sits at
+    # pr_create_retry.py:358), or a detector that always returned False
+    # would leave bypass_offenders empty and pass vacuously below.
+    retry_facts = next(
+        (f for rel, f in pr_create_call_sites.items() if rel.name == "pr_create_retry.py"),
+        None,
+    )
+    assert retry_facts is not None and retry_facts.has_raw_call
 
     # Positive control: the scan must actually find real wrapper usage, or
     # an empty `bypass_offenders` below would be indistinguishable from
