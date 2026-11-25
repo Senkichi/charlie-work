@@ -459,7 +459,7 @@ def _rescue_when(diff: Diff) -> bool:
 
 
 DECLARED_DIFFERENCES: tuple[DeclaredDifference, ...] = (
-    # --- the issue's table rows (seven remain): difference and reason exactly as its table gives them ---
+    # --- the issue's table rows (seven remain): difference and reason as its table gives them, except the two rows whose reason differs by design (issues #3105, #3106) ---
     DeclaredDifference(
         "No Rescue tier on the Local path",
         "stated in a comment in `record_local_review`; at the cap a local record escalates directly",
@@ -520,7 +520,13 @@ DECLARED_DIFFERENCES: tuple[DeclaredDifference, ...] = (
     ),
     DeclaredDifference(
         "Local lifecycle transitions omit the record number",
-        "drift, tracked separately",
+        (
+            "A Local path record's number is its local issue file's number, not a GitHub PR "
+            "number, and the dashboard links milestones to an item by (source, pr) alone. "
+            "`lifecycle_transition` rows are the exact Stage time source, so in an events.db "
+            "that also holds PR path history a same-numbered PR's drill-down would absorb the "
+            "Local issue's stages; the rows are already complete keyed by issue number."
+        ),
         ("events.lifecycle_transition#0.payload.pr_number",),
         lambda diff: diff.remote == 7 and diff.local in (MISSING, None),
     ),
