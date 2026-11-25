@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sys
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -136,8 +137,14 @@ def _launch(
     failure_kind: str | None = None,
     pid: int | None = None,
     worktree_path: str | None = None,
+    process_start_time: float | None = None,
+    during: Callable[[], None] | None = None,
 ) -> None:
+    """Script the launch; ``during`` runs between the claim and the outcome lock."""
+
     def _fake(_repo_root, _manifest, _results, _settings, requests):
+        if during is not None:
+            during()
         return [
             SessionDispatchResult(
                 issue_number=r.issue_number,
@@ -149,6 +156,7 @@ def _launch(
                 error=None if ok else _FOREIGN_WRITER_ERROR,
                 failure_kind=failure_kind,
                 pid=pid,
+                process_start_time=process_start_time,
                 worktree_path=worktree_path,
             )
             for r in requests
@@ -190,3 +198,17 @@ def _marker(app: OrchestratorApp, tmp_path: Path) -> Path:
     }
     (wt_path / WRITER_MARKER_FILENAME).write_text(json.dumps(marker), encoding="utf-8")
     return wt_path
+
+
+def _amend_state(
+    app: OrchestratorApp, edit: Callable[[dict[str, Any]], None]
+) -> Callable[[], None]:
+    """A ``during=`` callback that edits the stored state while the launch is in flight."""
+
+    def _edit() -> None:
+        with state_lock(app.paths.state_file):
+            state = load_state(app.paths.state_file)
+            edit(state)
+            save_state(app.paths.state_file, state)
+
+    return _edit

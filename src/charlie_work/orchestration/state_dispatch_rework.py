@@ -26,7 +26,6 @@ from charlie_work.worktree import worktree_ahead_of_sha
 import charlie_work.superseded_worker_reap as superseded_worker_reap
 import charlie_work.workflow as _wf
 from charlie_work.command_result import CommandResult
-from charlie_work.worker_pid_stamp import stamp_worker_process
 from charlie_work.worker_launch_gate import (
     REASON_PROVIDER_THROTTLED,
     FleetLaunchLock,
@@ -1369,29 +1368,33 @@ def _dispatch_rework_impl(
         for request in session_requests:
             full_issue = full_issues[request.issue_number]
             ok = request.issue_number in successful_issue_numbers
-            entry = {
-                **state["issues"].get(str(request.issue_number), {}),
-                "number": request.issue_number,
-                "title": full_issue.get("title"),
-                "url": full_issue.get("url"),
-                "branch_name": request.branch_name,
-                "prompt_path": str(request.prompt_path),
-                # On failure, restore to rework_requested so the issue can be retried
-                # in the next pass (issue #116). On success, mark as dispatched.
-                "status": "dispatched" if ok else "rework_requested",
-                "dispatched_at": _wf.utc_now() if ok else None,
-            }
-            entry.pop("dispatch_pending_at", None)
-            entry.pop("label_error", None)
-            # A successful dispatch supersedes any previous orphan flag.
+            entry = worker_launch_outcome.launch_base_entry(
+                state["issues"].get(str(request.issue_number), {}),
+                issue_number=request.issue_number,
+                title=full_issue.get("title"),
+                url=full_issue.get("url"),
+                branch_name=request.branch_name,
+                prompt_path=request.prompt_path,
+            )
             if ok:
-                entry.pop("orphan_flagged_at", None)
-                entry.pop("orphan_drift_fingerprint", None)
-                entry.pop("orphan_drift_at", None)
-                # Issue #1917: and the previous death's classification, so a
-                # stale provider-throttle kind cannot exempt a later,
-                # genuinely different death from the orphan-sweep caps.
-                _wf.clear_dead_worker_failure_kind(entry)
+                # On failure the record is restored to rework_requested by the
+                # launch-outcome module so the issue can be retried in the next
+                # pass (issue #116). On success, mark as dispatched.
+                status = "dispatched"
+                # A successful dispatch supersedes any previous orphan flag, and
+                # (issue #1917) the previous death's classification, so a stale
+                # provider-throttle kind cannot exempt a later, genuinely
+                # different death from the orphan-sweep caps. It also records
+                # the worker PID for state-based liveness detection (issue #207).
+                worker_launch_outcome.record_successful_launch(
+                    entry,
+                    status=status,
+                    dispatched_at=_wf.utc_now(),
+                    result=next(
+                        (r for r in dispatch_results if r.issue_number == request.issue_number),
+                        None,
+                    ),
+                )
                 # Issue #1106: a new rework dispatch supersedes any
                 # prior startup-death classification — the new session
                 # is the one whose outcome the next janitor pass will
@@ -1406,14 +1409,6 @@ def _dispatch_rework_impl(
                             "last_rework_failure_kind": None,
                             "last_rework_was_startup_death": False,
                         }
-            # Store worker PID and process start time for state-based liveness detection
-            # This allows recovery even when session sidecar files are orphaned (issue #207)
-            if ok:
-                result = next(
-                    (r for r in dispatch_results if r.issue_number == request.issue_number),
-                    None,
-                )
-                stamp_worker_process(entry, result)
             if ok:
                 # Track redispatch count for escalation cap (issue #165)
                 now = self.host.clock.now()
