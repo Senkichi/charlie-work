@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 from _fakes_github import FakeGitHub
+from charlie_work import layout
 from charlie_work.adapters import SessionDispatchResult
 from charlie_work.config import (
     DispatchConfig,
@@ -65,11 +66,60 @@ def _app(tmp_path: Path, lane: str, *, fleet_cap: int, dry_run: bool = False) ->
     return app
 
 
-def _install_hosts(fake_host: Any) -> FakeClock:
+PRE, HELD, POST = 7.0, 3.0, 11.0
+
+
+class _Phased:
+    """Fake clock plus a spy that advances it on every GitHub call.
+
+    The step depends on where the pass is relative to the fleet launch lock
+    (told apart by the holder sidecar, which exists only while the OS lock is
+    held): ``PRE`` before the lock is realized (the handle already exists),
+    ``HELD`` while it is held, ``POST`` once it has been released.  A correct
+    ``launch_lock_held_seconds`` therefore counts only the HELD steps (plus
+    the launch itself) -- stamping the start at handle mint or the end at
+    Event emission would add PRE / POST steps and fail.
+    """
+
+    def __init__(self, app: OrchestratorApp, clock: FakeClock) -> None:
+        self.clock = clock
+        self.holder = layout.fleet_lock_holder_path(override=app.fleet_dir_override)
+        self.seen_held = False
+        self.calls = {"pre": 0, "held": 0, "post": 0}
+        for name in dir(app.gh):
+            fn = getattr(app.gh, name)
+            if not name.startswith("_") and callable(fn):
+                setattr(app.gh, name, self._wrap(fn))
+
+    def phase(self) -> str:
+        if self.holder.exists():
+            self.seen_held = True
+            return "held"
+        return "post" if self.seen_held else "pre"
+
+    def _wrap(self, fn: Any) -> Any:
+        def _inner(*a: Any, **kw: Any) -> Any:
+            phase = self.phase()
+            self.calls[phase] += 1
+            self.clock.advance({"pre": PRE, "held": HELD, "post": POST}[phase])
+            return fn(*a, **kw)
+
+        return _inner
+
+    @property
+    def expected(self) -> float:
+        return HELD * self.calls["held"] + self.launched
+
+    launched = 0.0
+
+
+def _install_hosts(fake_host: Any, spy: list[_Phased] | None = None) -> FakeClock:
     clock = FakeClock(start=datetime(2026, 1, 1, tzinfo=UTC))
 
     def _launch(_repo_root, _manifest, _results, settings, requests):
         clock.advance(LAUNCH_SECONDS)  # time passes inside the locked window
+        if spy:
+            spy[0].launched += LAUNCH_SECONDS
         return [
             SessionDispatchResult(
                 issue_number=r.issue_number,
@@ -110,6 +160,24 @@ def test_pass_holding_the_lock_reports_held_seconds(tmp_path: Path, lane: str, f
 
 
 @LANES
+def test_value_is_exactly_acquire_to_release(tmp_path: Path, lane: str, fake_host) -> None:
+    """The clock also moves before the lock is realized (after the handle is
+    minted) and after it is released but before the aggregate Event is built;
+    neither may leak into the reported value."""
+    spy: list[_Phased] = []
+    clock = _install_hosts(fake_host, spy)
+    app = _app(tmp_path, lane, fleet_cap=4)
+    spy.append(_Phased(app, clock))
+
+    result = _run(app, lane)
+
+    assert result.data["selected_count"] == 1, result.message
+    assert spy[0].calls["pre"] > 0 and spy[0].calls["held"] > 0 and spy[0].calls["post"] > 0
+    (event,) = _events(app, lane)
+    assert event["payload"][FIELD] == pytest.approx(spy[0].expected)
+
+
+@LANES
 def test_pass_without_a_fleet_cap_omits_the_field(tmp_path: Path, lane: str, fake_host) -> None:
     _install_hosts(fake_host)
     app = _app(tmp_path, lane, fleet_cap=0)
@@ -119,3 +187,35 @@ def test_pass_without_a_fleet_cap_omits_the_field(tmp_path: Path, lane: str, fak
     assert result.data["selected_count"] == 1, result.message
     (event,) = _events(app, lane)
     assert FIELD not in event["payload"]
+
+
+@LANES
+def test_dry_run_with_a_fleet_cap_omits_the_field(tmp_path: Path, lane: str, fake_host) -> None:
+    """A dry run releases the lock right after the governor and emits no
+    aggregate ``dispatch`` / ``dispatch_rework`` Event at all, so no Event may
+    carry the field."""
+    _install_hosts(fake_host)
+    app = _app(tmp_path, lane, fleet_cap=4, dry_run=True)
+
+    result = _run(app, lane)
+
+    assert result.ok, result.message
+    assert [e for e in _events(app, lane) if FIELD in e["payload"]] == []
+
+
+def test_rework_without_valid_prompts_reports_elapsed_so_far(tmp_path: Path, fake_host) -> None:
+    """The no-valid-rework-prompts ``dispatch_rework`` Event is built while the
+    lock is still held (the lane's ``finally`` releases it afterwards), so the
+    field there is the Host-clock time elapsed up to the emission."""
+    spy: list[_Phased] = []
+    clock = _install_hosts(fake_host, spy)
+    app = _app(tmp_path, REWORK, fleet_cap=4)
+    (app.paths.prs / "pr-456" / "rework-prompt.md").unlink()
+    spy.append(_Phased(app, clock))
+
+    result = app.dispatch_rework()
+
+    assert result.message == "no valid rework prompts found", result.message
+    assert spy[0].calls["held"] > 0 and spy[0].calls["pre"] > 0
+    (event,) = _events(app, REWORK)
+    assert event["payload"][FIELD] == pytest.approx(HELD * spy[0].calls["held"])
