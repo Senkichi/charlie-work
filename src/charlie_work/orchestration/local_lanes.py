@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 import charlie_work.superseded_worker_reap as superseded_worker_reap
+import charlie_work.verdict_recording as verdict_recording
 import charlie_work.workflow as _wf
 from charlie_work import review_interdiff as _review_interdiff
 from charlie_work.command_result import CommandResult
@@ -74,10 +75,7 @@ from charlie_work.local_lane import (
 )
 from charlie_work.local_work_park import publishes_pull_requests
 from charlie_work.prompts import prompt_template_digest
-from charlie_work.review_decision import (
-    record_decision,
-    reclassify_human_call_verdict,
-)
+from charlie_work.review_decision import record_decision
 from charlie_work.state import is_claim_stale, without_review_dispatch_claim
 from charlie_work.worker import iter_workers
 from charlie_work.worktree import list_worktrees
@@ -96,6 +94,20 @@ _LIVE_DISPATCH_STATUSES = frozenset({"dispatched", "dispatch_pending", "manifest
 # Local records carry no GitHub-side merge check, so the claim/review loop
 # applies the same stale-claim timeout the remote stalled-review sweep uses.
 _REVIEW_STALE_CLAIM_TIMEOUT_MINUTES = 5
+
+# How the Local path differs from the PR path when it records a Verdict (issue #3102).
+_LOCAL_DIFFERENCES = verdict_recording.VerdictDifferences(
+    wording=verdict_recording.VerdictWording(
+        invalid_decision="invalid decision: {decision}",
+        invalid_provenance="invalid verdict provenance: {provenance}",
+        head_noun="branch",
+        reviewed_head_flag="reviewed-head",
+        choose_head_hint="pass reviewed_head to choose",
+    ),
+    stringify_required_changes=True,
+    local_decision_fields=True,
+    comment_repeats_derived_summary=True,
+)
 
 # The merge gate itself lives in ``orchestration/local_merge_gate.py``
 # (issue #1974 turned it asynchronous; this module stays under its
@@ -1057,45 +1069,24 @@ def record_local_review(
     (``_commit_timestamp`` needs ``gh``), and the verdict comment posts to the
     issue via ``issue_comment`` instead of ``pr_comment``.
     """
-    if decision not in ("approved", "request_changes", "blocked"):
-        return CommandResult(
-            False, f"invalid decision: {decision}", {"reason": "invalid_decision"}
-        )
-    if verdict_provenance not in _wf.VERDICT_PROVENANCE_VALUES:
-        return CommandResult(
-            False,
-            f"invalid verdict provenance: {verdict_provenance}",
-            {"reason": "invalid_verdict_provenance"},
-        )
-    summary_text = summary_file.read_text(encoding="utf-8") if summary_file else summary
-    # Same rule as record_review: empty summary rejects, empty
-    # required_changes never does -- it derives from the summary (or marks
-    # the channel "vacuous") so a malformed verdict can never wedge the lane
-    # in a silent re-review loop.
-    if decision in {"request_changes", "blocked"} and not summary_text.strip():
-        return CommandResult(
-            False,
-            f"--summary or --summary-file is required for decision '{decision}'",
-            {"reason": "missing_summary"},
-        )
-    effective_required_changes = (
-        [str(item) for item in required_changes] if required_changes else []
-    )
-    findings_channel: str | None = None
-    if decision in {"request_changes", "blocked"} and not effective_required_changes:
-        if _wf._summary_is_vacuous(summary_text):
-            findings_channel = "vacuous"
-        else:
-            effective_required_changes = [summary_text.strip()]
-            findings_channel = "derived"
-
-    decision, reclassified_human_call = reclassify_human_call_verdict(
+    verdict = verdict_recording.derive_verdict(
         decision,
-        effective_required_changes,
-        markers=self.config.review.human_decision_markers,
         verdict_provenance=verdict_provenance,
+        summary=summary,
+        summary_file=summary_file,
+        required_changes=required_changes,
+        human_decision_markers=self.config.review.human_decision_markers,
+        differences=_LOCAL_DIFFERENCES,
     )
+    if isinstance(verdict, CommandResult):
+        return verdict
+    decision = verdict.decision
+    summary_text = verdict.summary_text
+    effective_required_changes = verdict.required_changes
+    findings_channel = verdict.findings_channel
+    reclassified_human_call = verdict.reclassified_human_call
 
+    # Created before the guards below, as it always was: a refused call still leaves the dir.
     pr_dir = self.paths.prs / f"pr-{pr_number}"
     pr_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1109,9 +1100,21 @@ def record_local_review(
         )
     issue_number = pr_state.get("issue_number")
     issue_number = int(issue_number) if issue_number is not None else pr_number
-    guard_issue_state = (guard_state.get("issues") or {}).get(str(issue_number), {})
-    if pr_state.get("status") in ("merged", "closed"):
-        return CommandResult(
+    # The "live" head is the branch tip resolved locally, not a fetched headRefOid.
+    branch = str(pr_state.get("branch") or pr_state.get("headRefName") or "")
+
+    def _post_issue_comment(body: str) -> str | None:
+        # No PR exists to comment on; the issue is the operator-facing channel.
+        try:
+            body_path = pr_dir / "verdict-comment.md"
+            body_path.write_text(body, encoding="utf-8")
+            self.gh.issue_comment(issue_number, body_path)
+        except (GitHubError, OSError) as exc:
+            return str(exc)
+        return None
+
+    terminal_refusal = (
+        CommandResult(
             False,
             f"local record {pr_number} is already {pr_state.get('status')}; verdict not recorded",
             {
@@ -1121,80 +1124,40 @@ def record_local_review(
                 "terminal": True,
             },
         )
-    if pr_state.get("status") == "escalated" or guard_issue_state.get("status") == "escalated":
-        return CommandResult(
+        if pr_state.get("status") in ("merged", "closed")
+        else None
+    )
+    subject = verdict_recording.VerdictSubject(
+        pr_number=pr_number,
+        issue_number=issue_number,
+        terminal_refusal=terminal_refusal,
+        escalated_refusal=CommandResult(
             False,
             f"local record {pr_number} is escalated; verdict not recorded "
             "(unescalate the issue first)",
             {"pr": pr_number, "issue": issue_number, "reason": "pr_escalated", "escalated": True},
-        )
+        ),
+        guard_state=lambda: guard_state,
+        live_head=lambda: branch_head_sha(self.repo_root, branch) if branch else None,
+        post_comment=_post_issue_comment,
+    )
+    refusal = verdict_recording.check_recordable(subject)
+    if refusal is not None:
+        return refusal
 
-    # Head pinning: same packet-vs-live rule as record_review. The "live"
-    # head is the branch tip resolved locally, not a fetched headRefOid.
     packet_head_sha = self._read_packet_head_oid(pr_number)
-    branch = str(pr_state.get("branch") or pr_state.get("headRefName") or "")
-    live_head_sha = branch_head_sha(self.repo_root, branch) if branch else None
-
-    if reviewed_head is not None:
-        if packet_head_sha is not None and reviewed_head == packet_head_sha:
-            if (
-                not allow_stale_head
-                and live_head_sha is not None
-                and packet_head_sha != live_head_sha
-            ):
-                return CommandResult(
-                    False,
-                    f"reviewed head ({reviewed_head}) matches packet head "
-                    f"({packet_head_sha}) but live branch head has moved to "
-                    f"({live_head_sha}); verdict not recorded — head moved "
-                    "during build, will re-review next pass",
-                    {
-                        "pr": pr_number,
-                        "issue": issue_number,
-                        "reason": "head_moved_during_build",
-                        "packet_head_sha": packet_head_sha,
-                        "live_head_sha": live_head_sha,
-                    },
-                )
-            reviewed_head_sha = reviewed_head
-            reviewed_head_source = "packet"
-        elif live_head_sha is not None and reviewed_head == live_head_sha:
-            reviewed_head_sha = reviewed_head
-            reviewed_head_source = "live"
-        else:
-            options: list[str] = []
-            if packet_head_sha is not None:
-                options.append(f"packet head {packet_head_sha}")
-            if live_head_sha is not None:
-                options.append(f"live head {live_head_sha}")
-            return CommandResult(
-                False,
-                f"reviewed-head {reviewed_head} does not match "
-                f"{' or '.join(options) if options else 'any available head'}",
-                {"reason": "reviewed_head_mismatch"},
-            )
-    elif (
-        packet_head_sha is not None
-        and live_head_sha is not None
-        and packet_head_sha != live_head_sha
-    ):
-        return CommandResult(
-            False,
-            f"review packet head ({packet_head_sha}) differs from live branch "
-            f"head ({live_head_sha}); pass reviewed_head to choose the head "
-            "the verdict applies to",
-            {"reason": "head_moved_during_build"},
-        )
-    elif packet_head_sha is not None:
-        reviewed_head_sha = packet_head_sha
-        reviewed_head_source = "packet"
-    elif live_head_sha is not None:
-        reviewed_head_sha = live_head_sha
-        reviewed_head_source = "live"
-    else:
-        return CommandResult(
-            False, "no packet or live branch head available", {"reason": "no_head_available"}
-        )
+    pinned = verdict_recording.pin_reviewed_head(
+        subject,
+        packet_head_sha=packet_head_sha,
+        reviewed_head=reviewed_head,
+        allow_stale_head=allow_stale_head,
+        differences=_LOCAL_DIFFERENCES,
+    )
+    if isinstance(pinned, CommandResult):
+        return pinned
+    reviewed_head_sha = pinned.sha
+    reviewed_head_source = pinned.source
+    live_head_sha = pinned.live_head_sha
 
     # The patch-id must describe the head the verdict is pinned to (issue
     # #2151). The packet's diff.patch is that head's diff only when the
@@ -1210,47 +1173,11 @@ def record_local_review(
             str(pr_state.get("baseRefName") or local_base_branch(self.repo_root) or "HEAD"),
             reviewed_head_sha,
         )
-    reviewed_patch_id = _wf._calculate_patch_id(diff) if diff else ""
-    reviewed_signature = (
-        _wf._diff_content_signature(diff) if diff else _wf.DiffContentSignature((), frozenset())
-    )
-
-    decision_payload: dict[str, Any] = {
-        "pr_number": pr_number,
-        "issue_number": issue_number,
-        "local": True,
-        "decision": decision,
-        "summary": summary_text,
-        "required_changes": effective_required_changes,
-        "verdict_provenance": verdict_provenance,
-        "reviewed_head_sha": reviewed_head_sha,
-        "reviewed_head_source": reviewed_head_source,
-        "reviewed_patch_id": reviewed_patch_id,
-        "reviewed_changed_lines": list(reviewed_signature.changed_lines),
-        "reviewed_changed_files": sorted(reviewed_signature.changed_files),
-        "reviewed_has_binary": reviewed_signature.has_binary,
-        "carried_forward_from": [],
-        "reviewed_at": _wf.utc_now(),
-    }
-    if verdict_source is not None:
-        decision_payload["verdict_source"] = verdict_source
-    if findings_channel is not None:
-        decision_payload["findings_channel"] = findings_channel
-    provenance_caveat: str | None = None
-    if decision in {"request_changes", "blocked"}:
-        provenance_caveat = _wf.provenance_caveat_for(verdict_source)
-        if provenance_caveat is not None:
-            decision_payload["provenance_caveat"] = provenance_caveat
-    if reclassified_human_call is not None:
-        matched_item, matched_marker = reclassified_human_call
-        decision_payload["human_call_reclassified_from"] = "request_changes"
-        decision_payload["human_call_marker"] = {
-            "item": matched_item,
-            "marker": matched_marker,
-        }
+    content = verdict_recording.reviewed_content(diff)
+    reviewed_patch_id = content.patch_id
+    reviewed_at = _wf.utc_now()
 
     decision_path = pr_dir / "review-decision.json"
-    rounds_dir = pr_dir / "rounds"
     round_number = 0
     escalated = False
     request_changes_count = 0
@@ -1271,33 +1198,35 @@ def record_local_review(
                 escalated = request_changes_count >= self.config.review.max_rework_cycles
                 if not escalated:
                     request_changes_count += 1
-        decision_payload["escalated"] = escalated
         pr_escalation_reason = (
             "max_rework_cycles_exceeded"
             if (decision == "request_changes" and escalated)
             else ("review_blocked" if decision == "blocked" else None)
         )
 
-        # Persist the verdict BEFORE rendering the rework brief: the brief
-        # reads review-decision.json itself (issue #632).
-        if decision_path.exists():
-            try:
-                with decision_path.open("r", encoding="utf-8") as _handle:
-                    _existing_decision = json.load(_handle)
-                if isinstance(_existing_decision, dict) and isinstance(
-                    _existing_decision.get("authorized_override"), dict
-                ):
-                    decision_payload["authorized_override"] = _existing_decision[
-                        "authorized_override"
-                    ]
-            except (OSError, json.JSONDecodeError):
-                pass
-        round_number = _wf._next_round_number(rounds_dir, decision_payload)
-        round_dir = rounds_dir / f"round-{round_number}"
-        record_decision(pr_dir, decision_payload, None)
-        # Issue #2837: archive this round's diff.patch (the live packet diff is
-        # the one this verdict was recorded against; the next packet overwrites it).
-        _review_interdiff.archive_round_diff(pr_dir, round_dir)
+        decision_round = verdict_recording.write_decision_round(
+            pr_dir,
+            subject,
+            decision=decision,
+            summary_text=summary_text,
+            required_changes=effective_required_changes,
+            findings_channel=findings_channel,
+            reclassified_human_call=reclassified_human_call,
+            verdict_provenance=verdict_provenance,
+            verdict_source=verdict_source,
+            pinned=pinned,
+            content=content,
+            body_sha256=None,
+            external_findings=None,
+            ingestion_before=None,
+            escalated=escalated,
+            reviewed_at=reviewed_at,
+            next_round_number=_wf._next_round_number,
+            differences=_LOCAL_DIFFERENCES,
+        )
+        round_number = decision_round.round_number
+        round_dir = decision_round.round_dir
+        provenance_caveat = decision_round.provenance_caveat
         if decision == "request_changes" and not escalated:
             rework_path = str(
                 self._write_rework_prompt(
@@ -1499,29 +1428,19 @@ def record_local_review(
                 "remove_failures": transition_result.remove_failures,
             }
 
-    # No PR exists to comment on; the issue is the operator-facing channel.
     if not escalated and (comment or self.config.review.post_verdict_comment):
-        header = f"## Fleet review - round {round_number} - {decision}"
-        body_parts = [header]
-        if summary_text:
-            body_parts.append(summary_text)
-        if provenance_caveat is not None:
-            body_parts.append(provenance_caveat)
-        if effective_required_changes:
-            body_parts.append(
-                "### Required changes\n"
-                + "\n".join(f"- {rc}" for rc in effective_required_changes)
-            )
-        comment_body = "\n\n".join(body_parts)
-        try:
-            body_path = pr_dir / "verdict-comment.md"
-            body_path.write_text(comment_body, encoding="utf-8")
-            self.gh.issue_comment(issue_number, body_path)
-        except (GitHubError, OSError) as exc:
-            if label_error is None:
-                label_error = {"comment_error": str(exc)}
-            else:
-                label_error["comment_error"] = str(exc)
+        comment_error = verdict_recording.post_verdict_comment(
+            subject,
+            round_number=round_number,
+            decision=decision,
+            summary_text=summary_text,
+            provenance_caveat=provenance_caveat,
+            required_changes=effective_required_changes,
+            findings_channel=findings_channel,
+            differences=_LOCAL_DIFFERENCES,
+        )
+        if comment_error is not None:
+            label_error = verdict_recording.with_comment_error(label_error, comment_error)
 
     source_note = f"head from {reviewed_head_source}"
     if escalated:
