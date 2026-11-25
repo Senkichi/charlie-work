@@ -1211,10 +1211,10 @@ def _dispatch_impl(
             # branch binds and consumes its own locals -- there is no
             # second enumeration left to drift out of sync with the first.
             # status/dispatched_at are the only values that still cross out
-            # of this chain (applied once, after it); every arm binds them
-            # unconditionally, so a future arm that forgets to set one is a
-            # possibly-unbound error at type-check time, not a silently
-            # stale value copied from prev_entry.
+            # of this chain (applied after it; a success also records them in the
+            # shared call); every arm binds them unconditionally, so a future
+            # arm that forgets to set one is a possibly-unbound error at
+            # type-check time, not a silently stale value copied from prev_entry.
             entry = worker_launch_outcome.launch_base_entry(
                 prev_entry,
                 issue_number=request.issue_number,

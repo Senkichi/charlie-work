@@ -23,19 +23,28 @@ Interface: launch results and lane inputs in, recorded outcome out.
 - The reap helpers decide, stamp the issue entry they were handed and return an
   Event payload (or ``None`` when no reap happened).
 
+Writes, per function. :func:`launch_base_entry` and :func:`record_successful_launch`
+touch no stored state: the first returns a new dict, the second mutates only the
+entry it is given, and neither seats an entry into ``state`` nor saves.
+:func:`record_failed_launch` emits its Events and any escalation through the
+:class:`WriteGate`; with ``save_inline`` true (rework) it also seats the entry in
+``state["issues"]`` and saves, otherwise (fresh) the lane seats and saves once after
+its own tail. :func:`record_label_error` writes ``label_error`` onto the entry it is
+given and saves ``state`` through the gate, only when the transition did not apply.
+The reap helpers stamp only the entry they are handed and write nothing else.
+
 What the lanes keep: every label transition (``_wf.transition``, and the
-escalation edge a failure returns), seating the entry into ``state`` and the
-saves (fresh persists once after its own tail; rework persists inline), and the
-lane-only steps (fresh's escalation clear, failure-counter pop and manual
-harness status; rework's PR failure-marker reset, redispatch counter and cap).
+escalation edge a failure returns), seating and saving on the success path and,
+for fresh, on the failure path, and the lane-only steps (fresh's escalation clear,
+failure-counter pop and manual harness status; rework's PR failure-marker reset,
+redispatch counter and cap).
 
 Shape. The module imports nothing from :mod:`charlie_work.workflow`. Names that
 tests replace on ``charlie_work.workflow`` by path (``_try_reap_blocked_foreign_writer``
 and friends, ``utc_now``) stay resolved through ``workflow`` in the lane: the lane
 hands in the value (``dispatched_at``) or a zero-argument callable (the reap), so
 those patches keep taking effect. Lane differences are explicit keyword arguments,
-never inferred, and the module never seats an entry into ``state`` or mutates the
-stored record.
+never inferred.
 """
 
 from __future__ import annotations

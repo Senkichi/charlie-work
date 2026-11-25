@@ -203,7 +203,7 @@ def test_success_without_pid_drops_previous_epoch_pid(
 def test_success_uses_workflow_clock_and_stamp(
     tmp_path: Path, fake_host, monkeypatch, lane: str
 ) -> None:
-    """``utc_now`` and ``stamp_worker_process`` are read from the lane at call time."""
+    """``utc_now`` is read from ``charlie_work.workflow`` by the lane at call time."""
     app = _app(lane, tmp_path, config=_config(max_auto_redispatch=5))
     monkeypatch.setattr(wf, "utc_now", lambda: "2031-02-03T04:05:06Z")
     _launch(fake_host, ok=True, pid=4242, during=_plant(app, lane))
