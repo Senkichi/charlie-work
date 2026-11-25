@@ -7,8 +7,8 @@ and provenance validation, the summary requirement, deriving ``required_changes`
 human-call reclassification, the terminal and escalated guards, head pinning and the
 stale-review check, the patch-id and line-content signature, building and persisting
 the decision payload, and the verdict comment. It is step 1 of a chain; the decision
-rules (Rework cap, escalation, status and label-edge choice) and the Events stay in
-the two paths and move in step 2 (issue #3103).
+rules (Rework cap, escalation, status and label-edge choice) and the Events are step 2,
+in :mod:`charlie_work.verdict_rules` (issue #3103).
 
 It lives at the package root, not under ``orchestration/``, because every top-level
 function defined there is auto-installed on ``OrchestratorApp``.
@@ -18,7 +18,8 @@ would be circular). Names defined there that tests replace by path are resolved 
 time through :func:`_workflow`; a name the caller must resolve itself (``reviewed_at``,
 the round-number function) is handed in as a value.
 
-Each path keeps its own sequencing and calls these steps in turn. Each path describes the
+Each path keeps its own sequencing and calls these steps in turn, then the decision rules
+in :mod:`charlie_work.verdict_rules`. Each path describes the
 thing under review once, as a :class:`VerdictSubject` (its live head, how to refuse a
 terminal or escalated record, how to post the verdict comment), and states every
 difference between the two paths in a :class:`VerdictDifferences`; nothing is inferred

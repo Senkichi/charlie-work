@@ -10,7 +10,7 @@ scripted ``FakeAdapter``s from ``tests/_fake_transport.py`` (one real
 Covers, in order:
   * ``legacy_argv.request_for_argv`` -- the closed table: which shapes
     translate, which fail closed (no row).
-  * ``http_cache`` -- round trip, corruption fail-closed, bounded eviction.
+  * (``http_cache`` itself is covered in ``test_http_cache.py``.)
   * ``config.RuntimeConfig.gh_transport`` -- defaults to "http"; validation.
   * ``GitHub.run`` end to end against the fakes: success, REST/graphql error
     translation, 401 token re-resolution, pagination, ETag conditional GET,
@@ -28,7 +28,6 @@ Covers, in order:
 from __future__ import annotations
 
 import json
-import threading
 from pathlib import Path
 
 import pytest
@@ -230,97 +229,6 @@ def test_build_request_plan_graphql_body(tmp_path: Path):
     assert isinstance(request, GraphQLRequest)
     assert request.document == "query { x }"
     assert json.loads(request.variables) == {"owner": "acme", "name": "widgets"}
-
-
-# ---------------------------------------------------------------------------
-# http_cache
-# ---------------------------------------------------------------------------
-
-
-def test_cache_round_trip(tmp_path: Path):
-    path = tmp_path / "http-etag-cache.json"
-    link = '<https://api.github.com/repos/a/b?page=2>; rel="next"'
-    assert http_cache.get_cached(path, "/repos/a/b") is None
-    http_cache.record_response(
-        path, "/repos/a/b", etag='"abc"', status=200, body='{"ok":true}', link=link
-    )
-    cached = http_cache.get_cached(path, "/repos/a/b")
-    assert cached is not None
-    assert cached.etag == '"abc"'
-    assert cached.body == '{"ok":true}'
-    assert cached.link == link
-
-
-def test_cache_corrupt_file_fails_closed(tmp_path: Path):
-    path = tmp_path / "http-etag-cache.json"
-    path.write_text("not json{{{", encoding="utf-8")
-    assert http_cache.load_cache(path) == {}
-    assert http_cache.get_cached(path, "/x") is None
-
-
-def test_cache_evicts_oldest_beyond_max_entries(tmp_path: Path, monkeypatch):
-    path = tmp_path / "http-etag-cache.json"
-    monkeypatch.setattr(http_cache, "_MAX_ENTRIES", 2)
-    http_cache.record_response(path, "/a", etag="1", status=200, body="a")
-    http_cache.record_response(path, "/b", etag="2", status=200, body="b")
-    http_cache.record_response(path, "/c", etag="3", status=200, body="c")
-    entries = http_cache.load_cache(path)
-    assert len(entries) == 2
-    assert "/c" in entries  # most recent survives
-
-
-def test_save_cache_concurrent_writes_use_distinct_temps(tmp_path: Path, patch_path_replace):
-    """Issue #2265: two concurrent ``_save_cache`` calls shared one fixed
-    ``http-etag-cache.json.tmp`` name, colliding on open/truncate/rename and
-    surfacing ``PermissionError`` [WinError 5] on Windows. Each save now
-    stages a unique temp file, so both complete and the destination holds
-    one intact payload with no ``.tmp`` orphans."""
-    path = tmp_path / "http-etag-cache.json"
-    barrier = threading.Barrier(2, timeout=30)
-    rendezvous_done = threading.Event()
-    used: list[Path] = []
-    real_replace = Path.replace
-    errors: list[BaseException] = []
-
-    def _blocking_replace(self: Path, target: object) -> Path:
-        used.append(self)
-        # Rendezvous the writers' first replace calls while BOTH temp files
-        # exist -- under the fixed-name scheme this is exactly where the two
-        # writers shared one file. A retried replace (transient
-        # PermissionError -- the exact Windows condition the retry exists
-        # for) re-enters this hook, so it must pass straight through or the
-        # barrier would deadlock on its second phase.
-        if not rendezvous_done.is_set():
-            barrier.wait()
-            rendezvous_done.set()
-        return real_replace(self, target)
-
-    def _save(etag: str) -> None:
-        try:
-            http_cache._save_cache(
-                path,
-                {"/p": http_cache.CachedResponse(etag=etag, status=200, body="{}", stored_at="t")},
-            )
-        except BaseException as exc:  # noqa: BLE001 - collected for the assert
-            errors.append(exc)
-
-    patch_path_replace(_blocking_replace, scope=tmp_path)
-    threads = [threading.Thread(target=_save, args=(f'"e{i}"',)) for i in range(2)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=30)
-
-    assert not any(thread.is_alive() for thread in threads), "barrier deadlock"
-    assert errors == []
-    # Two DISTINCT tmp files coexisted at the barrier (a PermissionError
-    # retry re-uses the same tmp, so compare the set, not the count).
-    assert len(set(used)) == 2
-    assert used[0] != used[1]
-    loaded = http_cache.load_cache(path)
-    assert set(loaded) == {"/p"}
-    assert loaded["/p"].etag in {'"e0"', '"e1"'}
-    assert not list(tmp_path.glob("*.tmp"))
 
 
 # ---------------------------------------------------------------------------
