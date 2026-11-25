@@ -1,35 +1,50 @@
-"""What both worker lanes record once a launch has returned (issues #3098, #3099).
+"""What both worker lanes record once a launch has returned (issues #3098, #3099, #3100).
 
 Fresh ``dispatch`` and remote ``dispatch_rework`` each used to carry their own
-copy of the bookkeeping that follows a launch: the ``label_error`` record left
-behind when a label transition is not applied, the blocked-environment
-foreign-writer reap, and the two failure branches (blocked environment; generic
-or deterministic failure with its escalating cap). This module owns all of it,
-for both lanes; it is steps 1 and 2 of a chain that moves the rest of the
-post-launch handling here (issue #3100). It lives at the package root, beside
+copy of the bookkeeping that follows a launch. This module owns the shared part,
+for both lanes; it lives at the package root, beside
 :mod:`charlie_work.worker_launch_gate`, because every top-level function defined
 under ``orchestration/`` is auto-installed on ``OrchestratorApp``.
 
-Shape. The module imports nothing from :mod:`charlie_work.workflow`. Names that
-tests replace on ``charlie_work.workflow`` by path (``_try_reap_blocked_foreign_writer``
-and friends) stay resolved through ``workflow`` in the lane: the lane hands the
-reap in as a zero-argument callable, so those patches keep taking effect.
+Interface: launch results and lane inputs in, recorded outcome out.
 
-Lane differences are explicit keyword arguments, never inferred:
-
+- :func:`launch_base_entry` builds the issue record a launch starts from (the
+  stored record plus number, title, url, branch and prompt, minus the claim stamp
+  and any ``label_error``).
+- :func:`record_successful_launch` completes that record for a launch that
+  succeeded: ``status`` and ``dispatched_at`` as the lane decided them, the
+  orphan flags and the previous death's failure kind cleared, the launched
+  worker's pid stamped from the launch ``result``.
 - :func:`record_failed_launch` is the one entry point for a failed launch. It
   picks the blocked-environment or the generic branch itself, emits the branch's
   Events through the :class:`WriteGate` it is given, and returns a
-  :class:`LaunchFailureOutcome`; it never touches a label. The lane applies the
-  escalation edge (it needs the ``save_state`` the module already did, so the
-  order Event, save, transition is the lane's order on both sides of the move).
-- ``save_inline`` is the "Save timing" input: rework persists inside the call
-  (and seats its lane-built entry into ``state``); fresh persists once, after
-  its own tail, from the returned ``state`` and ``entry``.
-- :func:`record_label_error` writes through the gate it is given and nowhere else.
+  :class:`LaunchFailureOutcome`.
+- :func:`record_label_error` records a label transition that did not apply.
 - The reap helpers decide, stamp the issue entry they were handed and return an
-  Event payload (or ``None`` when no reap happened). The rework pre-claim safety
-  net still emits its own Event, with the raw ``append_event`` it has always used.
+  Event payload (or ``None`` when no reap happened).
+
+Writes, per function. :func:`launch_base_entry` and :func:`record_successful_launch`
+touch no stored state: the first returns a new dict, the second mutates only the
+entry it is given, and neither seats an entry into ``state`` nor saves.
+:func:`record_failed_launch` emits its Events and any escalation through the
+:class:`WriteGate`; with ``save_inline`` true (rework) it also seats the entry in
+``state["issues"]`` and saves, otherwise (fresh) the lane seats and saves once after
+its own tail. :func:`record_label_error` writes ``label_error`` onto the entry it is
+given and saves ``state`` through the gate, only when the transition did not apply.
+The reap helpers stamp only the entry they are handed and write nothing else.
+
+What the lanes keep: every label transition (``_wf.transition``, and the
+escalation edge a failure returns), seating and saving on the success path and,
+for fresh, on the failure path, and the lane-only steps (fresh's escalation clear,
+failure-counter pop and manual harness status; rework's PR failure-marker reset,
+redispatch counter and cap).
+
+Shape. The module imports nothing from :mod:`charlie_work.workflow`. Names that
+tests replace on ``charlie_work.workflow`` by path (``_try_reap_blocked_foreign_writer``
+and friends, ``utc_now``) stay resolved through ``workflow`` in the lane: the lane
+hands in the value (``dispatched_at``) or a zero-argument callable (the reap), so
+those patches keep taking effect. Lane differences are explicit keyword arguments,
+never inferred.
 """
 
 from __future__ import annotations
@@ -52,8 +67,67 @@ from charlie_work.dispatch_selection import (
 )
 from charlie_work.escalation import _escalate_issue
 from charlie_work.labels import TransitionOutcome, TransitionResult
-from charlie_work.state import clear_escalation, clear_escalation_on_issue_prs
+from charlie_work.state import (
+    clear_dead_worker_failure_kind,
+    clear_escalation,
+    clear_escalation_on_issue_prs,
+)
+from charlie_work.worker_pid_stamp import stamp_worker_process
 from charlie_work.write_gate import WriteGate, require_write_gate
+
+
+def launch_base_entry(
+    stored: dict[str, Any],
+    *,
+    issue_number: int,
+    title: Any,
+    url: Any,
+    branch_name: str,
+    prompt_path: Any,
+) -> dict[str, Any]:
+    """The issue record a launch outcome starts from, as a new dict.
+
+    ``stored`` spread first, then this launch's number, title, url, branch and
+    prompt; the claim stamp (``dispatch_pending_at``) and any ``label_error`` are
+    dropped. ``stored`` itself is not touched and the result is not seated in
+    ``state``.
+    """
+    entry = {
+        **stored,
+        "number": issue_number,
+        "title": title,
+        "url": url,
+        "branch_name": branch_name,
+        "prompt_path": str(prompt_path),
+    }
+    entry.pop("dispatch_pending_at", None)
+    entry.pop("label_error", None)
+    return entry
+
+
+def record_successful_launch(
+    entry: dict[str, Any],
+    *,
+    status: str,
+    dispatched_at: str,
+    result: SessionDispatchResult | None,
+) -> dict[str, Any]:
+    """Complete ``entry`` (from :func:`launch_base_entry`) for a launch that succeeded.
+
+    A success supersedes any previous orphan flag and the previous death's
+    failure kind (issue #1917), records ``status`` and ``dispatched_at`` (the lane
+    reads its clock and decides the status), and stamps the worker pid and process
+    start time from the launch ``result`` (issue #207), dropping a previous
+    epoch's pair when the launch reports none. Mutates and returns ``entry``.
+    """
+    entry.pop("orphan_flagged_at", None)
+    entry.pop("orphan_drift_fingerprint", None)
+    entry.pop("orphan_drift_at", None)
+    clear_dead_worker_failure_kind(entry)
+    entry["status"] = status
+    entry["dispatched_at"] = dispatched_at
+    stamp_worker_process(entry, result)
+    return entry
 
 
 def label_error_reason(label_error: dict[str, Any]) -> str:
