@@ -61,11 +61,9 @@ def _dispatch_rework_impl(
     The label is used for display only and never for selection.
     """
     if self.config.worker.harness == "manual":
-        return CommandResult(
-            True,
-            "rework dispatch skipped for manual adapter",
-            {"adapter": "manual", "selected_count": 0},
-        )
+        data = {"adapter": "manual", "selected_count": 0}
+        data.update(operator_claimed_skipped=[], worker_death_escalated=[])
+        return CommandResult(True, "rework dispatch skipped for manual adapter", data)
 
     sessions_dir = self._layout.sessions_dir
     # Issue #1393: clean up stranded .json.tmp session sidecar files from
@@ -203,6 +201,8 @@ def _dispatch_rework_impl(
             "adapter": self.config.worker.harness,
             "selected_count": 0,
             "deferred_reason": permit.reason,
+            "operator_claimed_skipped": sorted(operator_claimed_skipped),
+            "worker_death_escalated": [],
             **permit.report_fields(),
         }
         if permit.reason == REASON_PROVIDER_THROTTLED:
@@ -219,6 +219,8 @@ def _dispatch_rework_impl(
     if resume.deferred:
         data = {"adapter": self.config.worker.harness, "selected_count": 0}
         data.update(gov.report_fields() if gov.any_term_enabled else {})
+        data["operator_claimed_skipped"] = sorted(operator_claimed_skipped)
+        data["worker_death_escalated"] = []
         return resume.deferred_result("rework dispatch", data)
     rework_limit = resume.cap_limit(rework_limit)
 
@@ -1016,6 +1018,7 @@ def _dispatch_rework_impl(
             "routed_to_review": sorted(routed_to_review),
             "skipped_head_indeterminate": sorted(head_indeterminate),
             "review_blocked_retry": sorted(review_blocked_retry),
+            "operator_claimed_skipped": sorted(operator_claimed_skipped),
             "no_op_rework_escalated": sorted(no_op_rework_escalated),
             "worker_death_escalated": sorted(worker_death_escalated),
             "salvaged_to_review": sorted(salvaged_to_review),
@@ -1751,6 +1754,7 @@ def _dispatch_rework_impl(
         "review_blocked_retry": sorted(review_blocked_retry),
         "operator_claimed_skipped": sorted(operator_claimed_skipped),
         "no_op_rework_escalated": sorted(no_op_rework_escalated),
+        "worker_death_escalated": sorted(worker_death_escalated),
         "salvaged_to_review": sorted(salvaged_to_review),
         "blocked_environment_escalated": sorted(blocked_environment_escalated),
         "escalation_deferred_live_worker": sorted(live_worker_deferrals),
