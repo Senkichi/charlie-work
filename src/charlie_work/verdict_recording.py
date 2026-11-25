@@ -71,9 +71,6 @@ class VerdictDifferences:
     stringify_required_changes: bool
     # ``local: True`` and the ``human_call_*`` fields on the decision file (Local only).
     local_decision_fields: bool
-    # The Local verdict comment lists the required changes even when they are the
-    # summary itself (``findings_channel == "derived"``); the PR comment does not.
-    comment_repeats_derived_summary: bool
 
 
 @dataclass(frozen=True)
@@ -461,10 +458,8 @@ def post_verdict_comment(
     if provenance_caveat is not None:
         body_parts.append(provenance_caveat)
     # A "derived" list is ``[summary_text.strip()]`` -- rendering it would post the
-    # summary twice, so the PR comment skips it (the Local comment still lists it).
-    if required_changes and (
-        differences.comment_repeats_derived_summary or findings_channel != "derived"
-    ):
+    # summary twice, so both paths skip it.
+    if required_changes and findings_channel != "derived":
         body_parts.append(
             "### Required changes\n" + "\n".join(f"- {rc}" for rc in required_changes)
         )

@@ -90,7 +90,6 @@ _ISSUE_ROWS = (
         "Local-only decision fields (`human_call_reclassified_from`, `human_call_marker`, `local: True`)",
         "local bookkeeping",
     ),
-    ("Local verdict comment repeats the summary", "drift, tracked separately"),
     ("`reviewed_body_sha256` not recorded locally", "drift, tracked separately"),
     ("Local lifecycle transitions omit the record number", "drift, tracked separately"),
 )

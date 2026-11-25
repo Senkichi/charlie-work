@@ -458,16 +458,6 @@ def _rescue_when(diff: Diff) -> bool:
     return _RESCUE_PINNED[diff.path] == (diff.remote, diff.local)
 
 
-def _repeats_summary(diff: Diff) -> bool:
-    """Local body == PR body + exactly the one repeated Required changes section."""
-    if not isinstance(diff.remote, str):
-        return False
-    scenario = next(sc for sc in SCENARIOS if sc.name == diff.scenario)
-    if scenario.required_changes:
-        return False
-    return diff.local == f"{diff.remote}\n\n### Required changes\n- {scenario.summary.strip()}"
-
-
 DECLARED_DIFFERENCES: tuple[DeclaredDifference, ...] = (
     # --- the issue's eight rows: difference and reason exactly as its table gives them ---
     DeclaredDifference(
@@ -514,12 +504,6 @@ DECLARED_DIFFERENCES: tuple[DeclaredDifference, ...] = (
             "decision_file.local",
         ),
         _remote_missing,
-    ),
-    DeclaredDifference(
-        "Local verdict comment repeats the summary",
-        "drift, tracked separately",
-        ("verdict_comment",),
-        _repeats_summary,
     ),
     DeclaredDifference(
         "`reviewed_body_sha256` not recorded locally",

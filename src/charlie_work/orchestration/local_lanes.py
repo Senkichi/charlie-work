@@ -106,7 +106,6 @@ _LOCAL_DIFFERENCES = verdict_recording.VerdictDifferences(
     ),
     stringify_required_changes=True,
     local_decision_fields=True,
-    comment_repeats_derived_summary=True,
 )
 
 # The merge gate itself lives in ``orchestration/local_merge_gate.py``

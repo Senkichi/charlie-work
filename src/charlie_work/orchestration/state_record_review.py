@@ -28,7 +28,6 @@ _PR_DIFFERENCES = verdict_recording.VerdictDifferences(
     ),
     stringify_required_changes=False,
     local_decision_fields=False,
-    comment_repeats_derived_summary=False,
 )
 
 
