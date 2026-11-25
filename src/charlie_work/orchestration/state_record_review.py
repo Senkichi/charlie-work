@@ -9,20 +9,28 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Sequence
-import json
 
 from charlie_work import rescue as rescue_helpers
 from charlie_work.github import GitHubError
-from charlie_work.janitor import DiffContentSignature
 from charlie_work.labels import TransitionOutcome
 from charlie_work.local_work_park import publishes_pull_requests
-from charlie_work.review_decision import (
-    record_decision,
-    reclassify_human_call_verdict,
-)
-import charlie_work.review_interdiff as _review_interdiff
+import charlie_work.verdict_recording as verdict_recording
 import charlie_work.workflow as _wf
 from charlie_work.command_result import CommandResult
+
+# How the PR path differs from the Local path when it records a Verdict (issue #3102).
+_PR_DIFFERENCES = verdict_recording.VerdictDifferences(
+    wording=verdict_recording.VerdictWording(
+        invalid_decision="decision must be approved, request_changes, or blocked",
+        invalid_provenance="verdict_provenance must be one of: {allowed}",
+        head_noun="PR",
+        reviewed_head_flag="--reviewed-head",
+        choose_head_hint="use --reviewed-head to choose",
+    ),
+    stringify_required_changes=False,
+    local_decision_fields=False,
+    comment_repeats_derived_summary=False,
+)
 
 
 def record_review(
@@ -60,98 +68,22 @@ def record_review(
             allow_stale_head=allow_stale_head,
             verdict_source=verdict_source,
         )
-    if decision not in {"approved", "request_changes", "blocked"}:
-        return CommandResult(
-            False,
-            "decision must be approved, request_changes, or blocked",
-            {"reason": "invalid_decision"},
-        )
-    # Issue #1265: no default above -- every caller must say where the
-    # verdict came from. This membership check catches a garbage/typo'd
-    # literal (a missing argument is already caught earlier, at the call
-    # boundary, by the keyword-only parameter having no default).
-    if verdict_provenance not in _wf.VERDICT_PROVENANCE_VALUES:
-        return CommandResult(
-            False,
-            "verdict_provenance must be one of: "
-            + ", ".join(sorted(_wf.VERDICT_PROVENANCE_VALUES)),
-            {"reason": "invalid_verdict_provenance"},
-        )
-    summary_text = summary_file.read_text(encoding="utf-8") if summary_file else summary
-    # Issue #11: reject empty summary for request_changes/blocked decisions
-    # before any state/label mutation
-    if decision in {"request_changes", "blocked"} and not summary_text.strip():
-        return CommandResult(
-            False,
-            f"--summary or --summary-file is required for decision '{decision}'",
-            {"reason": "missing_summary"},
-        )
-
-    # Issue #792: required_changes has a near-0% fill rate because
-    # prompts/review.md historically documented it as optional, so
-    # reviewers reliably fill in `summary` and skip the structured list.
-    # `_render_required_changes_section` used to paper over this at
-    # *render* time, falling back to `summary` when the list was empty --
-    # but that runs long after the reviewer is gone and the verdict is
-    # frozen, so a bad or missing derivation there can never be
-    # corrected. Derive here instead, at the point of record, so
-    # whatever `required_changes` lands on disk is exactly what a
-    # worker's rework brief will show.
-    #
-    # This step never *rejects* a verdict for an empty required_changes
-    # -- see test_record_review_never_rejects_for_empty_required_changes.
-    # A reject path here is the tempting wrong fix and that test is what
-    # stops a future session from "tightening" it: a False return writes
-    # no review-decision.json, the caller logs review_verdict_missed and
-    # moves on, the next pass still sees the PR as pending, and it gets
-    # re-dispatched to a fresh reviewer -- an unbounded re-review loop
-    # with no cap and no escalation. Contrast with issue #597's reject
-    # gate on a contentless *approved* verdict in
-    # `_validate_review_verdict`: that gate is safe because rejecting an
-    # approval just means "not merged yet", not an infinite loop.
-    effective_required_changes = list(required_changes) if required_changes else []
-    findings_channel: str | None = None
-    if decision in {"request_changes", "blocked"} and not effective_required_changes:
-        if _wf._summary_is_vacuous(summary_text):
-            # Nothing derivable. Persist the empty list anyway (never
-            # reject) with an explicit marker so
-            # `_render_required_changes_section` can tell "genuinely
-            # nothing was recorded" apart from "the reviewer wrote
-            # prose instead of a list" and render its loud tier-3
-            # warning instead of silently treating this the same as a
-            # real derivation.
-            findings_channel = "vacuous"
-        else:
-            # The F1 extractor: `_render_required_changes_section`'s own
-            # tier-2 fallback, lifted here unchanged (issue #792) so the
-            # producer -- not a consumer with no way to correct a bad
-            # call -- makes this decision. `findings_channel = "derived"`
-            # tells the renderer this single item is reviewer prose, not
-            # an itemized list, so it renders as prose (tier 2) rather
-            # than a one-item bullet list built from a multi-paragraph
-            # summary.
-            effective_required_changes = [summary_text.strip()]
-            findings_channel = "derived"
-
-    # Issue #1642: a ``request_changes`` verdict whose own findings ask for a
-    # human/operator decision is a misfiled ``blocked`` verdict -- review.md
-    # already says "use blocked when human input is needed" but nothing
-    # enforced the filing, so a human-call finding (observed on PR #1641)
-    # routed to automated rework and the rework worker asserted an operator
-    # decision that never occurred. Reclassify here, at the single choke
-    # point every verdict write passes through, so the verdict takes the
-    # exact ``blocked`` path: operator queue, no rework brief, no rework
-    # budget. Runs on ``effective_required_changes`` post-derivation, so a
-    # human call written into ``summary`` (the #792 "derived" channel) is
-    # caught identically. The pure decision lives in
-    # ``review_decision.reclassify_human_call_verdict``; this site owns the
-    # enforcement (event + routing).
-    decision, reclassified_human_call = reclassify_human_call_verdict(
+    verdict = verdict_recording.derive_verdict(
         decision,
-        effective_required_changes,
-        markers=self.config.review.human_decision_markers,
         verdict_provenance=verdict_provenance,
+        summary=summary,
+        summary_file=summary_file,
+        required_changes=required_changes,
+        human_decision_markers=self.config.review.human_decision_markers,
+        differences=_PR_DIFFERENCES,
     )
+    if isinstance(verdict, CommandResult):
+        return verdict
+    decision = verdict.decision
+    summary_text = verdict.summary_text
+    effective_required_changes = verdict.required_changes
+    findings_channel = verdict.findings_channel
+    reclassified_human_call = verdict.reclassified_human_call
 
     pr = self.gh.pr_view(pr_number)
     issue_number = (
@@ -165,26 +97,12 @@ def record_review(
         else None
     )
 
-    # Issue #1131: a terminal-state PR (MERGED or CLOSED) must never have
-    # its decision file overwritten or rework routed. The observed race:
-    # an operator unescalate->approve->merge interleaved with a dispatch
-    # pass, so a reviewer's request_changes landed ~8 minutes after the
-    # merge and clobbered ``review-decision.json`` (approved ->
-    # request_changes), destroying the audit record that authorized the
-    # merge, firing a false unauthorized-merge tripwire, and applying
-    # ``agent:needs-rework`` to an already-CLOSED issue. Refuse here --
-    # the durable verdict that authorized the merge is preserved, and the
-    # late verdict is dropped (the caller logs ``review_verdict_missed``,
-    # same as any refused verdict). This is unconditional (not gated on
-    # ``allow_stale_head``): even the operator CLI must not overwrite a
-    # merge-authorizing decision file. GitHub's PR ``state`` is the
-    # authoritative terminal-state signal; ``pr`` is falsy only when
-    # ``pr_view`` itself failed, in which case the existing head-resolution
-    # logic below fails safe on its own and this guard correctly does not
-    # fire on missing data.
+    # GitHub's PR ``state`` is the authoritative terminal-state signal; ``pr`` is falsy
+    # only when ``pr_view`` itself failed, in which case the head resolution below fails
+    # safe on its own and this guard correctly does not fire on missing data.
     pr_github_state = str(pr.get("state") or "").upper() if pr else ""
-    if pr and pr_github_state in ("MERGED", "CLOSED"):
-        return CommandResult(
+    terminal_refusal = (
+        CommandResult(
             False,
             f"PR #{pr_number} is {pr_github_state}; verdict not recorded "
             f"(terminal-state PR decision file is preserved)",
@@ -195,140 +113,54 @@ def record_review(
                 "terminal_state": pr_github_state,
             },
         )
-
-    # Escalation is terminal for verdict recording too, mirroring review()'s
-    # guard: without this, a late-arriving verdict (a reviewer that finished
-    # after the attempt-cap escalation fired, or a stale reap) silently
-    # overwrites status="escalated" and re-enters the PR into the pipeline,
-    # which is exactly how escalated PRs were observed re-escalating 2-3x
-    # (pr-lifecycle.md: non-durable escalation). A human re-arms the PR with
-    # `charlie unescalate`, after which verdicts record normally again.
-    guard_state = _wf.load_state_locked(self.paths.state_file)
-    guard_pr_state = guard_state.get("prs", {}).get(str(pr_number), {})
-    guard_issue_state = (
-        guard_state.get("issues", {}).get(str(issue_number), {})
-        if issue_number is not None
-        else {}
+        if pr and pr_github_state in ("MERGED", "CLOSED")
+        else None
     )
-    if (
-        guard_pr_state.get("status") == "escalated"
-        or guard_issue_state.get("status") == "escalated"
-    ):
-        return CommandResult(
+
+    def _post_pr_comment(body: str) -> str | None:
+        try:
+            self._comment_pr(pr_number, body)
+        except GitHubError as exc:
+            return str(exc)
+        return None
+
+    subject = verdict_recording.VerdictSubject(
+        pr_number=pr_number,
+        issue_number=issue_number,
+        terminal_refusal=terminal_refusal,
+        escalated_refusal=CommandResult(
             False,
             f"PR #{pr_number} is escalated; verdict not recorded "
             f"(run `charlie unescalate --pr {pr_number}` to re-arm it first)",
             {"pr": pr_number, "issue": issue_number, "reason": "pr_escalated", "escalated": True},
-        )
+        ),
+        guard_state=lambda: _wf.load_state_locked(self.paths.state_file),
+        live_head=lambda: pr.get("headRefOid") if pr else None,
+        post_comment=_post_pr_comment,
+    )
+    refusal = verdict_recording.check_recordable(subject)
+    if refusal is not None:
+        return refusal
 
     pr_dir = self.paths.prs / f"pr-{pr_number}"
     pr_dir.mkdir(parents=True, exist_ok=True)
 
-    # reviewed_head_sha/reviewed_patch_id must reflect the packet the reviewer
-    # actually read (review()'s pr.json/diff.patch), not a fresh fetch made
-    # here at verdict time: a commit landing between packet generation and
-    # verdict recording would otherwise silently reattribute the decision to
-    # a head/diff that was never reviewed. Fall back to a live fetch only
-    # when no packet exists (e.g. a decision recorded without a prior
-    # review() call).
     packet_head_sha = self._read_packet_head_oid(pr_number)
-    live_head_sha = pr.get("headRefOid") if pr else None
+    pinned = verdict_recording.pin_reviewed_head(
+        subject,
+        packet_head_sha=packet_head_sha,
+        reviewed_head=reviewed_head,
+        allow_stale_head=allow_stale_head,
+        differences=_PR_DIFFERENCES,
+    )
+    if isinstance(pinned, CommandResult):
+        return pinned
+    reviewed_head_sha = pinned.sha
+    reviewed_head_source = pinned.source
+    live_head_sha = pinned.live_head_sha
 
-    # Issue #467: do not silently pin a verdict to a stale packet when the PR
-    # head has advanced since the packet was generated. If the packet head
-    # disagrees with the live PR head, require an explicit --reviewed-head
-    # choice. When they agree (or no packet exists), preserve the existing
-    # packet-first / live-fallback semantics and record where the SHA came from.
-    #
-    # Issue #1072: the #467 check only fired when *no* --reviewed-head was
-    # passed. When an automated caller (review()'s CI-failure exit,
-    # test-adequacy exit, dispatch_reviews, cross-family) passed
-    # --reviewed-head matching the packet head, the check was bypassed and
-    # the verdict was pinned to a head that had moved mid-build. The
-    # compare-and-swap guard added by #1036 covered only review()'s
-    # packet-commit tail exit; the two earlier exits returned through
-    # record_review() and bypassed it. Pushing the guard here — into the
-    # single choke point every verdict write passes through — makes the
-    # invariant hold by construction for every caller, not just the one
-    # exit #1036 happened to guard. The operator CLI (``charlie verdict``)
-    # is the one caller that may legitimately pin to a superseded head
-    # (issue #467's explicit-choice design), so it passes
-    # ``allow_stale_head=True``; every automated caller uses the default
-    # ``False`` and is refused. The failure direction is toward redundant
-    # work (the PR is re-reviewed next pass), never toward authorizing a
-    # merge on the wrong head — ``reviewed_head_sha`` is compared against
-    # the current head by every downstream consumer.
-    if reviewed_head is not None:
-        if packet_head_sha is not None and reviewed_head == packet_head_sha:
-            if (
-                not allow_stale_head
-                and live_head_sha is not None
-                and packet_head_sha != live_head_sha
-            ):
-                return CommandResult(
-                    False,
-                    f"reviewed head ({reviewed_head}) matches packet head "
-                    f"({packet_head_sha}) but live PR head has moved to "
-                    f"({live_head_sha}); verdict not recorded — head moved "
-                    "during build, will re-review next pass",
-                    {
-                        "pr": pr_number,
-                        "issue": issue_number,
-                        "reason": "head_moved_during_build",
-                        "packet_head_sha": packet_head_sha,
-                        "live_head_sha": live_head_sha,
-                    },
-                )
-            reviewed_head_sha = reviewed_head
-            reviewed_head_source = "packet"
-        elif live_head_sha is not None and reviewed_head == live_head_sha:
-            reviewed_head_sha = reviewed_head
-            reviewed_head_source = "live"
-        else:
-            options: list[str] = []
-            if packet_head_sha is not None:
-                options.append(f"packet head {packet_head_sha}")
-            if live_head_sha is not None:
-                options.append(f"live head {live_head_sha}")
-            options_str = " or ".join(options) if options else "any available head"
-            return CommandResult(
-                False,
-                f"--reviewed-head {reviewed_head} does not match {options_str}",
-                {"reason": "reviewed_head_mismatch"},
-            )
-    elif (
-        packet_head_sha is not None
-        and live_head_sha is not None
-        and packet_head_sha != live_head_sha
-    ):
-        return CommandResult(
-            False,
-            f"review packet head ({packet_head_sha}) differs from live PR head ({live_head_sha}); "
-            "use --reviewed-head to choose the head the verdict applies to",
-            {"reason": "head_moved_during_build"},
-        )
-    elif packet_head_sha is not None:
-        reviewed_head_sha = packet_head_sha
-        reviewed_head_source = "packet"
-    elif live_head_sha is not None:
-        reviewed_head_sha = live_head_sha
-        reviewed_head_source = "live"
-    else:
-        return CommandResult(
-            False, "no packet or live PR head available", {"reason": "no_head_available"}
-        )
-
-    # Calculate patch-id for the PR diff to detect actual content changes
-    # (issue #222: base-update merges can advance head SHA without changing diff content).
-    # All terminal decisions (approved/request_changes/blocked) persist reviewed_patch_id
-    # so the review-queue enumerator can carry them forward on content-identical heads.
-    # Also record the tier-2 content signature (issue #414): patch-id is
-    # unstable across every main advance (the merge-base moves), so the
-    # ordered +/- line stream and changed-file set are persisted here,
-    # at the moment the diff is freshly known, so a later carry-forward
-    # check never needs to reconstruct this historical diff.
-    reviewed_patch_id = ""
-    reviewed_signature = DiffContentSignature((), frozenset())
+    # The diff the verdict applies to: the packet's when the verdict is pinned to the
+    # packet, the live PR diff otherwise.
     diff: str | None = None
     if pr:
         if reviewed_head_source == "packet":
@@ -337,9 +169,8 @@ def record_review(
                 diff = self.gh.pr_diff(pr_number)
         else:
             diff = self.gh.pr_diff(pr_number)
-        reviewed_patch_id = _wf._calculate_patch_id(diff)
-        if diff:
-            reviewed_signature = _wf._diff_content_signature(diff)
+    content = verdict_recording.reviewed_content(diff)
+    reviewed_patch_id = content.patch_id
 
     # Issue #1939: stamp a hash of the PR body the reviewer read alongside
     # reviewed_patch_id. A request_changes finding whose required fix lives
@@ -435,84 +266,8 @@ def record_review(
                 findings_channel = "external"
             else:
                 recorded_external_findings = list(external_findings)
-    decision_payload = {
-        "pr_number": pr_number,
-        "issue_number": issue_number,
-        "decision": decision,
-        "summary": summary_text,
-        "required_changes": effective_required_changes,
-        # Issue #1265: unconditional -- every record_review call already
-        # requires this argument (no default, see the keyword-only
-        # parameter above), so it is always present, never a
-        # conditionally-added key the way findings_channel/
-        # external_findings are.
-        "verdict_provenance": verdict_provenance,
-        "reviewed_head_sha": reviewed_head_sha,
-        "reviewed_head_source": reviewed_head_source,
-        "reviewed_patch_id": reviewed_patch_id,
-        "reviewed_body_sha256": reviewed_body_sha256,
-        "reviewed_changed_lines": list(reviewed_signature.changed_lines),
-        "reviewed_changed_files": sorted(reviewed_signature.changed_files),
-        "reviewed_has_binary": reviewed_signature.has_binary,
-        "carried_forward_from": [],
-        "reviewed_at": _wf.utc_now(),
-    }
-    # Only present when the derivation above ran (issue #792): a verdict
-    # that already carried a populated required_changes, or an
-    # `approved` verdict, passes through with no new key at all.
-    if findings_channel is not None:
-        decision_payload["findings_channel"] = findings_channel
-    # Issue #999: external findings live in their own field, separate
-    # from the reviewer's required_changes. Absent on old-shape records
-    # (pre-#999, or the vacuous-replace case) -- the renderer treats
-    # absence as old-shape and renders exactly as before.
-    if recorded_external_findings is not None:
-        decision_payload["external_findings"] = recorded_external_findings
-    # Persist the ingestion upper bound so the next round's ``since`` can
-    # be derived from it (issue #998 rework: contiguous windowing across
-    # rounds -- see the contiguity note above). Only present when ingestion
-    # actually ran AND the upper bound was resolved; an ``approved`` verdict
-    # has no next ingestion round, and a None ``before`` means the upper
-    # bound was not applied (so there is nothing for the next round's
-    # ``since`` to recover -- it falls back to ``reviewed_at``).
-    if ingestion_before is not None:
-        decision_payload["before"] = ingestion_before
-    # Issue #1340: persist the parser-level provenance (which extractor
-    # found the verdict block: "log", "events", "file:<source>") into the
-    # decision file so a later reader can distinguish a log-extracted
-    # verdict (the reviewer process died before emitting a structured
-    # result) from a clean structured completion. Distinct from
-    # ``verdict_provenance`` (the mechanism that produced the verdict --
-    # "fresh_llm_review", "ci_gate_auto_reject", ...). Only present when a
-    # caller supplied it; the reap path threads ``session_metrics``'s
-    # ``verdict_source`` here, while direct operator/CI-gate callers leave
-    # it absent (no parser was involved).
-    if verdict_source is not None:
-        decision_payload["verdict_source"] = verdict_source
-    # Issue #1485: when a verdict was extracted from a dead reviewer's
-    # session artifacts (verdict_source = "log"/"events"/"file:*") rather
-    # than emitted as a clean structured completion, it may be incomplete
-    # or contain objectively wrong factual claims (e.g. "already merged",
-    # "duplicate"). Persist a provenance caveat into the decision file so
-    # every downstream surface (PR comment, rework brief, round-history)
-    # can render it and a human knows to re-verify before acting on a
-    # destructive-adjacent action like closing a PR. Only applies to
-    # ``blocked``/``request_changes`` -- an ``approved`` verdict has no
-    # required_changes to caveat, and the issue scopes to verdicts that
-    # route to operator instructions.
-    provenance_caveat: str | None = None
-    if decision in {"request_changes", "blocked"}:
-        provenance_caveat = _wf.provenance_caveat_for(verdict_source)
-        if provenance_caveat is not None:
-            decision_payload["provenance_caveat"] = provenance_caveat
+    reviewed_at = _wf.utc_now()
     decision_path = pr_dir / "review-decision.json"
-    # Issue #1268 (W11): per-round archive directory. ``round_number`` is
-    # declared here (rather than inside the lock below) so it survives
-    # past the lock for later use -- e.g. a comment header rendered after
-    # the lock releases needs to reference the same round this call
-    # recorded. It is always reassigned inside the lock before use; the
-    # 0 default is never observed downstream.
-    rounds_dir = pr_dir / "rounds"
     round_number: int = 0
     # Merge-update (never in-place assignment) and persist BEFORE any GitHub
     # label mutation: a label-write failure or crash must not desync the
@@ -586,73 +341,37 @@ def record_review(
                     if rescue_dispatched
                     else summary_text
                 )
-        decision_payload["escalated"] = escalated
         pr_escalation_reason = (
             "max_rework_cycles_exceeded"
             if (decision == "request_changes" and escalated)
             else ("review_blocked" if decision == "blocked" else None)
         )
-        # Persist the verdict BEFORE rendering the rework brief: the brief
-        # reads review-decision.json itself (issue #632, single point of
-        # enforcement) to surface required_changes, so the decision file
-        # must be on disk first. A label-write failure or crash after this
-        # point leaves a durable verdict and a brief consistent with it.
-        #
-        # Issue #934: ``decision_payload`` is a fresh dict that would
-        # silently discard an ``authorized_override`` written by
-        # ``merge_authorize``. The read-modify-write here is inside the
-        # ``state_lock`` (which ``merge_authorize`` also holds), so re-reading
-        # the file at this point is atomic against concurrent writers. Carry
-        # the override forward so a subsequent ``record_review`` for the same
-        # PR does not resurrect the false-positive tripwire finding this PR
-        # exists to eliminate.
-        if decision_path.exists():
-            try:
-                with decision_path.open("r", encoding="utf-8") as _handle:
-                    _existing_decision = json.load(_handle)
-                if isinstance(_existing_decision, dict) and isinstance(
-                    _existing_decision.get("authorized_override"), dict
-                ):
-                    decision_payload["authorized_override"] = _existing_decision[
-                        "authorized_override"
-                    ]
-            except (OSError, json.JSONDecodeError):
-                pass
-        # Issue #1268 (W11): archive this round's artifacts before a
-        # later round's call can overwrite the live files above in
-        # place. round_number is derived from the archive already on
-        # disk -- never from pr_state or request_changes_count (see
-        # _next_round_number's docstring) -- so a crash between this
-        # write and save_state() below cannot desync the round this call
-        # recorded from what is actually on disk. Computed here (not just
-        # inside record_decision) because round_dir is also the archive
-        # target for the rework-prompt/dispatch-note siblings below;
-        # record_decision (issue #1362 Stage 2) derives the identical
-        # number from the same rounds_dir/decision_payload pair, so the
-        # two never disagree.
-        round_number = _wf._next_round_number(rounds_dir, decision_payload)
-        round_dir = rounds_dir / f"round-{round_number}"
-        # Single writer (issue #1362 Stage 2): round-file-then-flat, so a
-        # crash between the two writes still leaves a durable, readable
-        # verdict via review_decision()'s round-fallback. head_sha=None:
-        # decision_payload["reviewed_head_sha"] is already resolved above.
-        # Issue #1650: direct import + bare call (same convention as the
-        # other three record_decision sites), not the _wf. attribute form --
-        # all four sites share one binding style by convention.
-        record_decision(pr_dir, decision_payload, None)
-        # Issue #2837: archive this round's diff.patch alongside the decision,
-        # so the next packet can build a PR-relative interdiff from it. The
-        # live pr_dir/diff.patch belongs to the packet the reviewer just read
-        # (record_review's head CAS guard proves it matches this verdict's
-        # head), and the next review() call overwrites it in place -- so the
-        # copy MUST land now, in the same round directory. The #1695
-        # void-archive path (record_decision with a carried-forward payload)
-        # deliberately does NOT copy: there diff.patch was already overwritten
-        # with the NEW head's diff, and pairing them would fabricate evidence.
-        # Legacy rounds (recorded before #2837) have no diff.patch; the packet
-        # builder then falls back to ``gh.compare_diff``,
-        # emitting a ``review_interdiff_fallback`` event.
-        _review_interdiff.archive_round_diff(pr_dir, round_dir)
+        # Persist the verdict BEFORE rendering the rework brief: the brief reads
+        # review-decision.json itself (issue #632), so the decision file must be on disk
+        # first. A label-write failure or crash after this point leaves a durable verdict.
+        decision_round = verdict_recording.write_decision_round(
+            pr_dir,
+            subject,
+            decision=decision,
+            summary_text=summary_text,
+            required_changes=effective_required_changes,
+            findings_channel=findings_channel,
+            reclassified_human_call=reclassified_human_call,
+            verdict_provenance=verdict_provenance,
+            verdict_source=verdict_source,
+            pinned=pinned,
+            content=content,
+            body_sha256=reviewed_body_sha256,
+            external_findings=recorded_external_findings,
+            ingestion_before=ingestion_before,
+            escalated=escalated,
+            reviewed_at=reviewed_at,
+            next_round_number=_wf._next_round_number,
+            differences=_PR_DIFFERENCES,
+        )
+        round_number = decision_round.round_number
+        round_dir = decision_round.round_dir
+        provenance_caveat = decision_round.provenance_caveat
         if decision == "request_changes" and not escalated:
             rework_path = str(self._write_rework_prompt(pr, issue_number, rework_summary))
             # Archived alongside the decision above, same round_dir: this
@@ -1040,45 +759,18 @@ def record_review(
     # section posted rather than silently skipping the comment for a
     # decision type this gate previously never even reached.
     if not escalated and (comment or self.config.review.post_verdict_comment):
-        header = f"## Fleet review - round {round_number} - {decision}"
-        body_parts = [header]
-        if summary_text:
-            body_parts.append(summary_text)
-        # Issue #1485: surface the provenance caveat in the PR comment
-        # before the required-changes section so an operator reading it
-        # knows to re-verify factual claims before acting. ``provenance_
-        # caveat`` is computed above (near the decision_payload build)
-        # and is only set for log-extracted blocked/request_changes
-        # verdicts.
-        if provenance_caveat is not None:
-            body_parts.append(provenance_caveat)
-        # Issue #792's `findings_channel == "derived"` marker (set above,
-        # ~15326) means `effective_required_changes` is not a real
-        # structured list -- it is `[summary_text.strip()]`, the exact
-        # same text just appended above as the summary paragraph.
-        # `_render_required_changes_section` (the rework-brief renderer)
-        # already treats this case specially for that reason -- tier-2
-        # prose, never a one-item bullet wrapping a whole paragraph
-        # (see its docstring) -- and this gate must honor the same
-        # invariant for the same reason: rendering both here would post
-        # the reviewer's entire summary twice in one comment. Every
-        # other channel (a real structured list, or `"external"``'s
-        # replacement list) is unaffected -- only `"derived"` is ever a
-        # verbatim copy of `summary_text`.
-        if effective_required_changes and findings_channel != "derived":
-            body_parts.append(
-                "### Required changes\n"
-                + "\n".join(f"- {rc}" for rc in effective_required_changes)
-            )
-        comment_body = "\n\n".join(body_parts)
-        try:
-            self._comment_pr(pr_number, comment_body)
-        except GitHubError as exc:
-            # Comment failure is separate from label transition failure
-            if label_error is None:
-                label_error = {"comment_error": str(exc)}
-            else:
-                label_error["comment_error"] = str(exc)
+        comment_error = verdict_recording.post_verdict_comment(
+            subject,
+            round_number=round_number,
+            decision=decision,
+            summary_text=summary_text,
+            provenance_caveat=provenance_caveat,
+            required_changes=effective_required_changes,
+            findings_channel=findings_channel,
+            differences=_PR_DIFFERENCES,
+        )
+        if comment_error is not None:
+            label_error = verdict_recording.with_comment_error(label_error, comment_error)
     source_note = f"head from {reviewed_head_source}"
     if rescue_dispatched:
         message = (
