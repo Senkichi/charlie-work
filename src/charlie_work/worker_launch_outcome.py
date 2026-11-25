@@ -1,37 +1,58 @@
-"""What both worker lanes record once a launch has returned (issue #3098).
+"""What both worker lanes record once a launch has returned (issues #3098, #3099).
 
 Fresh ``dispatch`` and remote ``dispatch_rework`` each used to carry their own
 copy of the bookkeeping that follows a launch: the ``label_error`` record left
-behind when a label transition is not applied, and the blocked-environment
-foreign-writer reap. This module owns both, for both lanes; it is step 1 of a
-chain that moves the rest of the post-launch handling here (issues #3099,
-#3100). It lives at the package root, beside :mod:`charlie_work.worker_launch_gate`,
-because every top-level function defined under ``orchestration/`` is
-auto-installed on ``OrchestratorApp``.
+behind when a label transition is not applied, the blocked-environment
+foreign-writer reap, and the two failure branches (blocked environment; generic
+or deterministic failure with its escalating cap). This module owns all of it,
+for both lanes; it is steps 1 and 2 of a chain that moves the rest of the
+post-launch handling here (issue #3100). It lives at the package root, beside
+:mod:`charlie_work.worker_launch_gate`, because every top-level function defined
+under ``orchestration/`` is auto-installed on ``OrchestratorApp``.
 
 Shape. The module imports nothing from :mod:`charlie_work.workflow`. Names that
 tests replace on ``charlie_work.workflow`` by path (``_try_reap_blocked_foreign_writer``
 and friends) stay resolved through ``workflow`` in the lane: the lane hands the
 reap in as a zero-argument callable, so those patches keep taking effect.
 
-Lane differences are explicit arguments, never inferred:
+Lane differences are explicit keyword arguments, never inferred:
 
-- The reap helpers write nothing. They decide, stamp the issue entry they were
-  handed and return the Event payload (or ``None`` when no reap happened). Each
-  lane emits the Event itself under its own kind, and decides its own status
-  change, because the fresh lane records through ``_record_event`` (a ``repo``
-  on the Event) and the rework lane through ``append_event`` (no ``repo``) --
-  a difference this step preserves.
-- :func:`record_label_error` writes through the :class:`WriteGate` it is given
-  and nowhere else.
+- :func:`record_failed_launch` is the one entry point for a failed launch. It
+  picks the blocked-environment or the generic branch itself, emits the branch's
+  Events through the :class:`WriteGate` it is given, and returns a
+  :class:`LaunchFailureOutcome`; it never touches a label. The lane applies the
+  escalation edge (it needs the ``save_state`` the module already did, so the
+  order Event, save, transition is the lane's order on both sides of the move).
+- ``save_inline`` is the "Save timing" input: rework persists inside the call
+  (and seats its lane-built entry into ``state``); fresh persists once, after
+  its own tail, from the returned ``state`` and ``entry``.
+- :func:`record_label_error` writes through the gate it is given and nowhere else.
+- The reap helpers decide, stamp the issue entry they were handed and return an
+  Event payload (or ``None`` when no reap happened). The rework pre-claim safety
+  net still emits its own Event, with the raw ``append_event`` it has always used.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
+from charlie_work.adapters import SessionDispatchResult
+from charlie_work.config import (
+    DETERMINISTIC_ESCALATION_FAILURE_KINDS,
+    DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS,
+    PRE_LAUNCH_BLOCKED_ENVIRONMENT_FAILURE_KINDS,
+)
+from charlie_work.dispatch_selection import (
+    _windowed_blocked_environment_at,
+    _windowed_foreign_writer_reaps,
+    _windowed_redispatch_at,
+)
+from charlie_work.escalation import _escalate_issue
 from charlie_work.labels import TransitionOutcome, TransitionResult
+from charlie_work.state import clear_escalation, clear_escalation_on_issue_prs
 from charlie_work.write_gate import WriteGate, require_write_gate
 
 
@@ -113,7 +134,7 @@ def reap_blocked_foreign_writer_at_cap(
     persistently-blocked worktree must not loop between reap and redispatch).
     ``try_reap`` is only called under the cap. On a successful reap ``entry`` is
     stamped (``blocked_environment_at`` cleared, ``foreign_writer_reaps``
-    extended with ``now_iso``) and the Event payload is returned for the lane to
+    extended with ``now_iso``) and the Event payload is returned for the caller to
     emit; otherwise ``entry`` is untouched and ``None`` is returned.
     """
     if not (len(prior_reaps) < max_reaps and try_reap()):
@@ -151,3 +172,305 @@ def stamp_pre_claim_reap(
         "blocked_environment_count": blocked_environment_count,
         "foreign_writer_reap_count": len(prior_reaps) + 1,
     }
+
+
+@dataclass(frozen=True)
+class LaunchFailureOutcome:
+    """What :func:`record_failed_launch` decided for one failed launch.
+
+    ``state`` is the state dict after the call (the Events it emitted, the
+    escalation it applied). ``entry`` is the issue record: on an escalation the
+    record stored in ``state["issues"]`` itself (so ``record_label_error`` can
+    persist onto it), otherwise the lane-built entry that was passed in.
+    ``status`` is what the lane records (``"escalated"`` or the restored status);
+    a failed launch always records ``dispatched_at = None``. ``reason_class`` is
+    set exactly when the launch escalated, and the lane then applies the
+    ``redispatch_escalated`` edge for it.
+    """
+
+    state: dict[str, Any]
+    entry: dict[str, Any]
+    status: str
+    reason_class: str | None
+
+
+def _seat(
+    state: dict[str, Any], entry: dict[str, Any], issue_number: int, *, restored_status: str
+) -> None:
+    """Rework's inline restore: stamp the status, seat the entry in ``state``."""
+    entry["status"] = restored_status
+    entry["dispatched_at"] = None
+    state["issues"][str(issue_number)] = entry
+
+
+def record_failed_launch(
+    write_gate: WriteGate,
+    state: dict[str, Any],
+    entry: dict[str, Any],
+    *,
+    failed_result: SessionDispatchResult | None,
+    issue_number: int,
+    now: datetime,
+    window_minutes: int,
+    max_auto_redispatch: int,
+    max_reaps: int,
+    try_reap: Callable[[], bool],
+    recent_attempts: Callable[[list[str]], list[str]] | None,
+    rework: bool,
+    save_inline: bool,
+    clear_stale_escalation: bool,
+    escalation_carries_entry: bool,
+    z_stamps: bool,
+    restored_status: str,
+    previous_status: str,
+    cap_reason: str,
+) -> LaunchFailureOutcome:
+    """Record one failed launch, in either lane (issues #1393, #1423, #461, #515, #807).
+
+    A pre-launch environment block (``PRE_LAUNCH_BLOCKED_ENVIRONMENT_FAILURE_KINDS``)
+    never started a worker, so it counts against ``blocked_environment_at``, not
+    the failure counter: at ``max_auto_redispatch`` it first tries one bounded
+    foreign-writer reap (``try_reap``, only while the windowed reap history is
+    under ``max_reaps``) and otherwise escalates ``dispatch_blocked_environment``.
+    Any other failure counts against the lane's failure counter and escalates
+    immediately for a deterministic kind, or past the cap with ``cap_reason``.
+
+    The lane differences are declared inputs:
+
+    - ``rework``: the lane (Event kind prefix, and the failure counter -- rework's
+      windowed ``redispatch_at`` versus fresh's never-pruned ``dispatch_failed_at``,
+      which ``recent_attempts`` windows for the cap decision only).
+    - ``restored_status`` / ``previous_status`` / ``cap_reason``: the status after a
+      restore, the ``previous_status`` of the ``session_failed_escalated`` Event and
+      the escalation reason of the cap.
+    - ``save_inline``: persist here (and seat ``entry`` in ``state``) versus leave
+      both to the lane.
+    - ``clear_stale_escalation``: clear a standing escalation on every restore.
+    - ``escalation_carries_entry``: escalate with the whole lane-built entry as
+      ``issue_extra`` versus only the counter and ``dispatched_at``.
+    - ``z_stamps``: the failure counter's stamp format (``Z`` versus ``+00:00``).
+
+    ``entry`` is never seated into ``state`` before an escalation: the escalation
+    merges onto the stored record, which keeps the claim stamp and any stale
+    ``label_error`` -- on both sides of the move.
+    """
+    write_gate = require_write_gate(write_gate)
+    failure_kind = failed_result.failure_kind if failed_result is not None else None
+    if failure_kind in PRE_LAUNCH_BLOCKED_ENVIRONMENT_FAILURE_KINDS:
+        return _record_blocked_environment(
+            write_gate,
+            state,
+            entry,
+            failed_result=failed_result,
+            failure_kind=failure_kind,
+            issue_number=issue_number,
+            now=now,
+            window_minutes=window_minutes,
+            max_auto_redispatch=max_auto_redispatch,
+            max_reaps=max_reaps,
+            try_reap=try_reap,
+            rework=rework,
+            save_inline=save_inline,
+            clear_stale_escalation=clear_stale_escalation,
+            escalation_carries_entry=escalation_carries_entry,
+            restored_status=restored_status,
+            previous_status=previous_status,
+        )
+    return _record_generic_failure(
+        write_gate,
+        state,
+        entry,
+        failure_kind=failure_kind,
+        issue_number=issue_number,
+        now=now,
+        window_minutes=window_minutes,
+        max_auto_redispatch=max_auto_redispatch,
+        recent_attempts=recent_attempts,
+        rework=rework,
+        save_inline=save_inline,
+        clear_stale_escalation=clear_stale_escalation,
+        escalation_carries_entry=escalation_carries_entry,
+        z_stamps=z_stamps,
+        restored_status=restored_status,
+        cap_reason=cap_reason,
+    )
+
+
+def _record_blocked_environment(
+    write_gate: WriteGate,
+    state: dict[str, Any],
+    entry: dict[str, Any],
+    *,
+    failed_result: SessionDispatchResult | None,
+    failure_kind: str | None,
+    issue_number: int,
+    now: datetime,
+    window_minutes: int,
+    max_auto_redispatch: int,
+    max_reaps: int,
+    try_reap: Callable[[], bool],
+    rework: bool,
+    save_inline: bool,
+    clear_stale_escalation: bool,
+    escalation_carries_entry: bool,
+    restored_status: str,
+    previous_status: str,
+) -> LaunchFailureOutcome:
+    now_iso = now.isoformat().replace("+00:00", "Z")
+    blocked_environment_at = _windowed_blocked_environment_at(
+        entry, window_minutes=window_minutes
+    ) + [now_iso]
+    blocking_error = failed_result.error if failed_result else None
+    entry["blocked_environment_at"] = blocked_environment_at
+    if len(blocked_environment_at) > max_auto_redispatch:
+        # Issue #1423: before escalating a blocked-environment cap exhaustion for
+        # a foreign writer, attempt to reap it one more time. A writer that was
+        # active on earlier passes but has since gone idle is reaped here instead
+        # of escalating a zombie to a human. Escalation is reserved for a writer
+        # that is alive *and* active. The number of auto-reaps per issue is
+        # bounded: each reap resets ``blocked_environment_at`` to ``[]``, so
+        # without the windowed ``foreign_writer_reaps`` counter (which survives
+        # the reset) a persistently-blocked worktree would loop forever between
+        # reap and redispatch.
+        reap_event = reap_blocked_foreign_writer_at_cap(
+            entry,
+            prior_reaps=_windowed_foreign_writer_reaps(entry, window_minutes=window_minutes),
+            max_reaps=max_reaps,
+            try_reap=try_reap,
+            now_iso=now_iso,
+            issue_number=issue_number,
+            failure_kind=failure_kind,
+            pid=failed_result.pid if failed_result else None,
+            blocked_environment_count=len(blocked_environment_at),
+        )
+        if reap_event is not None:
+            if clear_stale_escalation:
+                clear_escalation(entry)
+                clear_escalation_on_issue_prs(state, issue_number)
+            if save_inline:
+                _seat(state, entry, issue_number, restored_status=restored_status)
+            state = write_gate.record_event(  # event-consumer: audit-only -- records a foreign-writer reap (issue #1423) already enforced by the blocked_environment_at reset and foreign_writer_reaps counter; consumed by tests/test_charlie_work.py regression tests.
+                state,
+                "rework_dispatch_blocked_environment_reaped"
+                if rework
+                else "dispatch_blocked_environment_reaped",
+                reap_event,
+            )
+            if save_inline:
+                write_gate.save_state(state)
+            return LaunchFailureOutcome(state, entry, restored_status, None)
+        # Escalate with the environment reason and the blocking path so the
+        # operator sees "remove C:\...\wt", not "worker quality cap exceeded."
+        state = _escalate_issue(
+            state,
+            issue_number,
+            reason="dispatch_blocked_environment",
+            reason_class="mechanical",
+            issue_extra=entry
+            if escalation_carries_entry
+            else {"blocked_environment_at": blocked_environment_at, "dispatched_at": None},
+        )
+        entry = state["issues"][str(issue_number)]
+        state = write_gate.record_event(
+            state,
+            "session_failed_escalated",
+            {
+                "issue_number": issue_number,
+                "previous_status": previous_status,
+                "reason": "dispatch_blocked_environment",
+                "failure_kind": failure_kind,
+                "blocking_error": blocking_error,
+                "blocked_environment_count": len(blocked_environment_at),
+            },
+        )
+        if save_inline:
+            write_gate.save_state(state)
+        return LaunchFailureOutcome(state, entry, "escalated", "mechanical")
+    # Cap not exceeded: restore without touching the failure counter, and emit a
+    # distinct Event so the operator can see the environment conflict before it
+    # escalates.
+    if clear_stale_escalation:
+        clear_escalation(entry)
+        clear_escalation_on_issue_prs(state, issue_number)
+    if save_inline:
+        _seat(state, entry, issue_number, restored_status=restored_status)
+    state = write_gate.record_event(  # event-consumer: audit-only -- records a pre-launch environment block (issue #1393) already enforced by the blocked_environment_at counter and the dispatch_blocked_environment escalation; consumed by tests/test_charlie_work.py regression tests.
+        state,
+        "rework_dispatch_blocked_environment" if rework else "dispatch_blocked_environment",
+        {
+            "issue_number": issue_number,
+            "failure_kind": failure_kind,
+            "blocking_error": blocking_error,
+            "blocked_environment_count": len(blocked_environment_at),
+        },
+    )
+    if save_inline:
+        write_gate.save_state(state)
+    return LaunchFailureOutcome(state, entry, restored_status, None)
+
+
+def _record_generic_failure(
+    write_gate: WriteGate,
+    state: dict[str, Any],
+    entry: dict[str, Any],
+    *,
+    failure_kind: str | None,
+    issue_number: int,
+    now: datetime,
+    window_minutes: int,
+    max_auto_redispatch: int,
+    recent_attempts: Callable[[list[str]], list[str]] | None,
+    rework: bool,
+    save_inline: bool,
+    clear_stale_escalation: bool,
+    escalation_carries_entry: bool,
+    z_stamps: bool,
+    restored_status: str,
+    cap_reason: str,
+) -> LaunchFailureOutcome:
+    stamp = now.isoformat()
+    if z_stamps:
+        stamp = stamp.replace("+00:00", "Z")
+    if rework:
+        # Every attempt, successful or not, counts against the same windowed
+        # ``redispatch_at`` (issue #515); the stored list is the pruned one.
+        attempts = _windowed_redispatch_at(entry, window_minutes=window_minutes) + [stamp]
+        recent = attempts
+    else:
+        # Fresh never prunes what it stores (issue #461); only the cap decision
+        # looks at the window.
+        attempts = list(entry.get("dispatch_failed_at") or [])
+        attempts.append(stamp)
+        recent = recent_attempts(attempts) if recent_attempts is not None else attempts
+        entry["dispatch_failed_at"] = attempts
+    # Deterministic launch failures escalate immediately (issue #550); a
+    # deterministic judgment failure does too but as ``reason_class="judgment"``
+    # (issue #807).
+    terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+    deterministic_judgment = failure_kind in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
+    immediate_escalation = terminal_failure or deterministic_judgment
+    if immediate_escalation or len(recent) > max_auto_redispatch:
+        reason = failure_kind if immediate_escalation else cap_reason
+        reason_class = "judgment" if deterministic_judgment else "mechanical"
+        state = _escalate_issue(
+            state,
+            issue_number,
+            reason=reason,
+            reason_class=reason_class,
+            issue_extra=entry
+            if escalation_carries_entry
+            else {"redispatch_at": attempts, "dispatched_at": None},
+        )
+        entry = state["issues"][str(issue_number)]
+        if save_inline:
+            write_gate.save_state(state)
+        return LaunchFailureOutcome(state, entry, "escalated", reason_class)
+    if clear_stale_escalation:
+        clear_escalation(entry)
+        clear_escalation_on_issue_prs(state, issue_number)
+    if rework:
+        entry["redispatch_at"] = attempts
+    if save_inline:
+        _seat(state, entry, issue_number, restored_status=restored_status)
+        write_gate.save_state(state)
+    return LaunchFailureOutcome(state, entry, restored_status, None)
