@@ -1226,22 +1226,13 @@ def _write_failure_kind_to_sidecar(
     see devin_shell.py / claude_code.py. Best-effort: any I/O failure here
     just means the existing log-tail classifier runs normally instead.
     """
-    from .claude_code import CLAUDE_RECORD_KINDS
+    # Lazy: ``worker_fate`` imports ``worker``, which imports this module.
+    from . import worker_fate
 
-    if worker.adapter_kind == "devin":
-        from .devin_shell import _sidecar_path as devin_sidecar_path
-        from .devin_shell import _write_json
-
-        sidecar_path = devin_sidecar_path(sessions_dir, worker.issue_number)
-        writer = _write_json
-    elif worker.adapter_kind in CLAUDE_RECORD_KINDS:
-        from .claude_code import _sidecar_path as claude_sidecar_path
-        from .claude_code import _write_json_atomic as writer_fn
-
-        sidecar_path = claude_sidecar_path(sessions_dir, worker.issue_number, worker.adapter_kind)
-        writer = writer_fn
-    else:
+    profile = worker_fate.profile_for(worker.adapter_kind)
+    if profile is None or profile.sidecar is None:
         return
+    sidecar_path = profile.sidecar.path(sessions_dir, worker.issue_number)
 
     if not sidecar_path.exists():
         return
@@ -1255,7 +1246,7 @@ def _write_failure_kind_to_sidecar(
     if payload.get("failure_kind") is not None:
         return
     payload["failure_kind"] = failure_kind
-    writer(sidecar_path, payload)
+    profile.sidecar.write(sidecar_path, payload)
 
 
 def _classify_via_sessions_db(
