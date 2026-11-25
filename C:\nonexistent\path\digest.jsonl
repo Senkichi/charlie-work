@@ -1,1 +1,0 @@
-{"generated_at": "2026-07-07T00:00:00Z", "repo": "test-repo", "transitions": [{"issue_number": 1, "adapter_kind": "claude-code", "health": "STALLED", "previous_health": null, "last_log_line": "error: stuck", "pid": 12345, "terminal_tool": null, "terminal_reason": null}]}
