@@ -1219,6 +1219,7 @@ def _dispatch_rework_impl(
                     "label_errors": [],
                     "operator_claimed_skipped": sorted(operator_claimed_skipped),
                     "failures": no_session_failure_map,
+                    **launch_lock.event_fields(),
                     # Issue #1014 (mirroring #1005): the capacity axis.
                     # Always present -- gov.report_fields() is safe to call
                     # unclamped -- and explicit about `clamped` so a reader
@@ -1532,6 +1533,7 @@ def _dispatch_rework_impl(
                 "label_errors": sorted(label_errors),
                 "operator_claimed_skipped": sorted(operator_claimed_skipped),
                 "failures": rework_failure_map,
+                **launch_lock.event_fields(),
                 # Issue #1014 (mirroring #1005): the capacity axis.
                 # Always present -- gov.report_fields() is safe to call
                 # unclamped -- and explicit about `clamped` so a reader

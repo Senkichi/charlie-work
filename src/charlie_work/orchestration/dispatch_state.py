@@ -1661,6 +1661,7 @@ def _dispatch_impl(
                 "merged_pr_flagged_issue_numbers": sorted(newly_flagged_mention_issues),
                 "merged_pr_mention_rearmed_issue_numbers": sorted(newly_rearmed_mention_issues),
                 "failures": dispatch_failure_map,
+                **launch_lock.event_fields(),
                 # Issue #944: why zero, when it is zero. Every other field
                 # here describes issues the ready-filtered query returned;
                 # this one describes the backlog that query cannot see.
