@@ -1678,11 +1678,7 @@ def detect_drift(
     # This must happen AFTER the PR loop (to populate open_prs_by_issue) but BEFORE
     # the issue loop (to populate issues_handled_by_session_relabel for mutual exclusion)
     if repo_root is not None:
-        from .claude_code import (
-            CLAUDE_RECORD_KINDS,
-            update_worker_record_with_failure_classification,
-        )
-        from .devin_shell import update_session_record_with_failure_classification
+        from . import worker_fate
         from .post_mortem import classify_and_record
         from .worker import (
             _log_is_stalled_at_shim,
@@ -1717,20 +1713,13 @@ def detect_drift(
                         real_activity_probe=probe,
                     ):
                         # Session is alive but stalled at shim marker - classify as launch_stalled
-                        if w.adapter_kind == "devin":
-                            update_session_record_with_failure_classification(
+                        profile = worker_fate.profile_for(w.adapter_kind)
+                        if profile is not None and profile.record_failure is not None:
+                            profile.record_failure(
                                 sessions_dir,
                                 w.issue_number,
                                 fallback_kind="launch_stalled",
                                 config=config,
-                            )
-                        elif w.adapter_kind in CLAUDE_RECORD_KINDS:
-                            update_worker_record_with_failure_classification(
-                                sessions_dir,
-                                w.issue_number,
-                                fallback_kind="launch_stalled",
-                                config=config,
-                                adapter_kind=w.adapter_kind,
                             )
 
                         # Kill the process tree to free the slot
@@ -1807,6 +1796,7 @@ def detect_drift(
                         config.dispatch.materialize_dirs,
                     )
                     is_completed = inspection.state == WorktreeState.COMPLETED
+                    profile = worker_fate.profile_for(w.adapter_kind)
 
                     # Issue #261: post-mortem extraction is intertwined with log-tail
                     # classification. For a completed-but-unpublished worktree, we want
@@ -1823,26 +1813,13 @@ def detect_drift(
                         # the session's own completion-summary prose as a
                         # provider-throttle signature. See claude_code.
                         # update_worker_record_with_failure_classification.
-                        if w.adapter_kind == "devin":
-                            failure_kind, throttled_until = (
-                                update_session_record_with_failure_classification(
-                                    sessions_dir,
-                                    w.issue_number,
-                                    fallback_kind="unpublished_work",
-                                    config=config,
-                                    session_completed=True,
-                                )
-                            )
-                        elif w.adapter_kind in CLAUDE_RECORD_KINDS:
-                            failure_kind, throttled_until = (
-                                update_worker_record_with_failure_classification(
-                                    sessions_dir,
-                                    w.issue_number,
-                                    fallback_kind="unpublished_work",
-                                    config=config,
-                                    adapter_kind=w.adapter_kind,
-                                    session_completed=True,
-                                )
+                        if profile is not None and profile.record_failure is not None:
+                            failure_kind, throttled_until = profile.record_failure(
+                                sessions_dir,
+                                w.issue_number,
+                                fallback_kind="unpublished_work",
+                                config=config,
+                                session_completed=True,
                             )
                         else:
                             failure_kind, throttled_until = None, None
@@ -1854,24 +1831,12 @@ def detect_drift(
                         fallback_kind = (
                             "stalled" if inspection.state != WorktreeState.UNKNOWN else None
                         )
-                        if w.adapter_kind == "devin":
-                            failure_kind, throttled_until = (
-                                update_session_record_with_failure_classification(
-                                    sessions_dir,
-                                    w.issue_number,
-                                    fallback_kind=fallback_kind,
-                                    config=config,
-                                )
-                            )
-                        elif w.adapter_kind in CLAUDE_RECORD_KINDS:
-                            failure_kind, throttled_until = (
-                                update_worker_record_with_failure_classification(
-                                    sessions_dir,
-                                    w.issue_number,
-                                    fallback_kind=fallback_kind,
-                                    config=config,
-                                    adapter_kind=w.adapter_kind,
-                                )
+                        if profile is not None and profile.record_failure is not None:
+                            failure_kind, throttled_until = profile.record_failure(
+                                sessions_dir,
+                                w.issue_number,
+                                fallback_kind=fallback_kind,
+                                config=config,
                             )
                         else:
                             failure_kind, throttled_until = None, None

@@ -17,18 +17,12 @@ from pathlib import Path
 from typing import Any
 
 from .claude_code import (
-    CLAUDE_RECORD_KINDS,
     ClaudeWorkerRecord,
-    _sidecar_path as claude_sidecar_path,
     last_tool_call_timestamp,
     read_worker_records,
 )
 from .config import WRITER_MARKER_FILENAME, OrchestratorConfig
-from .devin_shell import (
-    SessionRecord,
-    _sidecar_path as devin_sidecar_path,
-    read_session_records,
-)
+from .devin_shell import SessionRecord, read_session_records
 from .post_mortem import (
     RealActivityProbe,
     _events_path_from_log,
@@ -337,7 +331,7 @@ class WorkerView:
     ) -> None:
         """Delete the sidecar file for this worker to prevent phantom sessions.
 
-        Dispatches to the adapter-specific sidecar path function based on adapter_kind.
+        Asks the adapter's fate profile where the sidecar lives (issue #3092).
         Best-effort cleanup: OSError is swallowed to avoid failing the entire dead-session
         classification loop if a single unlink fails (the sidecar will be reaped on the
         next cycle). Also removes the in-worktree writer marker when it matches this
@@ -354,19 +348,17 @@ class WorkerView:
         Callers without api context (legacy callers, tests, review-lane reaps)
         omit the kwargs and skip settlement — the unlink still happens.
         """
-        if self.adapter_kind == "devin":
-            sidecar_path = devin_sidecar_path(sessions_dir, self.issue_number)
-        elif self.adapter_kind in CLAUDE_RECORD_KINDS:
-            # api/opencode sidecars share the claude-code sidecar-path
-            # derivation; the adapter_kind-aware _sidecar_path helper selects
-            # the .api.json / .opencode.json suffix.
-            sidecar_path = claude_sidecar_path(sessions_dir, self.issue_number, self.adapter_kind)
-            # Best-effort spend settlement before the sidecar is unlinked (issue #480).
-            if self.adapter_kind == "api" and api_config is not None and state_dir is not None:
-                self._settle_api_budget(sidecar_path, api_config, state_dir)
-        else:
-            # Unknown adapter kind - nothing to reap
+        # Lazy: ``worker_fate`` imports this module at module level (see is_alive).
+        from . import worker_fate
+
+        profile = worker_fate.profile_for(self.adapter_kind)
+        if profile is None or profile.sidecar is None:
+            # Unknown adapter kind, or one that writes no sidecar - nothing to reap
             return
+        sidecar_path = profile.sidecar.path(sessions_dir, self.issue_number)
+        # Best-effort spend settlement before the sidecar is unlinked (issue #480).
+        if self.adapter_kind == "api" and api_config is not None and state_dir is not None:
+            self._settle_api_budget(sidecar_path, api_config, state_dir)
 
         try:
             sidecar_path.unlink(missing_ok=True)
@@ -1069,13 +1061,14 @@ def update_worker_log_stat(
     """
     import json
 
-    if worker.adapter_kind == "devin":
-        sidecar_path = devin_sidecar_path(sessions_dir, worker.issue_number)
-    elif worker.adapter_kind in CLAUDE_RECORD_KINDS:
-        sidecar_path = claude_sidecar_path(sessions_dir, worker.issue_number, worker.adapter_kind)
-    else:
-        # Unknown adapter kind - nothing to update
+    # Lazy: ``worker_fate`` imports this module at module level (see is_alive).
+    from . import worker_fate
+
+    profile = worker_fate.profile_for(worker.adapter_kind)
+    if profile is None or profile.sidecar is None:
+        # Unknown adapter kind, or one that writes no sidecar - nothing to update
         return
+    sidecar_path = profile.sidecar.path(sessions_dir, worker.issue_number)
 
     if not sidecar_path.exists():
         return
@@ -1121,17 +1114,8 @@ def update_worker_log_stat(
     if tool_released_at is not None:
         payload["tool_released_at"] = tool_released_at
 
-    # Write back atomically using the adapter-specific helper
-    if worker.adapter_kind == "devin":
-        from .devin_shell import _write_json
-
-        _write_json(sidecar_path, payload)
-    elif worker.adapter_kind in CLAUDE_RECORD_KINDS:
-        # api/opencode sidecars share the claude-code atomic-write helper (same on-disk
-        # record shape, just a different filename suffix).
-        from .claude_code import _write_json_atomic
-
-        _write_json_atomic(sidecar_path, payload)
+    # Write back atomically using the adapter's own helper
+    profile.sidecar.write(sidecar_path, payload)
 
 
 @dataclass(frozen=True)

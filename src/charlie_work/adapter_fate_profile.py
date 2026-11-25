@@ -21,6 +21,21 @@ from .worker import WorkerView
 
 
 @dataclass(frozen=True)
+class SidecarAccess:
+    """Where one harness keeps its Sidecar and how it is rewritten (issue #3092).
+
+    A caller that holds a ``WorkerView`` (or a harness name) asks the profile
+    for this instead of branching on the harness name to pick
+    ``devin_shell``'s or ``claude_code``'s helper.
+    """
+
+    # (sessions_dir, issue-or-PR number) -> that launch's Sidecar path.
+    path: Callable[[Path, int], Path]
+    # (Sidecar path, payload) -> None: the harness's own atomic JSON write.
+    write: Callable[[Path, dict[str, Any]], None]
+
+
+@dataclass(frozen=True)
 class AdapterFateProfile:
     """The internal Adapter seam (design doc §7): one place that knows how
     each harness reports liveness and failure, replacing the 14
@@ -62,6 +77,10 @@ class AdapterFateProfile:
     # stalled lane can release (``pipe_holder_release``) instead of killing the
     # whole session. True only where that mechanism was reproduced (opencode).
     releases_blocked_tool: bool = False
+    # Issue #3092: the harness's Sidecar location and write. None for a harness
+    # that writes no Sidecar (command, manual) -- the caller has nothing to
+    # read, rewrite or reap.
+    sidecar: SidecarAccess | None = None
 
 
 _PROFILES: dict[str, AdapterFateProfile] | None = None
@@ -108,6 +127,48 @@ def _opencode_record_failure(*args: Any, **kwargs: Any) -> tuple[str | None, str
     )
 
 
+def _devin_sidecar_path(sessions_dir: Path, number: int) -> Path:
+    """Late-bound ``devin_shell._sidecar_path``."""
+    from . import devin_shell
+
+    return devin_shell._sidecar_path(sessions_dir, number)
+
+
+def _devin_write_sidecar(path: Path, payload: dict[str, Any]) -> None:
+    """Late-bound ``devin_shell._write_json``."""
+    from . import devin_shell
+
+    devin_shell._write_json(path, payload)
+
+
+def _claude_record_sidecar_path(view_kind: str) -> Callable[[Path, int], Path]:
+    """Late-bound ``claude_code._sidecar_path`` for one ``ClaudeWorkerRecord`` kind.
+
+    claude-code, api and opencode share the path derivation; ``view_kind``
+    selects the ``.claude.json`` / ``.api.json`` / ``.opencode.json`` suffix.
+    """
+
+    def sidecar_path(sessions_dir: Path, number: int) -> Path:
+        from . import claude_code
+
+        return claude_code._sidecar_path(sessions_dir, number, view_kind)
+
+    return sidecar_path
+
+
+def _claude_record_write_sidecar(path: Path, payload: dict[str, Any]) -> None:
+    """Late-bound ``claude_code._write_json_atomic`` (claude-code, api, opencode)."""
+    from . import claude_code
+
+    claude_code._write_json_atomic(path, payload)
+
+
+def _claude_record_sidecar(view_kind: str) -> SidecarAccess:
+    return SidecarAccess(
+        path=_claude_record_sidecar_path(view_kind), write=_claude_record_write_sidecar
+    )
+
+
 def _build_profiles() -> dict[str, AdapterFateProfile]:
     """Build the by-harness profile table, then index it by ``view_kinds``.
 
@@ -129,7 +190,8 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
     CALL time (see :func:`_api_over_budget`): the registry is cached for the
     process, so binding the function objects here would freeze whichever
     implementation -- including a test's ``patch`` mock -- was live at the
-    first ``profile_for`` call.
+    first ``profile_for`` call. The ``sidecar`` shims are late-bound for the
+    same reason.
     """
     from .harnesses import WORKER_HARNESSES
     from .opencode_log import provider_error_digest
@@ -144,6 +206,7 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
             over_budget=None,
             writes_terminal_record=True,
             harness_auth_evidence=devin_harness_auth_evidence,
+            sidecar=SidecarAccess(path=_devin_sidecar_path, write=_devin_write_sidecar),
         ),
         "claude-code": AdapterFateProfile(
             harness="claude-code",
@@ -153,6 +216,7 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
             record_failure=_claude_code_record_failure,
             over_budget=None,
             writes_terminal_record=True,
+            sidecar=_claude_record_sidecar("claude-code"),
         ),
         "api": AdapterFateProfile(
             harness="api",
@@ -162,6 +226,7 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
             record_failure=_api_record_failure,
             over_budget=_api_over_budget,
             writes_terminal_record=True,
+            sidecar=_claude_record_sidecar("api"),
         ),
         # opencode sessions are ClaudeWorkerRecord sidecars written by
         # launch_claude_worker, so they share its classifier/terminal watcher.
@@ -178,6 +243,7 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
             log_digest=provider_error_digest,
             quota_reset=_opencode_quota_reset,
             releases_blocked_tool=True,
+            sidecar=_claude_record_sidecar("opencode"),
         ),
         # "command" and "manual" have no failure-classification or budget
         # consumer today: dead_worker_reap.py's 14 sites never branch on
