@@ -28,6 +28,11 @@ from charlie_work.state import load_state_locked
 
 BRANCH = "agent/issue-7-x"
 
+# The same four lines; only the depth of ``return x`` differs, which moves it
+# into the ``if`` block. ``git patch-id --stable`` cannot tell them apart.
+RETURN_AFTER_IF = "def f(x):\n    if x:\n        x = 1\n    return x\n"
+RETURN_INSIDE_IF = "def f(x):\n    if x:\n        x = 1\n        return x\n"
+
 
 @pytest.fixture
 def repo() -> Path:
@@ -74,7 +79,7 @@ def _zero_diff_branch(repo: Path) -> str:
     return head
 
 
-def _stale_packet_then_operator_approval(repo: Path):
+def _stale_packet_then_operator_approval(repo: Path, approved_content: str = "b = 1\n"):
     """Packet built at head A; branch advanced to B; operator approves B."""
     _init_repo(repo)
     issues_dir = repo / "docs" / "issues"
@@ -82,7 +87,7 @@ def _stale_packet_then_operator_approval(repo: Path):
     app = _app(repo, issues_dir)
     _parked_issue(app, issues_dir, 7, BRANCH)
     app._local_review_packets()
-    approved_head = _advance_branch(repo, "b.py", "b = 1\n")
+    approved_head = _advance_branch(repo, "b.py", approved_content)
     result = app.record_local_review(
         7, "approved", reviewed_head=approved_head, verdict_provenance="operator_manual"
     )
@@ -122,6 +127,20 @@ class TestOperatorVerdictPatchId:
         state = load_state_locked(app.paths.state_file)
         assert state["prs"]["7"]["status"] != "approved"
 
+    def test_indentation_only_commit_after_approval_is_re_reviewed(self, repo: Path) -> None:
+        """Issue #3090: a patch-id match is not enough -- an indentation-only
+        commit changes what Python does and was never reviewed."""
+        app, _, _ = _stale_packet_then_operator_approval(repo, RETURN_AFTER_IF)
+        moved_head = _advance_branch(repo, "b.py", RETURN_INSIDE_IF)
+        assert _patch_id(repo, moved_head) == app._review_decision(7)["reviewed_patch_id"]
+
+        outcome = app._local_review_packets()
+
+        assert outcome["packets"], "re-indented code must be re-reviewed"
+        state = load_state_locked(app.paths.state_file)
+        assert state["prs"]["7"]["status"] != "approved"
+        assert app._read_packet_head_oid(7) == moved_head
+
 
 class TestApprovalSurvivesHeadMove:
     def test_self_heals_a_verdict_recorded_with_the_wrong_patch_id(self, repo: Path) -> None:
@@ -141,6 +160,25 @@ class TestApprovalSurvivesHeadMove:
         _advance_branch(repo, "c.py", "c = 1\n")
 
         assert not approval_survives_head_move(repo, "main", BRANCH, app._review_decision(7))
+
+    def test_rejects_an_indentation_only_change(self, repo: Path) -> None:
+        app, _, _ = _stale_packet_then_operator_approval(repo, RETURN_AFTER_IF)
+        _advance_branch(repo, "b.py", RETURN_INSIDE_IF)
+
+        assert not approval_survives_head_move(repo, "main", BRANCH, app._review_decision(7))
+
+    @pytest.mark.parametrize("missing", ["reviewed_changed_lines", "reviewed_changed_files"])
+    def test_rejects_a_record_without_a_stored_line_signature(
+        self, repo: Path, missing: str
+    ) -> None:
+        """A verdict recorded before the line signature was stored has nothing
+        to compare line content against: it is reviewed again, never carried
+        on the patch-id alone."""
+        app, _, _ = _stale_packet_then_operator_approval(repo)
+        _gate_sync_merge(repo)
+        decision = {k: v for k, v in app._review_decision(7).items() if k != missing}
+
+        assert not approval_survives_head_move(repo, "main", BRANCH, decision)
 
     def test_empty_live_diff_survives_when_verdict_recorded_empty_patch_id(
         self, repo: Path
