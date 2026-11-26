@@ -58,6 +58,7 @@ from .labels import TransitionOutcome, apply_issue_labels, transition
 from .local_lane import synthesize_open_pr
 from .local_work_park import publishes_pull_requests
 from .merge_finalize import _merged_issue_fields
+from .merge_path.gather import persisted_from
 from .merge_path.model import MERGEQUEUE_DWELL_FIELDS, MERGEQUEUE_WEDGED_REVOKE
 from .paths import resolved_layout, runtime_paths
 from .process_utils import kill_process_tree
@@ -539,9 +540,12 @@ def _mergequeue_requeue_capped(
     try:
         paths = runtime_paths(repo_root, config.runtime.state_dir)
         entry = load_state_locked(paths.state_file).get("prs", {}).get(str(pr_number), {})
-        if not isinstance(entry, dict) or entry.get("mergequeue_requeues_head_sha") != head_sha:
+        if not isinstance(entry, dict):
             return False
-        return int(entry.get("consecutive_mergequeue_requeues") or 0) >= cap
+        persisted = persisted_from(entry)
+        if persisted.mergequeue_requeues_head_sha != head_sha:
+            return False
+        return int(persisted.mergequeue_requeues or 0) >= cap
     except (OSError, TypeError, ValueError, KeyError):
         return False
 
