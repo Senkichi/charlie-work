@@ -35,9 +35,19 @@ too, so the list can neither hide a new drift nor go stale.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
+
+from _dashboard_rollup_fixtures import _register
+from charlie_work import instrumentation
+from charlie_work.dashboard import rollup
+from charlie_work.dashboard.drill.timeline import pr_drill
+from charlie_work.dashboard.metrics_flow import EXACT_KINDS
+from charlie_work.local_issue_files import issue_number_from_name
+from charlie_work.local_issues import LocalFileGitHub
+from charlie_work.local_lane import local_pr_dict
 
 from _verdict_parity_driver import MISSING, Diff, Scenario, _diffs, run_both
 from _verdict_parity_table import DECLARED_DIFFERENCES, SCENARIOS
@@ -77,7 +87,9 @@ _REQUIRED_SCENARIOS = {
     "already_closed",
 }
 
-# The issue's table, verbatim: (difference, reason).
+# The issue's table, verbatim: (difference, reason). Exception: the `reviewed_body_sha256` row's
+# reason differs by design (issue #3105 kept the difference and replaced "drift, tracked separately"),
+# and so does the "Local lifecycle transitions omit the record number" row (issue #3106, same).
 _ISSUE_ROWS = (
     (
         "No Rescue tier on the Local path",
@@ -90,9 +102,27 @@ _ISSUE_ROWS = (
         "Local-only decision fields (`human_call_reclassified_from`, `human_call_marker`, `local: True`)",
         "local bookkeeping",
     ),
-    ("Local verdict comment repeats the summary", "drift, tracked separately"),
-    ("`reviewed_body_sha256` not recorded locally", "drift, tracked separately"),
-    ("Local lifecycle transitions omit the record number", "drift, tracked separately"),
+    (
+        "`reviewed_body_sha256` not recorded locally",
+        (
+            "the Local path has no PR body to hash (its packet `pr.json` and `local_pr_dict` "
+            "carry no `body`; `LocalFileGitHub.pr_view` returns `{}` and `pr_list` returns "
+            '`[]`), and every comparison of the stored hash requires `"body" in pr`, so a '
+            "recorded hash could never be compared. `_body_rework_escape_warning` does "
+            "execute for a Local path record in the mechanical de-escalation sweep, but with "
+            "`pr == {}` it fails closed; `_route_to_rework` only copies the stored value"
+        ),
+    ),
+    (
+        "Local lifecycle transitions omit the record number",
+        (
+            "A Local path record's number is its local issue file's number, not a GitHub PR "
+            "number, and the dashboard links milestones to an item by (source, pr) alone. "
+            "`lifecycle_transition` rows are the exact Stage time source, so in an events.db "
+            "that also holds PR path history a same-numbered PR's drill-down would absorb the "
+            "Local issue's stages; the rows are already complete keyed by issue number."
+        ),
+    ),
 )
 
 
@@ -147,6 +177,49 @@ def test_declared_differences_start_with_the_issues_eight_rows_verbatim() -> Non
     assert [row.reason for row in DECLARED_DIFFERENCES[len(_ISSUE_ROWS) :]] == ["undecided"] * (
         len(DECLARED_DIFFERENCES) - len(_ISSUE_ROWS)
     )
+
+
+def test_local_path_has_no_body_to_hash_so_no_reviewed_body_sha256(tmp_path) -> None:
+    """Pins the reason on the `reviewed_body_sha256` declared difference: if the Local path
+    ever gains a PR body, this fails and the difference must be revisited (issue #3105)."""
+    gh = LocalFileGitHub(repo_root=tmp_path, issues_dir=tmp_path)
+    assert gh.pr_view(1) == {}
+    assert gh.pr_list() == []
+    assert "body" not in local_pr_dict({"number": 1, "branch": "b", "headRefOid": "0" * 40})
+    local = _outcomes(_scenario("approve"))[1]
+    assert local.get("decision_file.reviewed_body_sha256", MISSING) is MISSING
+    assert local.get("pr_record.reviewed_body_sha256", MISSING) is MISSING
+
+
+def test_local_lifecycle_transition_omits_the_record_number_so_no_pr_drill_collision(
+    tmp_path, monkeypatch
+) -> None:
+    """Pins the reason on the "Local lifecycle transitions omit the record number" declared
+    difference (issue #3106). If a fact stops being true the difference must be revisited."""
+    # The Local path's Verdict transition carries no number through the real entry point.
+    local = _outcomes(_scenario("approve"))[1]
+    assert local["events.lifecycle_transition#0.payload.pr_number"] is None
+    # (i) a Local path record's number is its local issue file's number.
+    assert issue_number_from_name("7_some-issue.md") == 7
+    # (ii) lifecycle_transition is an exact Stage time kind.
+    assert "lifecycle_transition" in EXACT_KINDS
+    # (iii) the dashboard keys a milestone's PR link on the number alone: a row tagged with
+    # number 7 surfaces in PR 7's drill-down even though it belongs to a different issue.
+    slug = "local/guard"
+    root = _register(tmp_path / "fleet", tmp_path / "repo", slug)
+    state = root / "state.json"
+
+    def emit(ts: str, payload: dict) -> None:
+        monkeypatch.setattr(instrumentation, "_now_iso", lambda: ts)
+        instrumentation.log_event(state, "lifecycle_transition", payload)
+
+    emit("2026-10-01T00:00:00Z", {"issue_number": 5, "pr_number": 7, "to_state": "pr_open"})
+    emit("2026-10-01T01:00:00Z", {"issue_number": 9, "pr_number": 7, "to_state": "needs_rework"})
+    now = datetime(2026, 10, 2, tzinfo=UTC)
+    srcs = rollup.rollup_sources(str(tmp_path / "fleet"))
+    rollup.run_rollup(srcs, now)
+    drill = pr_drill(slug, 7, srcs.db_path, None, now)
+    assert {e.issue for e in drill.timeline} == {5, 9}
 
 
 def test_patch_id_follows_the_pinned_head_not_the_packet() -> None:

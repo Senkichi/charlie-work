@@ -352,6 +352,45 @@ def test_local_comment_is_written_to_verdict_comment_md_and_catches_oserror(
     assert result.data["label_error"] == {"comment_error": "disk full"}
 
 
+def test_derived_findings_comment_shows_the_summary_once_on_the_local_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No explicit required changes: the findings are derived from the summary, so a
+    # "Required changes" section would repeat it (issue #3104).
+    scenario = Scenario("derived", "request_changes", summary="Fix the null check.")
+    _, local = sides(scenario)
+    posted: list[str] = []
+
+    def capture(self: Any, issue_number: int, body_path: Path) -> None:
+        posted.append(Path(body_path).read_text("utf-8"))
+
+    monkeypatch.setattr(type(local.gh), "issue_comment", capture)
+    assert local.call(scenario).ok is True
+    assert _decision(local)["findings_channel"] == "derived"
+    body = (local.pr_dir / "verdict-comment.md").read_text("utf-8")
+    assert body == "## Fleet review - round 1 - request_changes\n\nFix the null check."
+    assert posted == [body]
+
+
+def test_explicit_required_changes_are_listed_on_both_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = Scenario(
+        "explicit", "request_changes", summary="Needs work.", required_changes=("Add a test.",)
+    )
+    remote, local = sides(scenario)
+    posted: list[str] = []
+    monkeypatch.setattr(remote.app, "_comment_pr", lambda pr, body, *a, **k: posted.append(body))
+    assert remote.call(scenario).ok is True
+    assert local.call(scenario).ok is True
+    for side in (remote, local):
+        assert _decision(side).get("findings_channel") != "derived"
+    local_body = (local.pr_dir / "verdict-comment.md").read_text("utf-8")
+    assert local_body.endswith("### Required changes\n- Add a test.")
+    assert len(posted) == 1
+    assert posted[0].endswith("### Required changes\n- Add a test.")
+
+
 def test_non_string_required_changes_items() -> None:
     scenario = Scenario("rework", "request_changes", summary="Needs work.")
     remote, local = sides(scenario)
