@@ -996,6 +996,20 @@ UNAUTHORIZED_MERGE_ACK_KEY = "unauthorized_merge_acknowledged"
 # Presence here silences the event, never the finding.
 UNAUTHORIZED_MERGE_DETECTED_KEY = "unauthorized_merge_detected"
 
+# state.json key holding the durable record of merged worker PRs whose linked
+# issue was proven to belong to another host (issue #2910 rework). A
+# `{pr_number: {issue, proven_at}}` map, written the first pass a finding is
+# positively proven foreign via a per-issue ``issue_view`` read. A foreign
+# merge is re-detected as a candidate on every pass -- it is neither baselined
+# nor acked -- so without this record the ownership proof (a subprocess per
+# issue) would be re-paid on every pass for as long as the merge stays inside
+# ``merged_pr_list()``'s window. Membership suppresses only the *re-proof*,
+# via ``host_routing.drop_foreign_findings``'s ``remembered_prs``: the finding
+# is dropped before any read, exactly as it was on the pass that proved it.
+# Entries are never removed: a merge's owner is a fact about when it merged,
+# so a later relabel does not re-open it.
+UNAUTHORIZED_MERGE_FOREIGN_KEY = "unauthorized_merge_foreign"
+
 
 # Issue #934: an operator who legitimately adjudicates and merges a worker PR
 # whose recorded review decision is stale, absent, or pending has no way to

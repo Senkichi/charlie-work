@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 import charlie_work.workflow as _wf
+from charlie_work import host_routing
 
 
 def _apply_unauthorized_merge_baseline(
@@ -147,3 +148,67 @@ def _apply_unauthorized_merge_baseline(
         ", ".join(f"#{n}" for n in pre_existing_now) or "none",
     )
     return []
+
+
+def _drop_foreign_unauthorized_merge_findings(
+    self, reported: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Drop findings whose linked issue provably belongs to another host (#2910).
+
+    A merge the other host reviewed and merged is that host's to audit: its
+    review decision lives in the other host's state directory, so here it can
+    only ever read ``missing``, and reporting it would fire on every normal
+    merge on a shared repository.
+
+    The proof mechanics live in ``host_routing.drop_foreign_findings``: an
+    exact per-issue ``issue_view`` read (never the 500-capped issue list) plus
+    the ``owned_by_another_host`` single-owner rule, and it only ever drops on
+    positive proof. What this delegate adds on top is the durable half of the
+    contract: PRs proven foreign are recorded under
+    ``UNAUTHORIZED_MERGE_FOREIGN_KEY`` and fed back as ``remembered_prs`` on
+    later passes, so a foreign merge that is re-detected every pass costs one
+    ``issue_view`` once, not one per pass. The ``unauthorized_merge_foreign_dropped``
+    event fires once per proven PR, the first pass it is proven.
+
+    A failed proof is deliberately *not* remembered: an unreadable issue is
+    retried next pass, not permanently exempted. ``dry_run`` writes nothing,
+    matching the arming and announce paths.
+    """
+
+    def _remembered(record: Any) -> set[int]:
+        # The record is a JSON object keyed by string PR numbers; parse them
+        # back to int for the membership test against int ``finding["pr"]``.
+        if not isinstance(record, dict):
+            return set()
+        out: set[int] = set()
+        for n in record:
+            try:
+                out.add(int(n))
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    if self.config.dispatch.host is None or not reported:
+        return reported
+    key = _wf.UNAUTHORIZED_MERGE_FOREIGN_KEY
+    remembered = _remembered(_wf.load_state_locked(self.paths.state_file).get(key))
+    kept, proven = host_routing.drop_foreign_findings(self, reported, remembered)
+    if not proven or self.dry_run:
+        return kept
+    with _wf.state_lock(self.paths.state_file):
+        locked = _wf.load_state(self.paths.state_file)
+        record = locked.get(key)
+        if not isinstance(record, dict):
+            record = {}
+        proven_at = _wf.utc_now()
+        for pr, issue in proven.items():
+            record[str(pr)] = {"issue": issue, "proven_at": proven_at}
+        locked[key] = record
+        for pr, issue in proven.items():
+            locked = self._record_event(
+                locked,
+                "unauthorized_merge_foreign_dropped",
+                {"pr": pr, "issue": issue},
+            )
+        _wf.save_state(self.paths.state_file, locked)
+    return kept

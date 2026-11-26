@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import charlie_work.workflow as _wf
 from typing import Any
-from charlie_work import host_routing, layout, queue_sync_coverage_cache
+from charlie_work import layout, queue_sync_coverage_cache
 from charlie_work.github import GitHubError
 
 
@@ -37,7 +37,7 @@ def _detect_unauthorized_merges(
     — see ``_apply_unauthorized_merge_baseline``, which every return path
     goes through so the bound cannot be bypassed by a future caller. A merge
     whose linked issue another host owns is outside that bound too
-    (``host_routing.drop_foreign_findings``, issue #2910).
+    (``_drop_foreign_unauthorized_merge_findings``, issue #2910).
     """
     candidates: list[dict[str, Any]] = []
     prefix = self.config.dispatch.branch_prefix
@@ -196,14 +196,15 @@ def _detect_unauthorized_merges(
     # to audit. Its review decision lives in the other host's state directory,
     # so here it can only ever read ``missing``, and raising it would fire on
     # every normal merge on a shared repository. Applied to the bounded set,
-    # not to ``candidates``: the issue read it costs (``state="all"``, since
-    # the issue is usually closed by now) is then paid only when there is
-    # something to report rather than every pass, and a PR baselined at
-    # arming stays baselined if host routing is later switched off. It drops
-    # only on positive proof of foreign ownership, so an unlinked PR or an
-    # unreadable issue list still reports. It must run before the announce
-    # below, which is what writes the event and the durable state entry.
-    reported = host_routing.drop_foreign_findings(self, reported)
+    # not to ``candidates``: the per-issue ``issue_view`` read the proof costs
+    # is then paid only when there is something to report rather than every
+    # pass, a PR baselined at arming stays baselined if host routing is later
+    # switched off, and a PR once proven foreign is remembered durably and
+    # never re-read. It drops only on positive proof of single foreign
+    # ownership, so an unlinked PR, a contested two-label issue, or a failed
+    # lookup still reports. It must run before the announce below, which is
+    # what writes the event and the durable state entry.
+    reported = self._drop_foreign_unauthorized_merge_findings(reported)
     # Announce on the bounded set, never on raw candidates: the arming pass
     # deliberately reports nothing, and an acked finding is deliberately
     # silent. Emitting before the bound would re-introduce exactly the noise

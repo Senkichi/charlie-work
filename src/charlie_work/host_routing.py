@@ -12,9 +12,10 @@ exactly one of them, or to neither:
 
 With ``dispatch.host`` unset (the kill switch) or an empty ``labels.host_prefix``
 every issue is local, which is exactly the behaviour before host routing.
-Intake, dispatch, the backlog classifier, reconcile, finalize, the review/merge
-lane and the unauthorized-merge tripwire all ask :func:`owned_here`, so the rule
-lives in one place.
+Intake, dispatch, the backlog classifier, reconcile, finalize and the
+review/merge lane all ask :func:`owned_here`, and the unauthorized-merge
+tripwire asks its positive-proof sibling :func:`owned_by_another_host`, so
+the rule lives in one place.
 """
 
 from __future__ import annotations
@@ -55,6 +56,30 @@ def owned_here(labels: Iterable[str], config: OrchestratorConfig) -> bool:
     if not hosts:
         return config.dispatch.default_host
     return hosts == (host.strip().lower(),)
+
+
+def owned_by_another_host(labels: Iterable[str], config: OrchestratorConfig) -> bool:
+    """True when exactly one host, and it is not this one, provably owns the issue.
+
+    The positive-proof direction of :func:`owned_here`, for controls that must
+    not act on a maybe. Routing off (``dispatch.host`` unset or an empty
+    ``labels.host_prefix``) means nothing is foreign. An issue with no host
+    label belongs to the default host, which is provable foreign ownership
+    only to a non-default host. An issue carrying two or more distinct host
+    labels belongs to *neither* host, so no single other host provably owns it
+    and this returns False -- the caller must fail towards keeping it in
+    scope, not towards dropping it.
+    """
+    host = config.dispatch.host
+    prefix = config.labels.host_prefix
+    if host is None or not prefix:
+        return False
+    hosts = issue_hosts(labels, prefix)
+    if len(hosts) > 1:
+        return False
+    if not hosts:
+        return not config.dispatch.default_host
+    return hosts[0] != host.strip().lower()
 
 
 def _label_names(item: Mapping[str, Any]) -> set[str]:
@@ -128,41 +153,86 @@ def local_prs(app: Any, prs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return kept
 
 
-def drop_foreign_findings(app: Any, findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """``findings`` without the ones whose linked issue another host provably owns (#2910).
+def drop_foreign_findings(
+    app: Any, findings: list[dict[str, Any]], remembered_prs: set[int]
+) -> tuple[list[dict[str, Any]], dict[int, int]]:
+    """``findings`` minus those whose linked issue another host provably owns (#2910).
 
     For a control that audits merges that already happened, where the other
     host did the reviewing and so left no evidence in this host's state. Each
-    finding names its linked issue under ``issue`` (``int | None``).
+    finding names its linked issue under ``issue`` (``int | None``) and its PR
+    under ``pr``.
 
-    This is deliberately not :func:`local_prs`, for two reasons:
+    Returns ``(kept, proven)``: the findings to still report, and a
+    ``{pr: issue}`` map of the findings this call newly proved foreign, which
+    the caller records durably and feeds back as ``remembered_prs`` on later
+    passes so the proof is not re-paid. A remembered PR is dropped without
+    any read: foreign ownership was proven when the merge was found, and a
+    merge's owner is a fact about when it merged, so a later relabel does not
+    re-open it.
 
-    - **Closed issues count.** A merged PR's issue is normally closed by the
-      time the finding is made, so an open-only read never sees it and treats
-      it as unlabelled, which the default host would keep. The ``state="all"``
-      snapshot is what reconcile feeds :func:`foreign_issue_numbers` for the
-      same reason.
-    - **It fails towards reporting.** :func:`local_prs` answers "may this host
-      act on the PR?", so on an unreadable issue list a non-default host drops
-      every PR. A finding is evidence of a possible bypass, so it is dropped
-      only on positive proof: the issue was read and
-      :func:`foreign_issue_numbers` says another host owns it. A finding with
-      no linked issue, an issue outside the fetched window, or an unreadable
-      issue list all stay.
+    The proof is per-issue and exact -- deliberately not an issue-list
+    snapshot, for two reasons:
+
+    - **The list read is capped.** ``gh.issue_list`` goes through
+      ``gh issue list --limit 500``, so a backlog issue older than the 500
+      newest issues is invisible to it -- precisely the shape that made this
+      control's false positive return on a long-lived repo (reconcile had to
+      retire the same capped read for the same reason, issue #762).
+      ``gh.issue_view(number)`` answers one issue by number and has no
+      window.
+    - **It fails towards reporting.** :func:`local_prs` answers "may this
+      host act on the PR?", so on an unreadable issue list a non-default
+      host drops every PR. A finding is evidence of a possible bypass, so it
+      is dropped only on positive proof: the issue was read by number and
+      :func:`owned_by_another_host` says exactly one other host owns it. A
+      finding with no linked issue, a lookup that fails or answers the wrong
+      payload, or an unreadable issue all stay.
 
     With ``dispatch.host`` unset (routing off) the list is returned untouched
-    and no issue read is made. The read is also skipped when no finding names
-    an issue.
+    and no issue read is made.
 
-    Ownership is :func:`foreign_issue_numbers`' own rule, inherited as is: an
-    issue carrying two different host labels belongs to neither host, so it is
-    foreign to both, and a merge linked to one is audited by neither.
+    Ownership is :func:`owned_by_another_host`'s rule, which is deliberately
+    stricter than :func:`foreign_issue_numbers`' on one point: an issue
+    carrying two or more distinct host labels belongs to *neither* host, so
+    no other host provably owns it and the finding is kept -- the tripwire
+    would rather report one merge too many than leave a merge no host owns
+    unaudited everywhere.
     """
-    if app.config.dispatch.host is None or not any(f.get("issue") is not None for f in findings):
-        return findings
-    try:
-        issues = app.gh.issue_list(state="all")
-    except GitHubError:
-        return findings
-    foreign = foreign_issue_numbers(issues, app.config)
-    return [finding for finding in findings if finding.get("issue") not in foreign]
+    if app.config.dispatch.host is None:
+        return findings, {}
+    kept: list[dict[str, Any]] = []
+    proven: dict[int, int] = {}
+    # Per-pass memo over issue_view calls (each is a subprocess): several
+    # findings can name the same issue, and ``None`` marks a looked-up issue
+    # whose ownership could not be proven this pass -- it is not re-fetched
+    # for a second finding naming it.
+    labels_by_issue: dict[int, frozenset[str] | None] = {}
+    for finding in findings:
+        pr = finding.get("pr")
+        issue = finding.get("issue")
+        if isinstance(pr, int) and pr in remembered_prs:
+            continue  # proven foreign on an earlier pass; durable, so no re-read
+        if not isinstance(issue, int) or isinstance(issue, bool):
+            kept.append(finding)
+            continue
+        if issue not in labels_by_issue:
+            try:
+                view = app.gh.issue_view(issue)
+            except (GitHubError, ValueError):
+                # GitHubError: the real read failed (gh down, issue gone).
+                # ValueError: a test double signals a missing issue the same
+                # way. Either way the proof is absent, so the finding stays.
+                view = None
+            labels_by_issue[issue] = (
+                frozenset(_label_names(view))
+                if isinstance(view, dict) and view.get("number") == issue
+                else None
+            )
+        labels = labels_by_issue[issue]
+        if labels is not None and owned_by_another_host(labels, app.config):
+            if isinstance(pr, int) and not isinstance(pr, bool):
+                proven[pr] = issue
+            continue
+        kept.append(finding)
+    return kept, proven
