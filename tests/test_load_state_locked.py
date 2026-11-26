@@ -17,6 +17,85 @@ from charlie_work.state import (
 from charlie_work.workflow import OrchestratorApp
 from _src_ast import parsed, source_files, source_text
 
+# The single sanctioned lock-free state reader (issue #3141):
+# ``state.read_state_snapshot`` never quarantines, renames, or writes, and
+# reports read/parse failure to its caller instead of returning empty state.
+# Every lock-free read goes through it; ``load_state`` -- which quarantines
+# on failure -- is never permitted unlocked, in ANY spelling.
+_LOCK_FREE_STATE_READER = "read_state_snapshot"
+
+# Unlocked ``load_state`` call sites exempted from the lint below, as
+# ``(path relative to src/charlie_work, enclosing function)`` -- the same
+# module-qualified convention ``_SANCTIONED_MODULE_FUNCTIONS`` uses in
+# ``test_state_decision_cache_enforcement``. It is deliberately EMPTY: after
+# the issue #3141 rework every lock-free read goes through
+# ``read_state_snapshot``, so no unlocked ``load_state`` may exist at all.
+# Adding an entry here requires the same justification comment the sibling
+# lint demands -- an unlocked ``load_state`` quarantines a live state.json
+# on read failure (issue #310), which is why the reader primitive exists.
+_SANCTIONED_UNLOCKED_LOAD_STATE: frozenset[tuple[str, str]] = frozenset()
+
+_LOCK_CONTEXT_NAMES = frozenset({"state_lock", "advisory_file_lock"})
+
+
+class _LoadStateLockVisitor(ast.NodeVisitor):
+    """Flag ``load_state`` calls not inside a lock context.
+
+    Both spellings are matched, deliberately: the pre-#3141 lint only caught
+    the bare ``load_state(...)`` name form, which is exactly how an unlocked
+    read slipped in via ``_state.load_state(...)`` -- the attribute spelling
+    this visitor also flags. Lock contexts are recognized in both spellings
+    too (``with state_lock(...)`` and ``with _wf.state_lock(...)`` /
+    ``with ports.state_lock(...)``), plus ``advisory_file_lock``, the generic
+    primitive ``state_lock`` wraps.
+    """
+
+    def __init__(self) -> None:
+        self._lock_depth = 0
+        self._func_stack: list[str] = []
+        self.errors: list[str] = []
+        # (lineno, enclosing function) of every flagged call, for the
+        # sanction/ staleness checks in the test below.
+        self.flagged: list[tuple[int, str]] = []
+
+    def _enter_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        self._func_stack.append(node.name)
+        self.generic_visit(node)
+        self._func_stack.pop()
+
+    visit_FunctionDef = _enter_function
+    visit_AsyncFunctionDef = _enter_function
+
+    def _current_function(self) -> str:
+        return self._func_stack[-1] if self._func_stack else "<module>"
+
+    @staticmethod
+    def _is_lock_context(expr: ast.expr) -> bool:
+        if not isinstance(expr, ast.Call):
+            return False
+        func = expr.func
+        if isinstance(func, ast.Name):
+            return func.id in _LOCK_CONTEXT_NAMES
+        return isinstance(func, ast.Attribute) and func.attr in _LOCK_CONTEXT_NAMES
+
+    @staticmethod
+    def _is_load_state_call(func: ast.expr) -> bool:
+        if isinstance(func, ast.Name):
+            return func.id == "load_state"
+        return isinstance(func, ast.Attribute) and func.attr == "load_state"
+
+    def visit_With(self, node: ast.With) -> None:
+        entered = sum(1 for item in node.items if self._is_lock_context(item.context_expr))
+        self._lock_depth += entered
+        self.generic_visit(node)
+        self._lock_depth -= entered
+
+    def visit_Call(self, node: ast.Call) -> None:
+        if self._is_load_state_call(node.func) and self._lock_depth <= 0:
+            self.errors.append(f"line {node.lineno}: {ast.unparse(node)}")
+            self.flagged.append((node.lineno, self._current_function()))
+        self.generic_visit(node)
+
 
 class FakeGitHub:
     """Minimal stub sufficient for OrchestratorApp.status()."""
@@ -163,35 +242,22 @@ def test_status_concurrent_writer_no_quarantine(tmp_path: Path) -> None:
 
 
 def test_no_unlocked_load_state_in_production_code() -> None:
-    """Every load_state call in src/charlie_work must be inside a state_lock context.
+    """Every load_state call in src/charlie_work must be inside a lock context.
 
     This is the lint-style enforcement from issue #310: the locked read helper
     (load_state_locked) should be used for read-only callers, and all raw
     load_state calls must occur inside a state_lock block.
+
+    Issue #3141: the scan now flags the attribute spelling (``_state.load_state``,
+    ``_wf.load_state``, ``ports.load_state``) too -- the original Name-only
+    matcher is how the quarantining reader slipped into the fleet census --
+    and recognizes attribute-form lock contexts (``with _wf.state_lock(...)``,
+    ``with ports.state_lock(...)``). Lock-free reads that need no lock must
+    use ``state.read_state_snapshot`` -- the single sanctioned unlocked
+    reader, which never quarantines -- or be listed in
+    ``_SANCTIONED_UNLOCKED_LOAD_STATE`` above with justification.
     """
     src_root = Path(__file__).resolve().parents[1] / "src" / "charlie_work"
-
-    class LockVisitor(ast.NodeVisitor):
-        def __init__(self) -> None:
-            self._lock_depth = 0
-            self.errors: list[str] = []
-
-        def visit_With(self, node: ast.With) -> None:
-            is_state_lock = any(
-                isinstance(item.context_expr, ast.Call)
-                and isinstance(item.context_expr.func, ast.Name)
-                and item.context_expr.func.id == "state_lock"
-                for item in node.items
-            )
-            self._lock_depth += is_state_lock
-            self.generic_visit(node)
-            self._lock_depth -= is_state_lock
-
-        def visit_Call(self, node: ast.Call) -> None:
-            if isinstance(node.func, ast.Name) and node.func.id == "load_state":
-                if self._lock_depth <= 0:
-                    self.errors.append(f"line {node.lineno}: {ast.unparse(node)}")
-            self.generic_visit(node)
 
     errors: list[str] = []
     for source_file in source_files(src_root):
@@ -200,8 +266,74 @@ def test_no_unlocked_load_state_in_production_code() -> None:
         if "load_state" not in source_text(source_file):
             continue
         tree = parsed(source_file)
-        visitor = LockVisitor()
+        visitor = _LoadStateLockVisitor()
         visitor.visit(tree)
-        errors.extend(visitor.errors)
+        rel = source_file.relative_to(src_root).as_posix()
+        sanctioned = {func for (path, func) in _SANCTIONED_UNLOCKED_LOAD_STATE if path == rel}
+        flagged_funcs = {func for _lineno, func in visitor.flagged}
+        for error, (lineno, func) in zip(visitor.errors, visitor.flagged):
+            if func in sanctioned:
+                continue
+            errors.append(f"{rel}:{error} in {func}()")
+        # A sanction whose flagged call vanished must not sit here silently
+        # allow-listing nothing (same staleness rule as the decision-cache
+        # lint in test_state_decision_cache_enforcement.py).
+        stale = sanctioned - flagged_funcs
+        assert not stale, (
+            f"_SANCTIONED_UNLOCKED_LOAD_STATE lists {sorted(stale)} for {rel} "
+            "but no unlocked load_state call was found there anymore -- "
+            "remove the stale entry."
+        )
 
-    assert not errors, f"load_state calls outside state_lock: {errors}"
+    assert not errors, (
+        f"load_state calls outside a state lock: {errors}. Unlocked reads go "
+        f"through {_LOCK_FREE_STATE_READER}() -- the sanctioned non-mutating "
+        "reader -- or need an explicit entry in _SANCTIONED_UNLOCKED_LOAD_STATE."
+    )
+
+
+def test_load_state_lint_fails_closed_on_attribute_spelling() -> None:
+    """The scanner must flag the attribute spelling it was extended to catch.
+
+    A lint that only matches ``load_state(...)`` bare-Name calls fails open
+    the moment an unlocked read is written ``_state.load_state(...)`` --
+    the exact bypass the issue #3141 review caught. This pins both call
+    spellings AND both lock-context spellings against a synthetic module.
+    """
+    source = """
+import something as _state
+
+
+def unlocked_bare(path):
+    return load_state(path)
+
+
+def unlocked_attr(path):
+    return _state.load_state(path)
+
+
+def locked_bare(path):
+    with state_lock(path):
+        return load_state(path)
+
+
+def locked_attr(path):
+    with _wf.state_lock(path):
+        return _wf.load_state(path)
+
+
+def locked_generic(path):
+    with ports.advisory_file_lock(path):
+        return ports.load_state(path)
+
+
+def sanctioned_reader(path):
+    return _state.read_state_snapshot(path)
+"""
+    visitor = _LoadStateLockVisitor()
+    visitor.visit(ast.parse(source))
+
+    flagged = {func for _lineno, func in visitor.flagged}
+    assert flagged == {"unlocked_bare", "unlocked_attr"}, (
+        f"expected exactly the two unlocked spellings flagged, got: {visitor.errors}"
+    )

@@ -700,6 +700,15 @@ def test_desktop_sink_all_benign_events_returns_ok_without_subprocess():
     mock_run.assert_not_called()
 
 
+# Issue #3075 coverage dedupe: the report scored this "equal" to the kept
+# bash-launcher test because both skip in the nightly env (this leaf
+# needs an interactive Windows desktop; the kept test needs POSIX) --
+# each records the identical collection/setup footprint every skipped
+# test records (verified against the newest cached map), and equal
+# recorded coverage is not equal assertions. What this asserts that the
+# kept test does not: a REAL ``_desktop_sink`` subprocess exits 0 -- the
+# only unmocked end-to-end run of the PowerShell toast path; every
+# sibling above patches subprocess.run.
 @pytest.mark.skipif(
     sys.platform != "win32" or bool(os.environ.get("CI")),
     reason="Requires an interactive Windows desktop session",
