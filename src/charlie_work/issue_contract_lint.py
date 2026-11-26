@@ -21,6 +21,10 @@ awareness at all (issue #790), so an issue body must not carry the trigger
 syntax in any form. The keyword *vocabulary* is still delegated: the pattern is
 built from ``issue_linking._CLOSING_KEYWORDS_ALT``, the same GitHub keyword set
 the dispatcher matches on, so the two cannot drift apart on which words count.
+The whitespace between keyword and reference is ``\\s*`` — a superset of the
+``\\s+`` in the dispatcher's ``issue_linking._CLOSING_KEYWORD_REF`` — so a
+hard-wrapped ``fixes\\n#5`` the dispatcher binds is flagged here too: the lint
+may forbid more than the dispatcher binds, never less.
 """
 
 from __future__ import annotations
@@ -32,16 +36,20 @@ from .citation_check import parse_citations
 from .github_body_scan import detect_prose_only_dependencies, parse_blockers
 from .issue_linking import _CLOSING_KEYWORDS_ALT
 
-# A closing keyword followed by an issue reference on the same line — the
-# trigger syntax GitHub's auto-close-on-merge consumes regardless of authorial
-# intent (issue #790). The keyword alternation is shared with the dispatcher
-# via ``issue_linking._CLOSING_KEYWORDS_ALT``; the lint adds an optional colon
+# A closing keyword followed by an issue reference — the trigger syntax
+# GitHub's auto-close-on-merge consumes regardless of authorial intent (issue
+# #790). The keyword alternation is shared with the dispatcher via
+# ``issue_linking._CLOSING_KEYWORDS_ALT``; the lint adds an optional colon
 # (``Closes: #N``) and no negation filtering, because the contract forbids the
 # syntax entirely rather than judging which occurrence would bind. The
 # optional ``owner/repo`` qualifier mirrors ``closing_reference._CLOSING_LINE_RE``
 # — ``Fixes owner/repo#N`` is the same trigger syntax aimed cross-repo.
+# The whitespace is ``\s*``, a superset of the ``\s+`` in the dispatcher's
+# ``issue_linking._CLOSING_KEYWORD_REF``: a hard-wrapped ``this fixes\n#5``
+# binds for the dispatcher, so the lint must flag it too — a ``[ \t]`` class
+# would leave the lint narrower than the code it claims to superset.
 _CLOSING_KEYWORD_ISSUE_REF_RE = re.compile(
-    r"\b" + _CLOSING_KEYWORDS_ALT + r"\b[ \t]*:?[ \t]*(?:[\w.-]+/[\w.-]+)?#\d+",
+    r"\b" + _CLOSING_KEYWORDS_ALT + r"\b\s*:?\s*(?:[\w.-]+/[\w.-]+)?#\d+",
     flags=re.IGNORECASE,
 )
 
@@ -62,8 +70,8 @@ def lint_issue_body(text: str, expected_blockers: frozenset[int]) -> tuple[str, 
       line numbers rot; cite the symbol instead (docs/agents/issue-tracker.md
       convention, issue #1000).
     - No closing keyword followed by an issue reference (bare ``#N`` or
-      qualified ``owner/repo#N``) — the body must not carry syntax GitHub's
-      auto-close would act on.
+      qualified ``owner/repo#N``, including a hard-wrapped ``fixes\\n#5``) —
+      the body must not carry syntax GitHub's auto-close would act on.
     """
     problems: list[str] = []
 

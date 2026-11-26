@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from charlie_work import cli
+from charlie_work import cli, issue_linking
 from charlie_work.issue_contract_lint import lint_issue_body, render_blocker_section
 
 
@@ -114,12 +114,42 @@ def test_lint_issue_body_symbol_citation_is_clean() -> None:
         "Closes: owner/repo#3",
         "Closes owner/repo#3",
         "resolves some-org/some.repo#9",
+        # Hard-wrapped forms — the dispatcher's _CLOSING_KEYWORD_REF binds these
+        # through `\s+`, so the lint must flag them too: it may never be
+        # narrower than the dispatcher on what counts as a closing ref.
+        "this fixes\n#5 as well",
+        "fixes\n#5",
+        "fix\n\n#5",
+        "closes \n #5",
+        "Closes:\n#5",
+        "Fixes\nowner/repo#3",
     ],
 )
 def test_lint_issue_body_closing_keyword_fails(body: str) -> None:
     problems = lint_issue_body(body, frozenset())
     assert len(problems) == 1
     assert "closing" in problems[0] or "#5" in problems[0] or "#42" in problems[0]
+
+
+def test_lint_issue_body_closing_keyword_never_narrower_than_dispatcher() -> None:
+    """Dispatcher parity: every whitespace shape ``issue_linking.
+    _CLOSING_KEYWORD_REF`` binds — including the hard-wrapped forms its ``\\s+``
+    spans across newlines — must also be flagged by the lint. The lint may
+    forbid MORE than the dispatcher binds (colon forms, qualified refs, negated
+    phrasing) but never less; a ``[ \\t]``-style class that drops ``\\n``
+    silently lets a dispatcher-bound body lint clean."""
+    for body in (
+        "Closes #5",
+        "Closes\t#5",
+        "resolved  #5",
+        "fixes\n#5",
+        "fix\n\n#5",
+        "closes \n #5",
+        "this fixes\n#5 as well",
+    ):
+        assert issue_linking._CLOSING_KEYWORD_REF.search(body), body
+        problems = lint_issue_body(body, frozenset())
+        assert any("closing" in p for p in problems), (body, problems)
 
 
 @pytest.mark.parametrize(
