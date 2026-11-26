@@ -131,6 +131,44 @@ def test_create_issue_refuses_reserved_comment_markup(
     assert list(issues_dir.iterdir()) == []
 
 
+def test_create_issue_refuses_an_unencodable_body(issues_dir: Path, tmp_path: Path) -> None:
+    """A lone surrogate raises UnicodeEncodeError out of write_text_atomic's
+    encode -- a write failure, so it comes back as None with no file."""
+    gh = LocalFileGitHub(repo_root=tmp_path, issues_dir=issues_dir)
+
+    assert gh.create_issue("t", "body \ud800 surrogate") is None
+    assert list(issues_dir.iterdir()) == []
+
+
+def test_create_issue_refuses_an_unencodable_title(issues_dir: Path, tmp_path: Path) -> None:
+    """Same surrogate, in the title this time: refused as a value, no file."""
+    gh = LocalFileGitHub(repo_root=tmp_path, issues_dir=issues_dir)
+
+    assert gh.create_issue("title \ud800 surrogate", "b") is None
+    assert list(issues_dir.iterdir()) == []
+
+
+def test_create_issue_refuses_a_title_the_file_cannot_parse_back(
+    issues_dir: Path, tmp_path: Path
+) -> None:
+    """A literal DEL survives json.dumps but not yaml.safe_load: without the
+    render self-check the file is written unparseable and its number is
+    returned anyway."""
+    gh = LocalFileGitHub(repo_root=tmp_path, issues_dir=issues_dir)
+
+    assert gh.create_issue("bad \x7f title", "b") is None
+    assert list(issues_dir.iterdir()) == []
+
+
+def test_create_issue_refuses_an_empty_title(issues_dir: Path, tmp_path: Path) -> None:
+    """An empty title parses back to the filename stem, not "" -- the
+    round-trip mismatch branch of the render self-check."""
+    gh = LocalFileGitHub(repo_root=tmp_path, issues_dir=issues_dir)
+
+    assert gh.create_issue("", "b") is None
+    assert list(issues_dir.iterdir()) == []
+
+
 # -- edit_issue_body ---------------------------------------------------------
 
 
@@ -224,6 +262,36 @@ def test_edit_issue_body_refuses_reserved_comment_markup(
     view = gh.issue_view(4)
     assert view["body"] == "clean body"
     assert view["comments"] == []
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_edit_issue_body_on_eof_fence_file_still_loads(
+    issues_dir: Path, tmp_path: Path, newline: str
+) -> None:
+    """A file whose closing '---' sits at EOF (no trailing newline) came back
+    unparseable ('---new body') while edit_issue_body returned True."""
+    path = issues_dir / "003_eof_fence.md"
+    path.write_bytes(
+        newline.join(("---", 'title: "T"', "state: open", "labels: []", "---")).encode("utf-8")
+    )
+    gh = LocalFileGitHub(repo_root=tmp_path, issues_dir=issues_dir)
+
+    assert gh.edit_issue_body(3, "new body") is True
+
+    view = gh.issue_view(3)
+    assert view["title"] == "T"
+    assert view["body"] == "new body"
+
+
+def test_edit_issue_body_refuses_an_unencodable_body(issues_dir: Path, tmp_path: Path) -> None:
+    """A lone surrogate raises UnicodeEncodeError out of write_text_atomic's
+    encode -- a write failure: False, and the file is byte-for-byte intact."""
+    path = _write_issue(issues_dir, 4, body="old body")
+    before = path.read_bytes()
+    gh = LocalFileGitHub(repo_root=tmp_path, issues_dir=issues_dir)
+
+    assert gh.edit_issue_body(4, "body \ud800 surrogate") is False
+    assert path.read_bytes() == before
 
 
 # -- secret guard: machinery failure fails closed ----------------------------

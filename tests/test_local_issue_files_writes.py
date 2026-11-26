@@ -163,3 +163,17 @@ def test_rewrite_body_rejects_reserved_markup(marker: str) -> None:
 def test_rewrite_body_requires_frontmatter() -> None:
     with pytest.raises(IssueFileError):
         rewrite_body("no frontmatter here", "x")
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_rewrite_body_fence_at_eof_inserts_the_files_newline(tmp_path: Path, newline: str) -> None:
+    """A closing ``---`` at EOF carries no line ending; the new body must
+    land on its own line in the file's convention. Gluing it onto the fence
+    (``---new body``) stores a file that no longer parses -- while
+    ``edit_issue_body`` reports success."""
+    text = newline.join(("---", 'title: "T"', "state: open", "---"))
+    rewritten = rewrite_body(text, "new body")
+    assert rewritten.endswith(f"---{newline}new body{newline}")
+    issue = parse_issue_text(rewritten, _path(tmp_path))
+    assert issue.body == "new body"
+    assert issue.title == "T"

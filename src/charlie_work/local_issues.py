@@ -380,12 +380,16 @@ class LocalFileGitHub:
         The ``NNN_<slug>.md`` file is written atomically with the next free
         number and the caller's labels rendered into frontmatter, verbatim.
         ``None`` on a secret-guard refusal, on a write failure, on a body
-        carrying reserved comment markup (``render_issue_text`` raises
-        ``IssueFileError`` -- storing it would corrupt the file beyond what
-        a later ``edit_issue_body`` could repair), or in dry-run -- the
-        same failure vocabulary the real client's ``create_issue`` uses.
-        A missing ``issues_dir`` raises ``GitHubError`` exactly as every
-        read does: that is a config error, not a write failure.
+        carrying reserved comment markup, or on text the file format cannot
+        store (``render_issue_text`` raises ``IssueFileError`` -- it parses
+        its own output back first, so a DEL/C1 or empty title is refused
+        rather than stored unparseable; an unencodable title, body, or
+        label fails ``write_text_atomic``'s encode as ``UnicodeEncodeError``,
+        caught with the other ``ValueError`` write failures) -- or in
+        dry-run, the same failure vocabulary the real client's
+        ``create_issue`` uses. A missing ``issues_dir`` raises
+        ``GitHubError`` exactly as every read does: that is a config error,
+        not a write failure.
         """
         # Raises GitHubError on a missing issues_dir, like every read and
         # mutation: that is a config error, not a write failure -- even in
@@ -416,7 +420,11 @@ class LocalFileGitHub:
                 path,
                 render_issue_text(title=title, body=body, labels=tuple(labels), created=created),
             )
-        except (OSError, IssueFileError) as exc:
+        except (OSError, ValueError) as exc:
+            # ValueError covers IssueFileError plus UnicodeEncodeError /
+            # UnicodeDecodeError: text the format cannot store (an
+            # unencodable lone surrogate, a title that cannot round-trip)
+            # is a write failure, so it comes back as None like the rest.
             logger.warning("local issue create failed: %s", exc)
             return None
         queue_issue_write(self.repo_root, self.issues_dir, path, "create")
@@ -427,10 +435,13 @@ class LocalFileGitHub:
 
         Frontmatter, the comments block, and the file's newline convention
         survive unchanged (``local_issue_files.rewrite_body`` -- which also
-        normalizes the incoming body's line endings to the file's own).
-        ``False`` on a missing issue, a secret-guard refusal, a write
-        failure, a body carrying reserved comment markup, or in dry-run --
-        matching the real client's ``edit_issue_body``.
+        normalizes the incoming body's line endings to the file's own, and
+        re-emits it between the closing fence and the body when the fence
+        sits at EOF). ``False`` on a missing issue, a secret-guard refusal,
+        a write failure, or a body the file format cannot store -- reserved
+        comment markup, or text ``write_text_atomic`` cannot encode
+        (``UnicodeEncodeError``, a ``ValueError`` like ``IssueFileError``) --
+        or in dry-run, matching the real client's ``edit_issue_body``.
         """
         issue = self._scan().by_number().get(number)
         if issue is None:
@@ -459,7 +470,11 @@ class LocalFileGitHub:
         try:
             text = issue.path.read_bytes().decode("utf-8")
             write_text_atomic(issue.path, rewrite_body(text, body))
-        except (OSError, UnicodeDecodeError, IssueFileError) as exc:
+        except (OSError, ValueError) as exc:
+            # ValueError covers IssueFileError, UnicodeDecodeError, and
+            # UnicodeEncodeError from write_text_atomic's encode: a body
+            # the file format cannot store is a write failure, so it comes
+            # back as False like the rest.
             logger.warning("local issue #%d: could not edit body: %s", number, exc)
             return False
         queue_issue_write(self.repo_root, self.issues_dir, issue.path, "update")

@@ -332,6 +332,12 @@ def _check_body_markup(body: str) -> str:
     return body
 
 
+# ``render_issue_text``'s parse-back self-check needs a filename-shaped
+# ``Path``: the issue number comes from the name, never the frontmatter,
+# and the rendered text itself carries none.
+_RENDER_SELFCHECK_PATH = Path("000_render_selfcheck.md")
+
+
 def render_issue_text(*, title: str, body: str, labels: tuple[str, ...], created: str) -> str:
     """The full text of a freshly-created issue file (LF newlines).
 
@@ -343,6 +349,16 @@ def render_issue_text(*, title: str, body: str, labels: tuple[str, ...], created
     ``rewrite_frontmatter_key`` sees the same shape everywhere. The body's
     line endings are normalized to LF to match the rendered file, and a body
     carrying reserved comment markup is refused (``IssueFileError``).
+
+    Before returning, the rendered text is parsed back and refused
+    (``IssueFileError``) when it does not round-trip to the given
+    title/body: ``json.dumps`` quotes per JSON rules, not YAML's, so a
+    title carrying a literal DEL or C1 control survives the dump untouched
+    but is rejected by ``yaml.safe_load`` -- and an empty title parses back
+    to the filename stem rather than ``""``. Either shape would store a
+    file ``scan_issues`` cannot serve as the issue it was created as while
+    ``create_issue`` reports the number, so the refusal has to happen here,
+    before the write.
     """
     normalized = _lf(_check_body_markup(body)).strip()
     lines = [
@@ -353,7 +369,17 @@ def render_issue_text(*, title: str, body: str, labels: tuple[str, ...], created
         f'created: "{created}"',
         "---",
     ]
-    return "\n".join(lines) + "\n" + normalized + "\n"
+    text = "\n".join(lines) + "\n" + normalized + "\n"
+    try:
+        parsed = parse_issue_text(text, _RENDER_SELFCHECK_PATH)
+    except IssueFileError as exc:
+        raise IssueFileError(f"title/body are not storable in an issue file: {exc}") from exc
+    if parsed.title != title or parsed.body != normalized:
+        raise IssueFileError(
+            "title/body are not storable in an issue file: rendered text parses "
+            f"back to title={parsed.title!r} body={parsed.body!r}"
+        )
+    return text
 
 
 def rewrite_body(text: str, body: str) -> str:
@@ -372,8 +398,16 @@ def rewrite_body(text: str, body: str) -> str:
         raise IssueFileError("no '---' fenced frontmatter block")
     newline = match.group("nl")
     normalized = _lf(_check_body_markup(body)).strip("\r\n").replace("\n", newline)
+    head = text[: match.end()]
+    if not head.endswith("\n"):
+        # ``_FRONTMATTER_RE`` also accepts a closing fence at EOF with no
+        # line ending (its ``\Z`` alternative); appending the body bare
+        # would glue it onto the fence -- ``---new body`` -- a file that
+        # parses on no later read while ``edit_issue_body`` reported
+        # success. The file's own newline goes between fence and body.
+        head += newline
     tail = text[match.end() :]
     marker_at = tail.find(COMMENTS_MARKER)
     if marker_at < 0:
-        return text[: match.end()] + normalized + newline
-    return text[: match.end()] + newline.join((normalized, "", tail[marker_at:]))
+        return head + normalized + newline
+    return head + newline.join((normalized, "", tail[marker_at:]))
