@@ -130,8 +130,8 @@ def test_layered_null_keeps_both_layers(tmp_path: Path) -> None:
         # the layered load SUCCEEDS and no construction error is raised anymore
         # (that behavior is pinned by
         # test_scalar_null_in_global_host_wide_section_takes_the_default below).
-        # The redundancy report (issue #3076) flags these skipped leaves: they
-        # assert nothing beyond the kept test -- the leaf id itself is the keep.
+        # The redundancy report (issue #3076) flags these skipped leaves:
+        # skipped, they assert nothing at all -- the leaf id itself is the keep.
         pytest.param(
             "runner_allocation:\n  enabled: true\n  threads_per_slot:\n",
             marks=pytest.mark.skip(
