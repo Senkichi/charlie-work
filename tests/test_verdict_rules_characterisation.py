@@ -26,15 +26,16 @@ from typing import Any
 
 import pytest
 
+import _git_templates
 import charlie_work.selection_wrapper as selection_wrapper
 import charlie_work.workflow as workflow
 from _verdict_parity_driver import (
     ISSUE,
     Scenario,
     _call_args,
+    _fresh_repo,
     _label_names,
     _local_app,
-    _make_repo,
     _normalise,
     _pin_worker_selection,
     _remote_app,
@@ -328,7 +329,7 @@ def _extend_seed(app: Any, case: Case) -> None:
 
 def _snapshot(case: Case, side: str, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     scenario = case.scenario
-    repo = _make_repo()
+    repo = _fresh_repo()
     run = _Run()
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(selection_wrapper, "ci_fleet_executable", lambda: Path("ci-fleet"))
@@ -463,6 +464,12 @@ def _dump(snapshots: dict[str, Any]) -> str:
 @pytest.fixture(scope="module")
 def snapshots() -> dict[str, Any]:
     with pytest.MonkeyPatch.context() as patch:
+        # ``_isolate_git_env``'s GIT_CONFIG_* trio is function-scoped; apply it
+        # here too or ``_repo_template`` builds under a fingerprint the call
+        # phase never looks up (the issue-#2565 rule ``_git_templates``
+        # documents) and the verdict suites keep a second, cold template.
+        for key, value in _git_templates.GIT_CONFIG_ENV.items():
+            patch.setenv(key, value)
         return _all_snapshots(patch)
 
 
