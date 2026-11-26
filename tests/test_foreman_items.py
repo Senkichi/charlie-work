@@ -145,6 +145,100 @@ def test_corrupt_items_file_survives_create_item(tmp_path: Path) -> None:
     assert path.read_text(encoding="utf-8") == "[{corrupt"
 
 
+def test_undecodable_record_blocks_mutators(tmp_path: Path) -> None:
+    """A record that fails to decode makes the strict load an error — mutators
+    must not rewrite ``items.json`` without it. Readers still tolerate it and
+    surface the decodable records."""
+    fdir = _foreman(tmp_path)
+    path = fdir / "items.json"
+    payload = json.dumps(
+        {
+            "version": 1,
+            "items": [
+                {"id": "it-1", "kind": "report", "status": "open", "text": "x"},
+                {"id": "it-2", "kind": "wish", "status": "open", "text": "y"},
+            ],
+        }
+    )
+    path.write_text(payload, encoding="utf-8")
+    assert [item.id for item in load_items(fdir)] == ["it-1"]
+    created = create_item(fdir, kind="report", text="z")
+    assert not created.ok
+    assert "items.json" in created.error
+    dismissed = dismiss_item(fdir, "it-1")
+    assert not dismissed.ok
+    assert "items.json" in dismissed.error
+    assert path.read_text(encoding="utf-8") == payload
+
+
+def test_items_lock_busy_is_an_error_value(tmp_path: Path, monkeypatch) -> None:
+    """A held ``items.json`` lock makes mutators a bounded error — never a
+    hang. The lock covers the strict load AND the write, so ``create_item``
+    (validation inside the locked step) and ``answer_item``/``mark_notified``
+    (a single locked ``_update`` load) all see it."""
+    import types
+
+    from charlie_work import file_lock
+    from charlie_work.file_lock import try_acquire_byte_range_lock
+
+    monkeypatch.setattr(file_lock, "time", types.SimpleNamespace(sleep=lambda _s: None))
+    fdir = _foreman(tmp_path)
+    assert create_item(fdir, kind="decision", question="q", options=["a", "b"]).ok
+    held = try_acquire_byte_range_lock(fdir / "items.json.lock")
+    assert held is not None
+    try:
+        created = create_item(fdir, kind="report", text="y")
+        assert not created.ok
+        assert "lock busy" in created.error
+        answered = answer_item(fdir, "it-1", choice=0)
+        assert not answered.ok
+        assert "lock busy" in answered.error
+        notified = mark_notified(fdir, "it-1")
+        assert not notified.ok
+        assert "lock busy" in notified.error
+    finally:
+        held.release()
+    assert create_item(fdir, kind="report", text="y").ok
+
+
+def test_threaded_create_item_ids_are_unique(tmp_path: Path, monkeypatch) -> None:
+    """The strict load runs under the lock: concurrent creators cannot mint
+    the same id off a shared snapshot. The barrier widens the unprotected
+    window to certainty — every thread is held at the load until all arrive,
+    so without the lock they all read the same pre-write state."""
+    import threading
+
+    from charlie_work.foreman import items as items_mod
+
+    fdir = _foreman(tmp_path)
+    workers = 8
+    barrier = threading.Barrier(workers, timeout=0.5)
+    real_load = items_mod._load_items_strict
+
+    def gated_load(foreman_root: Path):
+        try:
+            barrier.wait()
+        except threading.BrokenBarrierError:
+            # The lock serializes callers, so under the fix each thread
+            # reaches the barrier alone and it breaks — proceed anyway.
+            pass
+        return real_load(foreman_root)
+
+    monkeypatch.setattr(items_mod, "_load_items_strict", gated_load)
+    results = []
+    threads = [
+        threading.Thread(target=lambda: results.append(create_item(fdir, kind="report", text="x")))
+        for _ in range(workers)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert all(r.ok for r in results)
+    assert sorted(r.value.id for r in results) == [f"it-{i}" for i in range(1, workers + 1)]
+    assert len(load_items(fdir)) == workers
+
+
 def test_answer_fields_round_trip_from_disk(tmp_path: Path) -> None:
     """``command``, ``created_at``, ``answer_note`` and ``answered_at`` reload off disk."""
     fdir = _foreman(tmp_path)

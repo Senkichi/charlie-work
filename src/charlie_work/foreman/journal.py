@@ -9,22 +9,28 @@ append-only file can exhibit.
 
 These files append rather than rewrite: a JSONL stream exists so a writer can
 add one line without reading or replacing what is already there, and a torn
-write can only damage the line being written — which ``_iter_entries`` skips.
-The atomic-rewrite invariant covers whole-document JSON state files
+write can only damage the line being written. ``_iter_entries`` decodes each
+line independently — a torn or undecodable line is skipped, never allowed to
+blank the whole stream (a whole-file strict decode would read one invalid
+byte as zero entries, and id allocation would restart at 1). The
+atomic-rewrite invariant covers whole-document JSON state files
 (``state.json``, ``items.json``), which this module does not write.
 """
 
 from __future__ import annotations
 
 import json
-import time
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from ..file_lock import try_acquire_byte_range_lock
+from ..file_lock import (
+    LOCK_ACQUIRE_RETRIES,
+    LOCK_ACQUIRE_RETRY_DELAY_SECONDS,
+    acquire_byte_range_lock,
+)
 from . import Result
 from .paths import inbox_path, journal_path, signals_path
 
@@ -83,8 +89,10 @@ def _append(path: Path, record: dict[str, Any]) -> Result[None]:
     return Result()
 
 
-_LOCK_RETRIES = 50
-_LOCK_RETRY_DELAY_SECONDS = 0.02
+# Aliased into module scope so tests can patch the bound without reaching into
+# ``file_lock`` — the values themselves are the shared defaults, not a fork.
+_LOCK_RETRIES = LOCK_ACQUIRE_RETRIES
+_LOCK_RETRY_DELAY_SECONDS = LOCK_ACQUIRE_RETRY_DELAY_SECONDS
 
 
 def _append_entry(path: Path, record: dict[str, Any]) -> Result[int]:
@@ -96,17 +104,22 @@ def _append_entry(path: Path, record: dict[str, Any]) -> Result[int]:
     byte-range lock on ``<name>.lock`` beside the log — a bounded retry so a
     wedged writer surfaces as an error value rather than hanging a Turn.
     """
+    # The lock acquire mkdirs ``lock_path.parent`` — without this guard an
+    # append to a removed foreman silently re-creates ``foremen/<name>/`` plus
+    # a lock and a log, and ``gang list`` shows a charterless foreman.
+    if not path.parent.is_dir():
+        return Result(error=f"{path.name}: parent directory {path.parent} does not exist")
     lock_path = path.with_name(path.name + ".lock")
-    lock = None
-    for _ in range(_LOCK_RETRIES):
-        lock = try_acquire_byte_range_lock(lock_path)
-        if lock is not None:
-            break
-        time.sleep(_LOCK_RETRY_DELAY_SECONDS)
+    lock = acquire_byte_range_lock(
+        lock_path, retries=_LOCK_RETRIES, retry_delay_seconds=_LOCK_RETRY_DELAY_SECONDS
+    )
     if lock is None:
         return Result(error=f"{path.name}: append lock busy after {_LOCK_RETRIES} retries")
     try:
-        record["id"] = _next_id(path)
+        allocated = _next_id(path)
+        if not allocated.ok:
+            return Result(error=allocated.error)
+        record["id"] = allocated.value
         written = _append(path, record)
         if not written.ok:
             return Result(error=written.error)
@@ -115,31 +128,64 @@ def _append_entry(path: Path, record: dict[str, Any]) -> Result[int]:
         lock.release()
 
 
-def _iter_entries(path: Path) -> Iterator[dict[str, Any]]:
-    """Yield decoded entries, skipping blank lines and a torn final write."""
+def _read_lines(path: Path) -> Result[tuple[bytes, ...]]:
+    """The log's raw byte lines; an absent file reads as no lines.
+
+    Bytes, not text — decoding is per-line downstream so one undecodable line
+    cannot take the whole stream down with it. An existing file that cannot
+    be read is an error value: id allocation must never fall back to 1 over a
+    stream it could not see.
+    """
     try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return
-    for line in text.splitlines():
-        line = line.strip()
+        return Result(value=tuple(path.read_bytes().split(b"\n")))
+    except FileNotFoundError:
+        return Result(value=())
+    except OSError as exc:
+        return Result(error=f"{path.name}: unreadable: {exc}")
+
+
+def _decode_entries(lines: Iterable[bytes]) -> Iterator[dict[str, Any]]:
+    """Decode each line independently; blank, undecodable, and torn lines skip."""
+    for raw in lines:
+        line = raw.strip()
         if not line:
             continue
         try:
-            record = json.loads(line)
+            text = line.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        try:
+            record = json.loads(text)
         except json.JSONDecodeError:
             continue
         if isinstance(record, dict):
             yield record
 
 
-def _next_id(path: Path) -> int:
+def _iter_entries(path: Path) -> Iterator[dict[str, Any]]:
+    """Yield decoded entries, skipping blank, undecodable, and torn lines."""
+    lines = _read_lines(path)
+    if not lines.ok:
+        return
+    yield from _decode_entries(lines.value)
+
+
+def _next_id(path: Path) -> Result[int]:
+    """``max(id) + 1`` over the log; an unreadable existing file is an error.
+
+    Falling back to 1 after a failed read would mint a duplicate id — the
+    append would report ``ok`` and every ``after_id >= 1`` cursor would skip
+    the entry forever.
+    """
+    lines = _read_lines(path)
+    if not lines.ok:
+        return Result(error=lines.error)
     last = 0
-    for record in _iter_entries(path):
+    for record in _decode_entries(lines.value):
         entry_id = record.get("id")
         if isinstance(entry_id, int) and entry_id > last:
             last = entry_id
-    return last + 1
+    return Result(value=last + 1)
 
 
 def append_journal(

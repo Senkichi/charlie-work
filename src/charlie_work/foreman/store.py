@@ -114,10 +114,21 @@ def scaffold_foreman(
         return Result(error=str(exc))
     if root.exists():
         return Result(error=f"foreman {name!r}: already exists at {root}")
+    # Read and decode --from sources BEFORE any mkdir: a seed that cannot be
+    # read or decoded is an error value, never a half-scaffolded charterless
+    # foreman that blocks retry (a UnicodeDecodeError out of read_text is not
+    # an OSError — it must be named here).
+    copied: dict[str, str] | None = None
     if from_dir is not None:
+        copied = {}
         for filename in (CHARTER_FILENAME, INSTRUCTIONS_FILENAME):
-            if not (from_dir / filename).is_file():
+            source = from_dir / filename
+            if not source.is_file():
                 return Result(error=f"--from {from_dir}: {filename} not found")
+            try:
+                copied[filename] = source.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                return Result(error=f"--from {from_dir}: {filename}: unreadable: {exc}")
     try:
         foremen_root(fleet_dir).mkdir(parents=True, exist_ok=True)
         root.mkdir()
@@ -126,11 +137,9 @@ def scaffold_foreman(
     except OSError as exc:
         return Result(error=f"foreman {name!r}: cannot create directories: {exc}")
     try:
-        if from_dir is not None:
+        if copied is not None:
             for filename in (CHARTER_FILENAME, INSTRUCTIONS_FILENAME):
-                write_text_atomic(
-                    root / filename, (from_dir / filename).read_text(encoding="utf-8")
-                )
+                write_text_atomic(root / filename, copied[filename])
         else:
             write_text_atomic(root / CHARTER_FILENAME, _CHARTER_TEMPLATE.format(name=name))
             write_text_atomic(

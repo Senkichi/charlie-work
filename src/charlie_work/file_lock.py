@@ -7,7 +7,13 @@ silently drift apart.
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
+
+#: Bounded-retry defaults for ``acquire_byte_range_lock`` — the one place the
+#: retry count and delay live so callers cannot silently drift apart.
+LOCK_ACQUIRE_RETRIES = 50
+LOCK_ACQUIRE_RETRY_DELAY_SECONDS = 0.02
 
 
 class ByteRangeFileLock:
@@ -79,3 +85,24 @@ def try_acquire_byte_range_lock(lock_path: Path) -> ByteRangeFileLock | None:
         return ByteRangeFileLock(lock_path, handle)
     except OSError:
         return None
+
+
+def acquire_byte_range_lock(
+    lock_path: Path,
+    *,
+    retries: int = LOCK_ACQUIRE_RETRIES,
+    retry_delay_seconds: float = LOCK_ACQUIRE_RETRY_DELAY_SECONDS,
+) -> ByteRangeFileLock | None:
+    """Bounded-retry variant of ``try_acquire_byte_range_lock``.
+
+    A transiently busy lock gets ``retries`` probes before the caller gives
+    up — a wedged holder surfaces as ``None`` (an error value at the call
+    site) rather than a hang. Same contract as the single-try variant: never
+    raises.
+    """
+    for _ in range(retries):
+        lock = try_acquire_byte_range_lock(lock_path)
+        if lock is not None:
+            return lock
+        time.sleep(retry_delay_seconds)
+    return None

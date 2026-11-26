@@ -82,6 +82,54 @@ def test_append_after_torn_line_is_readable(tmp_path: Path) -> None:
     assert appended.value.id == 2
 
 
+def test_undecodable_middle_line_is_skipped(tmp_path: Path) -> None:
+    """Decoding is per line: one invalid byte costs its line, not the stream.
+
+    A whole-file strict decode would read the log as empty, let the next
+    append report ``ok`` with a duplicate id 1, and strand every
+    ``after_id >= 1`` cursor forever.
+    """
+    fdir = _foreman(tmp_path)
+    append_inbox(fdir, "first")
+    append_inbox(fdir, "second")
+    inbox = fdir / "inbox.jsonl"
+    first, second = inbox.read_bytes().split(b"\n")[:2]
+    inbox.write_bytes(first + b"\n" + b'\xff\xfe{"id": 9' + b"\n" + second + b"\n")
+    assert [m.text for m in read_inbox(fdir)] == ["first", "second"]
+    appended = append_inbox(fdir, "third")
+    assert appended.ok and appended.value.id == 3
+
+
+def test_unreadable_log_is_an_error_not_an_id_reset(tmp_path: Path, monkeypatch) -> None:
+    """An OSError reading an existing log is an error value — the append must
+    not restart ids at 1 and must not write."""
+    fdir = _foreman(tmp_path)
+    assert append_inbox(fdir, "kept").ok
+    inbox = fdir / "inbox.jsonl"
+    before = inbox.read_bytes()
+
+    def _unreadable(self, *args, **kwargs):
+        raise OSError("simulated read failure")
+
+    monkeypatch.setattr(Path, "read_bytes", _unreadable)
+    appended = append_inbox(fdir, "lost")
+    assert not appended.ok
+    assert "unreadable" in appended.error
+    monkeypatch.undo()
+    assert inbox.read_bytes() == before
+
+
+def test_append_to_missing_foreman_dir_is_an_error(tmp_path: Path) -> None:
+    """The lock acquire mkdirs the log's parent — appending to a removed or
+    never-created foreman must refuse first, not silently re-materialize a
+    charterless ``foremen/<name>/`` that ``gang list`` would then show."""
+    fdir = paths.foreman_dir(tmp_path, "ghost")
+    assert not append_journal(fdir, "x").ok
+    assert not append_inbox(fdir, "x").ok
+    assert not append_signal(fdir, "source").ok
+    assert not fdir.exists()
+
+
 def test_append_lock_busy_is_an_error_value(tmp_path: Path, monkeypatch) -> None:
     """A held log lock makes the append a bounded error — never a hang."""
     from charlie_work.file_lock import try_acquire_byte_range_lock

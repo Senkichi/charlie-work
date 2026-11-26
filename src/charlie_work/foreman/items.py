@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from ..atomic_write import write_json_atomic
+from ..file_lock import LOCK_ACQUIRE_RETRIES, acquire_byte_range_lock
 from . import Result
 from .journal import utc_now
 from .paths import items_path
@@ -116,9 +117,15 @@ def _from_record(raw: Any) -> Item | None:
     )
 
 
-def _decode_items(raw: Any) -> tuple[Item, ...]:
+def _raw_records(raw: Any) -> list[Any] | None:
+    """The raw record list — ``{"items": [...]}`` or a bare top-level list."""
     records = raw.get("items") if isinstance(raw, dict) else raw if isinstance(raw, list) else ()
-    if not isinstance(records, list):
+    return records if isinstance(records, list) else None
+
+
+def _decode_items(raw: Any) -> tuple[Item, ...]:
+    records = _raw_records(raw)
+    if records is None:
         return ()
     return tuple(item for item in (_from_record(r) for r in records) if item is not None)
 
@@ -153,7 +160,16 @@ def _load_items_strict(foreman_root: Path) -> Result[tuple[Item, ...]]:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         return Result(error=f"items.json: unreadable or corrupt: {exc}")
-    return Result(value=_decode_items(raw))
+    records = _raw_records(raw)
+    if records is None:
+        return Result(error="items.json: unreadable or corrupt: 'items' is not a list")
+    decoded = [_from_record(record) for record in records]
+    undecodable = sum(1 for item in decoded if item is None)
+    if undecodable:
+        return Result(
+            error=f"items.json: unreadable or corrupt: {undecodable} record(s) failed to decode"
+        )
+    return Result(value=tuple(item for item in decoded if item is not None))
 
 
 def _parse_utc(value: str) -> datetime | None:
@@ -195,6 +211,47 @@ def _next_item_id(items: tuple[Item, ...]) -> str:
         if match:
             highest = max(highest, int(match.group(1)))
     return f"it-{highest + 1}"
+
+
+def _mutate_items(
+    foreman_root: Path,
+    mutate: Callable[[tuple[Item, ...]], Result[tuple[tuple[Item, ...], Item]]],
+) -> Result[Item]:
+    """One locked load-mutate-save pass over ``items.json``.
+
+    ``mutate`` receives the strictly-decoded items and returns the replacement
+    list plus the item to hand back. The per-file lock on ``items.json.lock``
+    covers the strict load, the mutation step, and the atomic write: two
+    mutators cannot interleave a read-modify-write (a second creator minting
+    the same id, an answer landing on a stale read), and a busy lock is an
+    error value rather than a hang.
+    """
+    try:
+        path = items_path(foreman_root)
+    except ValueError as exc:
+        return Result(error=str(exc))
+    # Both the lock acquire and ``write_json_atomic`` mkdir the parent — an
+    # item write to a removed foreman must refuse, not silently re-materialize
+    # a charterless ``foremen/<name>/``.
+    if not path.parent.is_dir():
+        return Result(error=f"{path.name}: parent directory {path.parent} does not exist")
+    lock = acquire_byte_range_lock(path.with_name(path.name + ".lock"))
+    if lock is None:
+        return Result(error=f"{path.name}: lock busy after {LOCK_ACQUIRE_RETRIES} retries")
+    try:
+        loaded = _load_items_strict(foreman_root)
+        if not loaded.ok:
+            return Result(error=loaded.error)
+        mutated = mutate(loaded.value)
+        if not mutated.ok:
+            return Result(error=mutated.error)
+        new_items, result_item = mutated.value
+        saved = _save_items(path, new_items)
+        if not saved.ok:
+            return Result(error=saved.error)
+        return Result(value=result_item)
+    finally:
+        lock.release()
 
 
 def open_items(items: tuple[Item, ...], *, now: str | None = None) -> tuple[Item, ...]:
@@ -255,54 +312,46 @@ def create_item(
             return Result(
                 error=f"item.recommended {recommended}: index into {len(options)} options"
             )
-    try:
-        path = items_path(foreman_root)
-    except ValueError as exc:
-        return Result(error=str(exc))
-    loaded = _load_items_strict(foreman_root)
-    if not loaded.ok:
-        return Result(error=loaded.error)
-    items = loaded.value
-    resolved_id = item_id or _next_item_id(items)
-    if any(i.id == resolved_id for i in items):
-        return Result(error=f"item.id {resolved_id!r}: already exists")
-    item = Item(
-        id=resolved_id,
-        kind=kind,
-        question=question,
-        text=text,
-        options=options,
-        recommended=recommended if kind != ITEM_REPORT else None,
-        command=command,
-        created_at=created_at or utc_now(),
-    )
-    saved = _save_items(path, (*items, item))
-    if not saved.ok:
-        return Result(error=saved.error)
-    return Result(value=item)
+
+    def step(items: tuple[Item, ...]) -> Result[tuple[tuple[Item, ...], Item]]:
+        resolved_id = item_id or _next_item_id(items)
+        if any(i.id == resolved_id for i in items):
+            return Result(error=f"item.id {resolved_id!r}: already exists")
+        item = Item(
+            id=resolved_id,
+            kind=kind,
+            question=question,
+            text=text,
+            options=options,
+            recommended=recommended if kind != ITEM_REPORT else None,
+            command=command,
+            created_at=created_at or utc_now(),
+        )
+        return Result(value=((*items, item), item))
+
+    return _mutate_items(foreman_root, step)
 
 
 def _update(
-    foreman_root: Path, item_id: str, update: Callable[[Item], Item], *, verb: str
+    foreman_root: Path, item_id: str, update: Callable[[Item], Result[Item]], *, verb: str
 ) -> Result[Item]:
-    """Find ``item_id``, apply ``update(item) -> Item``, and persist."""
-    try:
-        path = items_path(foreman_root)
-    except ValueError as exc:
-        return Result(error=str(exc))
-    loaded = _load_items_strict(foreman_root)
-    if not loaded.ok:
-        return Result(error=loaded.error)
-    items = loaded.value
-    index = next((i for i, item in enumerate(items) if item.id == item_id), None)
-    if index is None:
-        return Result(error=f"item {item_id!r}: not found (cannot {verb})")
-    updated = update(items[index])
-    new_items = (*items[:index], updated, *items[index + 1 :])
-    saved = _save_items(path, new_items)
-    if not saved.ok:
-        return Result(error=saved.error)
-    return Result(value=updated)
+    """Find ``item_id``, run ``update(item) -> Result[Item]``, and persist.
+
+    ``update`` carries the verb's validation so the whole read-modify-write —
+    strict load, validate, replace, save — runs inside ``_mutate_items``'
+    lock instead of loading twice across an unprotected gap.
+    """
+
+    def step(items: tuple[Item, ...]) -> Result[tuple[tuple[Item, ...], Item]]:
+        index = next((i for i, item in enumerate(items) if item.id == item_id), None)
+        if index is None:
+            return Result(error=f"item {item_id!r}: not found (cannot {verb})")
+        updated = update(items[index])
+        if not updated.ok:
+            return Result(error=updated.error)
+        return Result(value=((*items[:index], updated.value, *items[index + 1 :]), updated.value))
+
+    return _mutate_items(foreman_root, step)
 
 
 def answer_item(
@@ -314,36 +363,30 @@ def answer_item(
     answered_at: str | None = None,
 ) -> Result[Item]:
     """Record the operator's answer: an option index or the option's exact text."""
-    loaded = _load_items_strict(foreman_root)
-    if not loaded.ok:
-        return Result(error=loaded.error)
-    target = next((i for i in loaded.value if i.id == item_id), None)
-    if target is None:
-        return Result(error=f"item {item_id!r}: not found (cannot answer)")
-    if target.status != STATUS_OPEN and target.status != STATUS_SNOOZED:
-        return Result(error=f"item {item_id!r}: already {target.status}")
-    if isinstance(choice, str):
-        if choice not in target.options:
-            return Result(error=f"item.answer {choice!r}: not one of {list(target.options)}")
-        index = target.options.index(choice)
-    else:
-        index = choice
-        if not 0 <= index < len(target.options):
-            return Result(error=f"item.answer {index}: index into {len(target.options)} options")
-    stamp = answered_at or utc_now()
-    return _update(
-        foreman_root,
-        item_id,
-        lambda item: replace(
-            item,
-            status=STATUS_ANSWERED,
-            answer=index,
-            answer_note=note,
-            answered_at=stamp,
-            snoozed_until=None,
-        ),
-        verb="answer",
-    )
+
+    def step(item: Item) -> Result[Item]:
+        if item.status != STATUS_OPEN and item.status != STATUS_SNOOZED:
+            return Result(error=f"item {item_id!r}: already {item.status}")
+        if isinstance(choice, str):
+            if choice not in item.options:
+                return Result(error=f"item.answer {choice!r}: not one of {list(item.options)}")
+            index = item.options.index(choice)
+        else:
+            index = choice
+            if not 0 <= index < len(item.options):
+                return Result(error=f"item.answer {index}: index into {len(item.options)} options")
+        return Result(
+            value=replace(
+                item,
+                status=STATUS_ANSWERED,
+                answer=index,
+                answer_note=note,
+                answered_at=answered_at or utc_now(),
+                snoozed_until=None,
+            )
+        )
+
+    return _update(foreman_root, item_id, step, verb="answer")
 
 
 def snooze_item(
@@ -361,50 +404,41 @@ def snooze_item(
             error=f"item.snoozed_until {until!r}: an aware ISO-8601 timestamp "
             "(e.g. 2026-11-26T09:00:00Z or ...+02:00)"
         )
-    loaded = _load_items_strict(foreman_root)
-    if not loaded.ok:
-        return Result(error=loaded.error)
-    target = next((i for i in loaded.value if i.id == item_id), None)
-    if target is None:
-        return Result(error=f"item {item_id!r}: not found (cannot snooze)")
-    if target.status in (STATUS_ANSWERED, STATUS_DISMISSED):
-        return Result(error=f"item {item_id!r}: already {target.status}")
     normalized = _format_utc(deadline)
-    return _update(
-        foreman_root,
-        item_id,
-        lambda item: replace(item, status=STATUS_SNOOZED, snoozed_until=normalized),
-        verb="snooze",
-    )
+
+    def step(item: Item) -> Result[Item]:
+        if item.status in (STATUS_ANSWERED, STATUS_DISMISSED):
+            return Result(error=f"item {item_id!r}: already {item.status}")
+        return Result(value=replace(item, status=STATUS_SNOOZED, snoozed_until=normalized))
+
+    return _update(foreman_root, item_id, step, verb="snooze")
 
 
 def dismiss_item(
     foreman_root: Path, item_id: str, *, dismissed_at: str | None = None
 ) -> Result[Item]:
     """Close an item without an answer."""
-    loaded = _load_items_strict(foreman_root)
-    if not loaded.ok:
-        return Result(error=loaded.error)
-    target = next((i for i in loaded.value if i.id == item_id), None)
-    if target is None:
-        return Result(error=f"item {item_id!r}: not found (cannot dismiss)")
-    if target.status in (STATUS_ANSWERED, STATUS_DISMISSED):
-        return Result(error=f"item {item_id!r}: already {target.status}")
-    stamp = dismissed_at or utc_now()
-    return _update(
-        foreman_root,
-        item_id,
-        lambda item: replace(item, status=STATUS_DISMISSED, answered_at=stamp, snoozed_until=None),
-        verb="dismiss",
-    )
+
+    def step(item: Item) -> Result[Item]:
+        if item.status in (STATUS_ANSWERED, STATUS_DISMISSED):
+            return Result(error=f"item {item_id!r}: already {item.status}")
+        return Result(
+            value=replace(
+                item,
+                status=STATUS_DISMISSED,
+                answered_at=dismissed_at or utc_now(),
+                snoozed_until=None,
+            )
+        )
+
+    return _update(foreman_root, item_id, step, verb="dismiss")
 
 
 def mark_notified(foreman_root: Path, item_id: str, *, at: str | None = None) -> Result[Item]:
     """Stamp ``notified_at`` so a notify pass does not re-send the same item."""
-    stamp = at or utc_now()
     return _update(
         foreman_root,
         item_id,
-        lambda item: replace(item, notified_at=stamp),
+        lambda item: Result(value=replace(item, notified_at=at or utc_now())),
         verb="mark notified",
     )

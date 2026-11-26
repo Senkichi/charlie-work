@@ -66,6 +66,20 @@ def test_gang_new_from_copies_documents(tmp_path: Path) -> None:
     assert not result.ok
 
 
+def test_gang_new_from_undecodable_seed_is_a_clean_error(tmp_path: Path) -> None:
+    """A UTF-16 seed decodes BEFORE any mkdir — an undecodable charter comes
+    back as an error naming the file, not a traceback, and leaves no
+    charterless ``foremen/<name>/`` behind to block retry."""
+    source = tmp_path / "seed"
+    source.mkdir()
+    (source / "charter.yaml").write_bytes("name: g1\noutcome: seed\n".encode("utf-16"))
+    (source / "instructions.md").write_text("seeded\n", encoding="utf-8")
+    result = run_gang_command(_args(tmp_path, "new", "g1", from_dir=str(source)))
+    assert not result.ok
+    assert "charter.yaml" in result.message
+    assert not (tmp_path / "foremen" / "g1").exists()
+
+
 def test_gang_list_empty_is_clean_noop(tmp_path: Path) -> None:
     result = run_gang_command(_args(tmp_path, "list"))
     assert result.ok
