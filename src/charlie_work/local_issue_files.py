@@ -25,6 +25,7 @@ the file mid-write.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -292,3 +293,121 @@ def append_comment(text: str, comment: str, *, timestamp: str) -> str:
 def write_text_atomic(path: Path, text: str) -> None:
     """Temp file + ``replace``; bytes, so no newline translation on Windows."""
     write_bytes_atomic(path, text.encode("utf-8"))
+
+
+# The slug half of a new issue filename: lowercase alphanumeric runs joined by
+# hyphens. Non-ASCII and punctuation collapse to separators; a title with no
+# usable characters falls back to ``issue`` -- the number carries identity,
+# the slug is only a human-readable hint.
+_SLUG_RUN_RE = re.compile(r"[^a-z0-9]+")
+_SLUG_MAX = 60
+
+
+def new_issue_filename(number: int, title: str) -> str:
+    """``NNN_<slug>.md`` name for a freshly-created issue file."""
+    slug = _SLUG_RUN_RE.sub("-", title.lower()).strip("-")[:_SLUG_MAX].rstrip("-")
+    return f"{number:03d}_{slug or 'issue'}.md"
+
+
+def _lf(text: str) -> str:
+    """``text`` with every newline convention collapsed to bare LF."""
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _check_body_markup(body: str) -> str:
+    """``body``, or ``IssueFileError`` when it carries reserved comment markup.
+
+    ``COMMENTS_MARKER`` splits the file into the body region and the comment
+    region, and ``_COMMENT_SEPARATOR`` splits the comment region into
+    entries. A body containing either marker would be *stored* corrupted:
+    ``parse_issue_text`` reads everything below the marker as comments, so
+    the tail of the submitted body silently becomes a comment -- and no
+    later ``rewrite_body`` can remove it, because that region is preserved
+    verbatim. Refusing at the helper boundary is what keeps "the body"
+    meaning "the region above the marker".
+    """
+    for marker in (COMMENTS_MARKER, _COMMENT_SEPARATOR):
+        if marker in body:
+            raise IssueFileError(f"issue body must not contain reserved markup {marker!r}")
+    return body
+
+
+# ``render_issue_text``'s parse-back self-check needs a filename-shaped
+# ``Path``: the issue number comes from the name, never the frontmatter,
+# and the rendered text itself carries none.
+_RENDER_SELFCHECK_PATH = Path("000_render_selfcheck.md")
+
+
+def render_issue_text(*, title: str, body: str, labels: tuple[str, ...], created: str) -> str:
+    """The full text of a freshly-created issue file (LF newlines).
+
+    The title goes through ``json.dumps`` rather than f-string interpolation:
+    a JSON double-quoted string is also a valid YAML double-quoted scalar on
+    one line, so a title containing a colon, a quote, or a newline can never
+    break the frontmatter mapping. Labels render through the same
+    ``render_flow_list`` the label mutations use, so a later
+    ``rewrite_frontmatter_key`` sees the same shape everywhere. The body's
+    line endings are normalized to LF to match the rendered file, and a body
+    carrying reserved comment markup is refused (``IssueFileError``).
+
+    Before returning, the rendered text is parsed back and refused
+    (``IssueFileError``) when it does not round-trip to the given
+    title/body: ``json.dumps`` quotes per JSON rules, not YAML's, so a
+    title carrying a literal DEL or C1 control survives the dump untouched
+    but is rejected by ``yaml.safe_load`` -- and an empty title parses back
+    to the filename stem rather than ``""``. Either shape would store a
+    file ``scan_issues`` cannot serve as the issue it was created as while
+    ``create_issue`` reports the number, so the refusal has to happen here,
+    before the write.
+    """
+    normalized = _lf(_check_body_markup(body)).strip()
+    lines = [
+        "---",
+        f"title: {json.dumps(title, ensure_ascii=False)}",
+        "state: open",
+        f"labels: {render_flow_list(labels)}",
+        f'created: "{created}"',
+        "---",
+    ]
+    text = "\n".join(lines) + "\n" + normalized + "\n"
+    try:
+        parsed = parse_issue_text(text, _RENDER_SELFCHECK_PATH)
+    except IssueFileError as exc:
+        raise IssueFileError(f"title/body are not storable in an issue file: {exc}") from exc
+    if parsed.title != title or parsed.body != normalized:
+        raise IssueFileError(
+            "title/body are not storable in an issue file: rendered text parses "
+            f"back to title={parsed.title!r} body={parsed.body!r}"
+        )
+    return text
+
+
+def rewrite_body(text: str, body: str) -> str:
+    """Return ``text`` with the issue *body* replaced by ``body``.
+
+    Pure. Only the region between the closing frontmatter fence and the
+    comments marker is touched: frontmatter, the marker itself, and every
+    comment survive byte-for-byte, and the file's own newline convention is
+    reused -- the incoming body's line endings are normalized to it, so a
+    multi-line LF body cannot smuggle bare ``\\n`` into a CRLF file. Raises
+    ``IssueFileError`` when there is no frontmatter, or when ``body``
+    carries reserved comment markup (which would be stored corrupted).
+    """
+    match = _FRONTMATTER_RE.match(text)
+    if match is None:
+        raise IssueFileError("no '---' fenced frontmatter block")
+    newline = match.group("nl")
+    normalized = _lf(_check_body_markup(body)).strip("\r\n").replace("\n", newline)
+    head = text[: match.end()]
+    if not head.endswith("\n"):
+        # ``_FRONTMATTER_RE`` also accepts a closing fence at EOF with no
+        # line ending (its ``\Z`` alternative); appending the body bare
+        # would glue it onto the fence -- ``---new body`` -- a file that
+        # parses on no later read while ``edit_issue_body`` reported
+        # success. The file's own newline goes between fence and body.
+        head += newline
+    tail = text[match.end() :]
+    marker_at = tail.find(COMMENTS_MARKER)
+    if marker_at < 0:
+        return head + normalized + newline
+    return head + newline.join((normalized, "", tail[marker_at:]))
