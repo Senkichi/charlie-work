@@ -26,8 +26,11 @@ from charlie_work.worktree import worktree_ahead_of_sha
 import charlie_work.superseded_worker_reap as superseded_worker_reap
 import charlie_work.workflow as _wf
 from charlie_work.command_result import CommandResult
+from charlie_work.dispatch_empty_pass import (
+    _rework_deferral_result,
+    nothing_to_dispatch_rework,
+)
 from charlie_work.worker_launch_gate import (
-    REASON_PROVIDER_THROTTLED,
     FleetLaunchLock,
     WorkerLaunchDeferral,
     _launch_workers,
@@ -182,6 +185,20 @@ def _dispatch_rework_impl(
 
     rework_limit = limit if limit is not None else self.config.dispatch.default_limit
 
+    # Issue #3139: when the scan found no rework candidate (rework_requested
+    # + open PR + not operator-claimed), nothing this pass can launch --
+    # return the lane's normal "no candidates" result without requesting the
+    # launch permit, so the pending lock handle is never realized. The
+    # dry-run path is unchanged -- it still realizes and releases the lock
+    # itself before its read-only planning scan.
+    if not self.dry_run and not rework_issues:
+        return nothing_to_dispatch_rework(
+            self,
+            rework_limit=rework_limit,
+            operator_claimed_skipped=operator_claimed_skipped,
+            launch_lock=launch_lock,
+        )
+
     # Issue #2041/#2055: the shared worker-launch gate -- provider-throttle
     # pre-check (lock-free), the fleet lock realized HERE with a bounded wait
     # (never across the scans above), live_count computed under it (the
@@ -192,21 +209,12 @@ def _dispatch_rework_impl(
     permit = issue_worker_launch_permit(self, rework_limit, launch_lock=launch_lock)
     if isinstance(permit, WorkerLaunchDeferral):
         # Return immediately with deferral reason
-        data = {
-            "adapter": self.config.worker.harness,
-            "selected_count": 0,
-            "deferred_reason": permit.reason,
-            "operator_claimed_skipped": sorted(operator_claimed_skipped),
-            "worker_death_escalated": [],
-            **permit.report_fields(),
-        }
-        if permit.reason == REASON_PROVIDER_THROTTLED:
-            message = (
-                f"rework dispatch deferred: provider throttled until {permit.throttled_until}"
-            )
-        else:
-            message = f"rework dispatch deferred: {permit.reason}"
-        return CommandResult(permit.ok, message, data)
+        return _rework_deferral_result(
+            self,
+            permit,
+            operator_claimed_skipped=operator_claimed_skipped,
+            launch_lock=launch_lock,
+        )
     gov = permit.governor
     rework_limit = permit.max_launches
 

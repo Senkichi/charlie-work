@@ -326,10 +326,12 @@ def test_concurrency_governor_zero_dispatch_is_self_explaining_in_dispatch_event
        the bounded ``failures`` map (built from the same truncated list) does
        not silently grow unbounded even though 8 issues were deferred.
     2. The *same* clamped governor config against a genuinely empty backlog --
-       proves the forensic case that actually matters: two passes that are
-       BOTH ``clamped=True`` are still distinguishable via
-       ``deferred_by_concurrency_count``. (Clamped-vs-disabled would let
-       ``clamped`` alone do the discriminating, which is a weaker claim.)
+       proves the forensic case that actually matters: a clamped pass and an
+       empty-backlog pass are still distinguishable. Issue #3139 sharpened
+       it -- the empty pass never runs the governor, so ``clamped`` itself
+       now discriminates, on top of ``deferred_by_concurrency_count`` (the
+       field that separates "nothing to dispatch" from "nothing COULD be
+       dispatched", which is the realistic forensic question).
     3. A fleet-only-binding clamp -- repo governor recomputes
        ``available_slots=1`` (nonzero!) while the fleet cap independently
        zeroes ``dispatch_limit``. Confirms ``dispatch_limit`` -- not
@@ -428,22 +430,27 @@ def test_concurrency_governor_zero_dispatch_is_self_explaining_in_dispatch_event
     }
 
     # --- Scenario 2: same clamped config, genuinely empty backlog ---------
-    # Machine-checkable differentiation (acceptance criterion): two passes
-    # that are BOTH clamped must still be distinguishable from events.db
-    # alone. Reusing the identical governor config (not a disabled one) means
-    # `clamped` is True in both payloads -- deferred_by_concurrency_count is
-    # the field that actually separates "nothing to dispatch" from "nothing
-    # COULD be dispatched", which is the realistic forensic question.
+    # Machine-checkable differentiation (acceptance criterion): a clamped
+    # pass and an empty-backlog pass must be distinguishable from events.db
+    # alone. Issue #3139 changed how: an empty backlog returns before the
+    # launch permit, so the governor never runs and the lock is never
+    # realized -- governor-only fields report their pre-governor-deferral
+    # values (`clamped` False, `dispatch_limit` the unclamped request). The
+    # two passes are now distinguishable on BOTH `clamped` AND
+    # `deferred_by_concurrency_count`.
     empty_gh = SaturatedGitHub(0)
     empty_app = OrchestratorApp(tmp_path, paths, config, empty_gh)
     empty_result = empty_app.dispatch()
     assert empty_result.data["selected_count"] == 0
     empty_events = query_events(paths.state_file, kind="dispatch")
     empty_payload = empty_events[-1]["payload"]
-    assert empty_payload["concurrency_governor"]["clamped"] is True
+    assert empty_payload["concurrency_governor"] == {
+        "clamped": False,
+        "dispatch_limit": 5,
+    }
     assert empty_payload["deferred_by_concurrency_count"] == 0
     assert empty_payload["deferred_by_concurrency"] == []
-    assert empty_payload["concurrency_governor"] == payload["concurrency_governor"]
+    assert empty_payload["concurrency_governor"] != payload["concurrency_governor"]
     assert (
         empty_payload["deferred_by_concurrency_count"] != payload["deferred_by_concurrency_count"]
     )
