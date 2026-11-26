@@ -31,7 +31,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import NamedTuple, Protocol
+from typing import Any, NamedTuple, Protocol
 
 import psutil
 
@@ -145,10 +145,11 @@ def _bulk_create_time_map() -> dict[int, float | None] | None:
 
     Returns ``None`` where the platform ships no ``cext.proc_times`` --
     the snapshot's ``process_iter`` leg remains the correct (slower)
-    fallback there.
+    fallback there. The reader is resolved through ``_optional_proc_times``
+    so the snapshot and the per-hop walk share one spelling of "does this
+    platform ship the fast leg" (issue #3168).
     """
-    cext = getattr(getattr(psutil, "_psplatform", None), "cext", None)
-    proc_times = getattr(cext, "proc_times", None)
+    proc_times = _optional_proc_times()
     if proc_times is None:
         return None
     times: dict[int, float | None] = {}
@@ -219,6 +220,25 @@ def win32_process_ppid_snapshot() -> dict[int, ProcRow]:
     return ppid_by_pid
 
 
+def _optional_proc_times() -> Any:
+    """The ``cext.proc_times`` fast create-time reader where the platform ships it.
+
+    ``win32_ancestor_rows`` reads one creation stamp per ancestor hop. The
+    cross-platform spelling ``Process.create_time()`` answers a denied
+    ``OpenProcess`` with ``proc_info(pid)`` — a full
+    ``NtQuerySystemInformation`` table walk *per denied ancestor*, the same
+    per-denied-process cost issue #2372 measured in the host-wide snapshot
+    (and the reason ``_bulk_create_time_map`` takes this C call directly).
+    ``cext.proc_times`` is that call's fast leg: a denied open raises
+    ``OSError`` and the caller records ``created=None``, which the walk's
+    own rule already keeps as a link — an unknown stamp never disqualifies.
+    ``None`` where the platform ships no ``proc_times`` (the
+    ``proc.create_time()`` fallback leg stays correct there).
+    """
+    cext = getattr(getattr(psutil, "_psplatform", None), "cext", None)
+    return getattr(cext, "proc_times", None)
+
+
 def win32_ancestor_rows(pid: int, *, max_hops: int = MAX_CHAIN_HOPS) -> dict[int, ProcRow]:
     """``pid -> ProcRow`` for ``pid``'s own ancestor chain, gathered hop by hop.
 
@@ -231,9 +251,13 @@ def win32_ancestor_rows(pid: int, *, max_hops: int = MAX_CHAIN_HOPS) -> dict[int
     under uv/pytest/pwsh). The walk therefore takes the same one-shot bulk
     table ``win32_process_ppid_snapshot`` uses — once per *walk* (issue
     #2362) — leaving each hop to pay only ``Process()``'s
-    ``OpenProcess``/``GetProcessTimes`` identity probe, whose result also
-    answers ``create_time()`` (a protected pid's failed open falls back to
-    a ``NtQuerySystemInformation`` scan). A pid absent from the table (born
+    ``OpenProcess``/``GetProcessTimes`` identity probe plus one
+    ``cext.proc_times`` call for the creation stamp (issue #3168:
+    ``create_time()``'s permission-error fallback is ``proc_info(pid)`` — a
+    full ``NtQuerySystemInformation`` scan *per denied ancestor*, the same
+    per-denied-process cost issue #2372 measured in the host-wide snapshot;
+    a denied open records ``created=None``, which the walk's own rule keeps
+    as a link). A pid absent from the table (born
     mid-walk) or a platform with no bulk table falls back to the per-hop
     ``ppid()`` read this replaces. Compared with ``process_iter`` — which
     pays the enumeration-plus-handle-open pair once per *process*, growing
@@ -258,6 +282,16 @@ def win32_ancestor_rows(pid: int, *, max_hops: int = MAX_CHAIN_HOPS) -> dict[int
     # taken, so a map miss is a mid-walk spawn (or no bulk table at all) —
     # exactly the cases the per-hop ``ppid()`` read still answers.
     ppids = _optional_bulk_ppid_map()
+    # Per-hop creation stamps come from the fast ``cext.proc_times`` leg
+    # where it ships (issue #3168): ``proc.create_time()`` would pay its
+    # permission-error fallback — ``proc_info(pid)``, a full
+    # ``NtQuerySystemInformation`` walk — once per access-denied ancestor,
+    # which is what the ledger measured as the ``kill_process_tree`` guard's
+    # residual ~1 s on a busy host. A denied open here reads as
+    # ``created=None`` — the same outcome the fallback produced (the link is
+    # kept) without the table scan. Platforms with no ``proc_times`` keep
+    # the ``create_time()`` fallback leg.
+    proc_times = _optional_proc_times()
     rows: dict[int, ProcRow] = {}
     current = pid
     for _ in range(max_hops):
@@ -271,10 +305,17 @@ def win32_ancestor_rows(pid: int, *, max_hops: int = MAX_CHAIN_HOPS) -> dict[int
                 ppid = proc.ppid()
         except (psutil.Error, OSError):
             break
-        try:
-            created = proc.create_time()
-        except (psutil.Error, OSError):
-            created = None
+        if proc_times is not None:
+            try:
+                _user, _system, stamp = proc_times(current)
+                created = float(stamp) if isinstance(stamp, (int, float)) else None
+            except (psutil.Error, OSError):
+                created = None
+        else:
+            try:
+                created = proc.create_time()
+            except (psutil.Error, OSError):
+                created = None
         rows[current] = ProcRow(
             int(ppid or 0), float(created) if isinstance(created, (int, float)) else None
         )
