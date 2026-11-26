@@ -108,12 +108,36 @@ def test_lint_issue_body_symbol_citation_is_clean() -> None:
         "Closes:#5",
         "fixes:  #5",
         "This body ends with resolves #42.",
+        # Qualified owner/repo#N forms — closing_reference.py's _CLOSING_LINE_RE
+        # treats these as closing refs, and GitHub's auto-close honors them.
+        "Fixes Senkichi/charlie-work#12",
+        "Closes: owner/repo#3",
+        "Closes owner/repo#3",
+        "resolves some-org/some.repo#9",
     ],
 )
 def test_lint_issue_body_closing_keyword_fails(body: str) -> None:
     problems = lint_issue_body(body, frozenset())
     assert len(problems) == 1
     assert "closing" in problems[0] or "#5" in problems[0] or "#42" in problems[0]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # `\b`-boundary negatives: a keyword occurring only as a word-internal
+        # substring ("prefix" contains "fix", "prefixes" contains "fixes")
+        # must not trip the rule — no word boundary precedes it.
+        "prefix #5",
+        "prefixes #5",
+        "prefix issue 5",
+        # A qualifier that never reaches a #N reference is not a closing ref
+        # (mirrors _CLOSING_LINE_RE, which requires the qualifier adjacent to #).
+        "Fixes owner/repo ordering.",
+    ],
+)
+def test_lint_issue_body_closing_keyword_boundary_stays_clean(body: str) -> None:
+    assert lint_issue_body(body, frozenset()) == ()
 
 
 def test_lint_issue_body_closing_keyword_negated_still_fails() -> None:
@@ -206,6 +230,41 @@ def test_lint_issue_cli_failing_body_exits_1(tmp_path: Path, capsys) -> None:
     assert results[str(good)]["ok"] is True
     assert results[str(bad)]["ok"] is False
     assert results[str(bad)]["problems"]
+
+
+def test_lint_issue_cli_pairs_blockers_positionally(tmp_path: Path, capsys) -> None:
+    """The Nth --blockers spec must bind to the Nth --body, not any other.
+
+    Two bodies with DIFFERENT declared blocker sets: A declares #7, B declares
+    none. Correct pairing exits 0; swapping the specs must fail BOTH bodies,
+    each failure attributed to the correct body. A "first-spec-for-all" or
+    "swapped-zip" mutant fails the first invocation.
+    """
+    repo = _fake_repo(tmp_path)
+    body_a = tmp_path / "a.md"
+    body_a.write_text("Body A.\n\n## Blocked by\n\nBlocked by #7\n", encoding="utf-8")
+    body_b = tmp_path / "b.md"
+    body_b.write_text("Body B.\n\n## Blocked by\n\nNone\n", encoding="utf-8")
+
+    assert cli.main(_lint_issue_args(repo, (str(body_a), "7"), (str(body_b), ""))) == 0
+    document = json.loads(capsys.readouterr().out)
+    assert document["ok"] is True
+    results = {r["body"]: r for r in document["results"]}
+    assert results[str(body_a)]["ok"] is True
+    assert results[str(body_a)]["expected_blockers"] == [7]
+    assert results[str(body_b)]["ok"] is True
+    assert results[str(body_b)]["expected_blockers"] == []
+
+    assert cli.main(_lint_issue_args(repo, (str(body_a), ""), (str(body_b), "7"))) == 1
+    document = json.loads(capsys.readouterr().out)
+    assert document["ok"] is False
+    results = {r["body"]: r for r in document["results"]}
+    assert results[str(body_a)]["ok"] is False
+    assert results[str(body_a)]["expected_blockers"] == []
+    assert results[str(body_a)]["blockers"] == [7]
+    assert results[str(body_b)]["ok"] is False
+    assert results[str(body_b)]["expected_blockers"] == [7]
+    assert results[str(body_b)]["blockers"] == []
 
 
 def test_lint_issue_cli_missing_body_file_exits_1(tmp_path: Path, capsys) -> None:

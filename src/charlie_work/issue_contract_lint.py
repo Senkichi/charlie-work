@@ -13,7 +13,9 @@ dispatcher function exists.
 The closing-keyword rule has no dispatcher function to delegate to: the
 dispatcher needs only the first unnegated binding (``issue_linking.
 iter_unnegated_closing_keyword_matches``), while the lint flags every
-occurrence, including the colon form (``Closes: #N``) and negated phrasing —
+occurrence, including the colon form (``Closes: #N``), the qualified
+``owner/repo#N`` form (``closing_reference._CLOSING_LINE_RE``'s qualifier), and
+negated phrasing —
 GitHub's auto-close-on-merge scans for the keyword syntax with no negation
 awareness at all (issue #790), so an issue body must not carry the trigger
 syntax in any form. The keyword *vocabulary* is still delegated: the pattern is
@@ -35,9 +37,11 @@ from .issue_linking import _CLOSING_KEYWORDS_ALT
 # intent (issue #790). The keyword alternation is shared with the dispatcher
 # via ``issue_linking._CLOSING_KEYWORDS_ALT``; the lint adds an optional colon
 # (``Closes: #N``) and no negation filtering, because the contract forbids the
-# syntax entirely rather than judging which occurrence would bind.
+# syntax entirely rather than judging which occurrence would bind. The
+# optional ``owner/repo`` qualifier mirrors ``closing_reference._CLOSING_LINE_RE``
+# — ``Fixes owner/repo#N`` is the same trigger syntax aimed cross-repo.
 _CLOSING_KEYWORD_ISSUE_REF_RE = re.compile(
-    r"\b" + _CLOSING_KEYWORDS_ALT + r"\b[ \t]*:?[ \t]*#\d+",
+    r"\b" + _CLOSING_KEYWORDS_ALT + r"\b[ \t]*:?[ \t]*(?:[\w.-]+/[\w.-]+)?#\d+",
     flags=re.IGNORECASE,
 )
 
@@ -57,8 +61,9 @@ def lint_issue_body(text: str, expected_blockers: frozenset[int]) -> tuple[str, 
     - ``citation_check.parse_citations`` must find no ``path:line`` citation —
       line numbers rot; cite the symbol instead (docs/agents/issue-tracker.md
       convention, issue #1000).
-    - No closing keyword followed by an issue reference — the body must not
-      carry syntax GitHub's auto-close would act on.
+    - No closing keyword followed by an issue reference (bare ``#N`` or
+      qualified ``owner/repo#N``) — the body must not carry syntax GitHub's
+      auto-close would act on.
     """
     problems: list[str] = []
 
