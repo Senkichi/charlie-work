@@ -1,0 +1,7 @@
+issue #2910 rework (PR #2941): drops a bounded unauthorized-merge finding
+whose linked issue ``host_routing.drop_foreign_findings`` proves belongs to
+another host, and durably records the proof under
+``UNAUTHORIZED_MERGE_FOREIGN_KEY`` so the per-issue ``issue_view`` read is
+paid once per PR, not once per pass. Installed from
+``orchestration/state_unauthorized_merge.py``. Net-new OrchestratorApp member
+added after the Track 2 Phase B surface baseline was pinned.
