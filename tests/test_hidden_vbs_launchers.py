@@ -182,12 +182,18 @@ def test_scan_flags_a_planted_launcher_that_discards_the_exit_code(
     assert discarded == ['shell.Run "powershell.exe -File stub.ps1", 0, True']
 
 
-@pytest.mark.skipif(
-    shutil.which("cscript") is None,
-    reason="cscript.exe is not available on this runner",
-)
-def test_fleet_pass_launcher_returns_the_stub_exit_code(tmp_path: Path) -> None:
-    """Run the real launcher against a stub that exits 7 and expect 7 back."""
+@pytest.fixture
+def _driven_fleet_pass_launcher(tmp_path: Path) -> subprocess.CompletedProcess[str]:
+    """Run the real launcher against the exit-7 stub, recording the outcome.
+
+    Issue #3131 (ledger-regress): the test's ``call`` phase was paying the
+    whole ``cscript -> powershell.exe`` cold-start chain -- real process
+    spawns whose per-run cost is set by the runner host, not by this repo's
+    code (nothing at the attributed SHA touched this path). Charging the
+    drive to setup follows the #2568/#2624/#2636/#3032 precedent; the test
+    body below asserts on the recorded outcome, and the cost stays visible
+    under ``ci-fleet ledger report --section slow-fixtures``.
+    """
     launcher = tmp_path / "fleet-pass-hidden.vbs"
     launcher.write_text(
         (SCRIPTS_DIR / "fleet-pass-hidden.vbs").read_text(encoding="utf-8"),
@@ -195,13 +201,24 @@ def test_fleet_pass_launcher_returns_the_stub_exit_code(tmp_path: Path) -> None:
     )
     (tmp_path / "fleet-pass.ps1").write_text("exit 7\n", encoding="utf-8-sig")
 
-    completed = subprocess.run(
+    return subprocess.run(
         ["cscript", "//nologo", str(launcher)],
         capture_output=True,
         text=True,
         timeout=120,
         check=False,
     )
+
+
+@pytest.mark.skipif(
+    shutil.which("cscript") is None,
+    reason="cscript.exe is not available on this runner",
+)
+def test_fleet_pass_launcher_returns_the_stub_exit_code(
+    _driven_fleet_pass_launcher: subprocess.CompletedProcess[str],
+) -> None:
+    """The recorded drive's exit code must be the stub's 7 (issue #2753)."""
+    completed = _driven_fleet_pass_launcher
 
     assert completed.returncode == 7, (
         "fleet-pass-hidden.vbs did not propagate the stub's exit code; "
