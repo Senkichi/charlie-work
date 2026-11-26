@@ -15,13 +15,19 @@ def _bump(ack: str, actor: str = "worker") -> Bump:
 @pytest.mark.parametrize(
     "ack,expected",
     [
-        ("https://example.test/issues/123", True),
-        ("http://example.test/pull/1", True),
-        ("#123", True),
-        ("owner/repo#123", True),
-        ("source:id", False),
-        ("dispatch:abc123", False),
-        ("handle:senkichi", False),
+        # Issue #3077 ci-fleet dedupe: the report scored every non-empty row
+        # "equal" to the kept #123 leaf because all share identical line
+        # coverage (strip -> _ACK_SHAPE.match -> source_id group check), but
+        # each kept row asserts a DISTINCT _ACK_SHAPE alternative the #123
+        # leaf does not -- per-row comments name it. The removed
+        # "dispatch:abc123" / "handle:senkichi" rows matched the identical
+        # source_id named-group alternative "source:id" still covers; their
+        # assertion is merged into that row, not dropped.
+        ("https://example.test/issues/123", True),  # URL alternative -> True
+        ("http://example.test/pull/1", True),  # plain-http arm of https?://
+        ("#123", True),  # kept leaf: bare issue-ref alternative
+        ("owner/repo#123", True),  # non-empty [\w./-]* prefix on that alternative
+        ("source:id", False),  # source_id group -> shape-valid but NOT external
         ("", False),
         ("   ", False),
     ],
