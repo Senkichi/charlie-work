@@ -359,7 +359,7 @@ def sanitize_env(
             (issue #2795) — see :func:`provider_api_key_env_vars`. The default
             of ``None`` fails open (strips nothing extra) for out-of-tree
             callers; every in-tree launch site must pass it explicitly — an
-            AST guard test (``tests/test_env_sanitize.py``) fails when a
+            AST guard test (``tests/test_env_sanitize_call_sites.py``) fails when a
             ``sanitize_env(`` call in ``src/`` omits ``config=``.
 
     Returns:
