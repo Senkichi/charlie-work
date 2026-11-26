@@ -10,11 +10,13 @@ values -- ``None`` / ``False`` -- never raising on a write failure.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from charlie_work.github import GitHubError
 from charlie_work.instrumentation import query_events
+from charlie_work.local_issue_files import _COMMENT_SEPARATOR, COMMENTS_MARKER
 from charlie_work.local_issues import LocalFileGitHub
 
 
@@ -118,6 +120,17 @@ def test_create_issue_missing_dir_raises_github_error(tmp_path: Path) -> None:
         gh.create_issue("t", "b")
 
 
+@pytest.mark.parametrize("marker", [COMMENTS_MARKER, _COMMENT_SEPARATOR])
+def test_create_issue_refuses_reserved_comment_markup(
+    issues_dir: Path, tmp_path: Path, marker: str
+) -> None:
+    """A marker in the body would store a corrupted file -- refused, no file."""
+    gh = LocalFileGitHub(repo_root=tmp_path, issues_dir=issues_dir)
+
+    assert gh.create_issue("t", f"junk {marker} junk") is None
+    assert list(issues_dir.iterdir()) == []
+
+
 # -- edit_issue_body ---------------------------------------------------------
 
 
@@ -186,3 +199,67 @@ def test_edit_issue_body_missing_issue_and_dry_run(issues_dir: Path, tmp_path: P
     dry = LocalFileGitHub(repo_root=tmp_path, issues_dir=issues_dir, dry_run=True)
     assert dry.edit_issue_body(1, "x") is False
     assert gh.issue_view(1)["body"] == "old body"
+
+
+@pytest.mark.parametrize("marker", [COMMENTS_MARKER, _COMMENT_SEPARATOR])
+def test_edit_issue_body_refuses_reserved_comment_markup(
+    issues_dir: Path, tmp_path: Path, marker: str
+) -> None:
+    """A marker body is refused and the file is left byte-for-byte untouched.
+
+    The corruption this prevents is permanent: had the marker landed, a
+    later clean ``edit_issue_body`` could never remove it -- ``rewrite_body``
+    preserves everything below the marker verbatim, so the junk would parse
+    as a comment forever.
+    """
+    path = _write_issue(issues_dir, 4, body="old body")
+    before = path.read_bytes()
+    gh = LocalFileGitHub(repo_root=tmp_path, issues_dir=issues_dir)
+
+    assert gh.edit_issue_body(4, f"junk {marker} junk") is False
+    assert path.read_bytes() == before
+
+    # The probe: a later clean edit must leave no trace of the refused body.
+    assert gh.edit_issue_body(4, "clean body") is True
+    view = gh.issue_view(4)
+    assert view["body"] == "clean body"
+    assert view["comments"] == []
+
+
+# -- secret guard: machinery failure fails closed ----------------------------
+
+
+@pytest.fixture
+def _broken_ruleset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Point the guard's rule loader at a malformed file so every check raises
+    ``OutboundBodyGuardError`` (same construction as test_outbound_body_guard.py's
+    fixture)."""
+    import charlie_work.outbound_body_guard as obg
+
+    bad = tmp_path / "broken-secrets.toml"
+    bad.write_text("rules = [[[not toml", encoding="utf-8")
+    monkeypatch.setattr(obg, "_RULES_PATH", bad)
+    obg._rules.cache_clear()
+    yield bad
+    obg._rules.cache_clear()
+
+
+def test_create_issue_guard_failure_returns_none_and_writes_nothing(
+    issues_dir: Path, tmp_path: Path, _broken_ruleset: Path
+) -> None:
+    """Fail-closed: a guard that cannot run cannot pass text through."""
+    gh = LocalFileGitHub(repo_root=tmp_path, issues_dir=issues_dir)
+
+    assert gh.create_issue("t", "clean body") is None
+    assert list(issues_dir.iterdir()) == []
+
+
+def test_edit_issue_body_guard_failure_returns_false_and_untouched(
+    issues_dir: Path, tmp_path: Path, _broken_ruleset: Path
+) -> None:
+    path = _write_issue(issues_dir, 4, body="old body")
+    before = path.read_bytes()
+    gh = LocalFileGitHub(repo_root=tmp_path, issues_dir=issues_dir)
+
+    assert gh.edit_issue_body(4, "clean body") is False
+    assert path.read_bytes() == before

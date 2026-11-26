@@ -309,6 +309,29 @@ def new_issue_filename(number: int, title: str) -> str:
     return f"{number:03d}_{slug or 'issue'}.md"
 
 
+def _lf(text: str) -> str:
+    """``text`` with every newline convention collapsed to bare LF."""
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _check_body_markup(body: str) -> str:
+    """``body``, or ``IssueFileError`` when it carries reserved comment markup.
+
+    ``COMMENTS_MARKER`` splits the file into the body region and the comment
+    region, and ``_COMMENT_SEPARATOR`` splits the comment region into
+    entries. A body containing either marker would be *stored* corrupted:
+    ``parse_issue_text`` reads everything below the marker as comments, so
+    the tail of the submitted body silently becomes a comment -- and no
+    later ``rewrite_body`` can remove it, because that region is preserved
+    verbatim. Refusing at the helper boundary is what keeps "the body"
+    meaning "the region above the marker".
+    """
+    for marker in (COMMENTS_MARKER, _COMMENT_SEPARATOR):
+        if marker in body:
+            raise IssueFileError(f"issue body must not contain reserved markup {marker!r}")
+    return body
+
+
 def render_issue_text(*, title: str, body: str, labels: tuple[str, ...], created: str) -> str:
     """The full text of a freshly-created issue file (LF newlines).
 
@@ -317,8 +340,11 @@ def render_issue_text(*, title: str, body: str, labels: tuple[str, ...], created
     one line, so a title containing a colon, a quote, or a newline can never
     break the frontmatter mapping. Labels render through the same
     ``render_flow_list`` the label mutations use, so a later
-    ``rewrite_frontmatter_key`` sees the same shape everywhere.
+    ``rewrite_frontmatter_key`` sees the same shape everywhere. The body's
+    line endings are normalized to LF to match the rendered file, and a body
+    carrying reserved comment markup is refused (``IssueFileError``).
     """
+    normalized = _lf(_check_body_markup(body)).strip()
     lines = [
         "---",
         f"title: {json.dumps(title, ensure_ascii=False)}",
@@ -327,7 +353,7 @@ def render_issue_text(*, title: str, body: str, labels: tuple[str, ...], created
         f'created: "{created}"',
         "---",
     ]
-    return "\n".join(lines) + "\n" + body.strip() + "\n"
+    return "\n".join(lines) + "\n" + normalized + "\n"
 
 
 def rewrite_body(text: str, body: str) -> str:
@@ -336,14 +362,18 @@ def rewrite_body(text: str, body: str) -> str:
     Pure. Only the region between the closing frontmatter fence and the
     comments marker is touched: frontmatter, the marker itself, and every
     comment survive byte-for-byte, and the file's own newline convention is
-    reused. Raises ``IssueFileError`` when there is no frontmatter.
+    reused -- the incoming body's line endings are normalized to it, so a
+    multi-line LF body cannot smuggle bare ``\\n`` into a CRLF file. Raises
+    ``IssueFileError`` when there is no frontmatter, or when ``body``
+    carries reserved comment markup (which would be stored corrupted).
     """
     match = _FRONTMATTER_RE.match(text)
     if match is None:
         raise IssueFileError("no '---' fenced frontmatter block")
     newline = match.group("nl")
+    normalized = _lf(_check_body_markup(body)).strip("\r\n").replace("\n", newline)
     tail = text[match.end() :]
     marker_at = tail.find(COMMENTS_MARKER)
     if marker_at < 0:
-        return text[: match.end()] + body.strip("\r\n") + newline
-    return text[: match.end()] + newline.join((body.strip("\r\n"), "", tail[marker_at:]))
+        return text[: match.end()] + normalized + newline
+    return text[: match.end()] + newline.join((normalized, "", tail[marker_at:]))

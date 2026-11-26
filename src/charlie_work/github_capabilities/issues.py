@@ -56,7 +56,7 @@ from ..outbound_body_guard import (
     check_outbound_write,
 )
 from ._base import CapabilityCollaborator, GitHubRunResult, _LIST_LIMIT
-from ._outcome import failure_text, is_success
+from ._outcome import failure_text, is_success, number_from_response
 from ._send import read_json, send, send_text
 from .issue_list_rest import (
     emit_fallback,
@@ -251,21 +251,6 @@ def get_github_issue_dependencies(gh: GitHubLike, issue_number: int) -> list[int
             issue_number,
         )
         return []
-
-
-def _issue_number_from_response(outcome: Response) -> int | None:
-    """The created issue's number from the REST create response, or None.
-
-    Same shape ``_pr_number_from_response`` verifies for ``pr_create``: the
-    JSON body carries ``number`` directly. Never raises; ``None`` when the
-    body is not an object with an integer number.
-    """
-    try:
-        payload = outcome.json()
-    except ValueError:
-        return None
-    number = payload.get("number") if isinstance(payload, dict) else None
-    return number if isinstance(number, int) and not isinstance(number, bool) else None
 
 
 @runtime_checkable
@@ -668,7 +653,7 @@ class Issues(CapabilityCollaborator):
             )
             return None
         assert isinstance(outcome, Response)
-        number = _issue_number_from_response(outcome)
+        number = number_from_response(outcome)
         if number is None:
             logger.warning(
                 "issue create reported success but its response carried no issue number: %r",

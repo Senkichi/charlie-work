@@ -379,11 +379,13 @@ class LocalFileGitHub:
 
         The ``NNN_<slug>.md`` file is written atomically with the next free
         number and the caller's labels rendered into frontmatter, verbatim.
-        ``None`` on a secret-guard refusal, on a write failure, or in
-        dry-run -- the same failure vocabulary the real client's
-        ``create_issue`` uses. A missing ``issues_dir`` raises
-        ``GitHubError`` exactly as every read does: that is a config error,
-        not a write failure.
+        ``None`` on a secret-guard refusal, on a write failure, on a body
+        carrying reserved comment markup (``render_issue_text`` raises
+        ``IssueFileError`` -- storing it would corrupt the file beyond what
+        a later ``edit_issue_body`` could repair), or in dry-run -- the
+        same failure vocabulary the real client's ``create_issue`` uses.
+        A missing ``issues_dir`` raises ``GitHubError`` exactly as every
+        read does: that is a config error, not a write failure.
         """
         # Raises GitHubError on a missing issues_dir, like every read and
         # mutation: that is a config error, not a write failure -- even in
@@ -414,7 +416,7 @@ class LocalFileGitHub:
                 path,
                 render_issue_text(title=title, body=body, labels=tuple(labels), created=created),
             )
-        except OSError as exc:
+        except (OSError, IssueFileError) as exc:
             logger.warning("local issue create failed: %s", exc)
             return None
         queue_issue_write(self.repo_root, self.issues_dir, path, "create")
@@ -424,9 +426,11 @@ class LocalFileGitHub:
         """Rewrite only issue ``number``'s body. Returns False on failure.
 
         Frontmatter, the comments block, and the file's newline convention
-        survive unchanged (``local_issue_files.rewrite_body``). ``False`` on
-        a missing issue, a secret-guard refusal, a write failure, or in
-        dry-run -- matching the real client's ``edit_issue_body``.
+        survive unchanged (``local_issue_files.rewrite_body`` -- which also
+        normalizes the incoming body's line endings to the file's own).
+        ``False`` on a missing issue, a secret-guard refusal, a write
+        failure, a body carrying reserved comment markup, or in dry-run --
+        matching the real client's ``edit_issue_body``.
         """
         issue = self._scan().by_number().get(number)
         if issue is None:

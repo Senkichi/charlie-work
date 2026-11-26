@@ -11,6 +11,9 @@ from __future__ import annotations
 import json
 import pathlib
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 from _fake_transport import FakeAdapter, failure, make_github, ok, sent
 from charlie_work.github import GitHub
@@ -152,6 +155,9 @@ def test_create_issue_refuses_secret_title_before_transport(tmp_path: Path) -> N
     gh, http = _client(tmp_path)
     assert gh.create_issue(title=f"wip {_GHO}", body="clean") is None
     assert http.calls == []
+    events = query_events(_state_file(tmp_path), kind="outbound_body_secret_refused")
+    assert len(events) == 1
+    assert events[0]["payload"]["surface"] == "create_issue"
 
 
 def test_edit_issue_body_refuses_secret_body_before_transport(tmp_path: Path) -> None:
@@ -162,3 +168,40 @@ def test_edit_issue_body_refuses_secret_body_before_transport(tmp_path: Path) ->
     assert len(events) == 1
     assert events[0]["payload"]["surface"] == "edit_issue_body"
     assert events[0]["issue_number"] == 9
+
+
+# --------------------------------------------------------------------------
+# Secret guard: machinery failure fails closed (nothing sent)
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _broken_ruleset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Point the guard's rule loader at a malformed file so every check raises
+    ``OutboundBodyGuardError`` (same construction as test_outbound_body_guard.py's
+    fixture)."""
+    import charlie_work.outbound_body_guard as obg
+
+    bad = tmp_path / "broken-secrets.toml"
+    bad.write_text("rules = [[[not toml", encoding="utf-8")
+    monkeypatch.setattr(obg, "_RULES_PATH", bad)
+    obg._rules.cache_clear()
+    yield bad
+    obg._rules.cache_clear()
+
+
+def test_create_issue_guard_failure_returns_none_before_transport(
+    tmp_path: Path, _broken_ruleset: Path
+) -> None:
+    """Fail-closed: a guard that cannot run cannot pass text through."""
+    gh, http = _client(tmp_path)
+    assert gh.create_issue(title="t", body="clean") is None
+    assert http.calls == []
+
+
+def test_edit_issue_body_guard_failure_returns_false_before_transport(
+    tmp_path: Path, _broken_ruleset: Path
+) -> None:
+    gh, http = _client(tmp_path)
+    assert gh.edit_issue_body(9, "clean") is False
+    assert http.calls == []
