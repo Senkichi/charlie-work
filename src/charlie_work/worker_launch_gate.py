@@ -467,7 +467,10 @@ def issue_worker_launch_permit(
         return WorkerLaunchDeferral(REASON_FLEET_PAUSED, ok=True, extra=paused)
 
     # Issue #2055 gate 0: lock-free provider-throttle/operator-hold
-    # pre-check -- a cheap unlocked ``state.json`` read. A throttled repo
+    # pre-check -- a cheap unlocked ``state.json`` read via
+    # ``read_state_snapshot`` (issue #3141: the sanctioned non-mutating
+    # reader -- an unlocked ``load_state`` could quarantine a live file on a
+    # transient read failure). A throttled repo
     # defers here without ever contending for the fleet lock (a throttled
     # fleet previously still saturated it: the lock was taken before the
     # throttle check and held across the whole scan). The authoritative
@@ -485,7 +488,9 @@ def issue_worker_launch_permit(
             throttled_until=selection.report_fields().get("chain_retry_at"),
             extra=selection.report_fields(),
         )
-    pre_state = _wf.load_state(app.paths.state_file)
+    # An unreadable state (None) reads as "not throttled" here -- the
+    # authoritative locked read below still runs before any launch.
+    pre_state = _wf.read_state_snapshot(app.paths.state_file) or {}
     if _wf.is_throttled(pre_state) and not role_selection.window_covered(
         pre_state.get("throttled_until"),
         selection,
