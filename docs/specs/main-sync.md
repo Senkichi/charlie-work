@@ -60,7 +60,7 @@ It has one job: bring one registered repo's primary checkout up to `origin/<defa
 - It runs once per full supervisor pass (the `full_pass_interval_seconds` fallback, or a local change), never on the 20-second poll.
 - It iterates the same registry the pass uses (`fleet.json` through `fleet_registry._iter_registered_repo_contexts`, the resolver the fleet walkers share), and takes each entry's `repo_root`, `state_dir` and layered config from there. No other list of repos exists.
 - **It excludes the supervisor's own checkout, compared by resolved path** to `orchestrator_root()`, not by repo key, because `self_deploy` owns that checkout. On the operator host the `Senkichi/charlie-work` registry entry is the operator's dev checkout, a different path, so it is synced.
-- It skips repos with no `origin` remote, because the local lane owns their main.
+- It skips repos with no `origin` remote, because the Local path owns their main.
 - Kill switches: `main_sync.enabled`, defaulting to true. Set it in the fleet-wide `<fleet_dir>/config.yaml` layer to turn it off everywhere, or in one repo's `orchestrator.config.yaml` for that repo; the registry walker merges both layers.
 - A wall-clock budget covers the whole step. When it runs out, the remaining repos are skipped with `budget_exhausted` and go first on the next pass.
 

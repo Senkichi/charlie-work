@@ -18,9 +18,11 @@ from .sources import JsonRead, SnapshotRead
 
 
 class FindingLike(Protocol):
-    """Duck type of ``heartbeat_alarms.Finding`` (built on another branch).
+    """Duck type of ``heartbeat_alarms.Finding``.
 
-    Declared locally so this package does not import that module.
+    Declared locally so this module stays free of the alarm-module import;
+    the producers (``alarm_feed``, ``now_cadence``) import
+    ``heartbeat_alarms_fleet`` directly.
     """
 
     check: str
