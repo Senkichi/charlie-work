@@ -1,7 +1,10 @@
-"""Dead-worker sweep: decision module and apply shell (dormant until consumers are wired).
+"""Dead-worker sweep: decision module and apply shell.
 
-``decide`` is the pure decision table; ``run_orphan_sweep`` is the shell that applies
-its requests and commits. Nothing in the orchestrator imports this package yet.
+``decide`` is the pure decision table; ``run_orphan_sweep`` and
+``run_stalled_sweep`` are the shells that apply its requests and commits. The
+orchestrator reaches them through the ``workflow`` re-exports
+(``_detect_and_handle_orphaned_workers`` / ``_detect_and_handle_stalled_sessions``),
+and other modules import the package's helpers directly.
 """
 
 from __future__ import annotations

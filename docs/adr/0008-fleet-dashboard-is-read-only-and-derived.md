@@ -1,6 +1,6 @@
 # The fleet dashboard is read-only and reads only local derived state
 
-Accepted 2026-10-01; implementation pending.
+Accepted 2026-10-01; implemented (#2244, #2250, #2255).
 
 The fleet dashboard (`charlie dashboard`, local web app on 127.0.0.1) never changes fleet state and never calls GitHub. It reads only what the fleet already writes: each repo's `status-snapshot.json`, the per-repo and global `events.db`, the fleet registry, and `ci_fleet`'s allocation files. It keeps derived facts in `dashboard.db`, a rollup it builds incrementally and that can be deleted and rebuilt at any time. When a problem it shows needs action, the page shows the `charlie …` command to run instead of a button.
 
