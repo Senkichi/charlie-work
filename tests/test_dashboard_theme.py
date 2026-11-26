@@ -78,6 +78,11 @@ def test_base_groups_match_swole_unchanged() -> None:
 
 @pytest.mark.skipif(SWOLE_TOKENS is None or not SWOLE_TOKENS.is_file(), reason=_SKIP_REASON)
 def test_vendored_base_equals_live_swole_checkout() -> None:
+    # Kept despite the redundancy report (issue #3076): the only opt-in
+    # LIVE-parity check -- it asserts the vendored base token groups still
+    # equal a real swole checkout's, which no other test does. Nightlies run
+    # it without CHARLIE_WORK_SWOLE_ROOT, so it skips there and reports as
+    # coverage-free.
     upstream = json.loads(SWOLE_TOKENS.read_text(encoding="utf-8"))
     assert base_groups(load_tokens()) == base_groups(upstream)
     assert swole_drift(SWOLE).status in {"in_sync", "drifted"}

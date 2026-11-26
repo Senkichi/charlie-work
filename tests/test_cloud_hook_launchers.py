@@ -90,6 +90,11 @@ def _fake_interpreter(path: Path, label: str) -> None:
     ("present", "expected"),
     [
         (("Scripts/python.exe", "bin/python"), "Scripts/python.exe"),
+        # The solo-layout params are kept on purpose (ci-fleet redundancy
+        # report, issue #3076): the both-present param only proves the
+        # tie-break ORDERING. Each single-file layout asserts that layout
+        # resolves with the other ABSENT -- the actual arrangement on every
+        # real host (Windows hosts have only Scripts/, POSIX only bin/).
         (("bin/python",), "bin/python"),
         (("Scripts/python.exe",), "Scripts/python.exe"),
     ],
