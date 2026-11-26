@@ -39,6 +39,7 @@ from typing import Any, Sequence
 
 import charlie_work.superseded_worker_reap as superseded_worker_reap
 import charlie_work.verdict_recording as verdict_recording
+import charlie_work.verdict_rules as verdict_rules
 import charlie_work.workflow as _wf
 from charlie_work import review_interdiff as _review_interdiff
 from charlie_work.command_result import CommandResult
@@ -63,7 +64,6 @@ from charlie_work.review_fleet_gate import (
 )
 from charlie_work.janitor import check_operator_containment, check_test_adequacy
 from charlie_work.local_approval_carry import approval_survives_head_move
-from charlie_work.labels import TransitionOutcome
 from charlie_work.local_lane import (
     LOCAL_PENDING_STATUS,
     branch_diff,
@@ -106,7 +106,6 @@ _LOCAL_DIFFERENCES = verdict_recording.VerdictDifferences(
     ),
     stringify_required_changes=True,
     local_decision_fields=True,
-    comment_repeats_derived_summary=True,
 )
 
 # The merge gate itself lives in ``orchestration/local_merge_gate.py``
@@ -1059,15 +1058,21 @@ def record_local_review(
     allow_stale_head: bool = False,
     verdict_source: str | None = None,
 ) -> CommandResult:
-    """Record a review verdict for a local-lane record (no ``pr_view``).
+    """Record a review verdict for a Local-path record (no ``pr_view``).
 
-    Local mirror of ``record_review``: same decision file (``prs/pr-<n>/
-    review-decision.json`` + rounds archive via ``record_decision``), same
-    packet-vs-live head pinning rules, same rework cap and escalation routing,
-    same label edges. The remote-only seams are dropped: no external-findings
-    ingestion (no PR comments exist to ingest), no ``before`` timestamp
-    (``_commit_timestamp`` needs ``gh``), and the verdict comment posts to the
-    issue via ``issue_comment`` instead of ``pr_comment``.
+    The caller on the Local path: it builds the review subject (the record in
+    ``state["prs"]``, the branch head resolved with git, the verdict comment posted on the
+    issue) and hands the recording mechanics to ``verdict_recording`` and the decision rules
+    (rework counter, Rework cap, escalation, status transitions, label edge, Events) to
+    ``verdict_rules``, the same code ``record_review`` runs on the PR path: the same
+    decision file (``prs/pr-<n>/review-decision.json`` plus the rounds archive via
+    ``record_decision``) and the same packet-versus-live head pinning rules.
+
+    What differs is passed to those functions as explicit inputs: the Rescue tier is
+    ``off`` (at the Rework cap a Local record escalates directly; the PR path passes the
+    configured value), there is no external-findings intake (no PR comments exist to
+    ingest) and no ``before`` timestamp (``_commit_timestamp`` needs ``gh``), and the
+    verdict comment posts to the issue via ``issue_comment`` instead of ``pr_comment``.
     """
     verdict = verdict_recording.derive_verdict(
         decision,
@@ -1179,30 +1184,25 @@ def record_local_review(
 
     decision_path = pr_dir / "review-decision.json"
     round_number = 0
-    escalated = False
-    request_changes_count = 0
     rework_path: str | None = None
 
     with _wf.state_lock(self.paths.state_file):
         state = _wf.load_state(self.paths.state_file)
         pr_state = (state.get("prs") or {}).get(str(pr_number), {})
-        request_changes_count = int(pr_state.get("request_changes_count", 0))
-        if decision == "request_changes":
-            # Same counting rule as record_review: only a head that actually
-            # advanced since the last verdict consumes rework budget. (The
-            # remote lane's rescue tier is not mirrored here -- at the cap a
-            # local record escalates directly, the documented fallback when
-            # ``rescue.enabled`` is off.)
-            head_advanced = reviewed_head_sha != pr_state.get("reviewed_head_sha")
-            if head_advanced:
-                escalated = request_changes_count >= self.config.review.max_rework_cycles
-                if not escalated:
-                    request_changes_count += 1
-        pr_escalation_reason = (
-            "max_rework_cycles_exceeded"
-            if (decision == "request_changes" and escalated)
-            else ("review_blocked" if decision == "blocked" else None)
+        # The Rescue tier is off on the Local path: at the cap a Local record escalates
+        # directly (``rescue_enabled=False``), the documented fallback.
+        outcome = verdict_rules.decide_rework(
+            decision=decision,
+            reviewed_head_sha=reviewed_head_sha,
+            prior_head_sha=pr_state.get("reviewed_head_sha"),
+            prior_count=int(pr_state.get("request_changes_count", 0)),
+            max_rework_cycles=self.config.review.max_rework_cycles,
+            rescue_enabled=False,
+            rescue_attempted=bool(pr_state.get("rescue_attempted")),
+            summary_text=summary_text,
         )
+        escalated = outcome.escalated
+        request_changes_count = outcome.request_changes_count
 
         decision_round = verdict_recording.write_decision_round(
             pr_dir,
@@ -1246,187 +1246,54 @@ def record_local_review(
                 (pr_dir / "rework-dispatch-note.txt").read_text(encoding="utf-8"),
             )
 
-        state["prs"][str(pr_number)] = {
-            **pr_state,
-            "number": pr_number,
-            "local": True,
-            "issue_number": issue_number,
-            "decision": decision,
-            "decision_path": str(decision_path),
-            "reviewed_head_sha": reviewed_head_sha,
-            "reviewed_patch_id": reviewed_patch_id,
-            "carried_forward_from": [],
-            "request_changes_count": request_changes_count,
-            "status": "escalated" if escalated else decision,
-            "consecutive_failed_merge_attempts": 0,
-            "review_dispatch_status": "review_dispatch_completed",
-            "reviewer_pid": None,
-            "reviewer_process_start_time": None,
-            "review_dispatch_attempt_count": 0,
-            "review_log_unreadable_streak": 0,
-            "review_api_error_streak": 0,  # issue #1808
-            "review_turn_limit_miss_streak": 0,
-            "review_session_metrics": (
-                session_metrics
-                if session_metrics is not None
-                else pr_state.get("review_session_metrics")
-            ),
-            **(
-                {"escalation_reason": pr_escalation_reason}
-                if pr_escalation_reason is not None
-                else {}
-            ),
-        }
-        if decision == "request_changes":
-            if not escalated:
-                issue_entry = {
-                    **(state["issues"].get(str(issue_number)) or {}),
-                    "number": issue_number,
-                    "status": "rework_requested",
-                    "merge_alert": "OK",
-                }
-                _wf.clear_escalation(issue_entry)
-                _wf.clear_escalation_on_issue_prs(state, issue_number)
-                prior_patch_id = pr_state.get("reviewed_patch_id")
-                content_advanced = bool(reviewed_patch_id) and reviewed_patch_id != prior_patch_id
-                if content_advanced and verdict_provenance in _wf.NO_OP_RESET_PROVENANCES:
-                    issue_entry["no_op_checkpoint_at"] = _wf.utc_now()
-                state["issues"][str(issue_number)] = issue_entry
-            else:
-                state = _wf._escalate_issue(
-                    state,
-                    issue_number,
-                    reason="max_rework_cycles_exceeded",
-                    reason_class="mechanical",
-                )
-        elif decision == "approved":
-            issue_entry = {
-                **(state["issues"].get(str(issue_number)) or {}),
-                "number": issue_number,
-                "status": "approved",
-                "merge_alert": "OK",
-            }
-            _wf.clear_escalation(issue_entry)
-            _wf.clear_escalation_on_issue_prs(state, issue_number)
-            state["issues"][str(issue_number)] = issue_entry
-            state["issues"][str(issue_number)].pop("worker_pid", None)
-            state["issues"][str(issue_number)].pop("worker_process_start_time", None)
-        elif decision == "blocked":
-            state = _wf._escalate_issue(
-                state,
-                issue_number,
-                reason="review_blocked",
-                reason_class="judgment",
-                status="blocked",
-            )
-            state["issues"][str(issue_number)].pop("worker_pid", None)
-            state["issues"][str(issue_number)].pop("worker_process_start_time", None)
-
-        event_payload: dict[str, Any] = {
-            "pr_number": pr_number,
-            "issue_number": issue_number,
-            "decision": decision,
-            "escalated": escalated,
-            "local": True,
-            "verdict_provenance": verdict_provenance,
-            "summary": _wf._truncate_for_event(summary_text),
-            "required_changes": _wf._truncate_for_event("\n".join(effective_required_changes)),
-        }
-        if findings_channel is not None:
-            event_payload["findings_channel"] = findings_channel
-        if session_metrics is not None:
-            event_payload["session_metrics"] = session_metrics
-        state = self._record_event(state, "record_review", event_payload)
-        if reclassified_human_call is not None:
-            matched_item, matched_marker = reclassified_human_call
-            state = self._record_event(
-                state,
-                "review_decision_reclassified_blocked",
-                {
-                    "pr_number": pr_number,
-                    "issue_number": issue_number,
-                    "original_decision": "request_changes",
-                    "matched_item": matched_item,
-                    "matched_marker": matched_marker,
-                },
-            )
-        if findings_channel == "vacuous":
-            state = self._record_event(
-                state,
-                "required_changes_vacuous",
-                {
-                    "pr_number": pr_number,
-                    "issue_number": issue_number,
-                    "decision": decision,
-                },
-            )
+        state = verdict_rules.record_verdict(
+            self.write_gate,
+            state,
+            pr_number=pr_number,
+            issue_number=issue_number,
+            decision=decision,
+            outcome=outcome,
+            pr_state=pr_state,
+            decision_path=str(decision_path),
+            reviewed_head_sha=reviewed_head_sha,
+            reviewed_patch_id=reviewed_patch_id,
+            verdict_provenance=verdict_provenance,
+            session_metrics=session_metrics,
+            summary_text=summary_text,
+            required_changes=effective_required_changes,
+            findings_channel=findings_channel,
+            reclassified_human_call=reclassified_human_call,
+            record_extras={"local": True},
+            event_extras={"local": True},
+            utc_now=_wf.utc_now,
+        )
         self.write_gate.save_state(state)
 
     # Label side effects are best-effort and outside the lock.
     label_error: dict[str, Any] | None = None
-    if decision == "request_changes":
-        issue_is_closed = False
-        try:
-            linked_issue = self.gh.issue_view(issue_number)
-            issue_is_closed = str(linked_issue.get("state") or "OPEN").upper() == "CLOSED"
-        except Exception:
-            pass
-        if issue_is_closed:
-            with _wf.state_lock(self.paths.state_file):
-                state = _wf.load_state(self.paths.state_file)
-                state = self._record_event(
-                    state,
-                    "rework_label_skipped_issue_closed",
-                    {
-                        "pr_number": pr_number,
-                        "issue_number": issue_number,
-                        "decision": decision,
-                        "escalated": escalated,
-                    },
-                    level="warning",
-                )
-                self.write_gate.save_state(state)
-        else:
-            target = (
-                _wf._escalation_edge("escalated", "mechanical")
-                if escalated
-                else "rework_requested"
+    label_edge = verdict_rules.choose_label_edge(
+        self.gh, issue_number, decision=decision, escalated=escalated
+    )
+    if label_edge is not None and label_edge.skip_issue_closed:
+        with _wf.state_lock(self.paths.state_file):
+            state = _wf.load_state(self.paths.state_file)
+            state = self._record_event(
+                state,
+                "rework_label_skipped_issue_closed",
+                {
+                    "pr_number": pr_number,
+                    "issue_number": issue_number,
+                    "decision": decision,
+                    "escalated": escalated,
+                },
+                level="warning",
             )
-            transition_result = self.write_gate.transition(
-                self.gh, self.config.labels, issue_number, target
-            )
-            if transition_result.outcome != TransitionOutcome.APPLIED:
-                label_error = {
-                    "edge": target,
-                    "outcome": transition_result.outcome.value,
-                    "add_failures": transition_result.add_failures,
-                    "remove_failures": transition_result.remove_failures,
-                }
-    elif decision == "blocked":
+            self.write_gate.save_state(state)
+    elif label_edge is not None:
         transition_result = self.write_gate.transition(
-            self.gh,
-            self.config.labels,
-            issue_number,
-            _wf._escalation_edge("blocked", "judgment"),
+            self.gh, self.config.labels, issue_number, label_edge.edge
         )
-        if transition_result.outcome != TransitionOutcome.APPLIED:
-            label_error = {
-                "edge": "blocked",
-                "outcome": transition_result.outcome.value,
-                "add_failures": transition_result.add_failures,
-                "remove_failures": transition_result.remove_failures,
-            }
-    elif decision == "approved":
-        transition_result = self.write_gate.transition(
-            self.gh, self.config.labels, issue_number, "review_approved"
-        )
-        if transition_result.outcome != TransitionOutcome.APPLIED:
-            label_error = {
-                "edge": "review_approved",
-                "outcome": transition_result.outcome.value,
-                "add_failures": transition_result.add_failures,
-                "remove_failures": transition_result.remove_failures,
-            }
+        label_error = verdict_rules.label_error(label_edge.error_edge, transition_result)
 
     if not escalated and (comment or self.config.review.post_verdict_comment):
         comment_error = verdict_recording.post_verdict_comment(
@@ -1437,7 +1304,6 @@ def record_local_review(
             provenance_caveat=provenance_caveat,
             required_changes=effective_required_changes,
             findings_channel=findings_channel,
-            differences=_LOCAL_DIFFERENCES,
         )
         if comment_error is not None:
             label_error = verdict_recording.with_comment_error(label_error, comment_error)
