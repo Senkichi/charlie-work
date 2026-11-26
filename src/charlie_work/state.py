@@ -45,6 +45,11 @@ from .periodic_pass_schedule import (  # noqa: F401 (deliberate re-export)
     schedule_worktree_reclamation,
 )
 
+# File-size ratchet (#1442): the sanctioned lock-free, non-mutating state
+# reader (issue #3141) lives in its own module; re-exported so
+# ``state.read_state_snapshot`` is the stable import path.
+from .state_snapshot import read_state_snapshot  # noqa: F401 (deliberate re-export)
+
 if TYPE_CHECKING:
     # write_gate.py imports this module, so the gate can only be named in
     # annotations -- a runtime import here would be circular.
@@ -689,13 +694,31 @@ def advisory_file_lock(path: Path):
     context manager raises ``StateLockBusy``. A writer that cannot acquire the
     lock must fail that unit of work as a value (skip + event log), never write
     unlocked.
+
+    Both waiting stages share ONE ``_LOCK_TIMEOUT_SECONDS`` budget: the
+    intra-process thread-lock acquire AND the cross-process file-lock retry
+    loop together never wait longer than the timeout (issue #3141). Before
+    this, the thread lock was a bare ``acquire()`` -- a thread waiting on
+    another thread's state-lock hold waited forever and logged nothing,
+    which is what let one repo's slow reconcile freeze every other lane's
+    fleet census.
     """
     lock_path = path.with_suffix(path.suffix + ".lock")
     lock_file = None
     acquired = False
 
+    def _lock_busy() -> StateLockBusy:
+        logger.warning(f"Failed to acquire lock on {lock_path} after {_LOCK_TIMEOUT_SECONDS}s")
+        return StateLockBusy(
+            f"Could not acquire state lock at {lock_path} within {_LOCK_TIMEOUT_SECONDS}s"
+        )
+
+    start = time.monotonic()
     thread_lock = _thread_lock_for(path)
-    thread_lock.acquire()
+    if not thread_lock.acquire(
+        timeout=max(0.0, _LOCK_TIMEOUT_SECONDS - (time.monotonic() - start))
+    ):
+        raise _lock_busy()
     try:
         # Create the lock file if needed. touch() leaves it at 0 bytes, which
         # is fine: msvcrt.locking(..., LK_NBLCK, 1) succeeds on a 0-byte file
@@ -710,51 +733,47 @@ def advisory_file_lock(path: Path):
             lock_file = lock_path.open("r+b", encoding=None)
             # msvcrt.locking mode: 0 = lock, 1 = unlock
             # LK_NBLCK = non-blocking lock, LK_LOCK = blocking lock
-            # We use a retry loop with timeout for bounded waiting
-            import time
-
-            start = time.monotonic()
-            while time.monotonic() - start < _LOCK_TIMEOUT_SECONDS:
+            # We use a retry loop with timeout for bounded waiting. ``start``
+            # was sampled before the thread-lock acquire, so this loop only
+            # gets whatever budget that stage left over (issue #3141). The
+            # attempt precedes the budget check so a thread-lock stage that
+            # consumed the whole budget still gets at least one file-lock
+            # attempt instead of being skipped entirely (issue #3141).
+            while True:
                 try:
                     # Try non-blocking lock first
                     msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
                     acquired = True
                     break
                 except OSError:
+                    if time.monotonic() - start >= _LOCK_TIMEOUT_SECONDS:
+                        # Timeout — the lock is held by another writer. Fail
+                        # this unit of work as a value rather than degrading
+                        # integrity.
+                        raise _lock_busy()
                     # Lock held, wait and retry
                     time.sleep(0.1)
-            else:
-                # Timeout — the lock is held by another writer. Fail this unit
-                # of work as a value rather than degrading integrity.
-                logger.warning(
-                    f"Failed to acquire lock on {lock_path} after {_LOCK_TIMEOUT_SECONDS}s"
-                )
-                raise StateLockBusy(
-                    f"Could not acquire state lock at {lock_path} within {_LOCK_TIMEOUT_SECONDS}s"
-                )
         else:
             import fcntl
-            import time
 
             lock_file = lock_path.open("r+b", encoding=None)
-            start = time.monotonic()
-            while time.monotonic() - start < _LOCK_TIMEOUT_SECONDS:
+            # ``start`` was sampled before the thread-lock acquire, so this
+            # loop only gets whatever budget that stage left over (issue
+            # #3141). The attempt precedes the budget check so a fully
+            # consumed budget still gets at least one file-lock attempt.
+            while True:
                 try:
                     fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                     acquired = True
                     break
                 except (IOError, BlockingIOError):
+                    if time.monotonic() - start >= _LOCK_TIMEOUT_SECONDS:
+                        # Timeout — the lock is held by another writer. Fail
+                        # this unit of work as a value rather than degrading
+                        # integrity.
+                        raise _lock_busy()
                     # Lock held, wait and retry
                     time.sleep(0.1)
-            else:
-                # Timeout — the lock is held by another writer. Fail this unit
-                # of work as a value rather than degrading integrity.
-                logger.warning(
-                    f"Failed to acquire lock on {lock_path} after {_LOCK_TIMEOUT_SECONDS}s"
-                )
-                raise StateLockBusy(
-                    f"Could not acquire state lock at {lock_path} within {_LOCK_TIMEOUT_SECONDS}s"
-                )
 
         yield
     finally:
