@@ -17,6 +17,7 @@ from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # no
 from _helpers import _init_git_repo
 from _review_fixtures import (
     _dispatch_reviews_app,
+    _make_dead_opencode_review_sidecar,
     _make_dead_review_sidecar,
     _set_review_dispatched_state,
     _write_review_events,
@@ -327,3 +328,136 @@ def test_reap_review_verdicts_leaves_invalid_verdict_for_stalled_reaper(
 
     state = load_state(app.paths.state_file)
     assert state["prs"]["100"]["review_dispatch_status"] == "review_dispatch_failed"
+
+
+def test_reap_sweeps_opencode_quota_death_rolls_back_claim(monkeypatch, tmp_path: Path) -> None:
+    """End-to-end ordering regression for the 0-tool-call opencode quota death.
+
+    _run_review_reap_sweeps runs _reap_review_verdicts BEFORE
+    _detect_and_handle_stalled_reviews. A reviewer that emitted step_start
+    then died on a provider quota error with zero tool calls must classify as
+    launch_failed (not died_mid_session), so the miss pass does NOT set
+    review_turn_limit_summary_posted -- and the stalled sweep that follows in
+    the SAME pass takes the provider_throttled rollback path instead of
+    failing the PR as provider_throttled_turn_limit_counted.
+    """
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    reviews_dir = app._layout.reviews_dir
+
+    old_dispatched = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    # step_start + provider-quota error, zero tool calls: the reviewer died
+    # inside its first provider call (GoUsageLimitError in the response body,
+    # the shape opencode's opencode-go provider emits).
+    _make_dead_opencode_review_sidecar(
+        reviews_dir,
+        100,
+        '{"type":"step_start","part":{"id":"s1"}}\n'
+        '{"type":"error","error":{"name":"APIError","data":{"message":"Usage limit reached",'
+        '"statusCode":429,"isRetryable":true,"responseBody":"{\\"type\\":\\"error\\",'
+        '\\"error\\":{\\"type\\":\\"GoUsageLimitError\\"}}"}}}\n',
+        started_at=old_dispatched,
+    )
+    _set_review_dispatched_state(app, 100, 10, old_dispatched)
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["100"]["review_dispatch_attempt_count"] = 1
+        save_state(app.paths.state_file, state)
+
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
+
+    result = app._run_review_reap_sweeps(datetime.now(UTC))
+
+    # The miss pass classified the death environmental (no substantial work),
+    # so no turn-limit summary flag exists to deny the rollback.
+    assert [entry["reason"] for entry in result["verdict_result"]["missed"]] == ["launch_failed"]
+    # The stalled sweep in the same pass took the rollback path, not the
+    # counted-failure path.
+    assert [entry["reason"] for entry in result["stalled"]] == ["provider_throttled"]
+
+    state = load_state(app.paths.state_file)
+    pr = state["prs"]["100"]
+    assert not pr.get("review_turn_limit_summary_posted")
+    # Claim rolled back (re-dispatchable once quota clears), NOT failed.
+    assert pr["review_dispatch_status"] is None
+    assert pr["review_dispatch_status"] != "review_dispatch_failed"
+    # The quota death must not burn the per-PR attempt budget.
+    assert pr["review_dispatch_attempt_count"] == 0
+    # The throttle signal itself is still armed fleet-wide.
+    assert state.get("reviewer_quota", {}).get("throttled_until")
+
+
+def test_reap_sweeps_opencode_v2_retry_death_rolls_back_claim(monkeypatch, tmp_path: Path) -> None:
+    """The 2.x wire shape of the same e2e ordering invariant: opencode 2.3.0
+    emits {"type":"retry"} events (carrying the structured quota error) while
+    it sleeps out retry-after, and a watchdog kill inside that sleep may never
+    produce a terminal error event. The retry records must classify the death
+    provider_throttled exactly like the 1.x error-event fixture above."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    reviews_dir = app._layout.reviews_dir
+
+    old_dispatched = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    # The captured 2.3.0 shape: structured error is flat, retry-after at the
+    # event top level, no terminal error event -- the retry record is the
+    # only provider-error evidence.
+    _make_dead_opencode_review_sidecar(
+        reviews_dir,
+        100,
+        '{"type":"step_start","part":{"id":"s1"}}\n'
+        '{"type":"retry","messageID":"msg_1","attempt":1,'
+        '"nextRetryAt":1763473200000,"error":{"type":"provider.quota",'
+        '"message":"Usage limit reached -- you have used your monthly budget",'
+        '"status":429,"response":{"body":"{\\"error\\":{\\"message\\":'
+        '\\"Usage limit reached\\",\\"type\\":\\"GoUsageLimitError\\"}}"}},"retryAfterMs":3600000}\n',
+        started_at=old_dispatched,
+    )
+    _set_review_dispatched_state(app, 100, 10, old_dispatched)
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["100"]["review_dispatch_attempt_count"] = 1
+        save_state(app.paths.state_file, state)
+
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
+
+    result = app._run_review_reap_sweeps(datetime.now(UTC))
+
+    assert [entry["reason"] for entry in result["verdict_result"]["missed"]] == ["launch_failed"]
+    assert [entry["reason"] for entry in result["stalled"]] == ["provider_throttled"]
+
+    state = load_state(app.paths.state_file)
+    pr = state["prs"]["100"]
+    assert not pr.get("review_turn_limit_summary_posted")
+    assert pr["review_dispatch_status"] is None
+    assert pr["review_dispatch_attempt_count"] == 0
+    assert state.get("reviewer_quota", {}).get("throttled_until")

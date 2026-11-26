@@ -96,9 +96,10 @@ def test_default_config_session_limit_markers() -> None:
     Unlike throttle_error_markers (which includes generic substrings like
     "rate limit" / "usage limit" appropriate for worker log tails), this list
     contains only specific CLI death-message phrasing safe to match against
-    reviewer analysis prose. Generic markers must NOT appear here: reviewer
-    launches force tee_stream_json=True, making log_path and events_path
-    byte-identical, so a marker matched against the log tail is also matched
+    reviewer analysis prose. Generic markers must NOT appear here: a tee'd
+    claude-code reviewer launch writes log_path and events_path
+    byte-identically (the opencode review path never tees and uses its own
+    digest), so a marker matched against the log tail is also matched
     against the parsed assistant text -- generic markers would false-positive
     on legitimate rate-limit/quota review commentary.
     """

@@ -380,11 +380,13 @@ def wrap_launchers(
         from charlie_work.api_worker import launch_api_worker
         from charlie_work.claude_code import launch_claude_worker
         from charlie_work.devin_shell import launch_devin_session
+        from charlie_work.opencode_worker import launch_opencode_worker
 
         real_launchers = {
             "launch_api_worker": launch_api_worker,
             "launch_claude_worker": launch_claude_worker,
             "launch_devin_session": launch_devin_session,
+            "launch_opencode_worker": launch_opencode_worker,
         }
     wrapped = 0
     for module in list(sys.modules.values()):

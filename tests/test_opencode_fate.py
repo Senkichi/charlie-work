@@ -1,5 +1,4 @@
 """opencode fate/classification wiring: the provider-error digest, quota
-classification through the fate profile, early-kill health, data-dir lifecycle,
 requires_model config rule, provider-qualified model family, orphan sweep."""
 
 from __future__ import annotations
@@ -23,8 +22,10 @@ from charlie_work.config import (
 )
 from charlie_work.devin_failure_classification import get_rate_limit_defer_until
 from charlie_work.harnesses import HARNESS_REGISTRY
-from charlie_work.opencode_log import opencode_data_dir, provider_error_digest
-from charlie_work.opencode_worker import DEFAULT_COMMAND_TEMPLATE
+from charlie_work.opencode_log import (
+    opencode_data_dir,
+    provider_error_digest,
+)
 from charlie_work.role_chain import RoleEntry, model_family
 from charlie_work.worker import WorkerHealth, WorkerView, classify_worker_health, iter_workers
 
@@ -49,48 +50,6 @@ def _log(tmp_path: Path, text: str) -> Path:
     path = tmp_path / "issue-1.claude.log"
     path.write_text(text, encoding="utf-8")
     return path
-
-
-# --- opencode_log -----------------------------------------------------------
-
-
-def test_default_command_template_is_json_stream_with_print_logs() -> None:
-    assert DEFAULT_COMMAND_TEMPLATE[:2] == ("opencode", "run")
-    assert "--print-logs" in DEFAULT_COMMAND_TEMPLATE
-    assert "--format" in DEFAULT_COMMAND_TEMPLATE
-
-
-def test_opencode_data_dir_layout(tmp_path: Path) -> None:
-    assert opencode_data_dir(tmp_path, 12) == tmp_path / "opencode-data" / "issue-12"
-
-
-def test_digest_keeps_final_error_event_with_status_and_body() -> None:
-    digest = provider_error_digest('{"type":"step_start"}\n' + FINAL_ERROR + "\n")
-    assert "Usage limit reached" in digest
-    assert "status=429" in digest
-    assert "GoUsageLimitError" in digest
-
-
-def test_digest_keeps_print_logs_error_lines() -> None:
-    digest = provider_error_digest(PRINT_LOG_ERROR + "\n")
-    assert "Usage limit reached" in digest
-
-
-def test_digest_drops_tool_output_and_forged_level_error_in_tool_json() -> None:
-    forged = (
-        '{"type":"tool_use","part":{"state":{"output":"timestamp=x level=ERROR '
-        'error.error=\\"usage limit\\""}}}\n'
-    )
-    assert provider_error_digest(TOOL_OUTPUT_ONLY) == ""
-    assert provider_error_digest(forged) == ""
-
-
-def test_digest_resets_on_progress_event() -> None:
-    """A 429 opencode retried through must not classify a later unrelated death."""
-    text = PRINT_LOG_ERROR + '\n{"type":"text","part":{"text":"recovered"}}\n'
-    assert provider_error_digest(text) == ""
-    text = FINAL_ERROR + '\n{"type":"step_start"}\n' + PRINT_LOG_ERROR + "\n"
-    assert provider_error_digest(text).count("Usage limit reached") == 1
 
 
 # --- classification through the fate profile ---------------------------------
@@ -269,6 +228,11 @@ def test_reap_sidecar_removes_opencode_data_dir(tmp_path: Path) -> None:
     data = opencode_data_dir(sessions, 5)
     (data / "sub").mkdir(parents=True)
     (data / "sub" / "opencode.db").write_text("x", encoding="utf-8")
+    # The seeded 2.x credential lives inside the data dir by design (see
+    # seed_auth_file's lifetime note): the reap must remove it with the
+    # session, never leave a provider key behind after the reviewer dies.
+    (data / "opencode").mkdir(parents=True)
+    (data / "opencode" / "auth.json").write_text('{"opencode-go": {}}', encoding="utf-8")
     other = opencode_data_dir(sessions, 6)
     other.mkdir(parents=True)
 
@@ -277,6 +241,7 @@ def test_reap_sidecar_removes_opencode_data_dir(tmp_path: Path) -> None:
 
     assert not sidecar.exists()
     assert not data.exists()
+    assert not (data / "opencode" / "auth.json").exists()
     assert other.exists()  # another worker's data dir is untouched
 
 

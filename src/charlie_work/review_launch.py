@@ -135,6 +135,47 @@ def _launch_review_api(
     )
 
 
+def _launch_review_opencode(
+    *,
+    pr_number: int,
+    branch: str,
+    prompt_path: Path,
+    prompt_text: str,
+    head_sha: str,
+    repo_root: Path,
+    reviews_dir: Path,
+    config: OrchestratorConfig,
+    worker_env: dict[str, str],
+    materialize_dirs: tuple[str, ...],
+    resolved_review_effort: str | None,
+    max_turns_override: int | None,
+    model_override: str | None,
+    api_worker_config: ApiWorkerConfig | None,
+) -> Any:
+    # opencode reads the prompt on stdin (prompt_text, like claude-code).
+    # resolved_review_effort is folded into the --model pin as
+    # provider/model#variant (opencode 2.x has no --variant flag);
+    # max_turns_override is ignored -- no such CLI concept, same as
+    # devin-shell. The read-only posture lives in
+    # opencode_review_policy._REVIEWER_CONFIG + the --agent/--server strip and
+    # the --standalone pin, not argv.
+    return _wf().launch_opencode_worker(
+        pr_number,
+        branch,
+        prompt_text,
+        repo_root=repo_root,
+        sessions_dir=reviews_dir,
+        command_template=None,
+        worker_env=worker_env,
+        materialize_dirs=materialize_dirs,
+        review=True,
+        head_sha=head_sha,
+        model_override=model_override,
+        resolved_review_effort=resolved_review_effort,
+        config=config,
+    )
+
+
 # Single dispatch table keyed by ``reviewer.harness`` name -- this, not a
 # per-harness if/elif chain, is what ``OrchestratorApp.dispatch_reviews``
 # consumes (issue #1513). Every launcher above shares one keyword-only
@@ -151,6 +192,7 @@ _REVIEW_LAUNCHERS: dict[str, Callable[..., Any]] = {
     "claude-code": _launch_review_claude_code,
     "devin-shell": _launch_review_devin_shell,
     "api": _launch_review_api,
+    "opencode": _launch_review_opencode,
 }
 
 assert set(_REVIEW_LAUNCHERS) == REVIEWER_HARNESSES, (

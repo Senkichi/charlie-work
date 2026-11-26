@@ -173,6 +173,46 @@ def test_go_quota_reset_skips_probe_for_free_tier_limit(go) -> None:
     assert fake.requests == []
 
 
+def test_go_quota_reset_prefers_the_2x_retry_after_ms_over_a_probe(go) -> None:
+    """opencode 2.x structured errors embed the retry-after the binary
+    itself honours (summarized as retry-after-ms= in the provider_error_digest
+    line): the exact window cools the ledger without any Go API probe."""
+    fake = go(_http_429(GO_429_BODY, retry_after="600"))
+    digest_line = (
+        "opencode error: name=provider.quota status=429 retryable= "
+        "retry-after-ms=3600000 message=Usage limit reached body=..."
+    )
+    assert opencode_limits.go_quota_reset(digest_line) == timedelta(hours=1)
+    assert fake.requests == []
+
+
+def test_go_quota_reset_ignores_unparseable_retry_after_ms(go) -> None:
+    fake = go(_http_429(GO_429_BODY, retry_after="600"))
+    assert opencode_limits.go_quota_reset("retry-after-ms=not-a-number") == timedelta(minutes=10)
+    assert len(fake.requests) == 2
+
+
+def test_go_quota_reset_ignores_transport_scale_retry_after(go) -> None:
+    """A short retry-after is transport backoff, not the quota window.
+
+    The same ``retry-after-ms`` field carries a gateway's "retry in a moment",
+    and using that as ``reset_at`` would open the fleet-wide cooldown seconds
+    later while the subscription window is still closed (the hot-redispatch
+    loop the quota ledger exists to prevent). Values below the window floor
+    must fall through to the probe/default rather than be clamped.
+    """
+    fake = go(_http_429(GO_429_BODY, retry_after="600"))
+    for too_short in (0, 1000, 30_000, 299_999):
+        assert opencode_limits.go_quota_reset(f"retry-after-ms={too_short}") == timedelta(
+            minutes=10
+        ), too_short
+    # The floor itself is window-scale and IS honoured.
+    assert opencode_limits.go_quota_reset("retry-after-ms=300000") == timedelta(minutes=5)
+    # One probe served every short value (the per-process cache is cleared per
+    # test, not per call): 2 requests = GET /models + POST /chat/completions.
+    assert len(fake.requests) == 2
+
+
 # --- wired through classify_for --------------------------------------------------
 
 

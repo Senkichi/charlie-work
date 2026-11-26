@@ -19,6 +19,7 @@ from .claude_code import (
 )
 from .api_worker import launch_api_worker  # noqa: F401  (deliberate re-export; see review_launch)
 from .devin_shell import launch_devin_session  # noqa: F401  (deliberate re-export; see review_launch)
+from .opencode_worker import launch_opencode_worker  # noqa: F401  (deliberate re-export; see review_launch)
 from .checks import (
     summarize_checks,
 )
@@ -349,7 +350,6 @@ from .verdict_parsing import (  # noqa: F401  (deliberate re-export)
     _REVIEW_FALLBACK_MAX_CANDIDATES,
     _DEFAULT_REVIEW_SESSION_LIMIT_MARKERS,
     _EXTRACTED_VERDICT_SOURCES,
-    _REVIEW_THROTTLE_TAIL_CHARS,
     _RESULT_EVENT_CAUSE_FIELDS,
     _validate_review_verdict,
     _extract_verdict_from_text,
@@ -359,7 +359,6 @@ from .verdict_parsing import (  # noqa: F401  (deliberate re-export)
     _parse_review_verdict_from_files,
     _session_mtime_cutoff,
     _reviewer_session_metrics,
-    _log_tail_throttled,
     _extract_terminating_cause,
     _extract_review_session_summary,
     REVIEW_SESSION_FAILED_HEADING,
@@ -367,6 +366,15 @@ from .verdict_parsing import (  # noqa: F401  (deliberate re-export)
     body_has_crash_signature,
     is_extracted_verdict_source,
     provenance_caveat_for,
+)
+
+# The reviewer-log throttle-tail helpers moved to verdict_log_extraction.py
+# (verdict_parsing.py's file-size ratchet mark); re-exported here so
+# `charlie_work.workflow.<name>` keeps resolving unchanged.
+from .verdict_log_extraction import (  # noqa: F401  (deliberate re-export)
+    _REVIEW_THROTTLE_TAIL_CHARS,
+    _log_died_on_provider_error,
+    _log_tail_throttled,
 )
 
 # LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`

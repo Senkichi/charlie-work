@@ -45,6 +45,7 @@ from _workflow_consumer_scan import consumer_referenced_names
 
 _REPO_ROOT = Path(__file__).parents[1]
 _VERDICT_PARSING_PATH = _REPO_ROOT / "src" / "charlie_work" / "verdict_parsing.py"
+_VERDICT_LOG_EXTRACTION_PATH = _REPO_ROOT / "src" / "charlie_work" / "verdict_log_extraction.py"
 _WORKFLOW_PATH = _REPO_ROOT / "src" / "charlie_work" / "workflow.py"
 
 
@@ -80,18 +81,22 @@ def _module_level_defined_names(path: Path) -> list[str]:
     return names
 
 
-def _facade_reexported_names(workflow_path: Path) -> set[str]:
-    """Names workflow.py's facade block currently re-exports from ``.verdict_parsing``."""
+def _facade_reexported_names_from(workflow_path: Path, module: str) -> set[str]:
+    """Names workflow.py's facade block re-exports from ``.<module>``."""
     tree = parsed(workflow_path)
-    names: set[str] = set()
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.ImportFrom)
-            and node.level == 1
-            and node.module == "verdict_parsing"
-        ):
-            names.update(alias.asname or alias.name for alias in node.names)
-    return names
+    return {
+        alias.asname or alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.level == 1 and node.module == module
+        for alias in node.names
+    }
+
+
+def _facade_reexported_names(workflow_path: Path) -> set[str]:
+    """Names workflow.py's facade blocks re-export from the split modules."""
+    return _facade_reexported_names_from(
+        workflow_path, "verdict_parsing"
+    ) | _facade_reexported_names_from(workflow_path, "verdict_log_extraction")
 
 
 # ---------------------------------------------------------------------------
@@ -166,41 +171,56 @@ def _cross_family_imports_in(source: str, *, filename: str = "<string>") -> list
     )
 
 
-def test_verdict_parsing_has_no_workflow_import() -> None:
-    """AC3: verdict_parsing.py must never import from workflow.py.
+_SPLIT_MODULE_PATHS = pytest.mark.parametrize(
+    "module_path",
+    [
+        pytest.param(_VERDICT_PARSING_PATH, id="verdict_parsing.py"),
+        pytest.param(_VERDICT_LOG_EXTRACTION_PATH, id="verdict_log_extraction.py"),
+    ],
+)
+
+
+@_SPLIT_MODULE_PATHS
+def test_split_modules_have_no_workflow_import(module_path: Path) -> None:
+    """AC3: neither split module may import from workflow.py.
 
     workflow.py's facade imports FROM verdict_parsing.py; the reverse import
     would be the exact cycle the issue's own Traps section warns against
     (import charlie_work.verdict_parsing would then transitively require
     charlie_work.workflow to already be fully initialized, and vice versa).
+    The same holds for verdict_log_extraction.py, which sits under a second
+    facade block in the same file -- a workflow import there is the same
+    cycle, and it is exactly where the moved ``_log_tail_throttled`` seam
+    helpers now live.
     """
     offenders = _workflow_imports_in(
-        _VERDICT_PARSING_PATH.read_text(encoding="utf-8"),
-        filename=str(_VERDICT_PARSING_PATH),
+        module_path.read_text(encoding="utf-8"),
+        filename=str(module_path),
     )
     assert offenders == [], (
-        "verdict_parsing.py imports from charlie_work.workflow -- this creates an "
+        f"{module_path.name} imports from charlie_work.workflow -- this creates an "
         f"import cycle with workflow.py's facade block: {offenders}"
     )
 
 
-def test_verdict_parsing_has_no_cross_family_import() -> None:
-    """verdict_parsing.py must never import from cross_family.py.
+@_SPLIT_MODULE_PATHS
+def test_split_modules_have_no_cross_family_import(module_path: Path) -> None:
+    """Neither split module may import from cross_family.py.
 
     cross_family.py maintains its own independent, byte-identical copy of the
     fenced-code-block regex that ``_VERDICT_FENCE_RE`` also implements,
     deliberately NOT imported from workflow (workflow imports cross_family,
     not the reverse -- see cross_family.py's own dependency-direction
-    comment). The new module inherits that same constraint: it must not
+    comment). Both split modules inherit that same constraint: neither may
     import cross_family.py or deduplicate that regex against it.
     """
     offenders = _cross_family_imports_in(
-        _VERDICT_PARSING_PATH.read_text(encoding="utf-8"),
-        filename=str(_VERDICT_PARSING_PATH),
+        module_path.read_text(encoding="utf-8"),
+        filename=str(module_path),
     )
     assert offenders == [], (
-        "verdict_parsing.py imports from charlie_work.cross_family -- these two "
-        f"modules must keep independent copies of the fence regex: {offenders}"
+        f"{module_path.name} imports from charlie_work.cross_family -- these two "
+        f"families must keep independent copies of the fence regex: {offenders}"
     )
 
 
@@ -237,7 +257,7 @@ def test_workflow_import_detector_flags_a_real_violation() -> None:
 
 def test_cross_family_import_detector_flags_a_real_violation() -> None:
     """Control for the cross_family detector used by
-    ``test_verdict_parsing_has_no_cross_family_import`` above.
+    ``test_split_modules_have_no_cross_family_import`` above.
 
     ``_cross_family_imports_in`` shares its walk (``_module_imports_in``)
     with ``_workflow_imports_in``, but the two are invoked with different
@@ -246,7 +266,7 @@ def test_cross_family_import_detector_flags_a_real_violation() -> None:
     module names) would not be caught by the workflow-detector's own control
     above, since that control never calls the cross_family entry point at
     all. Without this test, a wiring mistake here would leave the assertion
-    in ``test_verdict_parsing_has_no_cross_family_import`` vacuously true
+    in ``test_split_modules_have_no_cross_family_import`` vacuously true
     forever -- the exact failure mode the workflow-side control exists to
     rule out, just for the sibling detector.
 
@@ -350,14 +370,19 @@ def test_all_verdict_parsing_names_are_reexported_by_identity() -> None:
     The md-r4 monotone composition adds ``_legacy_extract_verdict_from_text``
     and ``_scan_extract_verdict_from_text`` (2 functions: 16 -> 18), for
     34 -> 36 overall.
+    The opencode reviewer-quota-death fix moved ``_log_tail_throttled``
+    (1 function: 18 -> 17) and ``_REVIEW_THROTTLE_TAIL_CHARS`` (1 constant:
+    17 -> 16) next door to ``verdict_log_extraction.py`` to keep this module
+    under its file-size ratchet mark, for 36 -> 34 overall; the workflow
+    facade re-exports them from the new home.
     """
     import charlie_work.verdict_parsing as verdict_parsing
     import charlie_work.workflow as workflow
 
     names = _module_level_defined_names(_VERDICT_PARSING_PATH)
     assert names, "AST derivation found zero module-level names -- derivation is broken"
-    assert len(names) == 36, (
-        f"expected 36 moved units (18 functions + ReviewSessionOutcome + 17 constants), "
+    assert len(names) == 34, (
+        f"expected 34 moved units (17 functions + ReviewSessionOutcome + 16 constants), "
         f"found {len(names)}: {sorted(names)}"
     )
 
@@ -385,6 +410,56 @@ def test_all_verdict_parsing_names_are_reexported_by_identity() -> None:
         "workflow.py re-exports these names as objects DIFFERENT from "
         f"verdict_parsing.py's own -- the facade must import, never redeclare: "
         f"{sorted(not_identical)}"
+    )
+
+
+def test_verdict_log_extraction_names_are_reexported_by_identity() -> None:
+    """AC4 for the second facade block: ``verdict_log_extraction.py`` helpers
+    must also resolve through ``charlie_work.workflow`` by identity.
+
+    The AC4 test above derives its universe from ``verdict_parsing.py``'s own
+    module-level names, so deleting workflow.py's
+    ``from .verdict_log_extraction import ...`` block -- or redeclaring one of
+    its names -- would leave that test green while breaking
+    ``workflow._log_tail_throttled`` resolution. This test guards the block
+    directly: every name it claims to re-export must be the SAME object, and
+    the documented moved units must still be in it.
+
+    ``expected`` is the hand-tracked tripwire (same style as the 34-count
+    above): the reviewer-log throttle-tail helpers moved out of
+    verdict_parsing.py to keep that module under its file-size ratchet mark
+    (``_log_tail_throttled``, ``_REVIEW_THROTTLE_TAIL_CHARS``), joined by
+    ``_log_died_on_provider_error``. A later move in or out of
+    ``verdict_log_extraction.py`` legitimately trips it -- update the set,
+    don't weaken the check.
+    """
+    import charlie_work.verdict_log_extraction as verdict_log_extraction
+    import charlie_work.workflow as workflow
+
+    expected = {
+        "_REVIEW_THROTTLE_TAIL_CHARS",
+        "_log_died_on_provider_error",
+        "_log_tail_throttled",
+    }
+    vle_defined = set(_module_level_defined_names(_VERDICT_LOG_EXTRACTION_PATH))
+    assert expected <= vle_defined, (
+        "expected facade names no longer defined in verdict_log_extraction.py "
+        f"-- update the tripwire: {sorted(expected - vle_defined)}"
+    )
+
+    facade_vle = _facade_reexported_names_from(_WORKFLOW_PATH, "verdict_log_extraction")
+    assert expected <= facade_vle, (
+        "workflow.py's verdict_log_extraction facade block is missing moved names "
+        f"(or was deleted outright): {sorted(expected - facade_vle)}"
+    )
+
+    not_identical = [
+        n for n in facade_vle if getattr(workflow, n) is not getattr(verdict_log_extraction, n)
+    ]
+    assert not_identical == [], (
+        "workflow.py re-exports these names as objects DIFFERENT from "
+        "verdict_log_extraction.py's own -- the facade must import, never "
+        f"redeclare: {sorted(not_identical)}"
     )
 
 
@@ -484,8 +559,14 @@ def test_facade_reexports_every_name_consumers_reach_through_workflow() -> None:
     here either. Issue #1354's ``CAUSE_UNKNOWN``,
     ``_RESULT_EVENT_CAUSE_FIELDS``, and ``_extract_terminating_cause`` join
     the same set for the same reason.
+
+    The ``verdict_log_extraction.py`` facade block adds its re-exported names
+    to the candidate set too: any consumer reaching
+    ``charlie_work.workflow._log_tail_throttled`` (etc.) imposes the same
+    re-export obligation as a verdict_parsing name.
     """
     candidates = set(_module_level_defined_names(_VERDICT_PARSING_PATH))
+    candidates |= _facade_reexported_names_from(_WORKFLOW_PATH, "verdict_log_extraction")
     referenced = _consumer_referenced_names(
         candidates,
         [_REPO_ROOT / "tests", _REPO_ROOT / "scripts", _REPO_ROOT / "src"],
@@ -640,9 +721,10 @@ _WRITE_EVENT_SURFACE_RE = re.compile(
 )
 
 
-def test_verdict_parsing_module_has_zero_write_or_event_surface() -> None:
-    """AC7 (post-move): re-confirms, against the FINAL moved spans in
-    verdict_parsing.py (not just the pre-move workflow.py spans the recon
+@_SPLIT_MODULE_PATHS
+def test_split_modules_have_zero_write_or_event_surface(module_path: Path) -> None:
+    """AC7 (post-move): re-confirms, against the FINAL moved spans in the
+    split modules (not just the pre-move workflow.py spans the recon
     checked), that this family never writes state or emits events.
 
     The family only parses verdict TEXT/JSON into a dict; the actual
@@ -651,12 +733,13 @@ def test_verdict_parsing_module_has_zero_write_or_event_surface() -> None:
     that stays in workflow.py, Phase B scope). A hit here would mean either
     the move picked up something it shouldn't have, or the recon's
     pre-move analysis was wrong -- either way this must fail loudly, not
-    silently.
+    silently. ``verdict_log_extraction.py`` (where ``_log_tail_throttled``
+    and ``_REVIEW_THROTTLE_TAIL_CHARS`` landed) is under the same contract.
     """
-    source = _VERDICT_PARSING_PATH.read_text(encoding="utf-8")
+    source = module_path.read_text(encoding="utf-8")
     hits = _WRITE_EVENT_SURFACE_RE.findall(source)
     assert hits == [], (
-        f"verdict_parsing.py contains write/event-emission surface: {hits} -- "
+        f"{module_path.name} contains write/event-emission surface: {hits} -- "
         "this family should only parse verdict text, never write state or emit events"
     )
 

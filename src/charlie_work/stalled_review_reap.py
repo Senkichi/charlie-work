@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from . import layout
+from . import opencode_log
 from .config import OrchestratorConfig
 from .github import GitHubLike
 from . import host as _host
@@ -65,6 +66,7 @@ from .throttle_signatures import (
     match_throttle_tail,
     parse_reset_clock_time,
 )
+from .adapter_fate_profile import profile_for
 from .review_provider_outage import apply_provider_api_error, session_api_error_status
 from .role_quota_ledger import (
     record_view as _ledger_record,  # issue #2086
@@ -507,7 +509,25 @@ def _detect_and_handle_stalled_reviews(
             # rationale.
             classification = _ThrottleClassification.UNDETERMINED
         else:
-            tail = log_text[-2048:] if len(log_text) > 2048 else log_text
+            # Per-adapter narrowing: a harness whose log also carries tool
+            # output (opencode) must match the classifiers against its own
+            # provider-error records, not the raw tail -- a reviewed file
+            # quoting "rate limit" in the last 2KB must not arm fleet-wide
+            # reviewer_quota. Same AdapterFateProfile.log_digest the
+            # worker-side fate classifier applies (dead_worker_reap).
+            #
+            # An EMPTY digest falls back to the raw tail only when the log
+            # carries no assistant text and no tool output (nothing that
+            # could quote a marker), so an unrecognized error shape still
+            # classifies instead of disabling throttle detection.
+            profile = profile_for(w.adapter_kind)
+            surface = log_text
+            if profile is not None and profile.log_digest is not None:
+                digest = profile.log_digest(log_text)
+                surface = digest or (
+                    "" if opencode_log.carries_work_output(log_text) else log_text
+                )
+            tail = surface[-2048:] if len(surface) > 2048 else surface
             # Issue #1684: quota exhaustion is a throttle outcome too. The
             # structured "cognition.ai/errorKind": "resource_exhausted"
             # trailer is matched before any prose so provider wording drift
@@ -533,12 +553,18 @@ def _detect_and_handle_stalled_reviews(
             # session that triggers the backoff (the first throttled one);
             # subsequent throttled sessions in the same wave reuse the
             # already-applied backoff, matching the one-increment-per-wave
-            # guard below.
+            # guard below. The adapter's own quota_reset takes precedence
+            # when it declares one (opencode Go's 5h/weekly/monthly windows)
+            # -- it reads the same narrowed provider-error tail.
             if (
                 classification is _ThrottleClassification.THROTTLED
                 and not throttle_backoff_applied
             ):
-                reset_at = parse_reset_clock_time(tail, resolved_now)
+                if profile is not None and profile.quota_reset is not None:
+                    reset_delta = profile.quota_reset(tail)
+                    reset_at = resolved_now + reset_delta if reset_delta is not None else None
+                if reset_at is None:
+                    reset_at = parse_reset_clock_time(tail, resolved_now)
 
         if classification is _ThrottleClassification.THROTTLED:
             # A green flat-interval probe may have already cleared

@@ -1081,10 +1081,14 @@ def launch_claude_worker(
     # Rotate the previous session's log before the new launch overwrites it.
     # This preserves the old log for post-mortem analysis on re-dispatch.
     _rotate_old_log(log_path)
-    # Also rotate the previous events.jsonl if it exists.
-    if tee_stream_json:
-        _events_path_old = _events_path(sessions_dir, issue_number, rework=rework, review=review)
-        _rotate_old_log(_events_path_old)
+    # Rotate the previous events.jsonl on EVERY launch, not just tee'd ones:
+    # adapters that leave tee_stream_json off (opencode) still route through
+    # this function, and the format-agnostic readers in verdict_parsing would
+    # otherwise misread an earlier round's claude/api transcript as this
+    # session's metrics and summary text. Same invariant devin_shell's
+    # unconditional rotation enforces for its launches (issue #2036).
+    _events_path_old = _events_path(sessions_dir, issue_number, rework=rework, review=review)
+    _rotate_old_log(_events_path_old)
     session_id = str(uuid.uuid4())
 
     # Issue #426: recovery probes carry a Signal-1-style deferral counter. Seed
@@ -1097,11 +1101,14 @@ def launch_claude_worker(
             _read_sidecar_inconclusive_count(sessions_dir, issue_number, adapter_kind),
         )
 
-    if review:
+    if review and adapter_kind != "opencode":
         # Hard-pinned, not a default: see _sanitize_review_command_template
         # and PR #397 round-2 review. No caller-supplied command_template
         # (including one forwarded from ClaudeCodeConfig.command) can result
-        # in a reviewer session running with write access.
+        # in a reviewer session running with write access. opencode carries
+        # the same guarantee in env (OPENCODE_CONFIG_CONTENT deny policy) and
+        # its own template sanitizer -- --permission-mode is invalid argv for
+        # it.
         command_template = _sanitize_review_command_template(command_template)
     elif command_template is None:
         command_template = _WORKER_COMMAND_TEMPLATE
@@ -1125,7 +1132,9 @@ def launch_claude_worker(
     launch_role = "reviewer" if review else "worker"
     # A non-Claude CLI sharing this launch path (opencode_worker) supplies its
     # own flag pins; the Claude --model/--effort pins below would be invalid
-    # argv for it. ``cli_pins`` is worker-only (never combined with review).
+    # argv for it. On a review+cli_pins launch the claude review pins
+    # (--permission-mode, --effort, --max-turns, tool scope) are likewise
+    # skipped -- that adapter's read-only posture lives in its env config.
     if cli_pins is not None:
         command_template = cli_pins(command_template)
     else:
@@ -1160,7 +1169,7 @@ def launch_claude_worker(
             _claude_code_cfg.reviewer_tools if review else _claude_code_cfg.worker_tools,
             _claude_code_cfg.isolate_mcp,
         )
-    if review:
+    if review and adapter_kind != "opencode":
         # Cap agentic turns for reviewer sessions to prevent unbounded
         # codebase exploration and runaway token spend. 0 = unlimited.
         # Issue #1439: ``max_turns_override`` (resolved by the dispatch path
@@ -1168,6 +1177,8 @@ def launch_claude_worker(
         # streak) takes precedence over the flat config default so a PR
         # threading a monolith gets a raised budget. ``None`` preserves the
         # pre-#1439 flat ``review_max_turns`` behaviour for direct callers.
+        # opencode has no --max-turns equivalent: its reviewer's turn bound is
+        # the same watchdog/reap cadence a devin-shell reviewer runs under.
         _review_max_turns = (
             max_turns_override
             if max_turns_override is not None
@@ -1355,9 +1366,11 @@ def launch_claude_worker(
         command = (resolve_cli_binary(command[0]), *command[1:])
 
     # If tee_stream_json is enabled, extend the command with --output-format stream-json
-    # and set up a tee to write to both plaintext log and events file
+    # and set up a tee to write to both plaintext log and events file. Skipped
+    # on the cli_pins path: --output-format/--verbose are invalid argv for the
+    # non-Claude CLI (opencode emits --format json natively in its template).
     events_path = None
-    if tee_stream_json:
+    if tee_stream_json and cli_pins is None:
         command = command + ("--output-format", "stream-json")
         # The installed Claude Code CLI hard-rejects `--print` +
         # `--output-format=stream-json` without `--verbose` ("Error: When

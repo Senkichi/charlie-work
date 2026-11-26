@@ -225,7 +225,10 @@ def _probe_adapter(add: Any, repo_root: Path, config: OrchestratorConfig) -> Non
         )
     # A fallback harness is only exercised on failover -- probe it now so a
     # missing binary surfaces here rather than as a launch failure mid-wave.
-    if adapter != "opencode" and any(e.harness == "opencode" for e in config.worker.chain):
+    # Reviewer chain too: an opencode review fallback launches the same CLI.
+    if adapter != "opencode" and any(
+        e.harness == "opencode" for e in (*config.worker.chain, *config.reviewer.chain)
+    ):
         _probe_opencode(add, repo_root, config)
 
 
@@ -240,6 +243,235 @@ def _probe_opencode(add: Any, repo_root: Path, config: OrchestratorConfig) -> No
         probe.ok,
         (probe.stdout.strip() or "ok") if probe.ok else (probe.error or probe.stderr.strip()),
     )
+    _probe_opencode_argv(add, repo_root, config, binary)
+    _probe_review_config_visibility(add, config)
+
+
+def _probe_review_config_visibility(add: Any, config: OrchestratorConfig) -> None:
+    """Warn when reviewer providers/models come from the operator's host config.
+
+    A review launch pins ``OPENCODE_CONFIG_DIR`` to a per-issue EMPTY directory
+    (``opencode_review_policy.apply_review_env_pins``) because the operator's
+    global config is the agent-permission override vector the deny policy
+    closes. The consequence is that a reviewer sees only the providers/models
+    built into the binary: a reviewer chain entry whose provider is declared
+    only in the host config fails at launch with ``provider.no-route``.
+
+    Reported as a WARNING, never a failure: a host config may legitimately
+    override a BUILT-IN provider (extra headers, a proxy baseURL, per-model
+    metadata) and a reviewer would still route without the override. The
+    overlap is worth saying out loud either way -- the operator is the only one
+    who knows which of these providers is custom.
+
+    Silent until proven otherwise: no host config (or no provider block) means
+    nothing to report.
+    """
+    reviewers = [e for e in config.reviewer.chain if e.harness == "opencode"]
+    if not reviewers:
+        return
+    declared, source = _host_opencode_providers()
+    if not declared:
+        return
+    provider_of = {
+        _review_model_provider(entry.model, config.opencode.provider) for entry in reviewers
+    }
+    used = sorted(provider_of & declared)
+    if used:
+        add(
+            "opencode review provider visibility",
+            True,
+            f"review launches pin an empty OPENCODE_CONFIG_DIR, so {source}'s "
+            f"definition(s) for {', '.join(used)} do NOT apply to reviewers. A reviewer "
+            "still routes when that provider is built into the binary; a provider "
+            "declared only here fails at launch with provider.no-route",
+            severity="warning",
+        )
+        return
+    add(
+        "opencode review provider visibility",
+        True,
+        f"{source} declares provider(s) {', '.join(sorted(declared))}; review launches "
+        "pin an empty config dir and will not load them (reviewer chain does not use them)",
+        severity="warning",
+    )
+
+
+def _review_model_provider(model: str, default_provider: str) -> str:
+    """The provider prefix a launch resolves for ``model`` (opencode_worker rule)."""
+    model = (model or "").strip()
+    if not model:
+        return default_provider
+    return model.split("/", 1)[0] if "/" in model else default_provider
+
+
+def _host_opencode_providers() -> tuple[frozenset[str], str]:
+    """Provider names declared in the operator's global opencode config, plus its path.
+
+    Checks the location opencode itself reads -- ``$XDG_CONFIG_HOME/opencode``,
+    else ``~/.config/opencode`` (verified against the installed 2.3.x bundle:
+    ``config = process.env.XDG_CONFIG_HOME || homedir()/.config``) --
+    tolerating a missing, unreadable or malformed file. This is a diagnostic,
+    never a reason to fail doctor on its own.
+    """
+    import os
+
+    candidates: list[Path] = []
+
+    def add_config(root: Path) -> None:
+        candidate = root / "opencode" / "opencode.json"
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    if xdg:
+        add_config(Path(xdg))
+    try:
+        add_config(Path.home() / ".config")
+    except (RuntimeError, OSError):
+        pass
+    for path in candidates:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        providers = payload.get("provider") if isinstance(payload, dict) else None
+        if isinstance(providers, dict) and providers:
+            return frozenset(str(name) for name in providers), str(path)
+    return frozenset(), ""
+
+
+def _probe_opencode_argv(
+    add: Any,
+    repo_root: Path,
+    config: OrchestratorConfig,
+    binary: str,
+) -> None:
+    """Validate the launch argv against the installed binary's own ``run --help``.
+
+    ``opencode --version`` succeeds for a binary whose ``run`` flags have
+    drifted, and the drift is fatal: an unknown flag (the 2.x ``--variant``
+    removal) or a rejected value (2.3.0's lowercase-only ``--log-level``
+    choices) makes every ``opencode run`` exit 1 BEFORE any request, which
+    looks like a healthy harness to a version-only probe. Every template flag
+    is checked against the installed binary's help text, and ``--log-level``
+    values against the choices printed on its help line, so the probe doubles
+    as the version gate: whatever major version is installed, the template is
+    validated against THAT binary's real argv surface.
+
+    Two argv-posture checks ride along, because the review posture is env-only
+    and therefore depends on argv shape (see
+    ``opencode_worker.sanitize_review_command_template``):
+
+    - the effective REVIEW template must carry ``--standalone`` (a private
+      server is what makes every env pin apply; the sanitizer pins it, so this
+      is a tripwire against a refactor that drops it again);
+    - an operator ``--server`` is reported: it is stripped for reviews, and
+      saying so here is cheaper than a silent behaviour difference.
+    """
+    from .claude_code import probe_claude
+    from .opencode_worker import DEFAULT_COMMAND_TEMPLATE, sanitize_review_command_template
+
+    template = tuple(config.opencode.command or DEFAULT_COMMAND_TEMPLATE)
+    review_template = sanitize_review_command_template(template)
+    posture_problems = []
+    if "--standalone" not in review_template:
+        posture_problems.append("missing the --standalone pin (the env posture would not apply)")
+    if "--server" in review_template:
+        posture_problems.append("still names --server (the review must own its private server)")
+    add(
+        "opencode review argv posture",
+        not posture_problems,
+        "; ".join(posture_problems) or "--standalone pinned and no --server",
+    )
+    if "--server" in template:
+        add(
+            "opencode review --server override",
+            True,
+            "opencode.command names --server; it is stripped from review launches "
+            "(a review must run on its own private server)",
+            severity="warning",
+        )
+    flags = [token for token in template[1:] if token.startswith("-")]
+    if not flags:
+        return
+    probe = probe_claude(repo_root, command=(binary, "run", "--help"))
+    if not probe.ok:
+        add(
+            "opencode run argv probe",
+            False,
+            probe.error or probe.stderr.strip() or "opencode run --help failed",
+        )
+        return
+    help_text = probe.stdout
+    level_choices = _opencode_log_level_choices(help_text)
+    unknown: list[str] = []
+    bad_values: list[str] = []
+    for index, token in enumerate(template[1:], start=1):
+        if not token.startswith("-"):
+            continue
+        name, sep, attached = token.partition("=")
+        if name not in help_text:
+            unknown.append(token)
+            continue
+        if name != "--log-level":
+            continue
+        # Both spellings: "--log-level warn" and "--log-level=warn".
+        value = attached if sep else (template[index + 1] if index + 1 < len(template) else "")
+        if not value:
+            bad_values.append("--log-level (no value)")
+        elif level_choices and value not in level_choices:
+            bad_values.append(f"--log-level {value} (choices: {'|'.join(sorted(level_choices))})")
+        elif not level_choices:
+            # The help text did not expose a parseable choice list -- report
+            # it as UNVERIFIED, never as a rejection. Failing here on a help
+            # format change would make doctor red for a healthy install.
+            add(
+                "opencode --log-level value",
+                True,
+                f"could not parse the choices from `run --help`; value {value!r} unverified",
+                severity="warning",
+            )
+    if unknown or bad_values:
+        add(
+            "opencode run argv probe",
+            False,
+            "installed binary rejects launch flags: " + ", ".join(unknown + bad_values),
+        )
+        return
+    add(
+        "opencode run argv probe",
+        True,
+        f"all {len(flags)} template flag(s) accepted by `opencode run --help`",
+    )
+
+
+def _opencode_log_level_choices(help_text: str) -> set[str]:
+    """The ``--log-level`` choices from a ``run --help`` text, lowercase-normalized.
+
+    Handles the cobra-style choices line ``--log-level <all|trace|...|none>``
+    as printed by the 2.3.0 binary (the bracketed choice list may wrap onto
+    its own line, so the scan continues onto the following line when the
+    opening bracket is unclosed).
+    """
+    lines = help_text.splitlines()
+    for index, line in enumerate(lines):
+        if "--log-level" not in line:
+            continue
+        segment = line.split("--log-level", 1)[1]
+        start = segment.find("<")
+        if start >= 0 and ">" not in segment[start:] and index + 1 < len(lines):
+            segment += " " + lines[index + 1]
+        inner = (
+            segment[segment.find("<") + 1 : segment.find(">")]
+            if "<" in segment and ">" in segment
+            else segment
+        )
+        return {
+            choice.strip().strip("<>").lower()
+            for choice in inner.split("|")
+            if choice.strip().strip("<>").isalpha()
+        }
+    return set()
 
 
 def _probe_api_worker(

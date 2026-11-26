@@ -248,6 +248,8 @@ def _reap_review_verdicts(self, reviews_dir: Path) -> dict[str, Any]:
                     Path(w.log_path),
                     max_turns,
                     session_limit_markers=self.config.runtime.session_limit_markers,
+                    throttle_error_markers=self.config.runtime.throttle_error_markers,
+                    quota_error_markers=self.config.runtime.quota_error_markers,
                     exit_code=exit_code,
                 )
                 if outcome is not None:
