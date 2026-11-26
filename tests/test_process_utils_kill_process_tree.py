@@ -262,18 +262,58 @@ def test_kill_process_tree_records_kill_when_taskkill_returncode_unexpected() ->
             proc.wait()
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only test")
-def test_kill_process_tree_own_group_guard_posix() -> None:
-    """Test that kill_process_tree refuses to kill its own process group on POSIX."""
-    # Try to kill our own process group - should refuse
-    own_pid = os.getpid()
-    os.getpgid(own_pid)
+def test_kill_process_tree_own_group_guard_posix(monkeypatch: pytest.MonkeyPatch) -> None:
+    """kill_process_tree refuses a non-ancestor target in the caller's own process group.
 
-    # Attempt to kill our own process group
-    killed = kill_process_tree(own_pid)
+    Issue #3075 coverage dedupe: the report scored the pre-rewrite leaf
+    "equal" to the kept bash-launcher test because both skipped on the
+    Windows fleet host -- each recorded the identical collection/setup
+    footprint every skipped test records (conftest.py, _os_name_guard.py,
+    _process_guard.py -- verified against the newest cached map). Equal
+    recorded coverage is not equal assertions. What this asserts that the
+    kept test does not: the POSIX ``pgid == os.getpgid(0)`` refusal itself.
+    The pre-#1842 body called ``kill_process_tree(os.getpid())``, but the
+    caller-ancestor exemption fires before the POSIX branch for a self target
+    (pinned cross-platform by test_kill_process_tree_self_pid_exempt below
+    and tests/test_process_utils_ancestor_guard.py), so the group guard was
+    never reached. This body keeps the pinned name but targets a non-ancestor
+    pid in the caller's group -- the only exercise of that branch, and it now
+    runs on every platform.
+    """
+    own_pid, target_pid = 424242, 555
+    monkeypatch.setattr("os.getpid", lambda: own_pid, raising=False)
 
-    # Should return empty list because we refused to kill our own group
+    # The target is outside the caller-ancestor exemption, so only the group
+    # guard can refuse. getpgid(0) is the caller's own group; the target gets
+    # the same pgid.
+    monkeypatch.setattr(
+        "charlie_work.process_utils._ancestor_guard_exempt_pids",
+        lambda: frozenset({own_pid}),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "charlie_work.process_utils.os.getpgid",
+        lambda pid: 700 if pid in (0, target_pid) else 900,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "charlie_work.process_utils._enumerate_fingerprinted_children", lambda _pid: {}
+    )
+
+    kill_attempts: list[Any] = []
+    monkeypatch.setattr(
+        "charlie_work.process_utils.os.killpg",
+        lambda pgid, sig: kill_attempts.append((pgid, sig)),
+        raising=False,
+    )
+
+    # Force the POSIX branch so the group guard is the thing under test. Bound to
+    # the call, not the test (issue #3010): see tests/_os_name_guard.py.
+    with monkeypatch.context() as patched:
+        patched.setattr("charlie_work.process_utils.os.name", "posix")
+        killed = kill_process_tree(target_pid)
     assert killed == []
+    assert kill_attempts == []
 
 
 def test_kill_process_tree_self_pid_exempt(monkeypatch: Any) -> None:
