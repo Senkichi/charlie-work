@@ -83,6 +83,13 @@ def test_vendored_base_equals_live_swole_checkout() -> None:
     assert swole_drift(SWOLE).status in {"in_sync", "drifted"}
 
 
+# Issue #3075 coverage dedupe: the report scored this "equal" to the kept
+# bash-launcher test only because both skip in the nightly env (no
+# CHARLIE_WORK_SWOLE_ROOT on CI) -- empty coverage, not shared assertions.
+# What this asserts that the kept test does not: the vendored ``status``
+# group is byte-equal to a LIVE swole checkout's and ``swole_drift`` reports
+# in_sync -- upstream drift detection that only runs where an operator-side
+# swole checkout exists.
 @pytest.mark.skipif(SWOLE_TOKENS is None or not SWOLE_TOKENS.is_file(), reason=_SKIP_REASON)
 def test_vendored_status_group_equals_live_swole_pr467() -> None:
     upstream = json.loads(SWOLE_TOKENS.read_text(encoding="utf-8"))
@@ -205,6 +212,12 @@ PR467_TOKENS = Path(
 )
 
 
+# Issue #3075 coverage dedupe: same degenerate "equal" verdict as the
+# live-swole leaf above -- this one only runs where the PR-#467 worktree
+# checkout exists. What this asserts that the kept test does not: the
+# vendored ``status`` AND ``base`` groups equal the PR-#467 branch's tokens
+# -- the shape pinned at vendor time, independent of where live swole has
+# moved since.
 @pytest.mark.skipif(
     not PR467_TOKENS.is_file(), reason=f"swole PR #467 worktree absent: {PR467_TOKENS}"
 )
