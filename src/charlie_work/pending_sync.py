@@ -29,10 +29,11 @@ import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from . import layout
 from .atomic_write import write_json_atomic
+from .command_result import CommandResult
 from .instrumentation import log_event
 from .state import utc_now
 from .subprocess_runner import RunResult, command_failure_message, run_captured
@@ -215,8 +216,27 @@ def record_sync_deferral(
 #: separately. A clean no-op emits nothing.
 SELF_DEPLOY_BOOT_SYNC_KIND = "self_deploy_boot_sync"
 
+#: Exit reason for the supervisor exit that follows a boot repair which really
+#: synced (issue #2919). The sync replaced packages the process had already
+#: imported, so every module in memory predates the install on disk. Declared
+#: here, next to the repair that produces it, and listed in
+#: ``fleet_dispatch.RESTART_EXIT_REASONS`` so ``restart_requested`` (and with
+#: it ``EXIT_RESTART_REQUESTED``) is derived from the vocabulary, not set by hand.
+BOOT_SYNC_EXIT_REASON = "boot_sync"
+
 _BOOT_SYNC_PROBE_TIMEOUT_SECONDS = 30
 _BOOT_SYNC_SYNC_TIMEOUT_SECONDS = 300
+
+#: The drift probe. One definition for both uses -- detection before the sync and
+#: the convergence check after it -- so the two can never disagree on flags
+#: (``--inexact`` in particular: see the comment at the detection probe).
+_BOOT_SYNC_CHECK_CMD: tuple[str, ...] = ("uv", "sync", "--locked", "--check", "--inexact")
+
+#: ``post_sync_check`` values recorded on the ``self_deploy_boot_sync`` event.
+POST_SYNC_CLEAN = "clean"  # probe exit 0: the install now matches the lock
+POST_SYNC_DRIFT = "drift"  # probe exit 1: the sync exited 0 yet drift remains
+POST_SYNC_INCONCLUSIVE = "inconclusive"  # spawn failure, timeout, or a uv error (2+)
+POST_SYNC_SKIPPED = "skipped"  # no uv.lock, so ``--locked`` cannot run
 
 
 @dataclass(frozen=True)
@@ -231,6 +251,19 @@ class BootSyncRepair:
     detected but live fleet runners are active -- the merge and sync stay
     parked for ``self_deploy``/the next restart. ``detail`` carries the
     operator-facing reason for deferred/failed outcomes.
+
+    ``synced`` is also the one field a caller restarts on (issue #2919): it is
+    the only outcome that changed the install under a process that has already
+    imported its modules. A failed, deferred, or no-op repair changed nothing,
+    so none of them may request a restart -- a persistent sync failure would
+    otherwise become a restart loop.
+
+    The same loop exists one step later: a sync that exits 0 but leaves the drift
+    probe still reporting drift would relaunch into the identical sync on every
+    boot. So ``synced`` is False -- with ``detail`` saying the sync did not
+    converge -- when the post-sync probe exits 1. A post-sync probe that is
+    merely inconclusive (timeout, uv error) does not suppress the restart: it
+    proves nothing about the venv, and the sync did succeed.
     """
 
     detected_via: str | None = None
@@ -270,12 +303,15 @@ def heal_pending_sync_at_boot(
     2. defers when live fleet runners are active (same live-runner rule as
        ``self_deploy``: do not rebuild a venv running children use),
     3. otherwise runs ``uv sync --locked --inexact`` and clears the marker
-       on success.
+       on success,
+    4. re-runs the probe after a successful sync (issue #2919 review): exit 1
+       means the sync did not converge, and the outcome then reports
+       ``synced=False`` so the caller does not restart into the same sync.
 
     Every terminal state -- detected+deferred, detected+synced,
-    detected+sync-failed, probe-inconclusive, and crashed -- emits a
-    ``self_deploy_boot_sync`` event. A clean no-op detects nothing and
-    emits nothing.
+    detected+synced-but-not-converged, detected+sync-failed,
+    probe-inconclusive, and crashed -- emits a ``self_deploy_boot_sync``
+    event. A clean no-op detects nothing and emits nothing.
 
     Never raises and never writes code: failures return
     ``BootSyncRepair(detail=...)`` and the caller decides whether to log or
@@ -352,7 +388,7 @@ def _boot_sync_repair(
         # child died on import). The repair only ever needs to *add* missing
         # locked packages, so preserving installed extras is correct on the
         # probe and the sync alike.
-        probe_cmd = ["uv", "sync", "--locked", "--check", "--inexact"]
+        probe_cmd = list(_BOOT_SYNC_CHECK_CMD)
         probe = run_command(
             probe_cmd,
             cwd=repo_root,
@@ -425,10 +461,55 @@ def _boot_sync_repair(
         )
         return BootSyncRepair(detected_via=detected_via, detail=detail)
 
+    # The sync exited 0, which is not the same as the install converging. If the
+    # probe still reports drift, a restart would relaunch into this same sync on
+    # every boot (the wrapper's relaunch cap retires one wrapper; the scheduled
+    # tick starts another), so the caller must be told not to restart. Same
+    # command as the detection probe; only exit 1 is drift (an inconclusive
+    # probe proves nothing, and the sync did succeed).
+    post_sync_check = POST_SYNC_SKIPPED
+    if (repo_root / "uv.lock").exists():
+        post_probe = run_command(
+            list(_BOOT_SYNC_CHECK_CMD),
+            cwd=repo_root,
+            timeout_seconds=probe_timeout_seconds,
+        )
+        if post_probe.returncode == 0:
+            post_sync_check = POST_SYNC_CLEAN
+        elif post_probe.returncode == 1:
+            post_sync_check = POST_SYNC_DRIFT
+        else:
+            post_sync_check = POST_SYNC_INCONCLUSIVE
+
+    # The marker tracks "HEAD advanced but the sync is parked"; the sync it was
+    # waiting for has now run, converged or not. Drift that survives it is found
+    # again by the next boot's own probe, so keeping the marker adds nothing.
     cleared = False
     if marker:
         _clear_marker(marker_path)
         cleared = True
+
+    if post_sync_check == POST_SYNC_DRIFT:
+        detail = (
+            f"{' '.join(sync_cmd)} succeeded but "
+            f"{' '.join(_BOOT_SYNC_CHECK_CMD)} still reports drift: the sync did not "
+            "converge; not requesting a restart (it would repeat the same sync)"
+        )
+        # write-gate-exempt(issue=2312): durable events.db signal, outside state lock
+        log_event(
+            state_path,
+            SELF_DEPLOY_BOOT_SYNC_KIND,
+            {
+                "detected_via": detected_via,
+                "deferred": False,
+                "synced": False,
+                "post_sync_check": post_sync_check,
+                "cleared_marker": cleared,
+                "error": detail,
+            },
+        )
+        return BootSyncRepair(detected_via=detected_via, detail=detail)
+
     # write-gate-exempt(issue=2312): durable events.db signal, outside state lock
     log_event(
         state_path,
@@ -437,7 +518,70 @@ def _boot_sync_repair(
             "detected_via": detected_via,
             "deferred": False,
             "synced": True,
+            "post_sync_check": post_sync_check,
             "cleared_marker": cleared,
         },
     )
     return BootSyncRepair(detected_via=detected_via, synced=True)
+
+
+class _Releasable(Protocol):
+    """The slice of the supervisor lock the restart exit needs."""
+
+    def release(self) -> None: ...
+
+
+class _WatchdogProbeLike(Protocol):
+    """The slice of ``fleet_dispatch.WatchdogProbe`` the restart exit reads."""
+
+    @property
+    def armed(self) -> bool | None: ...
+
+
+def boot_sync_restart_result(
+    repair: BootSyncRepair,
+    *,
+    lock: _Releasable,
+    fleet_dir_override: str | None,
+    restart_exit_reasons: frozenset[str],
+    probe_watchdog: Callable[[], _WatchdogProbeLike],
+    alert_watchdog_not_armed: Callable[..., None],
+) -> CommandResult:
+    """Build the supervisor's exit for a boot repair that synced (issue #2919).
+
+    The sync replaced packages this process had already imported, so it exits
+    for a relaunch before loading config. In order: probe the watchdog (#604, the
+    same armed-check the other two restart exits make) and alert only on a
+    confirmed ``armed=False``; release the fleet-supervisor lock so the relaunched
+    process can take it; return the restart ``CommandResult``.
+
+    The watchdog probe, its alert, and ``RESTART_EXIT_REASONS`` all live in
+    ``fleet_dispatch``, which imports this module -- so the caller passes them in
+    rather than this module importing them back. ``run_fleet_supervise`` resolves
+    them from its own globals at call time, which is also what keeps the
+    ``charlie_work.fleet_dispatch.*`` monkeypatches effective. ``restart_requested``
+    is derived from ``restart_exit_reasons``, never set by hand.
+
+    Raising before ``lock.release()`` is safe: the caller's startup ``try`` releases
+    the lock on any ``BaseException``. Config is not loaded yet, so the alert has
+    no notify sink and goes to the console and the fleet ``events.db`` only.
+    """
+    watchdog = probe_watchdog()
+    if watchdog.armed is False:
+        alert_watchdog_not_armed(
+            watchdog,
+            exit_reason=BOOT_SYNC_EXIT_REASON,
+            notify_config=None,
+            notify_enabled=False,
+            fleet_dir_override=fleet_dir_override,
+            now_str=datetime.datetime.now().strftime("%H:%M:%S"),
+        )
+    lock.release()
+    return CommandResult(
+        True,
+        f"boot repair synced via {repair.detected_via}; restarting for new deps",
+        {
+            "exit_reason": BOOT_SYNC_EXIT_REASON,
+            "restart_requested": BOOT_SYNC_EXIT_REASON in restart_exit_reasons,
+        },
+    )

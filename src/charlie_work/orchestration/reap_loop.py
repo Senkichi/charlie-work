@@ -47,6 +47,7 @@ from charlie_work.merge_path.queue_skip import merge_ready_unless_queued
 from charlie_work.mergequeue_stall import alarm_best_effort
 from charlie_work.notify import AttentionDigest, AttentionEntry
 from charlie_work.packet_currency import packet_body_current_for_skip
+from charlie_work.priority_reserve import critical_fresh_reserve
 from charlie_work.pass_deadline import (
     PassDeadline,
     PassDeadlineExceeded,
@@ -119,9 +120,8 @@ def _loop_body(
         now=now,
     )
     intake = deadline.phase("intake", self.intake)
-    # Share a single wave budget between fresh and rework dispatch
-    # Rework-first, then fresh fills the remainder
-    # Resolve the effective budget once
+    # One wave budget, resolved once, shared by both lanes: rework first -- minus the slots
+    # held for ready priority:critical fresh issues (#2917) -- then fresh fills the remainder
     effective_limit = limit if limit is not None else self.config.dispatch.default_limit
 
     # Apply global concurrency governor cap to the total wave budget
@@ -192,7 +192,10 @@ def _loop_body(
 
     dispatch_rework = deadline.phase(
         "dispatch_rework",
-        lambda: self.dispatch_rework(effective_limit, stalled_entries=loop_stalled_entries),
+        lambda: self.dispatch_rework(
+            effective_limit - critical_fresh_reserve(self, effective_limit),
+            stalled_entries=loop_stalled_entries,
+        ),
     )
     rework_count = dispatch_rework.data.get("selected_count", 0)
     fresh_limit = max(0, effective_limit - rework_count)

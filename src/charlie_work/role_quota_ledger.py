@@ -532,15 +532,12 @@ def sidecar_path_for(sessions_dir: Path, harness: str, number: int) -> Path | No
     capabilities = HARNESS_REGISTRY.get(harness)
     if capabilities is None:
         return None
-    if capabilities.adapter_kind == "devin":
-        from . import devin_shell
+    from . import adapter_fate_profile
 
-        return devin_shell._sidecar_path(sessions_dir, number)
-    from . import claude_code
-
-    if capabilities.adapter_kind in claude_code.CLAUDE_RECORD_KINDS:
-        return claude_code._sidecar_path(sessions_dir, number, capabilities.adapter_kind)
-    return None
+    profile = adapter_fate_profile.profile_for(capabilities.adapter_kind)
+    if profile is None or profile.sidecar is None:
+        return None
+    return profile.sidecar.path(sessions_dir, number)
 
 
 def _view_kind_to_harness(adapter_kind: str) -> str | None:

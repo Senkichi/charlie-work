@@ -612,7 +612,12 @@ def test_valid_issue_statuses_covers_every_assigned_status_literal() -> None:
 
     pattern = re.compile(
         r'["\']status["\']\s*(?::|\]\s*=)\s*["\']([a-z_]+)["\']'  # dict key / subscript
-        r"|\bstatus\s*=\s*[\"']([a-z_]+)[\"']"  # bare local later stored under "status"
+        # bare local later stored under "status", or the lanes' ``restored_status=``
+        # keyword: since issue #3099 both dispatch lanes hand the failed-launch
+        # status literal to ``worker_launch_outcome.record_failed_launch`` as
+        # ``restored_status=``, and the module stores it on the issue record.
+        # (``previous_status=`` is only an Event payload value, never stored.)
+        r"|\b(?:restored_)?status\s*=\s*[\"']([a-z_]+)[\"']"
     )
     found: set[str] = set()
     # rglob, not glob: since Track 2 Phase B the status-assigning code paths

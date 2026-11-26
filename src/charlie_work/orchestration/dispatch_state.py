@@ -17,8 +17,8 @@ Namespace rule (#1627). Two kinds of name are reached through the
   ``_detect_and_handle_stalled_sessions``,
   ``_try_reap_blocked_foreign_writer`` -- must resolve
   through ``_wf.`` so ``patch("charlie_work.workflow.<name>")`` still bites.
-- **Reached through workflow.py.** ``_build_failure_map``,
-  ``_label_error_reason`` and ``_recent_dispatch_failed_attempts`` are defined
+- **Reached through workflow.py.** ``_build_failure_map`` and
+  ``_recent_dispatch_failed_attempts`` are defined
   in ``workflow`` itself; ``_MergedPRListOutcome`` is a re-export
   (``backlog_reachability.py`` owns the definition), and so are the
   attention-digest emit tails ``_emit_stalled_session_digest`` /
@@ -47,12 +47,13 @@ module below.
 from __future__ import annotations
 
 from dataclasses import asdict
+from functools import partial
 from typing import Any
 
 import charlie_work.workflow as _wf
 from charlie_work.command_result import CommandResult
 from charlie_work import worker_fate
-from charlie_work.worker_pid_stamp import stamp_worker_process
+import charlie_work.worker_launch_outcome as worker_launch_outcome
 from charlie_work.worker_launch_gate import (
     REASON_PROVIDER_THROTTLED,
     FleetLaunchLock,
@@ -67,11 +68,6 @@ from charlie_work.backlog_reachability import (
 )
 from charlie_work.ci_findings import check_dispatch_staleness
 from charlie_work.citation_check import CitationVerdict
-from charlie_work.config import (
-    DETERMINISTIC_ESCALATION_FAILURE_KINDS,
-    DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS,
-    PRE_LAUNCH_BLOCKED_ENVIRONMENT_FAILURE_KINDS,
-)
 from charlie_work.cross_repo_gate import (
     CrossRepoGateResult,
     cross_repo_gate,
@@ -84,8 +80,6 @@ from charlie_work.dead_worker_sweep.effects_sessions import (
 from charlie_work.dispatch_selection import (
     _MAX_DEFERRED_CONCURRENCY_EXAMPLES,
     _select_dispatch_candidates,
-    _windowed_blocked_environment_at,
-    _windowed_foreign_writer_reaps,
 )
 from charlie_work.live_session_count import WORKER_LANE, _ghost_pid_alive
 import charlie_work.fleet_provider_throttle as fleet_provider_throttle
@@ -1168,6 +1162,12 @@ def _dispatch_impl(
     manual = self.config.worker.harness == "manual"
     label_errors: list[int] = []
     label_error_failures: dict[int, str] = {}
+    record_label_error = partial(
+        worker_launch_outcome.record_label_error,
+        self.write_gate,
+        label_errors=label_errors,
+        label_error_failures=label_error_failures,
+    )
     # B6: fates the phantom-worker lane resolves, reported (rule-1 stale
     # evidence) once the lock below is released.
     phantom_fates: dict[int, list[worker_fate.WorkerFate]] = {}
@@ -1211,30 +1211,34 @@ def _dispatch_impl(
             # branch binds and consumes its own locals -- there is no
             # second enumeration left to drift out of sync with the first.
             # status/dispatched_at are the only values that still cross out
-            # of this chain (applied once, after it); every arm binds them
-            # unconditionally, so a future arm that forgets to set one is a
-            # possibly-unbound error at type-check time, not a silently
-            # stale value copied from prev_entry.
-            entry = {
-                **prev_entry,
-                "number": request.issue_number,
-                "title": full_issue.get("title"),
-                "url": full_issue.get("url"),
-                "branch_name": request.branch_name,
-                "prompt_path": str(request.prompt_path),
-            }
-            # Clear the claim timestamp on successful upgrade
-            entry.pop("dispatch_pending_at", None)
-            entry.pop("label_error", None)
+            # of this chain (applied after it; a success also records them in the
+            # shared call); every arm binds them unconditionally, so a future
+            # arm that forgets to set one is a possibly-unbound error at
+            # type-check time, not a silently stale value copied from prev_entry.
+            entry = worker_launch_outcome.launch_base_entry(
+                prev_entry,
+                issue_number=request.issue_number,
+                title=full_issue.get("title"),
+                url=full_issue.get("url"),
+                branch_name=request.branch_name,
+                prompt_path=request.prompt_path,
+            )
             if ok:
                 status = "manifest_written" if manual else "dispatched"
                 dispatched_at = _wf.utc_now()
-                # A successful recovery supersedes any previous orphan flag.
-                entry.pop("orphan_flagged_at", None)
-                entry.pop("orphan_drift_fingerprint", None)
-                entry.pop("orphan_drift_at", None)
+                # Store worker PID and process start time for state-based liveness
+                # detection (issue #207); the shared outcome also drops the orphan
+                # flags and the previous death's failure kind.
+                worker_launch_outcome.record_successful_launch(
+                    entry,
+                    status=status,
+                    dispatched_at=dispatched_at,
+                    result=next(
+                        (r for r in dispatch_results if r.issue_number == request.issue_number),
+                        None,
+                    ),
+                )
                 entry.pop("dispatch_failed_at", None)
-                _wf.clear_dead_worker_failure_kind(entry)
                 clear_escalation(entry)
                 clear_escalation_on_issue_prs(state, request.issue_number)
             elif is_live_worker:
@@ -1280,186 +1284,54 @@ def _dispatch_impl(
                 entry.pop("worker_pid", None)
                 entry.pop("worker_process_start_time", None)
             else:
-                # Issue #461: bound dispatch_failed retries with the same
-                # redispatch-window cap used for rework.
+                # Issues #461 / #1393 / #1423 / #515: a failed launch is recorded
+                # by the launch-outcome module, blocked-environment and generic
+                # branches alike; the lane declares how it differs from rework.
                 now = self.host.clock.now()
                 failed_result = next(
                     (r for r in dispatch_results if r.issue_number == request.issue_number),
                     None,
                 )
-                failure_kind = failed_result.failure_kind if failed_result is not None else None
-                # Issue #1393: a pre-launch environment block (e.g.
-                # worktree_foreign_writer) never started a worker session,
-                # so it must NOT count against the dispatch_failed cap
-                # (which measures worker output, not environment hygiene).
-                # Use a separate blocked_environment_at counter and
-                # escalate with the correct reason + blocking path after
-                # the same cap.
-                blocked_environment = failure_kind in PRE_LAUNCH_BLOCKED_ENVIRONMENT_FAILURE_KINDS
-                if blocked_environment:
-                    blocked_environment_at = _windowed_blocked_environment_at(
-                        entry,
-                        window_minutes=self.config.watchdog.redispatch_window_minutes,
-                    ) + [now.isoformat().replace("+00:00", "Z")]
-                    blocking_error = failed_result.error if failed_result else None
-                    entry["blocked_environment_at"] = blocked_environment_at
-                    if len(blocked_environment_at) > self.config.watchdog.max_auto_redispatch:
-                        # Issue #1423: before escalating a blocked-environment
-                        # cap exhaustion for a foreign writer, attempt to reap
-                        # it one more time. A writer that was active on earlier
-                        # passes but has since gone idle is reaped here instead
-                        # of escalating a zombie to a human. Escalation is
-                        # reserved for a writer that is alive *and* active.
-                        #
-                        # Review finding: bound the number of auto-reaps per
-                        # issue before falling back to escalation. Each
-                        # successful reap resets ``blocked_environment_at`` to
-                        # ``[]``, so without a separate cross-pass cap a
-                        # persistently-blocked worktree loops forever between
-                        # reap and redispatch. ``foreign_writer_reaps`` is a
-                        # windowed counter that survives the reset; once it
-                        # reaches ``max_foreign_writer_reaps`` the issue
-                        # escalates instead of reaping again.
-                        max_reaps = self.config.watchdog.max_foreign_writer_reaps
-                        prior_reaps = _windowed_foreign_writer_reaps(
-                            entry,
-                            window_minutes=self.config.watchdog.redispatch_window_minutes,
-                        )
-                        if len(prior_reaps) < max_reaps and _wf._try_reap_blocked_foreign_writer(
-                            failed_result,
-                            self.config,
-                            self.paths.state_file,
-                            request.issue_number,
-                            sessions_dir,
-                        ):
-                            entry["blocked_environment_at"] = []
-                            entry["foreign_writer_reaps"] = prior_reaps + [
-                                now.isoformat().replace("+00:00", "Z")
-                            ]
-                            status = "dispatch_failed"
-                            dispatched_at = None
-                            clear_escalation(entry)
-                            clear_escalation_on_issue_prs(state, request.issue_number)
-                            state = self._record_event(  # event-consumer: audit-only -- records a foreign-writer reap (issue #1423) already enforced by the blocked_environment_at reset and foreign_writer_reaps counter; consumed by tests/test_charlie_work.py regression tests.
-                                state,
-                                "dispatch_blocked_environment_reaped",
-                                {
-                                    "issue_number": request.issue_number,
-                                    "failure_kind": failure_kind,
-                                    "pid": failed_result.pid if failed_result else None,
-                                    "blocked_environment_count": len(blocked_environment_at),
-                                    "foreign_writer_reap_count": len(prior_reaps) + 1,
-                                },
-                            )
-                        else:
-                            status = "escalated"
-                            dispatched_at = None
-                            reason_class = "mechanical"
-                            state = _escalate_issue(
-                                state,
-                                request.issue_number,
-                                reason="dispatch_blocked_environment",
-                                reason_class=reason_class,
-                                issue_extra=entry,
-                            )
-                            entry = dict(state["issues"][str(request.issue_number)])
-                            state = self._record_event(
-                                state,
-                                "session_failed_escalated",
-                                {
-                                    "issue_number": request.issue_number,
-                                    "previous_status": "dispatch_pending",
-                                    "reason": "dispatch_blocked_environment",
-                                    "failure_kind": failure_kind,
-                                    "blocking_error": blocking_error,
-                                    "blocked_environment_count": len(blocked_environment_at),
-                                },
-                            )
-                    else:
-                        status = "dispatch_failed"
-                        dispatched_at = None
-                        clear_escalation(entry)
-                        clear_escalation_on_issue_prs(state, request.issue_number)
-                        state = self._record_event(  # event-consumer: audit-only -- records a pre-launch environment block (issue #1393) already enforced by the blocked_environment_at counter and the dispatch_blocked_environment escalation; consumed by tests/test_charlie_work.py regression tests.
-                            state,
-                            "dispatch_blocked_environment",
-                            {
-                                "issue_number": request.issue_number,
-                                "failure_kind": failure_kind,
-                                "blocking_error": blocking_error,
-                                "blocked_environment_count": len(blocked_environment_at),
-                            },
-                        )
-                else:
-                    all_attempts = list(prev_entry.get("dispatch_failed_at") or [])
-                    if not isinstance(all_attempts, list):
-                        all_attempts = []
-                    all_attempts.append(now.isoformat())
-                    recent = _wf._recent_dispatch_failed_attempts(
-                        {"dispatch_failed_at": all_attempts},
-                        now,
-                        self.config.watchdog.redispatch_window_minutes,
-                    )
-                    # Deterministic launch failures escalate immediately,
-                    # mirroring dispatch_rework's post-#550 behavior — fresh
-                    # dispatch previously only consulted the redispatch-window
-                    # cap, so e.g. a worktree_unsafe failure burned every
-                    # capped retry before a human ever heard about it.
-                    terminal_failure = (
-                        failed_result is not None
-                        and failed_result.failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
-                    )
-                    # Issue #807: a deterministic judgment failure escalates
-                    # immediately but as ``reason_class="judgment"``.
-                    deterministic_judgment = (
-                        failed_result is not None
-                        and failed_result.failure_kind
-                        in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
-                    )
-                    immediate_escalation = terminal_failure or deterministic_judgment
-                    entry["dispatch_failed_at"] = all_attempts
-                    if (
-                        immediate_escalation
-                        or len(recent) > self.config.watchdog.max_auto_redispatch
-                    ):
-                        status = "escalated"
-                        dispatched_at = None
-                        reason_class = "judgment" if deterministic_judgment else "mechanical"
-                        state = _escalate_issue(
-                            state,
-                            request.issue_number,
-                            reason=(
-                                failed_result.failure_kind
-                                if (
-                                    immediate_escalation
-                                    and failed_result is not None
-                                    and failed_result.failure_kind is not None
-                                )
-                                else "dispatch_failed_cap_exceeded"
-                            ),
-                            reason_class=reason_class,
-                            issue_extra=entry,
-                        )
-                        # Re-read the escalation fields _escalate_issue merged in,
-                        # but keep ``entry`` a decoupled copy: the mutations below
-                        # must not reach state until the single atomic write at the
-                        # end of this block.
-                        entry = dict(state["issues"][str(request.issue_number)])
-                    else:
-                        status = "dispatch_failed"
-                        dispatched_at = None
-                        clear_escalation(entry)
-                        clear_escalation_on_issue_prs(state, request.issue_number)
+                window_minutes = self.config.watchdog.redispatch_window_minutes
+                outcome = worker_launch_outcome.record_failed_launch(
+                    self.write_gate,
+                    state,
+                    entry,
+                    failed_result=failed_result,
+                    issue_number=request.issue_number,
+                    now=now,
+                    window_minutes=window_minutes,
+                    max_auto_redispatch=self.config.watchdog.max_auto_redispatch,
+                    max_reaps=self.config.watchdog.max_foreign_writer_reaps,
+                    try_reap=lambda: _wf._try_reap_blocked_foreign_writer(
+                        failed_result,
+                        self.config,
+                        self.paths.state_file,
+                        request.issue_number,
+                        sessions_dir,
+                    ),
+                    recent_attempts=lambda attempts: _wf._recent_dispatch_failed_attempts(
+                        {"dispatch_failed_at": attempts}, now, window_minutes
+                    ),
+                    rework=False,
+                    save_inline=False,
+                    clear_stale_escalation=True,
+                    escalation_carries_entry=True,
+                    z_stamps=False,
+                    restored_status="dispatch_failed",
+                    previous_status="dispatch_pending",
+                    cap_reason="dispatch_failed_cap_exceeded",
+                )
+                state = outcome.state
+                status = outcome.status
+                dispatched_at = None
+                reason_class = outcome.reason_class
+                # An escalation hands back the stored record; keep ``entry`` a
+                # decoupled copy so the mutations below do not reach state until
+                # the single atomic write at the end of this block.
+                entry = dict(outcome.entry) if reason_class is not None else outcome.entry
             entry["status"] = status
             entry["dispatched_at"] = dispatched_at
-            # Store worker PID and process start time for state-based liveness detection
-            # This allows recovery even when session sidecar files are orphaned (issue #207)
-            if ok:
-                result = next(
-                    (r for r in dispatch_results if r.issue_number == request.issue_number),
-                    None,
-                )
-                stamp_worker_process(entry, result)
             # Issue #1000: stamp the citation-drift fingerprint computed in
             # the outside-lock loop. The comment was already posted there
             # (best-effort); this persists the dedup marker so a still-stale
@@ -1529,19 +1401,7 @@ def _dispatch_impl(
                     state_path=self.paths.state_file,
                     repo=self.repo_root.name,
                 )
-                if result.outcome != TransitionOutcome.APPLIED:
-                    label_error = {
-                        "edge": target,
-                        "outcome": result.outcome.value,
-                        "add_failures": result.add_failures,
-                        "remove_failures": result.remove_failures,
-                    }
-                    entry["label_error"] = label_error
-                    label_errors.append(request.issue_number)
-                    label_error_failures[request.issue_number] = _wf._label_error_reason(
-                        label_error
-                    )
-                    _wf.save_state(self.paths.state_file, state)
+                record_label_error(state, entry, result, request.issue_number, target)
                 if is_live_worker:
                     result = next(
                         (r for r in dispatch_results if r.issue_number == request.issue_number),
@@ -1577,19 +1437,7 @@ def _dispatch_impl(
                     state_path=self.paths.state_file,
                     repo=self.repo_root.name,
                 )
-                if result.outcome != TransitionOutcome.APPLIED:
-                    label_error = {
-                        "edge": edge,
-                        "outcome": result.outcome.value,
-                        "add_failures": result.add_failures,
-                        "remove_failures": result.remove_failures,
-                    }
-                    entry["label_error"] = label_error
-                    label_errors.append(request.issue_number)
-                    label_error_failures[request.issue_number] = _wf._label_error_reason(
-                        label_error
-                    )
-                    _wf.save_state(self.paths.state_file, state)
+                record_label_error(state, entry, result, request.issue_number, edge)
 
         # Issue #1010: escalate issues blocked by the cross-repo pre-flight
         # gate. Their referenced file paths are all absent from the target
@@ -1654,18 +1502,9 @@ def _dispatch_impl(
                 repo=self.repo_root.name,
             )
             if result.outcome != TransitionOutcome.APPLIED:
-                label_error = {
-                    "edge": edge,
-                    "outcome": result.outcome.value,
-                    "add_failures": result.add_failures,
-                    "remove_failures": result.remove_failures,
-                }
                 escalated_entry = state["issues"].get(str(issue_number), {})
-                escalated_entry["label_error"] = label_error
                 state["issues"][str(issue_number)] = escalated_entry
-                label_errors.append(issue_number)
-                label_error_failures[issue_number] = _wf._label_error_reason(label_error)
-                _wf.save_state(self.paths.state_file, state)
+                record_label_error(state, escalated_entry, result, issue_number, edge)
 
         # Issue #1758: audit event for the cross-repo gate override valve.
         # The issue already skipped both gates during the network-call loop
@@ -1822,6 +1661,7 @@ def _dispatch_impl(
                 "merged_pr_flagged_issue_numbers": sorted(newly_flagged_mention_issues),
                 "merged_pr_mention_rearmed_issue_numbers": sorted(newly_rearmed_mention_issues),
                 "failures": dispatch_failure_map,
+                **launch_lock.event_fields(),
                 # Issue #944: why zero, when it is zero. Every other field
                 # here describes issues the ready-filtered query returned;
                 # this one describes the backlog that query cannot see.

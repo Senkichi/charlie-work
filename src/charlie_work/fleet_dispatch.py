@@ -86,7 +86,11 @@ from .notify_freshness import (
     resolve_fleet_notify,
 )
 from .paths import runtime_paths, worktree_roots
-from .pending_sync import heal_pending_sync_at_boot
+from .pending_sync import (
+    BOOT_SYNC_EXIT_REASON,
+    boot_sync_restart_result,
+    heal_pending_sync_at_boot,
+)
 from .repo_retirement import (
     entry_is_retired,
     retired_pass_disposition,
@@ -2664,7 +2668,7 @@ def _fleet_has_configured_repos(
 # reintroduces #862's downtime hole; one that forgets to set a reason reports
 # "unknown", which is visible in the exit event and the launcher log. #855's
 # zero-pass alarm also cannot currently tell these cases apart.
-RESTART_EXIT_REASONS = frozenset({"self_deploy", "head_drift"})
+RESTART_EXIT_REASONS = frozenset({"self_deploy", "head_drift", BOOT_SYNC_EXIT_REASON})
 
 # Exit reason for an honored ``fleet-pause.json`` flag (issue #1776). Not a
 # restart reason: a paused supervisor must stay down.
@@ -2791,8 +2795,8 @@ def _alert_watchdog_not_armed(
 ) -> None:
     """Surface a confirmed-disarmed watchdog on a restart-requesting exit.
 
-    Called from both restart break sites (``self_deploy`` and
-    ``head_drift``) only when :func:`probe_fleet_watchdog` returned
+    Called from every restart site (``self_deploy``, ``head_drift`` and
+    ``boot_sync``) only when :func:`probe_fleet_watchdog` returned
     ``armed=False``. Alerts through two channels that are *not* the
     launcher log: the fleet attention digest (operator-facing, the same
     sink self-deploy failures use) and the fleet-level ``events.db``
@@ -2955,8 +2959,19 @@ def run_fleet_supervise(
             )
             if boot_repair.detail is not None:
                 logger.warning("Boot pending-sync repair: %s", boot_repair.detail)
-            elif boot_repair.synced:
+            if boot_repair.synced:
+                # Issue #2919: the sync replaced packages this process already imported;
+                # exit for a relaunch before loading config. Keyed on ``synced`` alone: a
+                # failed, deferred or no-op repair changed nothing and must not restart.
                 logger.info("Boot pending-sync repair: synced via %s", boot_repair.detected_via)
+                return boot_sync_restart_result(
+                    boot_repair,
+                    lock=lock,
+                    fleet_dir_override=fleet_dir_override,
+                    restart_exit_reasons=RESTART_EXIT_REASONS,
+                    probe_watchdog=probe_fleet_watchdog,
+                    alert_watchdog_not_armed=_alert_watchdog_not_armed,
+                )
 
         def _report_global_load_failure(exc: Exception) -> None:
             # Falling back to defaults silently is how a whole feature disappears

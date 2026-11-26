@@ -22,6 +22,7 @@ from _devin_shell_fixtures import (
     _install_fake_create_worktree,
     _write_fake_devin,
 )
+from _worktree_fixtures import _clone_repo, _git, _init_repo
 
 from charlie_work import devin_shell
 from charlie_work.devin_shell import launch_devin_session
@@ -157,73 +158,29 @@ def test_launch_devin_session_fetch_failure_yields_error_record_not_exception(
 
     This is a mutation gate: if RuntimeError is removed from the except tuple in
     launch_devin_session, this test will fail with an uncaught exception.
-    """
-    # Create a real git repo with an origin remote
-    remote_repo = tmp_path / "remote"
-    remote_repo.mkdir()
-    subprocess.run(
-        ["git", "init", "--initial-branch=main"],
-        cwd=remote_repo,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.email", "test@example.test"],
-        cwd=remote_repo,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test User"],
-        cwd=remote_repo,
-        check=True,
-        capture_output=True,
-    )
-    (remote_repo / "README.md").write_text("hello\n", encoding="utf-8")
-    subprocess.run(
-        ["git", "add", "README.md"],
-        cwd=remote_repo,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "commit", "-m", "initial commit"],
-        cwd=remote_repo,
-        check=True,
-        capture_output=True,
-    )
 
-    # Clone the remote repo to create a local repo with origin configured
+    Setup cost (issue #3014): the one-commit remote and its clone come from the
+    shared per-process git templates (``_init_repo`` / ``_clone_repo``) -- no git
+    process once warm -- instead of eight hand-run ``git`` spawns (only the
+    ``remote set-url`` that breaks ``origin`` still spawns). Process count is
+    what the test ledger's call-phase time tracks on the Windows runners (same
+    lever as #2569 and #3008). The real ``create_worktree`` fetch below is the
+    behavior under test and stays real.
+    """
+    # A one-commit ``main`` remote, and a clone of it with ``origin`` configured
+    # (the clone carries ``origin/HEAD``, which is what resolves ``base_ref=""``
+    # to ``origin/main`` and so triggers the fetch).
+    remote_repo = tmp_path / "remote"
     repo_root = tmp_path / "repo"
-    subprocess.run(
-        ["git", "clone", str(remote_repo), str(repo_root)],
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.email", "test@example.test"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test User"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-    )
+    _init_repo(remote_repo)
+    _clone_repo(remote_repo, repo_root)
 
     sessions_dir = tmp_path / "sessions"
     prompt_path = tmp_path / "prompt.md"
     prompt_path.write_text("do the thing", encoding="utf-8")
 
     # Break the origin remote to simulate a fetch failure
-    subprocess.run(
-        ["git", "remote", "set-url", "origin", "file:///nonexistent/path"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-    )
+    _git(repo_root, "remote", "set-url", "origin", "file:///nonexistent/path")
 
     # Call launch_devin_session with base_ref that triggers a fetch
     # Empty string resolves to origin/main, which will trigger the fetch in create_worktree
@@ -240,6 +197,10 @@ def test_launch_devin_session_fetch_failure_yields_error_record_not_exception(
     assert record.pid is None
     assert record.error is not None
     assert "worktree creation failed" in record.error
+    # The failure is the real base-ref fetch, not some other RuntimeError out of
+    # create_worktree: pins that the template-built repos still resolve
+    # ``base_ref=""`` to ``origin/main`` and reach the fetch.
+    assert "Failed to fetch base ref" in record.error
     assert record.worktree_path == ""
 
     # Verify the sidecar was written with the error

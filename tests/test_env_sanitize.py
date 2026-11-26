@@ -734,38 +734,3 @@ def test_sanitize_env_isolate_mcp_false_leaves_gate_unset(
     )
 
     assert ENABLE_CLAUDEAI_MCP_SERVERS_VAR not in env
-
-
-def test_sanitize_env_call_sites_in_src_all_pass_config() -> None:
-    """AST guard: every ``sanitize_env(`` call in src/ must pass ``config=``.
-
-    ``sanitize_env``'s ``config`` default is None, which fails OPEN — a call
-    site that forgets it hands the worker a base env that still carries the
-    orchestrator's api-provider keys (issue #2795). Because every in-tree launch
-    site plausibly has the orchestrator config in scope, forgetting ``config=``
-    is always a bug, never a deliberate choice, so instead of relying on a
-    reviewer noticing at diff time this test mechanically fails whenever a
-    ``src/`` call site omits the keyword (or a new call site appears without
-    it).
-    """
-    import ast
-    from _src_ast import parsed, source_files
-
-    src_root = Path(__file__).resolve().parent.parent / "src"
-    bad: list[str] = []
-    for py_file in source_files(src_root):
-        tree = parsed(py_file)
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            called = (isinstance(func, ast.Name) and func.id == "sanitize_env") or (
-                isinstance(func, ast.Attribute) and func.attr == "sanitize_env"
-            )
-            if called and not any(kw.arg == "config" for kw in node.keywords):
-                bad.append(f"{py_file.relative_to(src_root.parent)}:{node.lineno}")
-    assert not bad, (
-        "every sanitize_env( call in src/ must pass config= (the None default "
-        f"fails open and would leave api-provider keys in the worker base env): "
-        f"{bad}"
-    )

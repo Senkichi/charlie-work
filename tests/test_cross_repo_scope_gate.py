@@ -374,7 +374,7 @@ def _cross_repo_dead_session(tmp_path: Path, wt_scratch: Path) -> _CrossRepoDead
     a real ``git clone`` writes, so the call-phase ``inspect_worktree_state``
     would pay the ``remote set-head --auto`` heal (two extra spawns) to
     resolve the ``""`` base_ref. The heal path itself stays covered by
-    tests/test_base_branch.py and tests/test_worktree.py.
+    tests/test_base_branch.py and tests/test_worktree_base_ref.py.
     """
     remote, repo_root = _init_bare_remote_and_clone(wt_scratch / "repo")
     _git(

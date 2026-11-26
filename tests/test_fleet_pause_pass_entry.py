@@ -24,6 +24,7 @@ import argparse
 import ast
 import json
 import logging
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -200,6 +201,23 @@ def _derive_pass_running_commands() -> set[tuple[str, ...]]:
     return found
 
 
+# The derivation re-walks ``cli``'s call graph and every sibling module it
+# reaches (~5s plain, more under the nightly's coverage tracer); the four
+# structural tests below all need the identical set. Compute it once per pytest
+# process -- the walk reads only ``_src_ast``-cached trees, which the session
+# guard keeps immutable, so the answer cannot change mid-run. Same per-process
+# memo shape as ``test_fleet_repo_retirement_guard._lane_scopes`` (#3056).
+_PASS_RUNNING_COMMANDS: set[tuple[str, ...]] | None = None
+
+
+def _pass_running_commands() -> set[tuple[str, ...]]:
+    """``_derive_pass_running_commands()`` computed once per pytest process."""
+    global _PASS_RUNNING_COMMANDS
+    if _PASS_RUNNING_COMMANDS is None:
+        _PASS_RUNNING_COMMANDS = _derive_pass_running_commands()
+    return _PASS_RUNNING_COMMANDS
+
+
 def _leaf_commands(
     parser: argparse.ArgumentParser, prefix: tuple[str, ...] = ()
 ) -> Iterator[tuple[tuple[str, ...], argparse.ArgumentParser]]:
@@ -233,21 +251,39 @@ def _consults_pause_flag(module_stem: str, fn_name: str) -> bool:
 
 def test_derivation_finds_the_entrypoints_named_in_the_issue() -> None:
     """Positive control: an empty/short derived set would make the guard below vacuous."""
-    derived = _derive_pass_running_commands()
+    derived = _pass_running_commands()
     assert {("fleet", "bash-rats"), ("bash-rats",), ("fleet", "work"), ("work",)} <= derived
     assert ("fleet", "supervise") in derived  # the walk sees the already-guarded one too
 
 
 def test_derivation_does_not_flag_commands_that_run_no_pass() -> None:
     """Negative control: the walk discriminates; it is not "everything"."""
-    derived = _derive_pass_running_commands()
+    derived = _pass_running_commands()
     for path in (("fleet", "status"), ("fleet", "pause"), ("fleet", "resume"), ("roll-call",)):
         assert path not in derived
 
 
+def test_the_pass_running_derivation_is_computed_once_per_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The four structural tests share one derivation; a recompute here means the memo went."""
+    derivations: list[None] = []
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_derive_pass_running_commands",
+        lambda: derivations.append(None) or set(),
+    )
+    monkeypatch.setattr(sys.modules[__name__], "_PASS_RUNNING_COMMANDS", None)
+
+    _pass_running_commands()
+    _pass_running_commands()
+
+    assert len(derivations) == 1
+
+
 def test_every_pass_running_command_is_gated() -> None:
     """A command reaching a pass primitive needs the shared gate or its own flag check."""
-    derived = _derive_pass_running_commands()
+    derived = _pass_running_commands()
     marked = _marked_commands()
     self_guarded = {
         path for path, (module, fn) in SELF_GUARDED.items() if _consults_pause_flag(module, fn)
@@ -261,7 +297,7 @@ def test_every_pass_running_command_is_gated() -> None:
 
 def test_marker_is_only_on_commands_that_run_a_pass() -> None:
     """A stale marker would add `--ignore-pause` to a command the gate has no business on."""
-    assert _marked_commands() <= _derive_pass_running_commands()
+    assert _marked_commands() <= _pass_running_commands()
 
 
 def test_self_guarded_commands_do_not_also_carry_the_shared_gate() -> None:

@@ -19,6 +19,7 @@ either way, so they do NOT move in this leaf.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -48,9 +49,15 @@ from ci_fleet.github import GitHubError
 # bare global.
 from .. import layout
 from ..github_transport.json_read import JsonRead
+from ..github_transport.outcome import Response
 from ..github_transport.request import RestRequest
+from ..outbound_body_guard import (
+    OutboundBodyGuardError,
+    check_outbound_write,
+)
 from ._base import CapabilityCollaborator, GitHubRunResult, _LIST_LIMIT
-from ._send import read_json, send_text
+from ._outcome import failure_text, is_success, number_from_response
+from ._send import read_json, send, send_text
 from .issue_list_rest import (
     emit_fallback,
     fetch_open_issues,
@@ -248,7 +255,7 @@ def get_github_issue_dependencies(gh: GitHubLike, issue_number: int) -> list[int
 
 @runtime_checkable
 class IssuesLike(Protocol):
-    """Structural interface for issue read/close/dependency operations."""
+    """Structural interface for issue read/close/write/dependency operations."""
 
     def close_issue(self, number: int) -> bool: ...
 
@@ -259,6 +266,10 @@ class IssuesLike(Protocol):
     def issue_dependencies(self, issue_numbers: list[int]) -> dict[int, list[int]]: ...
 
     def are_issues_open(self, issue_numbers: list[int]) -> set[int]: ...
+
+    def create_issue(self, title: str, body: str, labels: Sequence[str] = ()) -> int | None: ...
+
+    def edit_issue_body(self, number: int, body: str) -> bool: ...
 
 
 class Issues(CapabilityCollaborator):
@@ -594,3 +605,105 @@ class Issues(CapabilityCollaborator):
             deps = get_github_issue_dependencies(self, number)
             result[number] = deps
         return result
+
+    def create_issue(self, title: str, body: str, labels: Sequence[str] = ()) -> int | None:
+        """Create a GitHub issue. Returns the new issue number, or ``None``.
+
+        Written for the foreman's Apply step (issue #3116, ADR-0010); nothing
+        calls it yet. Errors come back as values -- ``None`` on a transport
+        failure, on a secret-guard refusal, or in dry-run (a mutation returns
+        the failure value, not a fake number -- unlike ``pr_create``'s
+        historical ``0``, a made-up issue number is worse than no number).
+        The outbound secret guard (issue #1505) scans title and body before
+        anything leaves the process, exactly as ``pr_create`` does.
+        ``labels`` pass through verbatim: no label string is invented here.
+        """
+        if self.dry_run:
+            return None
+        try:
+            matches = check_outbound_write(
+                surface="create_issue",
+                parts=(("title", title), ("body", body)),
+                repo_root=self.repo_root,
+                state_dir=getattr(self.runtime, "state_dir", None),
+            )
+        except OutboundBodyGuardError as exc:
+            # Fail closed in this surface's vocabulary: a guard that cannot
+            # run is a guard that cannot pass text through.
+            logger.warning("gh issue create refused: %s", exc)
+            return None
+        if matches:
+            logger.warning(
+                "gh issue create refused: %d credential-pattern match(es) in outbound text",
+                len(matches),
+            )
+            return None
+        outcome = send(
+            self,
+            RestRequest.of(
+                "POST",
+                "repos/{owner}/{repo}/issues",
+                body={"title": title, "body": body, "labels": list(labels)},
+            ),
+        )
+        if not is_success(outcome):
+            logger.warning(
+                "issue create failed: %s",
+                failure_text(outcome).strip()[:500] or "(no detail)",
+            )
+            return None
+        assert isinstance(outcome, Response)
+        number = number_from_response(outcome)
+        if number is None:
+            logger.warning(
+                "issue create reported success but its response carried no issue number: %r",
+                outcome.body[:500],
+            )
+        return number
+
+    def edit_issue_body(self, number: int, body: str) -> bool:
+        """Replace issue ``number``'s body. Returns True on success.
+
+        The ``amend_issue`` counterpart of ``create_issue`` (issue #3116,
+        ADR-0010); PATCHes the issue's ``body`` field only. ``False`` on a
+        transport failure, a secret-guard refusal, or in dry-run -- the same
+        failure vocabulary as ``create_issue``. The guard scans the outgoing
+        body first: an edited body lands in the same visible edit history
+        the #694 incident made unrecoverable.
+        """
+        if self.dry_run:
+            return False
+        try:
+            matches = check_outbound_write(
+                surface="edit_issue_body",
+                parts=(("body", body),),
+                repo_root=self.repo_root,
+                state_dir=getattr(self.runtime, "state_dir", None),
+                issue_number=number,
+            )
+        except OutboundBodyGuardError as exc:
+            logger.warning("gh issue #%d body edit refused: %s", number, exc)
+            return False
+        if matches:
+            logger.warning(
+                "gh issue #%d body edit refused: %d credential-pattern match(es) in outbound text",
+                number,
+                len(matches),
+            )
+            return False
+        outcome = send(
+            self,
+            RestRequest.of(
+                "PATCH",
+                f"repos/{{owner}}/{{repo}}/issues/{number}",
+                body={"body": body},
+            ),
+        )
+        if not is_success(outcome):
+            logger.warning(
+                "issue #%d body edit failed: %s",
+                number,
+                failure_text(outcome).strip()[:500] or "(no detail)",
+            )
+            return False
+        return True

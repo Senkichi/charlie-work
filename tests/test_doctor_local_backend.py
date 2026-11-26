@@ -10,8 +10,12 @@ real client, and the positive controls use ``FakeDoctorGitHub`` doubles that
 keep the default ``publishes_pull_requests=True``.
 
 Sibling doctor-test seam: fixtures come from ``tests/_doctor_fixtures.py``;
-the small git/issue-file helpers are inlined here per this repo's convention
-of keeping each new test file self-contained (see test_local_review_ready.py).
+the repo is a copy of the per-process ``plain`` git template
+(``_worktree_fixtures._init_repo`` -> ``tests/_git_templates.py``) rather than
+a fresh ``git init`` + ``git commit`` per test -- two fewer process spawns in
+every test's ``call`` phase (issue #2966, the same remedy as #2387). The small
+issue-file helpers stay inlined here per this repo's convention of keeping each
+new test file self-contained (see test_local_review_ready.py).
 """
 
 from __future__ import annotations
@@ -21,9 +25,11 @@ import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 
+import _git_templates
 from charlie_work.config import AutoMergeConfig, LocalIssuesConfig, OrchestratorConfig
 from charlie_work.doctor import run_doctor
 from charlie_work.github import GitHubError
@@ -31,34 +37,8 @@ from charlie_work.local_issues import LocalFileGitHub
 from charlie_work.paths import runtime_paths
 from charlie_work.state import empty_state, save_state
 from _doctor_fixtures import FakeDoctorGitHub, _config, _write_workflow
-
-
-def _init_repo(repo_root: Path) -> None:
-    """A fresh git repo with one commit and NO origin remote."""
-    subprocess.run(
-        ["git", "init", "--initial-branch=main"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    subprocess.run(
-        [
-            "git",
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "--allow-empty",
-            "-m",
-            "chore: seed",
-        ],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+from _doctor_fixtures import _warm_plain_git_template  # noqa: F401  (module-scoped autouse)
+from _worktree_fixtures import _init_repo  # one-commit ``main`` repo, NO origin remote
 
 
 def _write_issue(issues_dir: Path, number: int, *, slug: str = "issue") -> Path:
@@ -90,6 +70,34 @@ def _local_gh(repo_root: Path, issues_dir: Path) -> LocalFileGitHub:
 
 def _by_name(checks):
     return {check.name: check for check in checks}
+
+
+@pytest.mark.skipif(
+    not _git_templates.reuse_enabled(),
+    reason="CI_FLEET_TEST_REUSE=off forces the fresh path; there is no template to pin",
+)
+def test_plain_git_template_warmed_by_module_setup(
+    _warm_plain_git_template: _git_templates.EnvKey | None,  # noqa: F811 (fixture by name)
+    tmp_path: Path,
+) -> None:
+    """Issue #3018 pin: the ``plain`` template is built at module setup, under the
+    fingerprint the ``call`` phase looks up, so no test here pays the cold build.
+
+    Fails if the warm-up is missing or fell back to the fresh path (the fixture then
+    returns ``None``), if it ran under a different ``GIT_CONFIG_*`` environment than
+    a test does (the template could never be looked up), or if ``_init_repo`` spawns
+    or builds a template anyway in the ``call`` phase.
+    """
+    assert _warm_plain_git_template is not None, "no plain template registered at module setup"
+    assert _warm_plain_git_template == _git_templates.env_fingerprint(), (
+        "module warm-up ran under a different env fingerprint than the call phase"
+    )
+    registry = _git_templates._REGISTRY
+    keys_before = set(registry._templates)
+    with mock.patch.object(subprocess, "Popen", wraps=subprocess.Popen) as popen:
+        _init_repo(tmp_path / "probe")
+    assert popen.call_count == 0, "the call phase spawned instead of copying the template"
+    assert set(registry._templates) == keys_before, "the call phase built a new template"
 
 
 def test_doctor_passes_on_healthy_local_file_repo(tmp_path: Path) -> None:

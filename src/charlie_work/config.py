@@ -65,6 +65,7 @@ from .config_validation import (
     unknown_sections_error,
     validate_section,
 )
+from .test_adequacy_globs import DEFAULT_TEST_PATH_GLOBS
 
 # Re-exported from the domain module (issue #763) for the same reason
 # ``RunnerAllocationConfig`` is re-exported from ``ci_fleet.config`` above:
@@ -385,6 +386,15 @@ class DispatchConfig:
     # so an operator adding or removing the label mid-flight takes effect on
     # the next pass.
     human_merge_labels: Annotated[tuple[str, ...], Typed, NotNull] = ()
+    # Issue #2920: required checks only the operator can clear (an approval-label
+    # gate), not a code push. When EVERY failed required check on a PR is listed
+    # here, that failure is the PR's sole janitor failure, and its bound issue carries
+    # a ``human_merge_labels`` label, review skips the ``request_changes`` verdict, the
+    # flake rerun and the rework worker, and parks the issue on
+    # ``agent:operator-queue`` directly (see ``operator_gated_route``). A name here
+    # only matters if it is also in ``auto_merge.required_checks``. Default empty:
+    # every failed required check routes to rework exactly as before.
+    operator_gated_checks: Annotated[tuple[str, ...], Typed, NotNull] = ()
     # Spec C2 (host_routing): this orchestrator's host name; None = every issue is local.
     host: Annotated[str | None, Typed, NonEmpty] = None
     default_host: Annotated[bool, Typed, NotNull] = True
@@ -405,10 +415,11 @@ class DispatchConfig:
     test_command: Annotated[str, Typed, NullIsDefault] = ""
     # Kill switch for the selector probe. On (default), a worker or rework prompt asks
     # ``ci-fleet select`` whether it can narrow anything before it tells the worker to
-    # run ``ci-fleet test``; a selector that can only answer ``full`` (stale or missing
-    # selection map) leaves the hand-picked targeted command in place, so the worker is
-    # not handed a serial run of the whole suite. Off skips the probe: the prompt trusts
-    # the static preconditions alone. See selection_wrapper.probe_selection.
+    # run ``ci-fleet test`` (once per pass per repo, not once per prompt); a selector
+    # that can only answer ``full`` (stale or missing selection map) leaves the
+    # hand-picked targeted command in place, so the worker is not handed a serial run
+    # of the whole suite. Off skips the probe: the prompt trusts the static
+    # preconditions alone. See selection_wrapper.probe_selection.
     worker_selection_probe: Annotated[bool, Typed, NullIsDefault] = True
     # Global concurrency governor: cap total live worker sessions across fresh,
     # rework, and recovery dispatch. Unset/0 preserves current unlimited behavior.
@@ -622,6 +633,7 @@ class DispatchConfig:
             "worker_prompt_comment_associations",
             "worker_prompt_excluded_comment_authors",
             "human_merge_labels",
+            "operator_gated_checks",
         ):
             value = getattr(self, field_name)
             normalized = (str(value),) if isinstance(value, str) else tuple(str(v) for v in value)
@@ -2215,12 +2227,9 @@ class TestAdequacyConfig:
 
     enabled: Annotated[bool, Typed] = False
     min_product_lines: Annotated[int, Typed, BoolTolerant] = 10
-    test_path_globs: Annotated[tuple[str, ...], Typed] = (
-        "tests/**",
-        "test_*.py",
-        "*_test.py",
-        "conftest.py",
-    )
+    # Issue #1707: root- and nested-layout, multi-language defaults live in
+    # ``test_adequacy_globs`` (one definition shared with ``CoverageProbeConfig``).
+    test_path_globs: Annotated[tuple[str, ...], Typed] = DEFAULT_TEST_PATH_GLOBS
     exempt_path_globs: Annotated[tuple[str, ...], Typed] = (
         "*.md",
         "docs/**",
@@ -2280,15 +2289,12 @@ class CoverageProbeConfig:
     enabled: Annotated[bool, Typed] = False
 
     # -- W3: branch-token-vs-test-add heuristic ------------------------------
-    # Path-classification defaults mirror TestAdequacyConfig's own, kept as
-    # an independent copy (not a shared reference) so the two gates can be
-    # configured separately without coupling.
-    test_path_globs: Annotated[tuple[str, ...], Typed] = (
-        "tests/**",
-        "test_*.py",
-        "*_test.py",
-        "conftest.py",
-    )
+    # Path-classification defaults mirror TestAdequacyConfig's own. The
+    # *default* is one shared immutable tuple (issue #1707: two hand-kept copies
+    # is how a fix to one silently missed the other); each config still
+    # overrides its own field independently, so the two gates stay separately
+    # configurable.
+    test_path_globs: Annotated[tuple[str, ...], Typed] = DEFAULT_TEST_PATH_GLOBS
     exempt_path_globs: Annotated[tuple[str, ...], Typed] = (
         "*.md",
         "docs/**",

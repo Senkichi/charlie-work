@@ -21,6 +21,7 @@ from .config import ApiWorkerConfig, OrchestratorConfig
 from .doctor_allocation import _check_runner_allocation
 from .doctor_config_drift import _check_aviator_required_checks, _check_triage_label_map
 from .doctor_cross_repo import _check_cross_repo_escalations
+from .doctor_external_checks import scan_dynamic_check_sources
 from .doctor_local_backend import _check_local_issue_backend
 from .doctor_worker_permissions import _check_claude_worker_permissions
 from .doctor_sync_starvation import _check_sync_starvation
@@ -1229,16 +1230,36 @@ def run_doctor(
     # replaced could pass a stale suffixed required-check entry against a
     # non-matrix job merely because a sibling workflow gained a matrix job.
     job_matrix_flags = workflow_job_matrix_flags(repo_root)
+    # Workflow shapes whose check names a static scan cannot read (issue #2316):
+    # derived from the same files as job_names, never configured by hand.
+    dynamic_check_sources = scan_dynamic_check_sources(repo_root)
     if publishes_prs and config.auto_merge.required_checks:
         if job_names:
             for required in config.auto_merge.required_checks:
                 kind = _check_name_match_kind(required, job_names)
                 if kind is None:
-                    add(
-                        f"check name: {required}",
-                        False,
-                        f"no job in .github/workflows/ reports this name; found: {sorted(job_names)}",
-                    )
+                    if dynamic_check_sources:
+                        # Issue #2316: no static job name matches, but a workflow
+                        # posts a check run itself or names a job by expression,
+                        # so the real context may exist only at run time -- and
+                        # the exact-match merge gate (checks.py) judges the PR's
+                        # real check runs, not this static scan. Unverifiable,
+                        # not wrong: warn instead of rejecting a working setup.
+                        add(
+                            f"check name: {required}",
+                            False,
+                            "no static job name in .github/workflows/ matches this "
+                            f"(found: {sorted(job_names)}), but "
+                            f"{dynamic_check_sources.describe()} -- doctor cannot verify "
+                            "this name statically; confirm it against a real PR's check runs",
+                            severity="warning",
+                        )
+                    else:
+                        add(
+                            f"check name: {required}",
+                            False,
+                            f"no job in .github/workflows/ reports this name; found: {sorted(job_names)}",
+                        )
                 elif kind == "exact":
                     add(f"check name: {required}", True, "matches a workflow job")
                 else:  # tolerance -- matrix-suffix or reusable-workflow delimiter

@@ -42,13 +42,15 @@ That is exactly the shape of bug that a test, and only a test, catches.
 
 from __future__ import annotations
 
+import ast
 import sqlite3
 import subprocess
 import sys
+import unicodedata
 from pathlib import Path
 
 import pytest
-from _src_ast import parsed, source_files
+from _src_ast import parsed, source_files, source_text
 
 # ---------------------------------------------------------------------------
 # The moved exception
@@ -619,10 +621,50 @@ def test_adapter_surface_matches_what_consumers_import() -> None:
     assert missing == []
 
 
+_ADAPTER_MODULE = "ci_fleet.charlie_work_adapter"
+
+# The one identifier every spelling of ``from ci_fleet.charlie_work_adapter
+# import ...`` must contain. The last component, not the dotted path: the
+# parser accepts ``ci_fleet . charlie_work_adapter`` and a backslash or
+# bracket continuation after the dot, none of which contain the dotted string.
+# Derived from ``_ADAPTER_MODULE`` so the gate and the matcher cannot name
+# different modules.
+_ADAPTER_MODULE_NEEDLE = _ADAPTER_MODULE.rpartition(".")[2]
+
+
+def _may_import_from_the_adapter(text: str) -> bool:
+    """Cheap, sound pre-filter: could ``text`` hold ``from <adapter> import ...``?
+
+    Issue #2969: this test parsed and ``ast.walk``-ed every file under
+    ``src/charlie_work`` (~510 files, ~625k nodes) to find the handful that
+    import from the adapter. A file whose text lacks the module's last
+    component cannot contain the import, so it need not be parsed -- the
+    ``source_text`` needle gate the other AST-scanning tests use.
+
+    Sound, not just fast: the parser NFKC-normalizes identifiers, so
+    ``from ci_fleet.charlie_work_adaptｅr import x`` (fullwidth ``e``) imports
+    the adapter although its raw text lacks the needle. This test exists to
+    catch a consumer the adapter forgot, so it must not fail open on that
+    spelling; non-ASCII text is normalized first (``str.isascii`` keeps the
+    common case free).
+    """
+    if not text.isascii():
+        text = unicodedata.normalize("NFKC", text)
+    return _ADAPTER_MODULE_NEEDLE in text
+
+
+def _adapter_imports(tree: ast.AST) -> list[str]:
+    """Every name imported by a ``from <adapter> import ...`` statement in ``tree``."""
+    return [
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == _ADAPTER_MODULE
+        for alias in node.names
+    ]
+
+
 def _names_imported_from_the_adapter() -> dict[str, str]:
     """Every name charlie_work imports from the adapter -> the file importing it."""
-    import ast
-
     import charlie_work
 
     # __path__, not __file__: the latter is typed ``str | None`` and is None for
@@ -632,14 +674,14 @@ def _names_imported_from_the_adapter() -> dict[str, str]:
 
     found: dict[str, str] = {}
     for path in source_files(root):
+        if not _may_import_from_the_adapter(source_text(path)):
+            continue
         try:
             tree = parsed(path)
         except SyntaxError:  # pragma: no cover - a broken tree is a different failure
             continue
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and node.module == "ci_fleet.charlie_work_adapter":
-                for alias in node.names:
-                    found.setdefault(alias.name, path.name)
+        for name in _adapter_imports(tree):
+            found.setdefault(name, path.name)
     return found
 
 
@@ -674,3 +716,57 @@ def test_adapter_exports_every_name_the_consumers_import() -> None:
     missing = {n: f for n, f in sorted(imported.items()) if not hasattr(charlie_work_adapter, n)}
 
     assert missing == {}, f"consumers import names the adapter does not export: {missing}"
+
+
+# Every spelling of the import the parser resolves to the adapter module, and
+# the names the real matcher finds in it. The gate in front of the matcher must
+# admit all of them: a file it wrongly skips is a consumer the test above never
+# sees, which passes silently -- the failure this whole test exists to prevent.
+_ADAPTER_IMPORT_SPELLINGS = {
+    "plain": ("from ci_fleet.charlie_work_adapter import a, b\n", ["a", "b"]),
+    "spaced_dot": ("from ci_fleet . charlie_work_adapter import a\n", ["a"]),
+    "continued_after_dot": ("from ci_fleet.\\\n    charlie_work_adapter import a\n", ["a"]),
+    "parenthesised": (
+        "from ci_fleet.charlie_work_adapter import (\n    a,\n    b,\n)\n",
+        ["a", "b"],
+    ),
+    "non_ascii_file": ("# café\nfrom ci_fleet.charlie_work_adapter import a\n", ["a"]),
+    # Fullwidth ``e``: NFKC-normalizes to ``e``, so the parser reads the adapter
+    # module while the raw text lacks the needle.
+    "fullwidth_identifier": ("from ci_fleet.charlie_work_adaptｅr import a\n", ["a"]),
+}
+
+
+@pytest.mark.parametrize(
+    "source, expected", _ADAPTER_IMPORT_SPELLINGS.values(), ids=list(_ADAPTER_IMPORT_SPELLINGS)
+)
+def test_adapter_text_gate_never_drops_a_file_the_ast_matcher_finds(
+    source: str, expected: list[str]
+) -> None:
+    """``_may_import_from_the_adapter`` admits every file ``_adapter_imports`` finds in."""
+    # Measure the matcher first, so the gate is compared with what the parser
+    # actually resolves rather than with this table's labels.
+    assert _adapter_imports(ast.parse(source)) == expected
+
+    assert _may_import_from_the_adapter(source) is True
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import os\nx = 1\n",
+        "from ci_fleet.provenance import check_provenance\n",
+        "# café -- nothing here imports the adapter\n",
+    ],
+)
+def test_adapter_text_gate_still_skips_unrelated_files(source: str) -> None:
+    """The gate filters: a file with no mention is skipped, so it is not `return True`."""
+    assert _adapter_imports(ast.parse(source)) == []
+
+    assert _may_import_from_the_adapter(source) is False
+
+
+def test_adapter_text_gate_needle_is_derived_from_the_matched_module() -> None:
+    """The gate and the matcher cannot drift onto different module names."""
+    assert _ADAPTER_MODULE.endswith(_ADAPTER_MODULE_NEEDLE)
+    assert "." not in _ADAPTER_MODULE_NEEDLE

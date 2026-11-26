@@ -1,0 +1,7 @@
+info
+# Issue #2917: loop() left slots of the wave unclaimed by the rework lane for
+# ready priority:critical fresh issues. Info, not warning: this is the intended
+# priority behavior, not a fault. The event exists so rework held back at the
+# concurrency cap ("deferred by concurrency cap") is attributable to the
+# critical issues it made room for, rather than reading as unexplained
+# starvation (the silence that hid #2902 behind the rework queue).

@@ -15,11 +15,25 @@ def _bump(ack: str, actor: str = "worker") -> Bump:
 @pytest.mark.parametrize(
     "ack,expected",
     [
-        ("https://example.test/issues/123", True),
-        ("http://example.test/pull/1", True),
-        ("#123", True),
-        ("owner/repo#123", True),
-        ("source:id", False),
+        # Issue #3077 ci-fleet dedupe: the report scored every non-empty row
+        # "equal" to the kept #123 leaf because all share identical line
+        # coverage (strip -> _ACK_SHAPE.match -> source_id group check) --
+        # coverage-equal is not assertion-equal, so per the issue each row is
+        # justified with a comment naming what it asserts that #123 does not.
+        # The merge/remove disposition was not taken: removing a parametrize
+        # leaf fails the collect-only gate (#1538), whose only waiver is the
+        # operator-applied collect-gate-exempt label.
+        ("https://example.test/issues/123", True),  # URL alternative -> True
+        ("http://example.test/pull/1", True),  # plain-http arm of https?://
+        ("#123", True),  # kept leaf: bare issue-ref alternative
+        ("owner/repo#123", True),  # non-empty [\w./-]* prefix on that alternative
+        ("source:id", False),  # source_id group -> shape-valid but NOT external
+        # Same source_id -> False arm as source:id, asserted on the two
+        # concrete self-ack spellings _ACK_SHAPE's spec comment names
+        # (baseline.py: a "dispatch-prompt id" and a "human handle"): a
+        # worker's dispatch-id ack and an interactive actor's handle ack
+        # (validate_bump's docstring cites "handle:operator") are the real
+        # inputs bump_ack_is_external exists to flag as non-external.
         ("dispatch:abc123", False),
         ("handle:senkichi", False),
         ("", False),

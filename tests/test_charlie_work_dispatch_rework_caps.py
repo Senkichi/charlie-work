@@ -18,6 +18,7 @@ from _fakes_github import FakeGitHub
 from _helpers import _init_git_repo
 from _rework_dispatch_fixtures import (
     _init_repo_with_remote_inline,
+    _rework_launch_at_redispatch_cap_app,
     _wg,
 )
 from _host_fixtures import host_probe
@@ -1175,3 +1176,24 @@ def test_dispatch_rework_no_op_reset_does_not_mask_genuine_stagnation(
     state = load_state(paths.state_file)
     assert state["issues"]["123"]["status"] == "escalated"
     assert state["issues"]["123"]["escalation_reason"] == "redispatch_cap_exceeded"
+
+
+def test_dispatch_rework_launch_at_redispatch_cap_keeps_launched_worker_entry(
+    tmp_path: Path, fake_host
+) -> None:
+    """Issue #3087: a rework launch that succeeds at the redispatch cap escalates, but its
+    Worker is live -- the record must carry this launch's process facts, branch and prompt."""
+    app, launcher = _rework_launch_at_redispatch_cap_app(
+        tmp_path, fake_host, pid=4242, process_start_time=1764000000.5
+    )
+
+    app.dispatch_rework()
+
+    request = launcher.calls[0][4][0]
+    issue = load_state(app.paths.state_file)["issues"]["123"]
+    assert issue["status"] == "escalated"
+    assert issue["escalation_reason"] == "redispatch_cap_exceeded"
+    assert len(issue["redispatch_at"]) == 3
+    assert (issue["worker_pid"], issue["worker_process_start_time"]) == (4242, 1764000000.5)
+    assert issue["branch_name"] == request.branch_name
+    assert issue["prompt_path"] == str(request.prompt_path)

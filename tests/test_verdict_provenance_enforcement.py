@@ -69,7 +69,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 import pytest
-from _src_ast import parsed, source_files
+from _src_ast import parsed, source_files, source_text
 
 from charlie_work.command_result import CommandResult
 from charlie_work.config import OrchestratorConfig
@@ -86,6 +86,15 @@ from _review_fixtures import (
     _make_dead_review_sidecar,
     _set_review_dispatched_state,
     _write_review_packet,
+)
+from _verdict_decision_scan import (
+    _RECORD_REVIEW_ATTRS,
+    _build_parent_map,
+    _enclosing_function,
+    _may_call_record_review,
+    _may_write_review_decision,
+    _review_decision_write_sites,
+    _write_site_supplies_provenance,
 )
 
 _SRC_ROOT = Path(__file__).resolve().parent.parent / "src" / "charlie_work"
@@ -426,9 +435,13 @@ def test_derived_from_prose_absent_from_verdict_provenance_surface() -> None:
 #      contains the "verdict_provenance" key literally (required by category
 #      1's own kwarg check upstream of this call), the write-site check below
 #      passes it on the merits rather than via a name-based carve-out.
+#
+# Issue #3038: the write-site scanner and both text gates live in
+# ``_verdict_decision_scan``: this file is over the file-size ratchet's cap
+# (issue #1442) and must not gain members, and issue #1284 forbids other
+# test modules from importing them here, so the shared machinery was
+# hoisted verbatim into ``tests/_verdict_decision_scan.py``.
 # ---------------------------------------------------------------------------
-
-_PROVENANCE_WRITER_EXEMPT_FUNCTIONS = frozenset({"merge_authorize"})
 
 
 def _nodes_outside_function_definition(tree: ast.AST, function_name: str) -> list[ast.AST]:
@@ -442,17 +455,21 @@ def _nodes_outside_function_definition(tree: ast.AST, function_name: str) -> lis
     return [n for n in ast.walk(tree) if id(n) not in skip]
 
 
+# ``record_local_review`` (issue #1844's no-remote lane) is the same
+# verdict-ingest contract under a different name -- required
+# verdict_provenance kwarg, same provenance literals -- so its call
+# sites are held to the identical mapping table. One tuple feeds both the
+# AST matcher and ``_may_call_record_review``'s text gate, so a name added
+# here cannot be matched by the one and dropped by the other.
+# (Issue #3038: both the tuple and the gate live in _verdict_decision_scan;
+# the comment here records the coupling the import preserves.)
 def _record_review_call_sites(tree: ast.AST) -> list[ast.Call]:
     sites: list[ast.Call] = []
-    # ``record_local_review`` (issue #1844's no-remote lane) is the same
-    # verdict-ingest contract under a different name -- required
-    # verdict_provenance kwarg, same provenance literals -- so its call
-    # sites are held to the identical mapping table.
     for node in _nodes_outside_function_definition(tree, "record_review"):
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
-            and node.func.attr in ("record_review", "record_local_review")
+            and node.func.attr in _RECORD_REVIEW_ATTRS
         ):
             sites.append(node)
     return sites
@@ -470,133 +487,6 @@ def _call_supplies_provenance(call_node: ast.Call) -> bool:
     return False
 
 
-def _build_parent_map(tree: ast.AST) -> dict[int, ast.AST]:
-    parents: dict[int, ast.AST] = {}
-    for node in ast.walk(tree):
-        for child in ast.iter_child_nodes(node):
-            parents[id(child)] = node
-    return parents
-
-
-def _enclosing_function(node: ast.AST, parents: dict[int, ast.AST]) -> ast.AST | None:
-    current = parents.get(id(node))
-    while current is not None:
-        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            return current
-        current = parents.get(id(current))
-    return None
-
-
-def _dict_var_has_key(func_node: ast.AST, var_name: str, key: str) -> bool:
-    """True if ``var_name`` is ever assigned a Dict literal containing
-    ``key``, OR ever subscript-assigned that key directly (the
-    read-modify-write shape ``_update_approval_head`` uses: ``updated_decision
-    = dict(current_decision)`` followed by
-    ``updated_decision["verdict_provenance"] = "carried_forward"``).
-
-    Covers ``ast.AnnAssign`` as well as ``ast.Assign`` -- the annotated
-    binding ``decision_payload: dict[str, Any] = {...}`` is the same write
-    with a type annotation (issue #1844's ``record_local_review`` binds it
-    that way); an Assign-only walk would fail open on the rephrase."""
-    for node in ast.walk(func_node):
-        if isinstance(node, ast.AnnAssign):
-            if (
-                isinstance(node.target, ast.Name)
-                and node.target.id == var_name
-                and isinstance(node.value, ast.Dict)
-                and any(isinstance(k, ast.Constant) and k.value == key for k in node.value.keys)
-            ):
-                return True
-            continue
-        if not isinstance(node, ast.Assign):
-            continue
-        for target in node.targets:
-            if (
-                isinstance(target, ast.Name)
-                and target.id == var_name
-                and isinstance(node.value, ast.Dict)
-                and any(isinstance(k, ast.Constant) and k.value == key for k in node.value.keys)
-            ):
-                return True
-            if (
-                isinstance(target, ast.Subscript)
-                and isinstance(target.value, ast.Name)
-                and target.value.id == var_name
-                and isinstance(target.slice, ast.Constant)
-                and target.slice.value == key
-            ):
-                return True
-    return False
-
-
-def _write_site_supplies_provenance(call_node: ast.Call, func_node: ast.AST) -> bool:
-    if len(call_node.args) < 2:
-        return False
-    value_arg = call_node.args[1]
-    if isinstance(value_arg, ast.Dict):
-        return any(
-            isinstance(k, ast.Constant) and k.value == "verdict_provenance" for k in value_arg.keys
-        )
-    if isinstance(value_arg, ast.Name):
-        return _dict_var_has_key(func_node, value_arg.id, "verdict_provenance")
-    return False
-
-
-def _review_decision_write_sites(
-    tree: ast.AST,
-) -> tuple[list[tuple[str, ast.Call, ast.AST]], list[tuple[str, ast.Call, ast.AST]]]:
-    """Returns ``(checked_sites, exempted_sites)``.
-
-    Issue #1362 Stage 2: matches calls to ``record_decision`` -- the single
-    writer of review-decision.json -- rather than the old direct
-    ``self._write_json(decision_path, ...)`` call sites (all four of which
-    were converted to call ``record_decision`` instead). No separate
-    "does this resolve to a review-decision.json path" check is needed the
-    way the old scan required one: ``record_decision`` writes nothing else,
-    so the function name alone scopes every match correctly.
-
-    Issue #1650: receiver-agnostic, mirroring WriteGate R9's
-    ``_primitive_name`` in ``tests/test_write_gate_enforcement.py``. A call
-    is matched whether it is a bare ``Name`` (``record_decision(...)``) or
-    an ``Attribute`` whose ``.attr == "record_decision"``
-    (``_wf.record_decision(...)``). The #1627 ``_wf.`` namespace rebind that
-    moved bodies apply must NOT hide a write site from this scan -- the
-    prior receiver-sensitive (``ast.Name``-only) matcher silently dropped
-    ``_wf.record_decision(...)`` calls from coverage, and the guard still
-    passed (fewer sites to check), so the erosion was silent.
-
-    Exempted sites are *collected*, not silently skipped, because the
-    exemption in ``_PROVENANCE_WRITER_EXEMPT_FUNCTIONS`` matches by function
-    *name*, not identity. Matching by name alone fails open: a future
-    function anywhere under ``_SRC_ROOT`` that happens to be named
-    ``merge_authorize`` would silently inherit the exemption and could write
-    review-decision.json with no provenance while this scanner stays green.
-    Returning the exempted sites lets the caller assert the exemption still
-    resolves to exactly the one known, deliberate exclusion instead of
-    trusting the name match blindly.
-    """
-    parents = _build_parent_map(tree)
-    checked: list[tuple[str, ast.Call, ast.AST]] = []
-    exempted: list[tuple[str, ast.Call, ast.AST]] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or len(node.args) < 2:
-            continue
-        func = node.func
-        is_record_decision = (isinstance(func, ast.Name) and func.id == "record_decision") or (
-            isinstance(func, ast.Attribute) and func.attr == "record_decision"
-        )
-        if not is_record_decision:
-            continue
-        func_node = _enclosing_function(node, parents)
-        if func_node is None:
-            continue
-        if func_node.name in _PROVENANCE_WRITER_EXEMPT_FUNCTIONS:
-            exempted.append((func_node.name, node, func_node))
-        else:
-            checked.append((func_node.name, node, func_node))
-    return checked, exempted
-
-
 def test_every_record_review_call_site_and_review_decision_writer_supplies_provenance() -> None:
     offenders: list[str] = []
     scanned_call_sites: list[str] = []
@@ -604,22 +494,32 @@ def test_every_record_review_call_site_and_review_decision_writer_supplies_prove
     exempted_write_sites: list[str] = []
 
     for path in source_files(_SRC_ROOT):
-        tree = parsed(path)
+        # Issue #3038: the same per-file text gates the AC1 scan got in
+        # issue #2931, one per scanner half. A file whose text names neither
+        # a record_review attribute nor record_decision cannot hold a call
+        # site either scan matches, so it is not parsed or walked; the
+        # needle rules above are NFKC-sound (see their docstrings), and the
+        # positive controls below are the evidence the gates drop nothing.
+        text = source_text(path)
+        tree: ast.AST | None = None
+        if _may_call_record_review(text):
+            tree = parsed(path)
+            for call in _record_review_call_sites(tree):
+                scanned_call_sites.append(f"{path.name}:{call.lineno}")
+                if not _call_supplies_provenance(call):
+                    offenders.append(f"{path.name}:{call.lineno} record_review() call site")
 
-        for call in _record_review_call_sites(tree):
-            scanned_call_sites.append(f"{path.name}:{call.lineno}")
-            if not _call_supplies_provenance(call):
-                offenders.append(f"{path.name}:{call.lineno} record_review() call site")
-
-        checked_sites, exempt_sites = _review_decision_write_sites(tree)
-        for func_name, call, _func_node in checked_sites:
-            scanned_write_sites.append(f"{path.name}:{call.lineno} ({func_name})")
-            if not _write_site_supplies_provenance(call, _func_node):
-                offenders.append(
-                    f"{path.name}:{call.lineno} {func_name}() review-decision.json write"
-                )
-        for func_name, call, _func_node in exempt_sites:
-            exempted_write_sites.append(f"{path.name}:{call.lineno} ({func_name})")
+        if _may_write_review_decision(text):
+            write_tree = tree if tree is not None else parsed(path)
+            checked_sites, exempt_sites = _review_decision_write_sites(write_tree)
+            for func_name, call, _func_node in checked_sites:
+                scanned_write_sites.append(f"{path.name}:{call.lineno} ({func_name})")
+                if not _write_site_supplies_provenance(call, _func_node):
+                    offenders.append(
+                        f"{path.name}:{call.lineno} {func_name}() review-decision.json write"
+                    )
+            for func_name, call, _func_node in exempt_sites:
+                exempted_write_sites.append(f"{path.name}:{call.lineno} ({func_name})")
 
     # Positive control: the scan must actually find the known call/write
     # sites, or an empty offenders list below would be indistinguishable
@@ -683,21 +583,22 @@ def test_every_record_review_call_site_and_review_decision_writer_supplies_prove
     # the exemption census -- so a silent drop (the _wf. form evading the
     # receiver-sensitive matcher) could not be caught. Pinning the total
     # means a future drop fails loudly instead of eroding coverage quietly.
-    # Today there are exactly 10 sites: 9 checked (two in review in
-    # workflow.py -- the #1695 archive-before-void write and the
-    # pending-stub write -- plus _update_approval_head in
-    # state_approval.py, record_review in state_record_review.py, two
-    # sites in unescalate() in state_operator_commands.py -- issue
-    # #1765 finding 1's own archive-before-void write and pending-stub
-    # write, the same two-call pattern review() already uses, applied here
-    # to void a still-valid terminal verdict before re-arming a PR -- and
-    # three in orchestration/local_lanes.py for issue #1844's local
-    # (no-remote) lane: _local_build_packet's archive-before-void write and
-    # pending-stub write (the same two-call pattern, applied to the local
-    # review packet) plus record_local_review's verdict write, which
-    # mirrors record_review's) + 1 exempted (merge_authorize in
-    # state_operator_commands.py).
-    assert len(scanned_write_sites) + len(exempted_write_sites) == 10, {
+    # Today there are exactly 9 sites: 8 checked (two in review() in workflow.py --
+    # the #1695 archive-before-void write and the pending-stub write -- plus
+    # _update_approval_head in state_approval.py, two sites in unescalate() in
+    # state_operator_commands.py -- issue #1765 finding 1's own archive-before-void
+    # write and pending-stub write, the same two-call pattern review() already uses,
+    # applied here to void a still-valid terminal verdict before re-arming a PR --
+    # _local_build_packet's two sites in orchestration/local_lanes.py for issue
+    # #1844's Local path, and the one verdict write in
+    # verdict_recording.write_decision_round) + 1 exempted (merge_authorize in
+    # state_operator_commands.py). Issue #3102 merged record_review's and
+    # record_local_review's verdict writes (previously one each, in
+    # state_record_review.py and local_lanes.py) into that single writer, so the
+    # census fell from 10 to 9; the new site is checked on the merits (its payload
+    # dict literally carries "verdict_provenance") and the exemption census above is
+    # unchanged.
+    assert len(scanned_write_sites) + len(exempted_write_sites) == 9, {
         "checked": scanned_write_sites,
         "exempted": exempted_write_sites,
     }
@@ -811,6 +712,12 @@ def test_record_review_call_sites_map_to_expected_provenance_literal() -> None:
     actual: dict[tuple[str, str], Counter[str]] = {}
 
     for path in source_files(_SRC_ROOT):
+        # Issue #2931: only the few files whose text names a record_review
+        # attribute can hold a site; skip parsing and walking the rest. The
+        # equality and total_sites controls below are the evidence that the
+        # gate drops nothing.
+        if not _may_call_record_review(source_text(path)):
+            continue
         tree = parsed(path)
         parents = _build_parent_map(tree)
         for call in _record_review_call_sites(tree):
@@ -852,6 +759,41 @@ def test_record_review_call_sites_map_to_expected_provenance_literal() -> None:
         sum(counter.values()) for counter in _EXPECTED_RECORD_REVIEW_PROVENANCE_BY_SITE.values()
     )
     assert total_sites == 11, _EXPECTED_RECORD_REVIEW_PROVENANCE_BY_SITE
+
+
+# Issue #2931: the text gate in the test above must never under-admit -- a
+# file it skips is a file whose call sites nobody checks. Each case pins the
+# gate against the AST matcher it fronts. The gate may over-admit (a file
+# that only mentions the name in a comment is parsed and found empty); these
+# cases are chosen where the two agree exactly, so ``is has_site`` also proves
+# the gate is not trivially True.
+@pytest.mark.parametrize(
+    ("source", "has_site"),
+    [
+        pytest.param("app.record_review(1)\n", True, id="record_review"),
+        pytest.param("app.record_local_review(1)\n", True, id="record_local_review"),
+        pytest.param("# — note\napp.record_review(1)\n", True, id="non_ascii_file"),
+        # The parser NFKC-normalizes identifiers: a fullwidth ``r`` is still a
+        # ``record_review`` attribute, though the raw text lacks the needle.
+        pytest.param("app.ｒecord_review(1)\n", True, id="fullwidth_identifier"),
+        pytest.param("app.record_decision(1)\n", False, id="other_attribute"),
+        pytest.param("def f():\n    return 1\n", False, id="unrelated"),
+    ],
+)
+def test_record_review_text_gate_never_drops_a_site_the_ast_matcher_finds(
+    source: str, has_site: bool
+) -> None:
+    # Control: the matcher sees what the case claims, so the gate is compared
+    # against a real positive/negative rather than against the author's label.
+    assert bool(_record_review_call_sites(ast.parse(source))) is has_site
+    assert _may_call_record_review(source) is has_site
+
+
+def test_record_review_text_gate_admits_every_attribute_name_the_matcher_accepts() -> None:
+    """Derived from ``_RECORD_REVIEW_ATTRS``, so a name added to the matcher
+    without the gate noticing is caught here, not by a silently shrunken scan."""
+    for attr in _RECORD_REVIEW_ATTRS:
+        assert _may_call_record_review(f"app.{attr}(1)\n"), attr
 
 
 # ---------------------------------------------------------------------------

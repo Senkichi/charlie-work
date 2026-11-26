@@ -75,6 +75,11 @@ HTTP_ETAG_CACHE_FILENAME = "http-etag-cache.json"
 # once-only baseline. Sibling of HTTP_ETAG_CACHE_FILENAME (same directory, same
 # atomic-write contract).
 ISSUE_STATE_UNRESOLVED_FILENAME = "issue-state-unresolved.json"
+# Issue #2921: the last "ci-fleet test is unavailable" answer ``worker_selection``
+# reported for the repo -- the durable change baseline that keeps the
+# ``worker_test_selection_*`` events to one row per change. Sibling of
+# ISSUE_STATE_UNRESOLVED_FILENAME (same directory, same atomic-write contract).
+WORKER_SELECTION_ANSWER_FILENAME = "worker-selection-answer.json"
 
 ISSUES_DIRNAME = "issues"
 PRS_DIRNAME = "prs"
@@ -253,6 +258,20 @@ def issue_state_unresolved_path(state_root: Path) -> Path:
     :func:`http_etag_cache_path` -- same directory, same atomic-write contract.
     """
     return state_root / ISSUE_STATE_UNRESOLVED_FILENAME
+
+
+def worker_selection_answer_path(state_root: Path) -> Path:
+    """Return the per-repo worker-selection answer baseline path under ``state_root``.
+
+    Issue #2921: ``worker_selection`` writes ``worker_test_selection_unavailable``
+    (or ``..._disabled``) when a rendered prompt cannot use ``ci-fleet test``.
+    Prompts are rendered for every candidate on every pass, so "once per change"
+    needs a record that outlives the pass. A sidecar rather than a ``state.json``
+    key because prompts render outside the state lock. Sibling of
+    :func:`issue_state_unresolved_path` -- same directory, same atomic-write
+    contract.
+    """
+    return state_root / WORKER_SELECTION_ANSWER_FILENAME
 
 
 def worktrees_dir(state_root: Path) -> Path:

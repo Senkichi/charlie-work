@@ -173,6 +173,7 @@ from .state import (
     mark_reviewer_quota_alerted,
     operator_claimed_issues,
     operator_queue_impact_baseline,  # noqa: F401  (deliberate re-export; issue #1768, used by moved L01 b3 delegates via _wf.)
+    read_state_snapshot,  # noqa: F401  (deliberate re-export; the sanctioned lock-free reader, issue #3141)
     record_operator_queue_impact_signature,  # noqa: F401  (deliberate re-export; issue #1768, used by moved L01 b3 delegates via _wf.)
     release_operator_claimed,  # noqa: F401  (deliberate re-export; used by moved L01 b4 delegates via _wf.)
     save_state,
@@ -249,6 +250,7 @@ from .review_empty_diff_route import (  # noqa: F401  (deliberate re-export)
     route_empty_diff_prs,
 )
 from .no_op_rework_body import _body_content_sha256  # noqa: F401  (deliberate re-export; reached via _wf. by orchestration/state_record_review.py)
+from .operator_gated_route import park_operator_gated_review
 
 # LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
 # below marks a deliberate re-export, not a lint concession.
@@ -721,22 +723,6 @@ def _dispatch_failure_reason(result: SessionDispatchResult) -> str:
     if result.failure_kind:
         return f"dispatch failed: {result.failure_kind}"
     return "dispatch failed"
-
-
-def _label_error_reason(label_error: dict[str, Any]) -> str:
-    """Format a persisted label_error dict into a short, human-readable reason."""
-    edge = label_error.get("edge", "unknown")
-    outcome = label_error.get("outcome", "unknown")
-    add_failures = label_error.get("add_failures") or []
-    remove_failures = label_error.get("remove_failures") or []
-    add_labels = [label for _issue, label in add_failures]
-    remove_labels = [label for _issue, label in remove_failures]
-    parts = [f"label transition '{edge}' {outcome}"]
-    if add_labels:
-        parts.append(f"add failures: {add_labels}")
-    if remove_labels:
-        parts.append(f"remove failures: {remove_labels}")
-    return "; ".join(parts)
 
 
 def _recent_dispatch_failed_attempts(
@@ -2887,6 +2873,21 @@ class OrchestratorApp:
             autofixed = autofix_body_closing_kw(self, pr, issue_number, verdict, checks)
             if autofixed is not None:  # #2108: body-only Lint failure, workers can't edit it
                 return autofixed
+            # Issue #2920: a check only the operator can clear is not a code failure --
+            # no rerun, request_changes or worker round can change it. Park it.
+            parked = park_operator_gated_review(
+                config=self.config,
+                state_file=self.paths.state_file,
+                write_gate=self.write_gate,
+                gh=self.gh,
+                pr=pr,
+                pr_number=pr_number,
+                issue=issue,
+                issue_number=issue_number,
+                verdict=verdict,
+            )
+            if parked is not None:
+                return _CommandResult(False, parked.message, parked.data)
             # Flake-aware debounce (issue #391): if the only blocker is a failed
             # required check and we have not yet retried the Actions run for this
             # head, trigger one automatic `gh run rerun --failed` and defer rework

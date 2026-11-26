@@ -679,6 +679,9 @@ def _escalation_scan_sources() -> list[str]:
         origin = getattr(module, "__file__", None)
         assert origin is not None, f"{module.__name__} has no __file__ to scan"
         sources.append(Path(origin).read_text(encoding="utf-8"))
+    # Issue #3103: the Verdict decision rules live at the package root, not in orchestration/.
+    verdict_rules = importlib.import_module("charlie_work.verdict_rules")
+    sources.append(Path(str(verdict_rules.__file__)).read_text(encoding="utf-8"))
     return sources
 
 

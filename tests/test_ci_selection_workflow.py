@@ -111,9 +111,11 @@ def test_other_shards_and_events_run_the_shard_unwrapped(
 def test_the_nightly_shard_runs_in_map_mode(tmp_path: Path) -> None:
     result, cmds = _shard(tmp_path, EVENT_NAME="schedule", GROUP="2")
     assert result.returncode == 0, result.stderr
+    # No --store-durations: map-mode timings must not balance the shards (#2924);
+    # the plain "Refresh test durations" step is the one writer.
     assert cmds == [
         "uv run --no-sync ci-fleet map prepare ctx=nightly",
-        f"{PYTEST.format(g=2)} --store-durations -p ci_fleet.selection.map_mode ctx=nightly",
+        f"{PYTEST.format(g=2)} -p ci_fleet.selection.map_mode ctx=nightly",
     ]
 
 
@@ -122,7 +124,7 @@ def test_a_dispatch_with_the_map_input_runs_in_map_mode(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert cmds == [
         "uv run --no-sync ci-fleet map prepare ctx=nightly",
-        f"{PYTEST.format(g=2)} --store-durations -p ci_fleet.selection.map_mode ctx=nightly",
+        f"{PYTEST.format(g=2)} -p ci_fleet.selection.map_mode ctx=nightly",
     ]
 
 
@@ -135,7 +137,7 @@ def test_a_dispatch_with_the_map_input_off_stays_unwrapped(tmp_path: Path) -> No
 def test_a_failed_map_prepare_still_runs_the_nightly_shard(tmp_path: Path) -> None:
     result, cmds = _shard(tmp_path, EVENT_NAME="schedule", FAKE_PREPARE_RC="1")
     assert result.returncode == 0, result.stderr
-    assert cmds[-1] == f"{PYTEST.format(g=1)} --store-durations ctx=nightly"
+    assert cmds[-1] == f"{PYTEST.format(g=1)} ctx=nightly"
     assert "::warning::" in result.stdout
 
 

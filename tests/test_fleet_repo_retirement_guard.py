@@ -29,9 +29,11 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+
 import charlie_work
 from charlie_work.fleet_registry import _iter_registered_repo_contexts, _select_repos
-from _src_ast import parsed, source_files
+from _src_ast import parsed, source_files, source_text
 
 PACKAGE_ROOT = Path(charlie_work.__file__).resolve().parent
 SELECTORS = {_select_repos.__name__, _iter_registered_repo_contexts.__name__}
@@ -145,26 +147,134 @@ def _has_retirement_evidence(node: ast.AST) -> bool:
     return bool(_direct_calls(node) & RETIREMENT_CALLS) or _branches_on_retired_field(node)
 
 
-def _lane_scopes() -> list[tuple[str, str, ast.AST, int]]:
-    """``(module, qualname, node, line)`` for every app-building per-repo scope."""
+def _app_building_scopes(module: str, tree: ast.AST) -> list[tuple[str, str, ast.AST, int]]:
+    """The app-building ``(module, qualname, node, line)`` scopes in one parsed tree.
+
+    One walk: attribute each Call to its innermost enclosing def. The
+    innermost-scope attribution is exactly what ``_direct_calls`` computes
+    for a def (a Call directly in the def, not inside a nested def), and
+    class scopes do not extend the qualname or swallow the calls in their
+    methods, so the reported ``(module, qualname, node, line)`` set matches
+    the previous two-walk-per-file version; see the #3040 ledger fix.
+    """
+    found: list[tuple[str, str, ast.AST, int]] = []
+
+    def visit(node: ast.AST, qualname: str, calls: set[str]) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            child_name = f"{qualname}.{node.name}" if qualname else node.name
+            inner: set[str] = set()
+            for child in ast.iter_child_nodes(node):
+                visit(child, child_name, inner)
+            if "_load_registry" in inner and "OrchestratorApp" in inner:
+                found.append((module, child_name, node, node.lineno))
+            return
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name):
+                calls.add(func.id)
+            elif isinstance(func, ast.Attribute):
+                calls.add(func.attr)
+        elif isinstance(node, ast.ClassDef):
+            # ``_direct_calls`` never descends into a class scope: calls
+            # written directly in a nested class body belong to no def.
+            for child in ast.iter_child_nodes(node):
+                visit(child, qualname, set())
+            return
+        for child in ast.iter_child_nodes(node):
+            visit(child, qualname, calls)
+
+    visit(tree, "", set())
+    return found
+
+
+def test_app_building_scopes_flags_only_the_innermost_def_and_never_a_class_body() -> None:
+    """Unit test of the single-pass walk: call attribution is per enclosing def.
+
+    The walk must attribute every ``Call`` to its innermost enclosing def --
+    a call inside a nested ``def`` belongs to that nested def alone and must
+    not leak into the enclosing ``def``'s call set (a leak would flag a lane
+    whose helpers only sit behind a nested helper); a call written directly
+    in a nested ``class`` body belongs to no ``def``; and a method inside a
+    class is still discovered as its own def, with the class name kept out
+    of the qualname -- the scope ``_direct_calls`` computes for the same
+    node must stay identical (#3040).
+    """
+    module = "unit_test_module"
+    tree = ast.parse(
+        "\n".join(
+            [
+                "def lane():",
+                "    _load_registry()",
+                "    OrchestratorApp(r)",
+                "",
+                "def owner():",
+                "    _load_registry()",
+                "    class Klass:",
+                "        OrchestratorApp(r)",
+                "",
+                "def outsider():",
+                "    def nested():",
+                "        _load_registry()",
+                "        OrchestratorApp(r)",
+                "",
+                "def host():",
+                "    class Prod:",
+                "        def build(self):",
+                "            _load_registry()",
+                "            OrchestratorApp(r)",
+            ]
+        )
+    )
+
+    found = _app_building_scopes(module, tree)
+
+    scopes = {(found_module, qualname) for found_module, qualname, _node, _line in found}
+    assert scopes == {
+        (module, "lane"),  # the plain positive: both helpers called directly
+        (module, "outsider.nested"),  # a nested def is its own scope, found there only
+        (module, "host.build"),  # methods inside a class are found, class names omitted
+    }, "call attribution leaked across a nested def or class boundary"
+
+
+def _scan_lane_scopes() -> list[tuple[str, str, ast.AST, int]]:
+    """``(module, qualname, node, line)`` for every app-building per-repo scope.
+
+    A scope needs ``_load_registry`` *and* ``OrchestratorApp`` as direct
+    call names, and ``_direct_calls`` reads those names only off
+    ``ast.Name`` ids and ``ast.Attribute`` attrs -- every such identifier
+    appears verbatim in the file text. A file missing either token cannot
+    hold a matching scope, so it is skipped before ``parsed()`` (the
+    sibling-filter shape of issue #2606's family; the residual -- an
+    identifier assembled from adjacent string literals -- is out of scope:
+    this guard does tripwire duty for accidental bypasses, not
+    adversarial ones).
+
+    One walk per file: see ``_app_building_scopes`` for the attribution.
+    """
     found: list[tuple[str, str, ast.AST, int]] = []
     for path in source_files(PACKAGE_ROOT):
+        text = source_text(path)
+        if "_load_registry" not in text or "OrchestratorApp" not in text:
+            continue
         tree = parsed(path)
-        module = _module_name(path)
-
-        def visit(node: ast.AST, scope: list[str]) -> None:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                calls = _direct_calls(node)
-                if "_load_registry" in calls and "OrchestratorApp" in calls:
-                    found.append((module, ".".join([*scope, node.name]), node, node.lineno))
-                for child in ast.iter_child_nodes(node):
-                    visit(child, [*scope, node.name])
-            else:
-                for child in ast.iter_child_nodes(node):
-                    visit(child, scope)
-
-        visit(tree, [])
+        found.extend(_app_building_scopes(_module_name(path), tree))
     return found
+
+
+_LANE_SCOPE_CACHE: list[tuple[str, str, ast.AST, int]] | None = None
+
+
+def _lane_scopes() -> list[tuple[str, str, ast.AST, int]]:
+    """``(module, qualname, node, line)`` for every app-building per-repo scope.
+
+    Scanned once per pytest process: the scan is one read-only walk per file
+    over the whole package, and three tests in this module consume the same
+    result (the trees come from ``_src_ast`` and are never mutated).
+    """
+    global _LANE_SCOPE_CACHE
+    if _LANE_SCOPE_CACHE is None:
+        _LANE_SCOPE_CACHE = _scan_lane_scopes()
+    return _LANE_SCOPE_CACHE
 
 
 def _scope_by_name(module: str, qualname: str) -> ast.AST:
@@ -201,16 +311,33 @@ def _scope_by_name(module: str, qualname: str) -> ast.AST:
     raise AssertionError(f"{module}:{qualname} not found -- update the guard's symbol")
 
 
-def test_scan_sees_the_known_lane() -> None:
+@pytest.fixture(scope="module")
+def lane_scopes() -> list[tuple[str, str, ast.AST, int]]:
+    """The app-building per-repo scope scan, shared by the module's consumers.
+
+    Scanning the package is the module's dominant cost and three of its
+    tests spend exactly the same scan, so they charge it to this module
+    fixture instead of repeating it per call (the accepted #2662/#2867/
+    #2875/#2882 remedy family; the scan now runs once per module instead
+    of up to three times). The scan's output is shared, read-only data:
+    the consumers only read/iterate it and never mutate the handed-out
+    trees (the ``_src_ast`` shared-tree discipline). The first consumer's
+    setup owns the scan; if it ever flags, ``ci-fleet ledger report
+    --section slow-fixtures`` is its owner.
+    """
+    return _lane_scopes()
+
+
+def test_scan_sees_the_known_lane(lane_scopes) -> None:
     """Positive control: the scan must find ``fleet_loop``'s app construction."""
-    scopes = {(module, scope) for module, scope, _node, _line in _lane_scopes()}
+    scopes = {(module, scope) for module, scope, _node, _line in lane_scopes}
     assert ("charlie_work.fleet_dispatch", "fleet_loop") in scopes
 
 
-def test_every_per_repo_lane_uses_retirement_aware_selection() -> None:
+def test_every_per_repo_lane_uses_retirement_aware_selection(lane_scopes) -> None:
     offenders = [
         f"{module}:{line} {scope}"
-        for module, scope, node, line in _lane_scopes()
+        for module, scope, node, line in lane_scopes
         if not (_direct_calls(node) & SELECTORS)
     ]
     assert not offenders, (
@@ -220,7 +347,7 @@ def test_every_per_repo_lane_uses_retirement_aware_selection() -> None:
     )
 
 
-def test_every_per_repo_lane_actually_checks_retirement() -> None:
+def test_every_per_repo_lane_actually_checks_retirement(lane_scopes) -> None:
     """Removing a lane's own skip/wind-down check must fail this guard.
 
     Selecting a retired repo through ``_select_repos`` only labels it; each
@@ -230,7 +357,7 @@ def test_every_per_repo_lane_actually_checks_retirement() -> None:
     """
     offenders = [
         f"{module}:{line} {scope}"
-        for module, scope, node, line in _lane_scopes()
+        for module, scope, node, line in lane_scopes
         if not _has_retirement_evidence(node)
     ]
     assert not offenders, (

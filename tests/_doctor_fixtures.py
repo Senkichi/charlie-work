@@ -11,6 +11,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
+
+import pytest
+
+import _git_templates
 from charlie_work.config import (
     ApiBudgetConfig,
     OrchestratorConfig,
@@ -20,6 +24,53 @@ from charlie_work.config import (
     ApiProviderConfig,
     ApiWorkerConfig,
 )
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _warm_plain_git_template(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> _git_templates.EnvKey | None:
+    """Charge the ``plain`` git-template cold build to module setup (issue #3018).
+
+    A doctor module that builds repos with ``_worktree_fixtures._init_repo``
+    copies a per-process template whose first use in an xdist worker runs a
+    five-spawn ``git`` build (``init``/``config``/``add``/``commit``); every later
+    use is a spawn-free copy. Whichever test reaches ``_init_repo`` first on a
+    worker paid that build inside its own ``call`` phase, which is what the
+    ledger flagged (0.28 s -> 1.33 s): not a change to the code under test, only
+    which test the cold build landed on. The ledger alerts on ``call_us`` and
+    reports ``setup_us`` separately, so materializing one scratch repo here moves
+    the build into ``setup`` and leaves every ``call`` a copy. When the template is
+    already warm this is one extra copy. Same remedy as #2565 / #2968.
+
+    Opt-in by import: this module's helpers are shared by every doctor test file,
+    and an autouse fixture only activates in a module that imports it by name.
+
+    ``TemplateRegistry`` keys templates by ``(shape, env_fingerprint())``, which
+    covers every ``GIT_*`` variable except ``GIT_CEILING_DIRECTORIES``. The
+    function-scoped autouse ``conftest._isolate_git_env`` sets the
+    ``GIT_CONFIG_*`` trio only *after* module fixtures run, so a warm-up without
+    it would register a template under a fingerprint no ``call`` ever looks up
+    and the build would still land in a test. The trio is applied through
+    ``_git_templates.GIT_CONFIG_ENV`` -- the mapping conftest itself reads, so the
+    two cannot drift -- in a ``MonkeyPatch`` context.
+
+    Returns the fingerprint under which a ``plain`` template is *verifiably
+    registered* when setup ends, not the one merely assumed: ``None`` under
+    ``CI_FLEET_TEST_REUSE=off`` (no registry to warm) or when the build fell back
+    to the fresh path, so a pin test cannot pass on a warm-up that built nothing.
+    """
+    if not _git_templates.reuse_enabled():
+        return None
+    from _worktree_fixtures import _init_repo
+
+    with pytest.MonkeyPatch.context() as mp:
+        for key, value in _git_templates.GIT_CONFIG_ENV.items():
+            mp.setenv(key, value)
+        _init_repo(tmp_path_factory.mktemp("plain-template-warmup") / "repo")
+        if _git_templates._REGISTRY.lookup("plain") is None:
+            return None
+        return _git_templates.env_fingerprint()
 
 
 def _write_workflow(repo_root: Path, body: str) -> None:

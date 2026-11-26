@@ -304,6 +304,61 @@ def test_bulk_create_time_map_absent_returns_none(
     assert pc._bulk_create_time_map() is None
 
 
+def test_optional_proc_times_returns_platform_callable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``cext.proc_times`` present: the seam hands the caller the fast C
+    reader itself. The issue #3168 review pin: a seam neutered to always
+    return ``None`` must fail loudly here rather than silently restoring
+    the per-denied-ancestor ``proc_info`` scan while the suite stays
+    green — every ``win32_ancestor_rows`` test pins the seam to ``None``
+    or a fake, so none of them can see the real resolution."""
+
+    def fake_proc_times(pid: int) -> tuple[float, float, float]:
+        return (0.0, 0.0, 1.0)
+
+    monkeypatch.setattr(
+        pc.psutil,
+        "_psplatform",
+        SimpleNamespace(cext=SimpleNamespace(proc_times=fake_proc_times)),
+        raising=False,
+    )
+
+    assert pc._optional_proc_times() is fake_proc_times
+
+
+def test_optional_proc_times_absent_without_psplatform(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No ``psutil._psplatform`` at all: ``None``, so the walk keeps its
+    ``create_time()`` fallback leg."""
+    monkeypatch.delattr(pc.psutil, "_psplatform", raising=False)
+
+    assert pc._optional_proc_times() is None
+
+
+def test_optional_proc_times_absent_without_cext(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A platform module shipping no ``cext`` attribute: ``None``."""
+    monkeypatch.setattr(pc.psutil, "_psplatform", SimpleNamespace(), raising=False)
+
+    assert pc._optional_proc_times() is None
+
+
+def test_optional_proc_times_absent_without_proc_times(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``cext`` present but shipping no ``proc_times``: ``None`` — the
+    ``create_time()`` fallback leg stays correct there (also the input the
+    ``_bulk_create_time_map`` absent case feeds the same seam)."""
+    monkeypatch.setattr(
+        pc.psutil, "_psplatform", SimpleNamespace(cext=SimpleNamespace()), raising=False
+    )
+
+    assert pc._optional_proc_times() is None
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows-only: real psutil snapshot")
 def test_win32_snapshot_real_reports_actual_parent() -> None:
     """Real psutil snapshot on Windows (issue #2353 review): assert the live
@@ -360,6 +415,15 @@ def _patch_win32_process(
     ``raising=False`` so the semantic pins still exercise the walk against
     code where the helper does not exist (the per-hop path) instead of
     erroring at patch time.
+
+    ``_optional_proc_times`` is pinned to ``None`` for the same reason:
+    the real ``cext.proc_times`` would read the host's stamp for a
+    fabricated pid, so these tests drive the ``create_time()`` fallback
+    leg. The fast leg has its own tests below, which patch the seam with a
+    fabricated ``proc_times``; the seam's real ``_psplatform`` resolution
+    has its own direct tests next to the ``_bulk_create_time_map`` block
+    (``test_optional_proc_times_*``), which is why pinning it here cannot
+    hide a neutered seam.
     """
     probes: list[int] = []
     monkeypatch.setattr(
@@ -373,6 +437,7 @@ def _patch_win32_process(
         lambda: {pid: row[0] for pid, row in rows.items()},
         raising=False,
     )
+    monkeypatch.setattr(pc, "_optional_proc_times", lambda: None, raising=False)
     return probes
 
 
@@ -493,6 +558,67 @@ def test_win32_ancestor_rows_falls_back_when_no_bulk_table(
     assert pc.win32_ancestor_rows(300) == {
         300: pc.ProcRow(200, 5.0),
         200: pc.ProcRow(100, 3.0),
+    }
+
+
+def test_win32_ancestor_rows_reads_stamps_via_proc_times(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #3168 regression pin: where ``cext.proc_times`` ships, each
+    hop's creation stamp comes from that fast call — never from
+    ``Process.create_time()``, whose permission-error fallback is
+    ``proc_info(pid)`` (a full ``NtQuerySystemInformation`` table walk per
+    denied ancestor, the ``kill_process_tree`` guard's residual ~1 s on a
+    busy host)."""
+    rows = {300: (200, 5.0), 200: (100, 3.0), 100: (1, 1.0)}
+    _patch_win32_process(monkeypatch, rows)
+
+    stamps = {300: 5.0, 200: 3.0, 100: 1.0}
+    proc_times_calls: list[int] = []
+
+    def fake_proc_times(pid: int) -> tuple[float, float, float]:
+        proc_times_calls.append(pid)
+        return (0.0, 0.0, stamps[pid])
+
+    monkeypatch.setattr(pc, "_optional_proc_times", lambda: fake_proc_times)
+
+    def forbidden_create_time(self: _FakePsutilProcess) -> float:
+        raise AssertionError(
+            "win32_ancestor_rows must not call Process.create_time() when "
+            "cext.proc_times is available -- its proc_info fallback is the "
+            "per-denied-ancestor cost this leg exists to avoid"
+        )
+
+    monkeypatch.setattr(_FakePsutilProcess, "create_time", forbidden_create_time)
+
+    assert pc.win32_ancestor_rows(300) == {
+        300: pc.ProcRow(200, 5.0),
+        200: pc.ProcRow(100, 3.0),
+        100: pc.ProcRow(1, 1.0),
+    }
+    assert proc_times_calls == [300, 200, 100]
+
+
+def test_win32_ancestor_rows_proc_times_denied_keeps_link(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``proc_times`` ``OSError`` (the denied-open leg) yields
+    ``created=None`` — the walk keeps the link, the same outcome the
+    ``proc_info`` fallback produced, without the table scan."""
+    rows = {300: (200, 5.0), 200: (100, 3.0), 100: (1, 1.0)}
+    _patch_win32_process(monkeypatch, rows)
+
+    def fake_proc_times(pid: int) -> tuple[float, float, float]:
+        if pid == 200:
+            raise PermissionError("Access is denied")
+        return (0.0, 0.0, rows[pid][1])
+
+    monkeypatch.setattr(pc, "_optional_proc_times", lambda: fake_proc_times)
+
+    assert pc.win32_ancestor_rows(300) == {
+        300: pc.ProcRow(200, 5.0),
+        200: pc.ProcRow(100, None),
+        100: pc.ProcRow(1, 1.0),
     }
 
 

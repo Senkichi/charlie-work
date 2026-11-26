@@ -63,8 +63,13 @@ def test_failure_is_nonfatal_and_emits_warning_event(monkeypatch, tmp_path) -> N
 
 
 def test_posix_is_noop(monkeypatch) -> None:
-    monkeypatch.setattr(cpp.os, "name", "posix")
-    assert cpp.raise_to_normal_priority().ok is True
+    # Bound to the call: a patch that outlives the body is still live when pytest-cov
+    # switches the coverage context for teardown, and on Windows a "posix" os.name makes
+    # coverage 7.17.1 raise there (issue #3010). tests/_os_name_guard.py enforces this.
+    with monkeypatch.context() as patched:
+        patched.setattr(cpp.os, "name", "posix")
+        result = cpp.raise_to_normal_priority()
+    assert result.ok is True
 
 
 def test_unexpected_exception_type_is_still_nonfatal(monkeypatch, tmp_path) -> None:

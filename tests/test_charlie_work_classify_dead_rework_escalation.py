@@ -380,7 +380,7 @@ def _completed_rework_scenario(tmp_path: Path) -> _CompletedReworkScenario:
     # extra spawns) to auto-resolve the "" base_ref. Stamp the symref once
     # here so the clone carries the shape a real clone has; the heal path
     # itself stays covered by tests/test_base_branch.py and
-    # tests/test_worktree.py.
+    # tests/test_worktree_base_ref.py.
     _git(
         repo_root,
         "symbolic-ref",

@@ -87,6 +87,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Generator, Mapping
 
+from .event_cursor import max_event_id  # noqa: F401  (deliberate re-export)
+
 logger = logging.getLogger(__name__)
 
 # Thread-local storage for the current correlation ID.
@@ -374,6 +376,17 @@ def _db_key(state_path: Path) -> str:
 def _jsonl_path(state_path: Path) -> Path:
     """Derive the legacy ``events.jsonl`` path from a ``state.json`` path."""
     return state_path.parent / "events.jsonl"
+
+
+def has_level_entry(kind: str) -> bool:
+    """True when ``kind`` has its own entry in the Event level registry.
+
+    Exact membership only: unlike ``_classify_level`` this does not inherit a
+    ``_sweep`` variant's base level and never defaults, so an unregistered kind is
+    ``False``. If the registry failed to load, ``_LEVEL_BY_KIND`` is empty and every
+    kind reports ``False`` (consumers see noise, not silence).
+    """
+    return kind in _LEVEL_BY_KIND
 
 
 def _classify_level(kind: str) -> str:
@@ -877,6 +890,7 @@ def _row_to_event(row: sqlite3.Row) -> dict[str, Any]:
         _warn_unreadable_payload(row["kind"], row["ts"], raw_payload)
         payload = {}
     return {
+        "id": row["id"],
         "ts": row["ts"],
         "kind": row["kind"],
         "payload": payload,
@@ -954,6 +968,7 @@ def query_events(
     level: str | None = None,
     since: str | None = None,
     until: str | None = None,
+    after_id: int | None = None,
     limit: int | None = None,
 ) -> list[dict[str, Any]]:
     """Query events with structured filters against indexed columns.
@@ -971,7 +986,13 @@ def query_events(
         level: Filter by log level ('info', 'warning', 'error').
         since: ISO-8601 timestamp; only events at or after this time.
         until: ISO-8601 timestamp; only events at or before this time.
-        limit: Maximum number of events to return (most recent N).
+        after_id: Exact cursor; only events with ``id`` greater than this
+            row id. Unlike ``since`` (a timestamp filter), an id cursor can
+            neither repeat nor drop rows that share a timestamp.
+        limit: Maximum number of events to return. Without ``after_id``
+            this is the most recent N; with ``after_id`` it is the first
+            (oldest) N rows after the cursor, so a caller paging forward
+            visits each row exactly once.
 
     Returns:
         A list of event dicts, oldest first.
@@ -1005,12 +1026,21 @@ def query_events(
     if until is not None:
         conditions.append("ts <= ?")
         params.append(until)
+    if after_id is not None:
+        conditions.append("id > ?")
+        params.append(after_id)
 
     where_clause = " AND ".join(conditions) if conditions else "1=1"
-    sql = f"SELECT * FROM events WHERE {where_clause} ORDER BY id ASC"
-    if limit is not None:
+    if limit is not None and after_id is not None:
+        # Cursor paging: the first N rows after the cursor, oldest first —
+        # the next page resumes at the last returned row's id.
+        sql = f"SELECT * FROM events WHERE {where_clause} ORDER BY id ASC LIMIT ?"
+        params.append(limit)
+    elif limit is not None:
         sql = f"SELECT * FROM (SELECT * FROM events WHERE {where_clause} ORDER BY id DESC LIMIT ?) ORDER BY id ASC"
         params.append(limit)
+    else:
+        sql = f"SELECT * FROM events WHERE {where_clause} ORDER BY id ASC"
 
     try:
         cursor = conn.execute(sql, params)

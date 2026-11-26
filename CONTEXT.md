@@ -7,7 +7,7 @@ charlie-work turns GitHub issues into merged pull requests. A deterministic orch
 ### Issue lifecycle
 
 **Ready**:
-An issue that a human has marked as eligible for automation. It is the only way into the lifecycle.
+An issue that the operator, or a foreman acting under its charter, has marked as eligible for automation. It is the only way into the lifecycle.
 _Avoid_: Approved, enabled, armed
 
 **Dispatchable**:
@@ -70,7 +70,7 @@ One hermetic LLM coding process scoped to a single issue, running in its own wor
 _Avoid_: Agent (agent is only the label namespace), session, spoke (only for the architecture diagram), bot
 
 **Operator**:
-The human who runs charlie-work, or an interactive session acting for them. The operator arms issues, records verdicts, applies escape hatches, and resolves escalations.
+The human who runs charlie-work, or an interactive session acting for them. The operator arms issues, records verdicts, applies escape hatches, and resolves escalations. A foreman is not an operator; it holds only the authority its charter grants.
 _Avoid_: Orchestrating agent, user, agent
 
 **Adapter**:
@@ -197,6 +197,40 @@ _Avoid_: Watchdog, alarm
 
 **Restart intensity**:
 How many times a stuck worker has been redispatched automatically. When it hits its cap, the issue is escalated instead of redispatched again.
+
+### Foreman
+
+**Foreman**:
+A delegated manager with a written, narrow authority. It owns one outcome, files and arms the issues that deliver it, and raises items for the operator. It never codes, reviews or merges, and it is a client of the orchestrator, not part of it.
+_Avoid_: Bot, manager agent, planner, operator
+
+**Charter**:
+The operator-authored file that states a foreman's outcome, repo, authority and bounds. Only a human edits it.
+_Avoid_: Config, prompt
+
+**Foreman pass**:
+One deterministic iteration over every foreman: decide whether each needs a Turn, and run it where it does. It runs once and does not repeat.
+_Avoid_: Tick, loop, a bare "pass"
+
+**Turn**:
+One Collect, Decide, Apply cycle for one foreman. Collect and Apply are code; Decide is the single model call.
+_Avoid_: Session, run, model turn (that is one step inside a launch)
+
+**Briefing**:
+The deterministic document a Turn hands to the model: the charter, the foreman's memory, and what changed since the last Turn.
+_Avoid_: Context, prompt
+
+**Action**:
+One proposed side effect in a Turn's output. It has no effect until the Apply step accepts it, and Apply can refuse it.
+_Avoid_: Tool call, command
+
+**Item**:
+Something a foreman needs from, or reports to, the operator: a decision, a permission request or a report. An item never expires and never answers itself.
+_Avoid_: Ticket, alert, escalation (that is a lifecycle event)
+
+**Authored issue** / **Tracked issue**:
+The two kinds of issue a foreman owns, both marked by its ownership label. It filed an authored issue and may amend or withdraw it. The operator handed it a tracked issue by adding the label, and the foreman may only watch it and comment on it.
+_Avoid_: Adopted, child issue
 
 ### State and instrumentation
 

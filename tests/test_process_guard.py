@@ -349,8 +349,11 @@ def test_wrap_launchers_rebinds_real_launcher_references(
 def test_enter_kill_on_close_job_skips_off_windows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(os, "name", "posix")
-    assert enter_kill_on_close_job() is False
+    # Bound to the call, not the test (issue #3010): see tests/_os_name_guard.py.
+    with monkeypatch.context() as patched:
+        patched.setattr(os, "name", "posix")
+        result = enter_kill_on_close_job()
+    assert result is False
 
 
 def test_enter_kill_on_close_job_tolerates_reentry() -> None:

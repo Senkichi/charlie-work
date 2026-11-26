@@ -18,6 +18,7 @@ holder. The suite therefore runs on Windows, the fleet's host and CI's OS.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -26,8 +27,9 @@ from pathlib import Path
 
 import psutil
 import pytest
+from _pipe_holder_fixtures import _PYTHON, _SLEEPER, _spawn_orphan
 from charlie_work import pipe_holder_release
-from charlie_work.pipe_holder_release import _is_orphan, release_pipe_holders
+from charlie_work.pipe_holder_release import _fresh_processes, _is_orphan, release_pipe_holders
 from charlie_work.process_utils import get_process_start_time
 
 pytestmark = pytest.mark.skipif(
@@ -38,19 +40,10 @@ pytestmark = pytest.mark.skipif(
 # Longer than the primitive's 1s start-time tolerance, so "started before the
 # worker" is unambiguous.
 _BEFORE_WORKER_GAP_SECONDS = 1.3
-_SLEEPER = "import time; print('r', flush=True); time.sleep(120)"
-# The interpreter the children run under. A venv's ``python.exe`` on Windows is a
-# launcher that spawns the real interpreter, so its ``Popen.pid`` is a process
-# whose cwd psutil misreports; the base interpreter is the process itself, the
-# shape of the real worker (a native ``opencode.exe`` the launcher resolves to).
-_PYTHON = getattr(sys, "_base_executable", sys.executable)
-# The real shape of the bug: a tool's shell backgrounds a child and exits.
-_ORPHAN_LAUNCHER = (
-    "import subprocess, sys; "
-    f"p = subprocess.Popen([{_PYTHON!r}, '-c', {_SLEEPER!r}], "
-    "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
-    "print(p.pid, flush=True)"
-)
+# A live look-alike that is nobody's sleeper: same shape, different script, so
+# the identity check must reject a printed pid naming it -- and never touch
+# the process behind that pid.
+_STRANGER = "import time; print('f', flush=True); time.sleep(120)"
 
 
 @pytest.fixture
@@ -59,6 +52,13 @@ def spawned() -> Iterator[list[subprocess.Popen[str]]]:
     yield procs
     for proc in procs:
         _reap(proc)
+
+
+# Same ``orphans`` lifecycle guard the settle rows of
+# tests/test_pipe_holder_spawn_parent_settle.py declare: at import time the
+# fixture name would collide with every test's ``orphans`` parameter (ruff's
+# redefinition rules), so each suite keeps this one-line teardown local rather
+# than importing it from _pipe_holder_fixtures.
 
 
 @pytest.fixture
@@ -93,7 +93,11 @@ def _tree(pid: int) -> list[psutil.Process]:
 
 
 def _spawn(
-    spawned: list[subprocess.Popen[str]], cwd: Path, code: str = _SLEEPER
+    spawned: list[subprocess.Popen[str]],
+    cwd: Path,
+    code: str = _SLEEPER,
+    *,
+    announce: str = "r",
 ) -> subprocess.Popen[str]:
     """Start ``python -c code`` in ``cwd`` and wait until it has announced itself."""
     proc = subprocess.Popen(
@@ -104,30 +108,8 @@ def _spawn(
     )
     spawned.append(proc)
     assert proc.stdout is not None
-    assert proc.stdout.readline().strip() == "r"
+    assert proc.stdout.readline().strip() == announce
     return proc
-
-
-def _spawn_orphan(orphans: list[psutil.Process], cwd: Path) -> psutil.Process:
-    """Start a sleeper in ``cwd`` whose parent has already exited -- a real orphan."""
-    launched = subprocess.run(
-        [_PYTHON, "-c", _ORPHAN_LAUNCHER],
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=True,
-    )
-    orphan = psutil.Process(int(launched.stdout.strip()))
-    orphans.append(orphan)
-    deadline = time.monotonic() + 10
-    while not orphan.is_running() and time.monotonic() < deadline:
-        time.sleep(0.05)
-    assert orphan.is_running(), "positive control: the orphan must be running"
-    # psutil's own parent() rule (missing, or a recycled pid) as an independent
-    # control that the process really is parentless in the table.
-    assert orphan.parent() is None, "positive control: the orphan's parent must be gone"
-    return orphan
 
 
 def _start_time(proc: subprocess.Popen[str]) -> float:
@@ -145,6 +127,40 @@ def worktree(tmp_path: Path) -> Path:
     path = tmp_path / "wt"
     path.mkdir()
     return path.resolve()
+
+
+@pytest.fixture
+def stale_process_cache() -> Iterator[Callable[[int, float], psutil.Process]]:
+    """Plant, in psutil's own ``process_iter`` cache, a ``Process`` that remembers an older owner.
+
+    ``process_iter`` caches one ``Process`` per pid and evicts a pid only when it
+    is absent from a sweep. Windows recycles pids, so a pid an earlier sweep cached
+    can be reborn as a new process before the next sweep; the cached instance then
+    still carries the previous owner's start time. Which earlier sweep populated the
+    cache is test order, so the failure appears only in a full, shuffled run.
+
+    The cache is the process-global one, so teardown empties it (public
+    ``cache_clear``): a planted entry must not outlive the pid it names.
+    """
+
+    def plant(pid: int, created: float) -> psutil.Process:
+        stale = psutil.Process(pid)
+        # psutil caches a Process's identity at construction and exposes no way to
+        # age one; these two attributes are what a previous owner's instance holds.
+        stale._create_time = created  # type: ignore[attr-defined]
+        stale._ident = (pid, created)  # type: ignore[attr-defined]
+        psutil._pmap[pid] = stale  # type: ignore[attr-defined]
+        # Positive controls: the aging took, and the cache really serves the stale
+        # instance -- so a pass cannot mean the plant silently missed (a psutil
+        # upgrade that renames these internals fails here, not by passing).
+        assert stale.create_time() == created, "positive control: the instance must be aged"
+        assert any(p is stale for p in psutil.process_iter()), (
+            "positive control: process_iter must serve the planted instance"
+        )
+        return stale
+
+    yield plant
+    psutil.process_iter.cache_clear()
 
 
 def test_an_orphan_started_after_the_worker_is_killed_and_the_worker_is_spared(
@@ -215,6 +231,33 @@ def test_a_process_that_started_before_the_worker_is_spared(
     assert earlier.is_running()
 
 
+def test_a_stale_cached_process_for_the_holders_pid_does_not_hide_the_holder(
+    worktree: Path,
+    spawned: list[subprocess.Popen[str]],
+    orphans: list[psutil.Process],
+    stale_process_cache: Callable[[int, float], psutil.Process],
+) -> None:
+    """The holder's pid is one ``process_iter`` already cached for an older process (#3028).
+
+    Selecting from the cached instance reads the previous owner's start time, so a
+    holder that started *after* the worker looks like it started before it and is
+    spared: the call stays blocked and the lane falls through to its ordinary reap.
+    The holder's own start time, not the cache's, decides.
+    """
+    worker = _spawn(spawned, worktree)
+    holder = _spawn_orphan(orphans, worktree)
+    worker_started = _start_time(worker)
+    stale = stale_process_cache(holder.pid, worker_started - 3600)
+    assert stale.pid == holder.pid
+    assert holder.create_time() > worker_started, "positive control: it did start after the worker"
+
+    released = release_pipe_holders(worktree, worker.pid, worker_started)
+
+    assert released == (holder.pid,)
+    assert not holder.is_running()
+    assert _alive(worker)
+
+
 def test_a_live_descendant_of_the_worker_is_spared(
     worktree: Path, spawned: list[subprocess.Popen[str]], orphans: list[psutil.Process]
 ) -> None:
@@ -266,6 +309,116 @@ def test_no_holder_means_nothing_is_killed_and_an_empty_result(
     assert _alive(worker)
 
 
+def _exited_interpreters_pid() -> int:
+    """A pid whose owner already exited: the recycling race, staged on demand.
+
+    Freed under no handle holders, exactly like the real sleeper's pid after the
+    launcher that printed it exits. Whether the pid is still free (psutil answers
+    ``NoSuchProcess``) or already reborn as an unrelated process (a foreign
+    cmdline), the identity check rejects it either way.
+    """
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait(timeout=10)
+    return child.pid
+
+
+def test_a_printed_pid_that_names_a_live_stranger_is_rejected_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+    worktree: Path,
+    spawned: list[subprocess.Popen[str]],
+    orphans: list[psutil.Process],
+) -> None:
+    """A live pid that is not the sleeper is rejected on its cmdline, untouched.
+
+    Staged: the first launch attempt's launcher prints the pid of a live
+    process that is not the sleeper (its cmdline is a different script), so
+    ``psutil.Process(pid)`` succeeds and is_running says yes. The identity
+    check must reject it as the attempt's evidence, never report it as the
+    orphan, retry the spawn for real, and leave the stranger running -- it was
+    never ours, whatever it shares the worktree with.
+    """
+    stranger = _spawn(spawned, worktree, code=_STRANGER, announce="f")
+    real_run = subprocess.run
+    state = {"stranger": True}
+
+    def run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if state["stranger"]:
+            state["stranger"] = False
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{stranger.pid}\n", stderr="")
+        return real_run(cmd, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    holder = _spawn_orphan(orphans, worktree)
+
+    assert state == {"stranger": False}, "the retry must have re-run the real launcher"
+    assert [proc.pid for proc in orphans] == [holder.pid]
+    assert any(_SLEEPER in arg for arg in holder.cmdline()), "the retry must be ours"
+    assert holder.pid != stranger.pid
+    assert _alive(stranger), "the stranger was never ours: it must survive the rejection"
+
+
+def test_a_printed_pid_that_names_a_stray_sleeper_is_killed_and_the_spawn_retried(
+    monkeypatch: pytest.MonkeyPatch,
+    worktree: Path,
+    spawned: list[subprocess.Popen[str]],
+    orphans: list[psutil.Process],
+) -> None:
+    """A printed pid can name a sleeper that is not an orphan: kill it, retry.
+
+    Staged: the first launch attempt's launcher prints the pid of a sleeper
+    this test process itself parented. The cmdline check accepts it (it really
+    is the sleeper code), but psutil's ``parent()`` answers a live process
+    even after the poll -- the helper must record that as the attempt's
+    evidence, kill the stray (a verified sleeper is pinned to its (pid, create
+    time) either way), retry the spawn, and record only the verified orphan.
+    """
+    stray = _spawn(spawned, worktree)
+    assert psutil.Process(stray.pid).parent() is not None, "positive control: a live parent"
+    real_run = subprocess.run
+    state = {"stray": True}
+
+    def run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if state["stray"]:
+            state["stray"] = False
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{stray.pid}\n", stderr="")
+        return real_run(cmd, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    holder = _spawn_orphan(orphans, worktree)
+
+    assert state == {"stray": False}, "the retry must have re-run the real launcher"
+    assert [proc.pid for proc in orphans] == [holder.pid]
+    assert any(_SLEEPER in arg for arg in holder.cmdline()), "the retry must be ours"
+    assert not _alive(stray), "the mis-parented stray was ours and got killed"
+
+
+def test_spawn_orphan_never_touches_a_foreign_pid_and_fails_loudly_when_raced_out(
+    monkeypatch: pytest.MonkeyPatch, worktree: Path
+) -> None:
+    """A printed pid whose owner already exited is dropped, never reported.
+
+    Every attempt is handed a pid that no longer names the sleeper: gone, or
+    reborn as someone else. The helper must (a) refuse to trust that pid
+    whatever now holds it -- it was never ours -- and (b) raise with the last
+    attempt's evidence rather than an assert against a phantom, so the failure
+    names the race instead of blaming the guard under test.
+    """
+    foreign_pid = _exited_interpreters_pid()
+    no_owners: list[psutil.Process] = []
+
+    def run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, 0, stdout=f"{foreign_pid}\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    with pytest.raises(AssertionError, match="raced out from under the test"):
+        _spawn_orphan(no_owners, worktree)
+
+    assert no_owners == [], "a foreign pid must not be recorded for teardown"
+
+
 class _FakeProc:
     """The two reads ``_is_orphan`` makes of a process: its ppid and its create time."""
 
@@ -313,6 +466,42 @@ def test_orphan_rule_on_the_parent_link(
     monkeypatch.setattr(pipe_holder_release.psutil, "Process", lookup)
 
     assert _is_orphan(_FakeProc(ppid=7, created=_CHILD_CREATED)) is expected  # type: ignore[arg-type]
+
+
+_UNREADABLE_PID = 4_000_001  # patched ``psutil.pids`` names it; no real process is asked about it
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(psutil.NoSuchProcess(_UNREADABLE_PID), id="vanished-mid-sweep"),
+        pytest.param(psutil.AccessDenied(_UNREADABLE_PID), id="identity-unreadable"),
+        pytest.param(OSError("handle could not be opened"), id="os-error"),
+    ],
+)
+def test_a_pid_that_cannot_be_read_is_skipped_and_the_sweep_goes_on(
+    error: Exception, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pid that vanishes or cannot be opened mid-sweep must not end the sweep (#3028).
+
+    ``_fresh_processes`` replaced ``process_iter``'s own handling of this with a
+    ``try``/``except``. Nothing else exercises it: a real sweep rarely meets an unreadable
+    pid, and an exception escaping the generator is swallowed by ``release_pipe_holders``'
+    outer ``except`` -- the lane would silently become a no-op. The unreadable pid comes
+    *first*, so a ``return`` or an uncaught raise in its place would lose the live pid.
+    """
+    live_pid = os.getpid()
+    real_process = psutil.Process
+
+    def process(pid: int) -> psutil.Process:
+        if pid == _UNREADABLE_PID:
+            raise error
+        return real_process(pid)
+
+    monkeypatch.setattr(pipe_holder_release.psutil, "pids", lambda: [_UNREADABLE_PID, live_pid])
+    monkeypatch.setattr(pipe_holder_release.psutil, "Process", process)
+
+    assert [proc.pid for proc in _fresh_processes()] == [live_pid]
 
 
 @pytest.mark.parametrize("ppid", [0, -1])

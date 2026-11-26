@@ -3,9 +3,9 @@
 Hoisted out of ``test_worktree.py`` (issue #1284): a thin ``git`` subprocess
 runner, a fresh-clone-with-identity builder, and a minimal repo initializer,
 all imported by other test modules that need a real (non-bare) git repo to
-exercise worktree behaviour against. ``test_worktree.py`` itself is one of
-the three monoliths issue #1284 marks out of scope for a full split -- only
-the exported symbols move; the rest of the file is untouched.
+exercise worktree behaviour against. ``test_worktree.py`` was later split
+into seam-named ``test_worktree_*.py`` siblings (issue #1555); the helpers
+more than one of them shares live in ``_worktree_shared_fixtures.py``.
 
 ``_init_repo`` joined the hoist under the #1688 rework: the file-size
 ratchet (issue #1442) required moving the new pre-merge-repair regression
@@ -64,6 +64,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -188,6 +189,88 @@ EOT
     # the stale state as local changes. ``checkout -f`` repopulates both from
     # the feature tree and moves HEAD to it.
     _git(repo_root, "checkout", "-f", "feature")
+
+
+_TRACKED_VENV_BRANCH = "tracked-venv"
+
+
+def _seed_tracked_venv_branch(repo_root: Path) -> str:
+    """Branch off ``main`` with ``.venv/pyvenv.cfg`` committed; returns its name.
+
+    A worktree added from this ref already contains ``.venv`` when
+    ``create_worktree`` reaches its venv-link step, so
+    ``_create_junction_or_symlink``'s "link target already exists" guard is
+    what fires -- the state ``create_worktree``'s docstring names ("that link
+    target already exists in the fresh worktree"). A hand-made stale directory
+    at the worktree path cannot reach the guard: git refuses ``worktree add``
+    into a non-empty directory first (exit 128), so a bare
+    ``pytest.raises(RuntimeError)`` passes whether or not the guard exists
+    (issue #2915).
+
+    One ``git fast-import`` spawn, no checkout: ``main`` and the working tree
+    stay as ``_init_repo`` left them (same shape as
+    ``_seed_staged_addition_bubble``).
+    """
+    subprocess.run(
+        ["git", "fast-import", "--quiet"],
+        cwd=repo_root,
+        # input as bytes: text=True would translate \n to \r\n on Windows
+        # stdin, and git parses the \r as part of each command line.
+        input=f"""\
+commit refs/heads/{_TRACKED_VENV_BRANCH}
+committer Test User <test@example.test> 0 +0000
+data <<MSG
+track a venv directory
+MSG
+from refs/heads/main
+M 100644 inline .venv/pyvenv.cfg
+data <<EOT
+home = somewhere
+EOT
+""".encode(),
+        check=True,
+        capture_output=True,
+    )
+    return _TRACKED_VENV_BRANCH
+
+
+def _seed_diverged_branch(repo_root: Path, branch: str, filename: str = "work.txt") -> str:
+    """Make ``branch`` one commit ahead of ``main`` with no worktree; return its tip.
+
+    The state an abandoned worker leaves behind once its worktree is removed: a
+    diverged agent branch and no checkout (the #1944 shape). Built in one
+    ``git fast-import`` spawn plus one ``rev-parse`` instead of
+    ``create_worktree`` + ``git add`` + ``git commit`` + ``remove_worktree``,
+    which is about ten git processes -- process count is what the test ledger's
+    call-phase time tracks on the Windows runners (issue #3008; same lever as
+    #2569).
+
+    The commit parents on ``main`` with a current timestamp, like a real worker
+    commit would. Callers must not depend on the worktree-side effects of the
+    longer route (a registered-then-pruned worktree entry, the ``.var`` scaffold
+    dirs): the branch ref is the only thing a later ``create_worktree`` reads.
+    """
+    subprocess.run(
+        ["git", "fast-import", "--quiet"],
+        cwd=repo_root,
+        # input as bytes: text=True would translate \n to \r\n on Windows
+        # stdin, and git parses the \r as part of each command line.
+        input=f"""\
+commit refs/heads/{branch}
+committer Test User <test@example.test> {int(time.time())} +0000
+data <<MSG
+worker commit on agent branch
+MSG
+from refs/heads/main
+M 100644 inline {filename}
+data <<EOT
+local work
+EOT
+""".encode(),
+        check=True,
+        capture_output=True,
+    )
+    return _git(repo_root, "rev-parse", f"refs/heads/{branch}").stdout.strip()
 
 
 def _clone_repo(remote_repo: Path, repo_root: Path, *, fresh: bool = False) -> None:
@@ -355,6 +438,25 @@ def _push_sibling_commit(remote: Path, tmp_path: Path, branch: str, filename: st
     pushed_sha = _git(other, "rev-parse", "HEAD").stdout.strip()
     _git(other, "push", "origin", branch)
     return pushed_sha
+
+
+REJECTED_PUSH_MESSAGE = "push refused by test pre-receive hook"
+
+
+def _reject_pushes(remote: Path) -> None:
+    """Install a ``pre-receive`` hook on ``remote`` that refuses every push.
+
+    Lets a test keep reads (``ls-remote``, ``fetch``) working while making the
+    write fail with a known stderr line (``REJECTED_PUSH_MESSAGE``) -- the
+    only way to fail a push and not the refuse-to-reset probe that precedes it.
+    Written as bytes so the shebang line keeps LF endings on Windows (a CRLF
+    ``#!/bin/sh`` fails to exec).
+    """
+    hooks = (remote / _git(remote, "rev-parse", "--git-path", "hooks").stdout.strip()).resolve()
+    hooks.mkdir(parents=True, exist_ok=True)
+    hook = hooks / "pre-receive"
+    hook.write_bytes(f"#!/bin/sh\necho '{REJECTED_PUSH_MESSAGE}' >&2\nexit 1\n".encode())
+    hook.chmod(0o755)
 
 
 def _setup_completed_worktree(

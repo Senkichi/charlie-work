@@ -65,12 +65,14 @@ def test_popen_worker_defaults_start_new_session_on_posix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """`popen_worker` defaults POSIX workers to a new session."""
-    monkeypatch.setattr(os, "name", "posix")
     mock = _capture_popen_call(monkeypatch)
 
-    popen_worker(
-        [sys.executable, "-c", "pass"], priority=CpuPriority.NORMAL, stdout=subprocess.DEVNULL
-    )
+    # Bound to the call, not the test (issue #3010): see tests/_os_name_guard.py.
+    with monkeypatch.context() as patched:
+        patched.setattr(os, "name", "posix")
+        popen_worker(
+            [sys.executable, "-c", "pass"], priority=CpuPriority.NORMAL, stdout=subprocess.DEVNULL
+        )
 
     assert mock.call_args.kwargs.get("start_new_session") is True
 

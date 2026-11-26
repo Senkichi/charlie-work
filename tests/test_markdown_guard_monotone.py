@@ -82,13 +82,30 @@ _GUARD_IDS = sorted(_GUARDS)
 
 _VERDICT_CORPUS = corpus.verdict_corpus()
 
+# Per-(guard, side) labels for the whole frozen corpus. The extractors are
+# pure, so these label tuples can never change between call sites: both
+# property loops below used to recompute them per corpus text even though the
+# composed extractor they call has already run the same legacy and scan sides
+# internally on every text, doubling the loop's CPU (ledger #3034).
+_SIDE_LABELS: dict[tuple[str, int], tuple[str, ...]] = {}
+
+
+def _cached_side_labels(guard: str, side: int) -> tuple[str, ...]:
+    labels = _SIDE_LABELS.get((guard, side))
+    if labels is None:
+        labels = tuple(_label(_GUARDS[guard][side](text)) for text in _VERDICT_CORPUS)
+        _SIDE_LABELS[(guard, side)] = labels
+    return labels
+
 
 @pytest.mark.parametrize("guard", _GUARD_IDS)
 def test_composed_verdict_is_never_less_severe_than_legacy(guard: str) -> None:
-    composed, legacy, scan = _GUARDS[guard]
+    composed = _GUARDS[guard][0]
     seen_stricter = seen_equal = False
-    for text in _VERDICT_CORPUS:
-        c, lg, sc = _label(composed(text)), _label(legacy(text)), _label(scan(text))
+    for text, lg, sc in zip(
+        _VERDICT_CORPUS, _cached_side_labels(guard, 1), _cached_side_labels(guard, 2), strict=True
+    ):
+        c = _label(composed(text))
         assert decision_severity(c) >= decision_severity(lg), (text, c, lg)
         assert decision_severity(c) >= decision_severity(sc), (text, c, sc)
         if c == "approved":
@@ -102,12 +119,13 @@ def test_composed_verdict_is_never_less_severe_than_legacy(guard: str) -> None:
 
 @pytest.mark.parametrize("guard", _GUARD_IDS)
 def test_disagreement_event_fires_only_on_disagreement(guard: str) -> None:
-    composed, legacy, scan = _GUARDS[guard]
+    composed = _GUARDS[guard][0]
     fired = quiet = 0
-    for text in _VERDICT_CORPUS:
+    for text, lg, sc in zip(
+        _VERDICT_CORPUS, _cached_side_labels(guard, 1), _cached_side_labels(guard, 2), strict=True
+    ):
         events: list[Disagreement] = []
         result = composed(text, on_disagreement=events.append)
-        lg, sc = _label(legacy(text)), _label(scan(text))
         if lg == sc:
             assert events == [], text
             quiet += 1
@@ -206,6 +224,7 @@ def test_strip_fenced_blocks_pins_line_anchored_behaviour() -> None:
 # --- outbound example-secret mask ----------------------------------------------------
 
 _KEY = corpus.KEY
+_AWS = corpus.AWS
 _OUTBOUND_CORPUS = corpus.outbound_corpus()
 
 
@@ -273,6 +292,51 @@ def test_outbound_agreeing_split_token_is_refused_control() -> None:
     assert {m.rule_id for m in scan_outbound_text(body, part="body")} == {"jwt-base64"}
 
 
+# (md-r4 #3036) the shared fixture of the two scans: a mask pair that agrees
+# byte for byte (both parsers blank the same lines) and one that does not.
+_AGREEING_BODY = f"a\n{_AWS}\n```example-secret\n{_KEY}\n```\nb\n"
+_DISAGREEING_BODY = f"{_SPLIT_TOKEN_HEAD}\n\t```example-secret\n\n```\n{_SPLIT_TOKEN_TAIL}\n"
+
+
+def test_outbound_scan_skips_the_legacy_pass_for_byte_identical_masks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3036: an agreeing mask pair makes the legacy scan a no-op rerun.
+
+    ``_scan_masked`` is a pure function of its input string, so when
+    ``_legacy_masked_text(text) == _mask_example_secret_fences(text)`` the
+    second rules pass over the legacy text returns exactly the composed
+    matches, the ``extra`` union is empty, and the scan is skipped. One rules
+    pass per agreeing document; two still pay when the two masks differ.
+    """
+    assert _legacy_masked_text(_AGREEING_BODY) == _mask_example_secret_fences(
+        _AGREEING_BODY, on_disagreement=lambda _d: None
+    )
+    assert _legacy_masked_text(_DISAGREEING_BODY) != _mask_example_secret_fences(
+        _DISAGREEING_BODY, on_disagreement=lambda _d: None
+    )
+    from charlie_work import outbound_body_guard as guard
+
+    calls = 0
+    real = guard._scan_masked
+
+    def counting(masked: str, *, part: str) -> tuple[SecretMatch, ...]:
+        nonlocal calls
+        calls += 1
+        return real(masked, part=part)
+
+    monkeypatch.setattr(guard, "_scan_masked", counting)
+    agreeing = scan_outbound_text(_AGREEING_BODY, part="body")
+    disagreeing = scan_outbound_text(_DISAGREEING_BODY, part="body")
+    # The agreeing document pays one rules pass (the composed one); the
+    # disagreeing one still pays both, so its union is unchanged.
+    assert calls == 3
+    # ...and the agreeing case's result is the real composed-side matches.
+    assert {m.rule_id for m in agreeing} == {"aws-access-token"}
+    # ...and the disagreeing one's union still carries main's lone match.
+    assert [m.rule_id for m in disagreeing] == ["jwt-base64"]
+
+
 def test_outbound_scan_reports_every_match_main_reports_over_the_corpus() -> None:
     """Compared against origin/main's LITERAL match keys, not the branch's own legacy scan.
 
@@ -327,9 +391,6 @@ def test_outbound_bare_cr_document_reports_the_line_model_disagreement() -> None
     body = f"x\r```example-secret\r{_KEY}\r```\r"
     assert _mask_example_secret_fences(body, on_disagreement=events.append) == body
     assert len(events) == 1 and events[0].chosen == "-"
-
-
-_AWS = corpus.AWS
 
 
 @pytest.mark.parametrize(

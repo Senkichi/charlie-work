@@ -225,6 +225,13 @@ def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
     # is added to the scan for the same reason dead_worker_reap.py was: keep
     # failing on a genuinely NEW writer rather than going blind to two known
     # call sites because they changed address.
+    #
+    # issue #3099: the rework failure branch's non-escalating write moved
+    # verbatim out of state_dispatch_rework.py into worker_launch_outcome.py
+    # (``record_failed_launch``) -- the writer still exists, only its module
+    # changed (state_dispatch_rework.py=1, worker_launch_outcome.py=1, total
+    # unchanged at 4). worker_launch_outcome.py is added to the scan for the
+    # same reason state_dispatch_rework.py was.
     import ast
 
     workflow_path = Path(__file__).parents[1] / "src" / "charlie_work" / "workflow.py"
@@ -237,6 +244,10 @@ def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
         / "charlie_work"
         / "orchestration"
         / "state_dispatch_rework.py"
+    )
+
+    worker_launch_outcome_path = (
+        Path(__file__).parents[1] / "src" / "charlie_work" / "worker_launch_outcome.py"
     )
 
     def _count_redispatch_at_assignments(path: Path) -> int:
@@ -270,11 +281,12 @@ def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
         + _count_redispatch_at_assignments(dispatch_selection_path)
         + sum(_count_redispatch_at_assignments(p) for p in sweep_paths)
         + _count_redispatch_at_assignments(state_dispatch_rework_path)
+        + _count_redispatch_at_assignments(worker_launch_outcome_path)
     )
     assert redispatch_assignments == 4, (
         'Expected 4 real entry["redispatch_at"] assignment statements across '
-        "workflow.py, dispatch_selection.py, dead_worker_sweep/, and "
-        "orchestration/state_dispatch_rework.py, found "
+        "workflow.py, dispatch_selection.py, dead_worker_sweep/, "
+        "orchestration/state_dispatch_rework.py, and worker_launch_outcome.py, found "
         f"{redispatch_assignments}"
     )
 

@@ -132,25 +132,29 @@ def test_label_edges_and_comments_batch_into_one_commit_per_issue(tmp_path: Path
     assert "verdict comment" in committed_text
 
 
-def test_flush_sweeps_dirt_without_a_queue_entry(tmp_path: Path) -> None:
+def test_flush_sweeps_dirt_without_a_queue_entry(
+    _seeded_tracker_repo: _SeededTrackerRepo,
+) -> None:
     """Self-healing: a hand-edited frontmatter (an operator flips a state by
     hand on this backend, per local_issues' own docstring) is committed at
-    the next flush even though no write site queued it -- "update" verb."""
-    repo_root = tmp_path / "repo"
-    _init_repo(repo_root)
-    issues_dir = repo_root / "docs" / "issues"
-    path = _write_issue(issues_dir, 3, slug="hand")
-    _seed_tracked(repo_root, path)
+    the next flush even though no write site queued it -- "update" verb.
+
+    Repo acquisition lives in ``_seeded_tracker_repo`` so the measured
+    ``call`` phase holds only the hand edit, the flush and the assertions
+    (issue #2951, the #2690 pattern)."""
+    repo_root = _seeded_tracker_repo.repo_root
+    issues_dir = _seeded_tracker_repo.issues_dir
+    path = _seeded_tracker_repo.issue_path
 
     path.write_text(
-        '---\ntitle: "issue 3"\nstate: closed\nlabels: []\n---\nBody.\n',
+        '---\ntitle: "issue 1"\nstate: closed\nlabels: []\n---\nBody.\n',
         encoding="utf-8",
     )
 
     # No queue_issue_write call at all: the flush reads the working tree.
     result = flush_tracker_writes(repo_root, issues_dir)
 
-    assert result.committed == ("chore(issues): update #3",)
+    assert result.committed == ("chore(issues): update #1",)
     assert dirty_tracker_files(repo_root, issues_dir) == ()
 
 

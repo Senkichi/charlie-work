@@ -1896,11 +1896,16 @@ def run_runners_ensure_started(args: argparse.Namespace) -> CommandResult:
     # Use subparser-specific dry_run flag if available, otherwise fall back to global
     dry_run = getattr(args, "dry_run", False)
 
+    # ci-fleet 0.8.4 (R-16) refuses every launch it cannot prove is for a
+    # private repo, and with no client it can prove nothing, so it would
+    # refuse them all. The context's client gives the guard a way to read
+    # each repo's visibility.
     started_count, messages = ensure_runners_started(
         managed_root,
         ctx.config.runner_scaling.runner_dir_prefix,
         ctx.config.runner_scaling,
         dry_run=dry_run,
+        gh=ctx.gh,
     )
 
     return CommandResult(

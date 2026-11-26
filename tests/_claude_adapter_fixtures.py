@@ -23,6 +23,7 @@ import subprocess
 import sys
 import textwrap
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -92,6 +93,33 @@ def _install_fake_create_worktree(
         return _fake_worktree(tmp_path, branch)
 
     monkeypatch.setattr(claude_code, "create_worktree", fake_create_worktree)
+
+
+def _install_fake_popen_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fake ``claude_code.popen_worker`` so a launch never spawns a real process.
+
+    For tests that assert only on the rendered argv (issue #2922). Left real,
+    the spawn seam makes such a test's cost and behavior depend on whether the
+    host has the ``claude`` CLI: where it is installed, the conftest guard
+    swaps argv[0] for ``sys.executable`` and a live interpreter starts; where
+    it is not (every CI runner), ``Popen`` fails and ``launch_claude_worker``
+    runs its failure teardown -- four ``git worktree``/``git branch``
+    subprocesses against a non-repo directory, ~10x the call time -- and still
+    returns a record whose ``command`` passes the same assertions. Pair this
+    with ``assert record.ok`` so a launch that never reached the spawn seam
+    cannot pass.
+
+    The fake process reports an immediate clean exit (``poll() == 0``) so the
+    terminal-status watcher thread ends at once instead of polling forever.
+    Opt-in: modules that exercise a real spawn (``_fake_claude_script``) do not
+    call it.
+    """
+    from charlie_work import claude_code
+
+    def fake_popen_worker(command, *args, **kwargs):
+        return SimpleNamespace(pid=4242, returncode=0, poll=lambda: 0)
+
+    monkeypatch.setattr(claude_code, "popen_worker", fake_popen_worker)
 
 
 def _fake_claude_script(tmp_path: Path) -> tuple[str, ...]:

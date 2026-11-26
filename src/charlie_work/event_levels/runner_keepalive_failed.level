@@ -1,0 +1,3 @@
+warning
+# ci_fleet 0.8.4: a runner's keepalive start went unanswered three times in a
+# row, so the allocator stops starting it until GitHub sees it online again.
