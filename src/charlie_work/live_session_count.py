@@ -20,12 +20,16 @@ issue #2235 once their patch surfaces migrated.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from . import host as _host
+from . import state as _state
 from .state import load_state_locked
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -73,6 +77,45 @@ REVIEW_LANE = LiveSessionKind(
 )
 
 
+def read_fleet_census_state(state_file: Path, name_with_owner: str) -> dict[str, Any] | None:
+    """One registered repo's ``state.json`` for the fleet-wide live census.
+
+    Always a lock-free ``state.read_state_snapshot`` (issue #3141): the census
+    runs under the fleet launch lock, so it must not queue on another repo's
+    state lock -- a slow holder there used to freeze every other lane's
+    launch gate for the whole hold. ``read_state_snapshot`` also never
+    quarantines/renames the file, so a census cannot damage the state it only
+    came to count from (issue #310).
+
+    ``None`` means the file could not be read or parsed. The caller must mark
+    the repo skipped and count only its live sidecars (never silently count 0
+    ghosts); this helper leaves the loud signal -- a warning log plus a
+    ``fleet_census_state_unreadable`` event in that repo's events.db.
+    """
+    snapshot = _state.read_state_snapshot(state_file)
+    if snapshot is None:
+        logger.warning(
+            "Skipping ghost corroboration for %s in the fleet live-count: "
+            "state file %s is unreadable -- counting live sidecars only",
+            name_with_owner,
+            state_file,
+        )
+        try:
+            from .instrumentation import log_event
+
+            # write-gate-exempt(issue=3141): no write_gate param; sibling raw calls remain
+            log_event(
+                state_file,
+                "fleet_census_state_unreadable",
+                {"repo": name_with_owner, "state_file": str(state_file)},
+                repo=name_with_owner,
+                level="warning",
+            )
+        except Exception:  # noqa: BLE001 — instrumentation never breaks the census
+            logger.debug("Failed to record fleet_census_state_unreadable for %s", name_with_owner)
+    return snapshot
+
+
 def _ghost_pid_alive(entry: dict[str, Any], kind: LiveSessionKind) -> bool:
     """pid + start-time liveness for a state.json dispatch record.
 
@@ -89,7 +132,11 @@ def _ghost_pid_alive(entry: dict[str, Any], kind: LiveSessionKind) -> bool:
 
 
 def count_live_sessions_with_adapter_kinds(
-    directory: Path, state_file: Path | None, kind: LiveSessionKind
+    directory: Path,
+    state_file: Path | None,
+    kind: LiveSessionKind,
+    *,
+    state_snapshot: dict[str, Any] | None = None,
 ) -> tuple[int, dict[str, int]]:
     """One ``iter_workers`` pass returning the corroborated total AND the per-kind counts.
 
@@ -113,6 +160,17 @@ def count_live_sessions_with_adapter_kinds(
     worker/reviewer invisible to concurrency accounting and the next pass
     can launch past the configured cap (issue #343). A ghost has no sidecar
     and therefore no known adapter, so it never enters the per-kind counts.
+
+    ``state_snapshot``: an already-read state dict to corroborate against,
+    used verbatim -- no state read happens at all. The fleet census passes
+    the ``read_state_snapshot`` result (lock-free: the census walks other
+    repos' state under the fleet launch lock and must not queue on their
+    state locks, issue #3141) and passes ``state_file=None`` when the
+    snapshot came back ``None`` (unreadable), which skips the corroboration
+    pass entirely -- the repo is then marked skipped and counts live
+    sidecars only, never 0 ghosts silently. Callers that pass only
+    ``state_file`` keep the locked read: their count gates a mutation of
+    that same state.
     """
     from .worker import iter_workers
 
@@ -125,8 +183,10 @@ def count_live_sessions_with_adapter_kinds(
             live_numbers.add(w.issue_number)
             counts[w.adapter_kind] = counts.get(w.adapter_kind, 0) + 1
 
-    if state_file is not None:
+    state: dict[str, Any] | None = state_snapshot
+    if state is None and state_file is not None:
         state = load_state_locked(state_file)
+    if state is not None:
         for number_str, entry in state.get(kind.state_map, {}).items():
             if not isinstance(entry, dict):
                 continue
@@ -151,10 +211,19 @@ def count_live_sessions_with_adapter_kinds(
     return live_count, counts
 
 
-def count_live_sessions(directory: Path, state_file: Path | None, kind: LiveSessionKind) -> int:
+def count_live_sessions(
+    directory: Path,
+    state_file: Path | None,
+    kind: LiveSessionKind,
+    *,
+    state_snapshot: dict[str, Any] | None = None,
+) -> int:
     """Count live sessions under ``directory``, corroborated against ``state_file``.
 
     Thin wrapper over :func:`count_live_sessions_with_adapter_kinds` (issue
     #2764): the total half of its single sidecar pass, unchanged in behavior.
+    ``state_snapshot`` is forwarded verbatim (issue #3141).
     """
-    return count_live_sessions_with_adapter_kinds(directory, state_file, kind)[0]
+    return count_live_sessions_with_adapter_kinds(
+        directory, state_file, kind, state_snapshot=state_snapshot
+    )[0]
