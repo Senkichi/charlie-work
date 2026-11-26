@@ -299,6 +299,47 @@ def test_detect_aviator_stale_blocked_cap_suppresses_the_requeue_but_not_the_rep
     assert drift[0].add_labels == ()
 
 
+def test_detect_aviator_stale_blocked_malformed_requeue_counter_is_not_capped(
+    tmp_path: Path,
+) -> None:
+    """Fail-open posture (issue #2743, kept through the #3095 reader
+    consolidation): a persisted ``consecutive_mergequeue_requeues`` that is
+    not int-coercible must yield "not capped" -- the stale-blocked repair
+    still re-adds the label rather than suppressing the re-queue forever."""
+    from charlie_work.paths import runtime_paths
+    from charlie_work.state import load_state, save_state
+
+    config = OrchestratorConfig()
+    mergequeue_label = config.auto_merge.mergequeue_label or "mergequeue"
+    config = replace(
+        config,
+        auto_merge=replace(config.auto_merge, mergequeue_label=mergequeue_label),
+    )
+    _pr, gh = _aviator_blocked_pr_and_gh(1408, "sha-1408")
+    _write_review_decision(
+        tmp_path,
+        config,
+        1408,
+        {"decision": "approved", "reviewed_head_sha": "sha-1408"},
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+    state = load_state(paths.state_file)
+    state["prs"]["1408"] = {
+        "number": 1408,
+        "status": "mergequeue",
+        "consecutive_mergequeue_requeues": "not-an-int",
+        "mergequeue_requeues_head_sha": "sha-1408",
+    }
+    save_state(paths.state_file, state)
+
+    drift = detect_aviator_stale_blocked(gh, config, repo_root=tmp_path)
+
+    assert len(drift) == 1
+    assert drift[0].remove_labels == ("blocked",)
+    assert drift[0].add_labels == (mergequeue_label,)
+
+
 def test_detect_aviator_stale_blocked_readds_below_the_cap_at_the_same_head(
     tmp_path: Path,
 ) -> None:
