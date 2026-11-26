@@ -145,10 +145,11 @@ def _bulk_create_time_map() -> dict[int, float | None] | None:
 
     Returns ``None`` where the platform ships no ``cext.proc_times`` --
     the snapshot's ``process_iter`` leg remains the correct (slower)
-    fallback there.
+    fallback there. The reader is resolved through ``_optional_proc_times``
+    so the snapshot and the per-hop walk share one spelling of "does this
+    platform ship the fast leg" (issue #3168).
     """
-    cext = getattr(getattr(psutil, "_psplatform", None), "cext", None)
-    proc_times = getattr(cext, "proc_times", None)
+    proc_times = _optional_proc_times()
     if proc_times is None:
         return None
     times: dict[int, float | None] = {}

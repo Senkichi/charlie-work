@@ -304,6 +304,61 @@ def test_bulk_create_time_map_absent_returns_none(
     assert pc._bulk_create_time_map() is None
 
 
+def test_optional_proc_times_returns_platform_callable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``cext.proc_times`` present: the seam hands the caller the fast C
+    reader itself. The issue #3168 review pin: a seam neutered to always
+    return ``None`` must fail loudly here rather than silently restoring
+    the per-denied-ancestor ``proc_info`` scan while the suite stays
+    green — every ``win32_ancestor_rows`` test pins the seam to ``None``
+    or a fake, so none of them can see the real resolution."""
+
+    def fake_proc_times(pid: int) -> tuple[float, float, float]:
+        return (0.0, 0.0, 1.0)
+
+    monkeypatch.setattr(
+        pc.psutil,
+        "_psplatform",
+        SimpleNamespace(cext=SimpleNamespace(proc_times=fake_proc_times)),
+        raising=False,
+    )
+
+    assert pc._optional_proc_times() is fake_proc_times
+
+
+def test_optional_proc_times_absent_without_psplatform(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No ``psutil._psplatform`` at all: ``None``, so the walk keeps its
+    ``create_time()`` fallback leg."""
+    monkeypatch.delattr(pc.psutil, "_psplatform", raising=False)
+
+    assert pc._optional_proc_times() is None
+
+
+def test_optional_proc_times_absent_without_cext(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A platform module shipping no ``cext`` attribute: ``None``."""
+    monkeypatch.setattr(pc.psutil, "_psplatform", SimpleNamespace(), raising=False)
+
+    assert pc._optional_proc_times() is None
+
+
+def test_optional_proc_times_absent_without_proc_times(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``cext`` present but shipping no ``proc_times``: ``None`` — the
+    ``create_time()`` fallback leg stays correct there (also the input the
+    ``_bulk_create_time_map`` absent case feeds the same seam)."""
+    monkeypatch.setattr(
+        pc.psutil, "_psplatform", SimpleNamespace(cext=SimpleNamespace()), raising=False
+    )
+
+    assert pc._optional_proc_times() is None
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows-only: real psutil snapshot")
 def test_win32_snapshot_real_reports_actual_parent() -> None:
     """Real psutil snapshot on Windows (issue #2353 review): assert the live
@@ -365,7 +420,10 @@ def _patch_win32_process(
     the real ``cext.proc_times`` would read the host's stamp for a
     fabricated pid, so these tests drive the ``create_time()`` fallback
     leg. The fast leg has its own tests below, which patch the seam with a
-    fabricated ``proc_times``.
+    fabricated ``proc_times``; the seam's real ``_psplatform`` resolution
+    has its own direct tests next to the ``_bulk_create_time_map`` block
+    (``test_optional_proc_times_*``), which is why pinning it here cannot
+    hide a neutered seam.
     """
     probes: list[int] = []
     monkeypatch.setattr(
