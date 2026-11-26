@@ -8,15 +8,22 @@ Two defects shared a root cause, fixed together:
    ``state.json`` through ``load_state_locked`` while holding the fleet
    launch lock -- so a lane whose OWN reconcile held its state lock for a
    long time froze every other lane's census (and therefore its launch
-   gate) for the whole hold. The census now passes
-   ``lock_free_state_read=True``: state writes are atomic replaces, so the
-   lock-free ``load_state`` sees the last committed snapshot, which is all
-   a census needs.
+   gate) for the whole hold. The census now reads through
+   ``state.read_state_snapshot`` (via ``live_session_count.
+   read_fleet_census_state``): a lock-free, non-mutating reader -- state
+   writes are atomic replaces, so it sees the last committed snapshot,
+   which is all a census needs. Unlike ``load_state`` it never quarantines
+   the file it reads and reports an unreadable file as ``None`` instead of
+   an empty state, so the census marks the repo skipped (with a warning +
+   ``fleet_census_state_unreadable`` event) and counts only its live
+   sidecars rather than silently counting 0 ghosts.
 2. ``advisory_file_lock``'s intra-process thread-lock stage was a bare
    ``acquire()`` -- no timeout, no log line -- so the same-process wait
    above waited forever and said nothing. It now shares the single
    ``_LOCK_TIMEOUT_SECONDS`` budget with the cross-process file-lock stage
-   and raises ``StateLockBusy`` with the same warning on timeout.
+   and raises ``StateLockBusy`` with the same warning on timeout; the
+   file-lock stage also always runs at least one acquisition attempt even
+   when the thread stage consumed the whole budget.
 """
 
 from __future__ import annotations
@@ -37,7 +44,13 @@ from charlie_work import live_session_count
 from charlie_work import state as state_module
 from charlie_work.fleet_live_counts import count_fleet_live_sessions_with_adapter_kinds
 from charlie_work.fleet_registry import count_fleet_live_reviews
-from charlie_work.live_session_count import WORKER_LANE, count_live_sessions
+from charlie_work.instrumentation import query_events
+from charlie_work.live_session_count import (
+    WORKER_LANE,
+    count_live_sessions,
+    read_fleet_census_state,
+)
+from charlie_work.state import append_event, load_state, save_state, state_lock
 
 
 class _SidecarStub:
@@ -197,8 +210,8 @@ def test_fleet_live_session_census_does_not_wait_on_a_held_state_lock(
 def test_count_live_sessions_default_read_is_still_locked(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Callers that do not pass ``lock_free_state_read`` keep the locked read:
-    the flag is opt-in for the fleet census, not a behavior change for the
+    """Callers that pass no ``state_snapshot`` keep the locked read: the
+    snapshot is opt-in for the fleet census, not a behavior change for the
     per-repo cap paths."""
     monkeypatch.setattr("charlie_work.worker.iter_workers", lambda _dir, **_kw: [])
     state_file = tmp_path / "state.json"
@@ -218,16 +231,17 @@ def test_count_live_sessions_default_read_is_still_locked(
         raise AssertionError("default count_live_sessions read state without the lock")
 
     monkeypatch.setattr(state_module, "load_state", _no_unlocked_read)
+    monkeypatch.setattr(state_module, "read_state_snapshot", _no_unlocked_read)
 
     assert count_live_sessions(tmp_path / "sessions", state_file, WORKER_LANE) == 0
     assert locked_reads == [state_file]
 
 
-def test_count_live_sessions_lock_free_read_uses_load_state(
+def test_count_live_sessions_state_snapshot_read_is_lock_free(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``lock_free_state_read=True`` selects ``load_state`` and never touches
-    the locked read."""
+    """A provided ``state_snapshot`` is used verbatim: no locked read and no
+    state read of any kind happens inside the counter."""
     monkeypatch.setattr("charlie_work.worker.iter_workers", lambda _dir, **_kw: [])
     state_file = tmp_path / "state.json"
     state_file.write_text(
@@ -235,25 +249,29 @@ def test_count_live_sessions_lock_free_read_uses_load_state(
         encoding="utf-8",
     )
 
-    free_reads: list[Path] = []
-    monkeypatch.setattr(
-        state_module,
-        "load_state",
-        lambda path: free_reads.append(path) or {"issues": {}, "prs": {}},
-    )
+    def _no_read(_path: Path) -> dict[str, Any]:
+        raise AssertionError("state_snapshot was provided but a state read ran anyway")
 
-    def _no_locked_read(_path: Path) -> dict[str, Any]:
-        raise AssertionError("lock_free_state_read took the state lock anyway")
+    monkeypatch.setattr(live_session_count, "load_state_locked", _no_read)
+    monkeypatch.setattr(state_module, "load_state", _no_read)
+    monkeypatch.setattr(state_module, "read_state_snapshot", _no_read)
 
-    monkeypatch.setattr(live_session_count, "load_state_locked", _no_locked_read)
-
+    snapshot = {
+        "issues": {
+            "9": {
+                "status": "dispatched",
+                "worker_pid": _OWN_PID,
+                "worker_process_start_time": None,
+            }
+        },
+        "prs": {},
+    }
     assert (
         count_live_sessions(
-            tmp_path / "sessions", state_file, WORKER_LANE, lock_free_state_read=True
+            tmp_path / "sessions", state_file, WORKER_LANE, state_snapshot=snapshot
         )
-        == 0
-    )
-    assert free_reads == [state_file]
+        == 1
+    )  # the ghost worker from the provided snapshot
 
 
 def test_thread_lock_wait_is_bounded_and_reports(
@@ -349,3 +367,222 @@ def test_thread_lock_acquired_within_timeout_behaves_normally(
         _release_held_thread_lock(state_path, release)
 
     assert entered, "advisory_file_lock did not yield after a within-budget wait"
+
+
+def test_exhausted_budget_still_gets_one_file_lock_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The file-lock stage runs at least ONE acquisition attempt even when
+    the shared budget is already gone at stage entry.
+
+    A successful ``thread_lock.acquire(timeout=...)`` always returns before
+    the deadline, so the only entry shape with zero budget left is a zero
+    ``_LOCK_TIMEOUT_SECONDS`` (non-blocking probe): the thread stage passes
+    instantly and the file stage used to run its ``while elapsed <
+    timeout`` loop ZERO times before raising. The attempt-first loop
+    guarantees one real attempt instead.
+    """
+    monkeypatch.setattr(state_module, "_LOCK_TIMEOUT_SECONDS", 0.0)
+    state_path = tmp_path / "state.json"
+
+    attempts: list[int] = []
+
+    def _record_busy(*_a: Any, **_k: Any) -> None:
+        attempts.append(1)
+        raise OSError("lock held (test stub)")
+
+    if sys.platform == "win32":
+        import msvcrt
+
+        monkeypatch.setattr(msvcrt, "locking", _record_busy)
+    else:
+        import fcntl
+
+        monkeypatch.setattr(fcntl, "flock", _record_busy)
+
+    with pytest.raises(state_module.StateLockBusy):
+        with state_module.advisory_file_lock(state_path):
+            pass
+
+    assert len(attempts) >= 1, (
+        "the file-lock stage was skipped entirely once the thread-lock stage "
+        "consumed the budget -- it must always make at least one attempt"
+    )
+
+
+def test_read_state_snapshot_returns_none_on_unreadable_state(tmp_path: Path) -> None:
+    """``read_state_snapshot`` reports failure instead of returning empty
+    state or quarantining: corrupt JSON and non-dict JSON both yield None,
+    and the file itself is left exactly as found (issue #3141)."""
+    corrupt = tmp_path / "corrupt.json"
+    corrupt.write_text("{ not json", encoding="utf-8")
+    assert state_module.read_state_snapshot(corrupt) is None
+    assert corrupt.exists() and corrupt.read_text(encoding="utf-8") == "{ not json", (
+        "read_state_snapshot must never rename/mutate the file it samples"
+    )
+    assert not list(tmp_path.glob("*.corrupt-*"))
+
+    non_dict = tmp_path / "list.json"
+    non_dict.write_text("[1, 2]", encoding="utf-8")
+    assert state_module.read_state_snapshot(non_dict) is None
+    assert non_dict.exists()
+
+
+def test_read_state_snapshot_missing_and_healthy_files(tmp_path: Path) -> None:
+    """Missing file -> ``empty_state()`` (a repo that has not run); healthy
+    file -> the parsed, normalized state."""
+    missing = tmp_path / "missing" / "state.json"
+    assert state_module.read_state_snapshot(missing) == state_module.empty_state()
+
+    state_file = tmp_path / "state.json"
+    saved = save_state(state_file, {"issues": {"1": {"status": "dispatched"}}, "prs": {}})
+    snapshot = state_module.read_state_snapshot(state_file)
+    assert snapshot is not None
+    assert snapshot["issues"]["1"]["status"] == "dispatched"
+    assert snapshot["generated_at"] == saved["generated_at"]
+
+
+def test_fleet_census_reader_never_quarantines_a_concurrent_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A writer looping state_lock+save_state against the lock-free census
+    reader (``read_fleet_census_state``) must never produce a ``*.corrupt-*``
+    quarantine file and the state must stay intact.
+
+    Regression for the review's issue #310 finding: ``load_state`` under
+    this exact contention can hit a transient read failure after its short
+    retries and RENAME the healthy state file; ``read_state_snapshot``
+    only ever reads (a ``None`` result is a skip signal, not an error here).
+    Mirrors ``test_status_concurrent_writer_no_quarantine``.
+
+    Real contention is not a reliable failure trigger, so the reader thread
+    also gets an injected burst of exactly ``_LOAD_RETRY_ATTEMPTS``
+    consecutive ``PermissionError``s on its ``state.json`` opens -- the same
+    Windows sharing-violation shape a racing tmp+replace produces. That
+    exhausts the retry budget deterministically: the fix returns one
+    ``None`` (a skip signal), while the quarantining ``load_state`` it
+    replaced renames the file -- which the ``*.corrupt-*`` assertion below
+    then catches.
+    """
+    state_file = tmp_path / "state.json"
+    save_state(state_file, {"issues": {}, "prs": {}})
+
+    iterations = 200
+    errors: list[Exception] = []
+    none_reads: list[bool] = []
+    injected_failures: list[int] = [state_module._LOAD_RETRY_ATTEMPTS]
+    reader_thread: list[threading.Thread] = []
+
+    orig_open = Path.open
+
+    def _flaky_open(self: Path, *args: Any, **kwargs: Any):
+        if (
+            self == state_file
+            and reader_thread
+            and threading.current_thread() is reader_thread[0]
+            and injected_failures[0] > 0
+        ):
+            injected_failures[0] -= 1
+            raise PermissionError("injected transient sharing violation")
+        return orig_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", _flaky_open)
+
+    def writer() -> None:
+        for i in range(iterations):
+            try:
+                with state_lock(state_file):
+                    state = load_state(state_file)
+                    state = append_event(state, "stress", {"i": i})
+                    save_state(state_file, state)
+            except Exception as exc:  # pragma: no cover - failures fail the test
+                errors.append(exc)
+                break
+
+    def reader() -> None:
+        for _ in range(iterations):
+            try:
+                # The exact reader the fleet census uses; a transient None
+                # under contention (including the injected burst) is a
+                # legitimate "skip" signal, not an error -- only an exception
+                # or a quarantined file is a bug.
+                snapshot = read_fleet_census_state(state_file, "owner/test")
+                if snapshot is None:
+                    none_reads.append(True)
+            except Exception as exc:  # pragma: no cover - failures fail the test
+                errors.append(exc)
+                break
+
+    writer_thread = threading.Thread(target=writer)
+    reader_thread.append(threading.Thread(target=reader))
+    writer_thread.start()
+    reader_thread[0].start()
+    writer_thread.join(timeout=30)
+    reader_thread[0].join(timeout=30)
+
+    assert not errors, f"exceptions during concurrent stress: {errors}"
+    assert none_reads, (
+        "the injected failure burst was never observed -- the test did not "
+        "exercise the retry-exhaustion path it exists to pin"
+    )
+
+    quarantine_files = list(state_file.parent.glob(f"{state_file.name}.corrupt-*"))
+    assert not quarantine_files, (
+        f"the lock-free census read quarantined a healthy state file: {quarantine_files}"
+    )
+
+    final_state = load_state(state_file)
+    assert final_state["version"] == 1
+    assert len(final_state.get("events", [])) == iterations
+
+
+def test_fleet_census_unreadable_state_skips_corroboration_not_destructively(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A repo whose state.json is corrupt is marked skipped, contributes
+    only its live sidecars (ghost corroboration cannot run), leaves a
+    ``fleet_census_state_unreadable`` warning event, and -- crucially --
+    the corrupt file is NOT renamed or quarantined away."""
+    fleet_dir = tmp_path / "fleet"
+    state_file = _register_repo(fleet_dir, tmp_path, "a")
+    state_file.write_text("{ not json", encoding="utf-8")
+    monkeypatch.setattr(
+        "charlie_work.worker.iter_workers",
+        lambda _dir, **_kw: [_SidecarStub(1)],
+    )
+
+    total, kinds, skipped = count_fleet_live_sessions_with_adapter_kinds(str(fleet_dir))
+
+    assert skipped == ["owner/a"]
+    assert total == 1  # the live sidecar; the ghost cannot be corroborated
+    assert kinds == {"claude-code": 1}
+    assert state_file.exists() and state_file.read_text(encoding="utf-8") == "{ not json", (
+        "the census must never mutate the state file it samples"
+    )
+    assert not list(state_file.parent.glob(f"{state_file.name}.corrupt-*"))
+    events = query_events(state_file, kind="fleet_census_state_unreadable")
+    assert events, "no fleet_census_state_unreadable event was recorded"
+    assert events[-1]["level"] == "warning"
+    assert events[-1]["repo"] == "owner/a"
+
+
+def test_fleet_review_census_unreadable_state_skips_corroboration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The review-lane twin of the worker-lane corrupt-state test: same
+    skip + sidecars-only + non-destructive contract."""
+    fleet_dir = tmp_path / "fleet"
+    state_file = _register_repo(fleet_dir, tmp_path, "a")
+    state_file.write_text("{ not json", encoding="utf-8")
+    monkeypatch.setattr(
+        "charlie_work.worker.iter_workers",
+        lambda _dir, **_kw: [_SidecarStub(1)],
+    )
+
+    count, skipped = count_fleet_live_reviews(str(fleet_dir))
+
+    assert skipped == ["owner/a"]
+    assert count == 1  # the live sidecar; the ghost reviewer is not corroborated
+    assert state_file.exists() and state_file.read_text(encoding="utf-8") == "{ not json"
+    assert not list(state_file.parent.glob(f"{state_file.name}.corrupt-*"))
+    assert query_events(state_file, kind="fleet_census_state_unreadable")

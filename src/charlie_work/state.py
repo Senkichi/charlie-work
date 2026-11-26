@@ -45,6 +45,11 @@ from .periodic_pass_schedule import (  # noqa: F401 (deliberate re-export)
     schedule_worktree_reclamation,
 )
 
+# File-size ratchet (#1442): the sanctioned lock-free, non-mutating state
+# reader (issue #3141) lives in its own module; re-exported so
+# ``state.read_state_snapshot`` is the stable import path.
+from .state_snapshot import read_state_snapshot  # noqa: F401 (deliberate re-export)
+
 if TYPE_CHECKING:
     # write_gate.py imports this module, so the gate can only be named in
     # annotations -- a runtime import here would be circular.
@@ -730,36 +735,45 @@ def advisory_file_lock(path: Path):
             # LK_NBLCK = non-blocking lock, LK_LOCK = blocking lock
             # We use a retry loop with timeout for bounded waiting. ``start``
             # was sampled before the thread-lock acquire, so this loop only
-            # gets whatever budget that stage left over (issue #3141).
-            while time.monotonic() - start < _LOCK_TIMEOUT_SECONDS:
+            # gets whatever budget that stage left over (issue #3141). The
+            # attempt precedes the budget check so a thread-lock stage that
+            # consumed the whole budget still gets at least one file-lock
+            # attempt instead of being skipped entirely (issue #3141).
+            while True:
                 try:
                     # Try non-blocking lock first
                     msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
                     acquired = True
                     break
                 except OSError:
+                    if time.monotonic() - start >= _LOCK_TIMEOUT_SECONDS:
+                        # Timeout — the lock is held by another writer. Fail
+                        # this unit of work as a value rather than degrading
+                        # integrity.
+                        raise _lock_busy()
                     # Lock held, wait and retry
                     time.sleep(0.1)
-            else:
-                # Timeout — the lock is held by another writer. Fail this unit
-                # of work as a value rather than degrading integrity.
-                raise _lock_busy()
         else:
             import fcntl
 
             lock_file = lock_path.open("r+b", encoding=None)
-            while time.monotonic() - start < _LOCK_TIMEOUT_SECONDS:
+            # ``start`` was sampled before the thread-lock acquire, so this
+            # loop only gets whatever budget that stage left over (issue
+            # #3141). The attempt precedes the budget check so a fully
+            # consumed budget still gets at least one file-lock attempt.
+            while True:
                 try:
                     fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                     acquired = True
                     break
                 except (IOError, BlockingIOError):
+                    if time.monotonic() - start >= _LOCK_TIMEOUT_SECONDS:
+                        # Timeout — the lock is held by another writer. Fail
+                        # this unit of work as a value rather than degrading
+                        # integrity.
+                        raise _lock_busy()
                     # Lock held, wait and retry
                     time.sleep(0.1)
-            else:
-                # Timeout — the lock is held by another writer. Fail this unit
-                # of work as a value rather than degrading integrity.
-                raise _lock_busy()
 
         yield
     finally:

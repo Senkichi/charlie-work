@@ -173,6 +173,7 @@ from .state import (
     mark_reviewer_quota_alerted,
     operator_claimed_issues,
     operator_queue_impact_baseline,  # noqa: F401  (deliberate re-export; issue #1768, used by moved L01 b3 delegates via _wf.)
+    read_state_snapshot,  # noqa: F401  (deliberate re-export; the sanctioned lock-free reader, issue #3141)
     record_operator_queue_impact_signature,  # noqa: F401  (deliberate re-export; issue #1768, used by moved L01 b3 delegates via _wf.)
     release_operator_claimed,  # noqa: F401  (deliberate re-export; used by moved L01 b4 delegates via _wf.)
     save_state,

@@ -38,7 +38,11 @@ def count_fleet_live_sessions_with_adapter_kinds(
     ``(total_live_count, counts_by_adapter_kind, skipped_repos)``.
     """
     from .fleet_registry import _iter_registered_repo_contexts
-    from .live_session_count import WORKER_LANE, count_live_sessions_with_adapter_kinds
+    from .live_session_count import (
+        WORKER_LANE,
+        count_live_sessions_with_adapter_kinds,
+        read_fleet_census_state,
+    )
 
     total_live_count = 0
     totals_by_kind: dict[str, int] = {}
@@ -63,12 +67,20 @@ def count_fleet_live_sessions_with_adapter_kinds(
         # Lock-free census read (issue #3141): this walk runs under the
         # fleet launch lock, so it must not queue on another repo's state
         # lock -- a long hold there (e.g. a slow reconcile) used to freeze
-        # every other lane's launch gate silently for the whole hold.
+        # every other lane's launch gate silently for the whole hold. An
+        # unreadable state file marks the repo skipped (with a warning +
+        # event from read_fleet_census_state): its live sidecars still count,
+        # but ghost corroboration is skipped rather than silently counting 0.
+        state_file = layout.state_file_path(state_dir)
+        snapshot = read_fleet_census_state(state_file, name_with_owner)
+        if snapshot is None:
+            skipped_repos.append(name_with_owner)
+            state_file = None  # sidecars only -- no state to corroborate against
         repo_total, repo_kinds = count_live_sessions_with_adapter_kinds(
             sessions_dir,
-            layout.state_file_path(state_dir),
+            state_file,
             WORKER_LANE,
-            lock_free_state_read=True,
+            state_snapshot=snapshot,
         )
         total_live_count += repo_total
         for kind, count in repo_kinds.items():
