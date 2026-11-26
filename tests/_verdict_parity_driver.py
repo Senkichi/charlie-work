@@ -5,13 +5,15 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+import _git_templates
 from _fakes_github import FakeGitHub
 from _local_lane_fixtures import (
     _app,
@@ -125,6 +127,44 @@ def _make_repo() -> _Repo:
     older_diff = branch_diff(root, "main", older)
     assert diff and older_diff and diff != older_diff
     return _Repo(root, older, head, diff, older_diff)
+
+
+_REPO_TEMPLATES: dict[_git_templates.EnvKey, _Repo] = {}
+
+
+def _repo_template() -> _Repo:
+    """The one ``_make_repo`` build per (process, git environment).
+
+    Every caller drives the identical history (``main`` plus one branch with
+    two commits), so the ~12-subprocess build is paid once and each consumer
+    copies the result (``_fresh_repo``). Keyed by
+    ``_git_templates.env_fingerprint()`` like the registry's shapes: a repo
+    built under a different ``GIT_*`` environment is never handed to the call
+    phase (the issue-#2565 rule ``_git_templates`` documents).
+    ``CI_FLEET_TEST_REUSE=off`` forces the fresh build.
+    """
+    if not _git_templates.reuse_enabled():
+        return _make_repo()
+    key = _git_templates.env_fingerprint()
+    repo = _REPO_TEMPLATES.get(key)
+    if repo is None:
+        repo = _REPO_TEMPLATES[key] = _make_repo()
+    return repo
+
+
+def _fresh_repo() -> _Repo:
+    """A per-caller ``shutil.copytree`` of ``_repo_template()`` (~0.5 s -> ~0.05 s).
+
+    The Local path uses ``root`` as its app/checkout directory and writes into
+    it (issue files, ``.var`` state, ``ci-fleet.toml``), so every caller gets
+    its own tree; the template stays pristine. Copies share commit SHAs --
+    fine here because no caller pushes, fetches or merges between two of these
+    repos.
+    """
+    template = _repo_template()
+    root = new_repo_root()
+    shutil.copytree(template.root, root, dirs_exist_ok=True)
+    return replace(template, root=root)
 
 
 def _config_data(scenario: Scenario) -> dict[str, Any]:
@@ -534,7 +574,7 @@ def _pin_worker_selection(*roots: Path) -> None:
 
 def run_both(scenario: Scenario) -> tuple[dict[str, Any], dict[str, Any]]:
     """The scenario through ``record_review`` and ``record_local_review``."""
-    repo = _make_repo()
+    repo = _fresh_repo()
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(selection_wrapper, "ci_fleet_executable", lambda: _FAKE_CI_FLEET)
         local, start_labels = _run_local(scenario, repo)

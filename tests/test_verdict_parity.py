@@ -35,11 +35,14 @@ too, so the list can neither hide a new drift nor go stale.
 
 from __future__ import annotations
 
+import subprocess
 from datetime import UTC, datetime
 from typing import Any
+from unittest import mock
 
 import pytest
 
+import _git_templates
 from _dashboard_rollup_fixtures import _register
 from charlie_work import instrumentation
 from charlie_work.dashboard import rollup
@@ -49,7 +52,7 @@ from charlie_work.local_issue_files import issue_number_from_name
 from charlie_work.local_issues import LocalFileGitHub
 from charlie_work.local_lane import local_pr_dict
 
-from _verdict_parity_driver import MISSING, Diff, Scenario, _diffs, run_both
+from _verdict_parity_driver import MISSING, Diff, Scenario, _diffs, _fresh_repo, run_both
 from _verdict_parity_table import DECLARED_DIFFERENCES, SCENARIOS
 
 _CACHE: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
@@ -263,6 +266,21 @@ def test_a_change_on_one_side_only_is_reported(
     assert local.get(path, MISSING) != changed
     perturbed = {**local, path: changed}
     assert [d.path for d in _undeclared(_diffs(scenario_name, remote, perturbed))] == [path]
+
+
+@pytest.mark.skipif(
+    not _git_templates.reuse_enabled(),
+    reason="CI_FLEET_TEST_REUSE=off forces the fresh path; there is no template to pin",
+)
+def test_fresh_repo_materializes_without_git_spawns() -> None:
+    """Issue #3150 pin: ``_fresh_repo`` copies the per-environment template, so
+    only the first call in a process pays ``_make_repo``'s ~12-subprocess git
+    build. The verdict suites drive it ~150 times; per-call builds pushed
+    shard 6/6 ~1.5x over baseline on the Windows CI host."""
+    _fresh_repo()  # warm this environment's template
+    with mock.patch.object(subprocess, "Popen", wraps=subprocess.Popen) as popen:
+        _fresh_repo()
+    assert popen.call_count == 0, "the copy phase spawned instead of copying the template"
 
 
 @pytest.mark.parametrize("path", ["issue.status", "labels.added", "events.order"])
