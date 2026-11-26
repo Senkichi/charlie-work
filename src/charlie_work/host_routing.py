@@ -186,8 +186,9 @@ def drop_foreign_findings(
       host drops every PR. A finding is evidence of a possible bypass, so it
       is dropped only on positive proof: the issue was read by number and
       :func:`owned_by_another_host` says exactly one other host owns it. A
-      finding with no linked issue, a lookup that fails or answers the wrong
-      payload, or an unreadable issue all stay.
+      finding with no linked issue, a lookup that fails, a payload answering
+      a different issue or missing its labels list, or an unreadable issue
+      all stay.
 
     With ``dispatch.host`` unset (routing off) the list is returned untouched
     and no issue read is made.
@@ -224,9 +225,22 @@ def drop_foreign_findings(
                 # ValueError: a test double signals a missing issue the same
                 # way. Either way the proof is absent, so the finding stays.
                 view = None
+            # Both real ``issue_view`` implementations signal a failed read
+            # with an EMPTY DICT, never a raise (the GitHubCapabilities
+            # client coerces a non-dict read to ``{}`` and the local backend
+            # returns ``{}`` for a missing number). A payload answering a
+            # different issue, or one missing its ``labels`` list, is equally
+            # unproven -- and the labels-list requirement is load-bearing on
+            # a non-default host, where ``_label_names`` would coerce the
+            # absence into the empty label set and an unlabelled issue reads
+            # as "the default host owns it": positive foreign proof conjured
+            # out of a malformed read. Only a dict answering this issue AND
+            # carrying a real labels list is a proof.
             labels_by_issue[issue] = (
                 frozenset(_label_names(view))
-                if isinstance(view, dict) and view.get("number") == issue
+                if isinstance(view, dict)
+                and view.get("number") == issue
+                and isinstance(view.get("labels"), list)
                 else None
             )
         labels = labels_by_issue[issue]

@@ -1,10 +1,1 @@
-2
-# Issue #2910 rework (PR #2941): +1 raw save_state for
-# _drop_foreign_unauthorized_merge_findings -- the durable proven-foreign-PR
-# record written under state_lock after host_routing.drop_foreign_findings
-# proves a finding's linked issue belongs to another host. Same out-of-wave
-# raw-site class as the arming write already in this module (the baseline's
-# 1): locked read-modify-write through _wf.state_lock/load_state/save_state,
-# matching the sibling's pattern until this module's full WriteGate
-# conversion wave. The companion self._record_event call is gate-covered by
-# construction (#1324) and counts nothing.
+1

@@ -3,6 +3,11 @@
 Track 2 Phase B leaf L01 batch 2 (issue #1645, parent #1632, umbrella #1582).
 Method bodies moved verbatim from ``OrchestratorApp`` in ``charlie_work.workflow``;
 the ``workflow_delegation`` installer re-attaches each ``def`` onto the class.
+Issue #2910 added two net-new members that were never ``workflow.py`` method
+bodies: the ``_drop_foreign_unauthorized_merge_findings`` delegate and the
+``UNAUTHORIZED_MERGE_FOREIGN_KEY`` state key it owns (moved here from
+``workflow.py`` -- this module is its only production reader/writer, and the
+over-cap monolith is the wrong place to grow).
 """
 
 from __future__ import annotations
@@ -11,6 +16,20 @@ from typing import Any
 
 import charlie_work.workflow as _wf
 from charlie_work import host_routing
+
+# state.json key holding the durable record of merged worker PRs whose linked
+# issue was proven to belong to another host (issue #2910). A
+# `{pr_number: {issue, proven_at}}` map, written the first pass a finding is
+# positively proven foreign via a per-issue ``issue_view`` read. A foreign
+# merge is re-detected as a candidate on every pass -- it is neither baselined
+# nor acked -- so without this record the ownership proof (a subprocess per
+# issue) would be re-paid on every pass for as long as the merge stays inside
+# ``merged_pr_list()``'s window. Membership suppresses only the *re-proof*,
+# via ``host_routing.drop_foreign_findings``'s ``remembered_prs``: the finding
+# is dropped before any read, exactly as it was on the pass that proved it.
+# Entries are never removed: a merge's owner is a fact about when it merged,
+# so a later relabel does not re-open it.
+UNAUTHORIZED_MERGE_FOREIGN_KEY = "unauthorized_merge_foreign"
 
 
 def _apply_unauthorized_merge_baseline(
@@ -171,8 +190,11 @@ def _drop_foreign_unauthorized_merge_findings(
     event fires once per proven PR, the first pass it is proven.
 
     A failed proof is deliberately *not* remembered: an unreadable issue is
-    retried next pass, not permanently exempted. ``dry_run`` writes nothing,
-    matching the arming and announce paths.
+    retried next pass, not permanently exempted. Under ``dry_run`` the gated
+    ``_record_event``/``write_gate.save_state`` primitives perform zero writes
+    (issue #1264's structural suppression -- the same shape
+    ``local_lane_stall_alarm`` uses), so a preview still drops the proven
+    finding from its result but leaves no durable record of having done so.
     """
 
     def _remembered(record: Any) -> set[int]:
@@ -190,10 +212,10 @@ def _drop_foreign_unauthorized_merge_findings(
 
     if self.config.dispatch.host is None or not reported:
         return reported
-    key = _wf.UNAUTHORIZED_MERGE_FOREIGN_KEY
+    key = UNAUTHORIZED_MERGE_FOREIGN_KEY
     remembered = _remembered(_wf.load_state_locked(self.paths.state_file).get(key))
     kept, proven = host_routing.drop_foreign_findings(self, reported, remembered)
-    if not proven or self.dry_run:
+    if not proven:
         return kept
     with _wf.state_lock(self.paths.state_file):
         locked = _wf.load_state(self.paths.state_file)
@@ -210,5 +232,5 @@ def _drop_foreign_unauthorized_merge_findings(
                 "unauthorized_merge_foreign_dropped",
                 {"pr": pr, "issue": issue},
             )
-        _wf.save_state(self.paths.state_file, locked)
+        self.write_gate.save_state(locked)
     return kept

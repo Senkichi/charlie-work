@@ -27,11 +27,13 @@ from _merge_tripwire_fixtures import _arm_unauthorized_merge_tripwire, _merged_w
 from charlie_work.config import OrchestratorConfig
 from charlie_work.github import GitHubError
 from charlie_work.instrumentation import query_events
+from charlie_work.orchestration.state_unauthorized_merge import (
+    UNAUTHORIZED_MERGE_FOREIGN_KEY,
+)
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state
 from charlie_work.workflow import (
     UNAUTHORIZED_MERGE_DETECTED_KEY,
-    UNAUTHORIZED_MERGE_FOREIGN_KEY,
     OrchestratorApp,
 )
 
@@ -47,19 +49,28 @@ class _SpyGitHub(FakeGitHub):
     ``issue_list_window`` simulates the real client's ``--limit 500`` cap: when
     set, ``issue_list`` answers only issues inside that window no matter what
     ``self.issues`` holds, while ``issue_view`` still answers by number.
+    ``view_overrides`` returns a canned payload verbatim, for the real
+    client's failure shapes (``{}``, a mismatched ``number``, no ``labels``).
     """
 
     def __init__(
-        self, *, fail_issue_view: bool = False, issue_list_window: set[int] | None = None
+        self,
+        *,
+        fail_issue_view: bool = False,
+        issue_list_window: set[int] | None = None,
+        view_overrides: dict[int, Any] | None = None,
     ) -> None:
         super().__init__()
         self.fail_issue_view = fail_issue_view
         self.issue_list_window = issue_list_window
+        self.view_overrides = view_overrides or {}
         self.issue_view_calls: list[int] = []
         self.issue_list_states: list[Any] = []
 
     def issue_view(self, number: int):
         self.issue_view_calls.append(number)
+        if number in self.view_overrides:
+            return self.view_overrides[number]
         if self.fail_issue_view:
             raise GitHubError("gh unavailable")
         return super().issue_view(number)
@@ -91,13 +102,18 @@ def _issue(number: int, labels: set[str], *, state: str = "CLOSED") -> dict[str,
 
 
 def _app(
-    tmp_path: Path, config: OrchestratorConfig, gh: FakeGitHub, issues: list[dict[str, Any]]
+    tmp_path: Path,
+    config: OrchestratorConfig,
+    gh: FakeGitHub,
+    issues: list[dict[str, Any]],
+    *,
+    dry_run: bool = False,
 ) -> tuple[OrchestratorApp, Any]:
     gh.issues = issues
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     paths.ensure()
     _arm_unauthorized_merge_tripwire(paths)
-    return OrchestratorApp(tmp_path, paths, config, gh), paths
+    return OrchestratorApp(tmp_path, paths, config, gh, dry_run=dry_run), paths
 
 
 def _recorded(paths: Any) -> tuple[list[str], list[dict[str, Any]], list[dict[str, Any]]]:
@@ -265,6 +281,36 @@ def test_a_proven_foreign_pr_is_remembered_and_never_re_read(tmp_path: Path) -> 
     assert len(query_events(paths.state_file, kind=_FOREIGN_KIND)) == 1
 
 
+def test_a_proven_foreign_pr_writes_nothing_in_dry_run(tmp_path: Path) -> None:
+    """``--dry-run`` drops the finding but persists no record of the proof (#2910 rework).
+
+    Modelled on
+    ``test_unauthorized_merge_baseline_arming_writes_nothing_in_dry_run``
+    (issues #609/#613/#621): a preview that recorded the proof would spend
+    the one durable ``issue_view``-free drop on data a real pass never
+    verified, and the ``unauthorized_merge_foreign_dropped`` audit event
+    would claim a proof the preview is not allowed to persist. The
+    WriteGate-routed ``_record_event``/``save_state`` make the suppression
+    structural; reverting the gated save to a raw ``_wf.save_state`` writes
+    the record under dry-run and fails this test.
+    """
+    gh = _SpyGitHub()
+    app, paths = _app(
+        tmp_path,
+        _config("workstation"),
+        gh,
+        [_issue(_ISSUE, {"host:macbook"})],
+        dry_run=True,
+    )
+
+    detected = app._detect_unauthorized_merges([_merged_worker_pr(_PR, _ISSUE, "sha-103")])
+
+    assert detected == [], "the preview still drops a proven-foreign finding"
+    assert gh.issue_view_calls == [_ISSUE], "the read still happens; only the write is gated"
+    assert _foreign_record(paths) == {}, "dry-run must leave no durable foreign record"
+    assert query_events(paths.state_file, kind=_FOREIGN_KIND) == []
+
+
 def test_a_failed_proof_is_not_remembered(tmp_path: Path) -> None:
     """An unreadable issue keeps the finding and is retried next pass."""
     gh = _SpyGitHub(fail_issue_view=True)
@@ -293,6 +339,47 @@ def test_issue_view_returning_nothing_is_not_proven_foreign(tmp_path: Path) -> N
 
     assert [d["pr"] for d in detected] == [_PR]
     assert gh.issue_view_calls == [_ISSUE]
+
+
+@pytest.mark.parametrize(
+    ("view_payload", "case"),
+    [
+        (
+            {},
+            "the real clients' failure shape: issue_view coerces a failed read to {}",
+        ),
+        (
+            {"number": _ISSUE + 900, "labels": [{"name": "host:workstation"}]},
+            "a payload answering a different issue -- fails without the number guard",
+        ),
+        (
+            {"number": _ISSUE},
+            "the right number but no labels list -- fails without the labels guard",
+        ),
+    ],
+)
+def test_an_unproven_issue_view_payload_keeps_the_finding(
+    tmp_path: Path, view_payload: dict[str, Any], case: str
+) -> None:
+    """Real-client ``issue_view`` failure shapes must keep the finding (#2910 rework).
+
+    Both production ``issue_view`` implementations signal a failed read by
+    returning ``{}``, never by raising, and a payload that names a different
+    issue or omits the labels list is equally unproven. The host is
+    deliberately NON-default (``macbook``): there the labels-less payload is
+    the sharp case -- read naively it is "unlabelled", and an unlabelled
+    issue belongs to the default host, so the missing-``labels`` shape would
+    be positive foreign proof conjured out of a malformed read.
+    """
+    gh = _SpyGitHub(view_overrides={_ISSUE: view_payload})
+    app, paths = _app(tmp_path, _config("macbook", default_host=False), gh, [])
+
+    detected = app._detect_unauthorized_merges([_merged_worker_pr(_PR, _ISSUE, "sha-103")])
+
+    assert [d["pr"] for d in detected] == [_PR], case
+    assert gh.issue_view_calls == [_ISSUE], "the read was attempted, then found unproven"
+    assert _foreign_record(paths) == {}, "an unproven PR must not be durably exempted"
+    assert _recorded(paths)[0] == [str(_PR)], "the kept finding is announced as before"
 
 
 def test_with_routing_off_the_finding_is_reported_exactly_as_before(tmp_path: Path) -> None:
