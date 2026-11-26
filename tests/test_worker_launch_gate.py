@@ -474,26 +474,30 @@ def test_throttle_deferral_releases_the_permit_owned_lock(
 ) -> None:
     """The AUTHORITATIVE (post-governor) throttle deferral -- not the lock-free
     pre-check -- must release the permit-owned fleet lock. The throttle is on
-    disk before the call; the patched first ``load_state`` (the pre-check
-    read) sees it unthrottled so the gate proceeds to the fleet lock, the
-    governor, and the state-locked re-read that finds it. The lock object is
-    wrapped so the release itself is observed -- probing the OS lock after
-    the fact cannot see a leaked handle (it is dropped with the deferral and
-    GC releases it)."""
+    disk before the call; the patched first ``read_state_snapshot`` (the
+    pre-check read -- issue #3141 moved it off the quarantining
+    ``load_state``) sees it unthrottled so the gate proceeds to the fleet
+    lock, the governor, and the state-locked re-read that finds it. The lock
+    object is wrapped so the release itself is observed -- probing the OS
+    lock after the fact cannot see a leaked handle (it is dropped with the
+    deferral and GC releases it)."""
     app = _app(tmp_path, FRESH, fleet_cap=4)
     _throttle(app)
 
-    orig_load_state = wf.load_state
+    orig_read_state_snapshot = wf.read_state_snapshot
     pre_check_saw_unthrottled = {"done": False}
 
-    def _load_state_hiding_throttle_once(path: Path) -> dict[str, Any]:
-        state = orig_load_state(path)
+    def _read_state_snapshot_hiding_throttle_once(path: Path) -> dict[str, Any]:
+        state = orig_read_state_snapshot(path) or {}
         if not pre_check_saw_unthrottled["done"]:
             pre_check_saw_unthrottled["done"] = True
             state = {**state, "throttled_until": None}
         return state
 
-    monkeypatch.setattr("charlie_work.workflow.load_state", _load_state_hiding_throttle_once)
+    monkeypatch.setattr(
+        "charlie_work.workflow.read_state_snapshot",
+        _read_state_snapshot_hiding_throttle_once,
+    )
 
     class _RecordingLock:
         def __init__(self, inner: Any) -> None:

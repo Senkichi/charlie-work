@@ -483,7 +483,7 @@ def count_fleet_live_reviews(
     """
     # Imported at the one call site so fleet_registry's module-load graph is
     # unchanged for every worker-lane consumer.
-    from .live_session_count import REVIEW_LANE, count_live_sessions
+    from .live_session_count import REVIEW_LANE, count_live_sessions, read_fleet_census_state
 
     total_live_count = 0
     skipped_repos: list[str] = []
@@ -498,8 +498,23 @@ def count_fleet_live_reviews(
         )
         if not reviews_dir.exists():
             continue
+        # Lock-free census read (issue #3141): this walk runs under the
+        # fleet launch lock, so it must not queue on another repo's state
+        # lock -- a long hold there used to freeze every other lane's
+        # launch gate silently for the whole hold. An unreadable state file
+        # marks the repo skipped (warning + event from
+        # read_fleet_census_state): its live sidecars still count, but ghost
+        # corroboration is skipped rather than silently counting 0.
+        state_file = layout.state_file_path(state_dir)
+        snapshot = read_fleet_census_state(state_file, _name)
+        if snapshot is None:
+            skipped_repos.append(_name)
+            state_file = None  # sidecars only -- no state to corroborate against
         total_live_count += count_live_sessions(
-            reviews_dir, layout.state_file_path(state_dir), REVIEW_LANE
+            reviews_dir,
+            state_file,
+            REVIEW_LANE,
+            state_snapshot=snapshot,
         )
 
     return total_live_count, skipped_repos

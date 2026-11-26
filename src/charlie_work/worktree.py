@@ -526,7 +526,11 @@ def _operator_marker_is_live(
     if state_file is None or issue_number is None:
         return False
     try:
-        data = _state.load_state(state_file)
+        # ``read_state_snapshot`` (issue #3141): a lock-free liveness probe
+        # must never quarantine/rename the state file it merely samples.
+        data = _state.read_state_snapshot(state_file)
+        if data is None:
+            return False
         entry = data.get("issues", {}).get(str(issue_number))
         return _state.is_operator_claimed(entry)
     except (OSError, ValueError, TypeError):
