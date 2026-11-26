@@ -78,7 +78,7 @@ from ..github_transport.outcome import Response
 from ..github_transport.request import ACCEPT_DIFF, RestRequest
 from ._base import CapabilityCollaborator, GitHubRunResult, _LIST_LIMIT
 from ._pr_mutations import mark_ready
-from ._outcome import failure_text, is_success
+from ._outcome import failure_text, is_success, number_from_response
 from ._send import read_json, read_result, send, send_json, send_result, send_text
 from .pr_diff_fallback import (
     base_ref_from_rest_pr,
@@ -222,20 +222,6 @@ def _pr_number_from_url(output: str) -> int | None:
     return int(match.group(1)) if match is not None else None
 
 
-def _pr_number_from_response(outcome: Response) -> int | None:
-    """The created PR's number from the REST create response (B9).
-
-    Replaces URL parsing: the JSON body carries ``number`` directly. Never
-    raises; ``None`` when the body is not an object with an integer number.
-    """
-    try:
-        payload = outcome.json()
-    except ValueError:
-        return None
-    number = payload.get("number") if isinstance(payload, dict) else None
-    return number if isinstance(number, int) and not isinstance(number, bool) else None
-
-
 @runtime_checkable
 class PullRequestsLike(Protocol):
     """Structural interface for pull-request read/create operations."""
@@ -374,7 +360,7 @@ class PullRequests(CapabilityCollaborator):
             )
             return None
         assert isinstance(outcome, Response)
-        number = _pr_number_from_response(outcome)
+        number = number_from_response(outcome)
         if number is None:
             logger.warning(
                 "pr create reported success for head=%s but its response carried no PR number: %r",
