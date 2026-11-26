@@ -1,0 +1,15 @@
+{
+ "boundary": 8.5,
+ "bumps": [
+  {
+   "to": 9,
+   "reason": "Issue #3116 adds create_issue / edit_issue_body to the Issues capability (the create-issue and edit-issue-body write requests the foreman's Apply step performs, ADR-0010); they live on the Issues collaborator so the delegation seam routes them onto the GitHub facade alongside the other issue members.",
+   "actor": "worker",
+   "ack": "https://github.com/Senkichi/charlie-work/issues/3116"
+  }
+ ],
+ "file": "src/charlie_work/github_capabilities/issues.py",
+ "identity": "Issues",
+ "kind": "class",
+ "member_count": 7
+}

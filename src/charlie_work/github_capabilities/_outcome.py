@@ -63,6 +63,21 @@ def is_success(outcome: Outcome) -> bool:
     return isinstance(outcome, Response) and outcome.ok
 
 
+def number_from_response(outcome: Response) -> int | None:
+    """The created object's number from a REST create response, or ``None``.
+
+    Shared by ``pr_create`` and ``create_issue``: the JSON body carries
+    ``number`` directly. Never raises; ``None`` when the body is not an
+    object with an integer number.
+    """
+    try:
+        payload = outcome.json()
+    except ValueError:
+        return None
+    number = payload.get("number") if isinstance(payload, dict) else None
+    return number if isinstance(number, int) and not isinstance(number, bool) else None
+
+
 def raise_for_failure(outcome: Outcome) -> None:
     """Raise the legacy exception for a failed outcome; no-op on success."""
     if is_success(outcome):
@@ -180,6 +195,7 @@ __all__ = [
     "expect_ok",
     "failure_text",
     "is_not_found_gh_error",
+    "number_from_response",
     "raise_for_failure",
     "to_run_result",
 ]
