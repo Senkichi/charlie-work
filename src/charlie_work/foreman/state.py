@@ -149,7 +149,7 @@ def load_state(foreman_root: Path) -> ForemanState:
         return ForemanState()
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return ForemanState()
     return _from_payload(raw)
 

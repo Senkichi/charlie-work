@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from _worktree_fixtures import (
     _git,
+    _init_bare_remote_and_clone,
     _init_repo,
     _wt_scratch as _register_wt_scratch,  # noqa: F401 -- registers the wt_scratch fixture
 )
@@ -66,6 +67,30 @@ def test_sync_moves_to_moved_default_tip(tmp_path: Path, wt_scratch: Path) -> No
     assert synced.ok, synced.error
     assert _head(fdir / "tree") != old_head
     assert _head(fdir / "tree") == _git(repo, "rev-parse", "main").stdout.strip()
+
+
+def test_sync_fetches_origin_tip_and_follows_it(tmp_path: Path, wt_scratch: Path) -> None:
+    """``origin/<branch>`` is a remote-tracking ref: without a fetch it names a
+    stale tip. origin advancing must move ``tree/`` on the next sync."""
+    remote, clone = _init_bare_remote_and_clone(wt_scratch)
+    fdir = _foreman(tmp_path)
+    assert tree_mod.ensure_tree(fdir, clone).ok
+    # Advance origin/main from a second clone; ``clone``'s cached ref stays stale.
+    other = wt_scratch / "other-clone"
+    subprocess.run(
+        ["git", "clone", str(remote), str(other)], check=True, capture_output=True, text=True
+    )
+    _git(other, "config", "user.email", "test@example.test")
+    _git(other, "config", "user.name", "Test User")
+    (other / "adv.txt").write_text("advanced\n")
+    _git(other, "add", "adv.txt")
+    _git(other, "commit", "-m", "advance origin main")
+    pushed = _git(other, "rev-parse", "HEAD").stdout.strip()
+    _git(other, "push", "origin", "main")
+    assert _git(clone, "rev-parse", "origin/main").stdout.strip() != pushed  # still stale
+    synced = tree_mod.sync_tree(fdir, clone)
+    assert synced.ok, synced.error
+    assert _head(fdir / "tree") == pushed
 
 
 def test_sync_without_tree_is_an_error_value(tmp_path: Path, wt_scratch: Path) -> None:

@@ -17,7 +17,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..subprocess_runner import run_captured
-from ..worktree import _resolve_default_branch_ref, list_worktrees
+from ..worktree import (
+    _has_origin_remote,
+    _resolve_default_branch_ref,
+    _run_remote_captured,
+    list_worktrees,
+)
 from . import Result
 from .paths import tree_path
 
@@ -51,6 +56,31 @@ def _default_ref(repo_root: Path) -> str:
     return ref
 
 
+def _live_default_ref(repo_root: Path) -> Result[str]:
+    """The default branch tip as a *fetched* ref.
+
+    ``origin/<branch>`` is a remote-tracking ref — without a fetch it resolves
+    to whatever the last fetch left behind, and ``tree/`` would park on a
+    stale tip. Fetch origin's copy of the branch first (the same
+    ``_run_remote_captured`` path the worktree helpers use) so the ref names
+    the live tip; a failed fetch is an error value, not a stale resolve.
+    """
+    try:
+        ref = _default_ref(repo_root)
+    except RuntimeError as exc:
+        return Result(error=f"tree: cannot resolve default branch: {exc}")
+    if ref.startswith("origin/") and _has_origin_remote(repo_root):
+        fetched = _run_remote_captured(
+            ["git", "fetch", "origin", ref[len("origin/") :]], cwd=repo_root
+        )
+        if not fetched.ok:
+            return Result(
+                error=f"tree: git fetch origin {ref[len('origin/') :]} failed: "
+                f"{fetched.error or fetched.stderr.strip()}"
+            )
+    return Result(value=ref)
+
+
 def ensure_tree(foreman_root: Path, repo_root: Path) -> Result[Path]:
     """Create ``tree/`` as a detached worktree at the default branch tip.
 
@@ -63,10 +93,10 @@ def ensure_tree(foreman_root: Path, repo_root: Path) -> Result[Path]:
         tree = tree_path(foreman_root)
     except ValueError as exc:
         return Result(error=str(exc))
-    try:
-        ref = _default_ref(repo_root)
-    except RuntimeError as exc:
-        return Result(error=f"tree: cannot resolve default branch: {exc}")
+    resolved = _live_default_ref(repo_root)
+    if not resolved.ok:
+        return Result(error=resolved.error)
+    ref = resolved.value
     if _registered(tree, repo_root):
         return Result(value=tree)
     if tree.exists():
@@ -105,10 +135,10 @@ def sync_tree(foreman_root: Path, repo_root: Path) -> Result[Path]:
         return Result(error=str(exc))
     if not _registered(tree, repo_root):
         return Result(error=f"tree: {tree} is not a registered worktree of {repo_root}")
-    try:
-        ref = _default_ref(repo_root)
-    except RuntimeError as exc:
-        return Result(error=f"tree: cannot resolve default branch: {exc}")
+    resolved = _live_default_ref(repo_root)
+    if not resolved.ok:
+        return Result(error=resolved.error)
+    ref = resolved.value
     checkout = run_captured(
         ["git", "checkout", "--detach", ref],
         cwd=tree,

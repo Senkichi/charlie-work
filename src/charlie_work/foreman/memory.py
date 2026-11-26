@@ -40,7 +40,7 @@ def read_memory(foreman_root: Path, name: str) -> Result[str]:
         return Result(value=path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return Result(error=f"memory file {name!r}: not found")
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         return Result(error=f"memory file {name!r}: unreadable: {exc}")
 
 

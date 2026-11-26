@@ -10,7 +10,9 @@ items the operator has not yet been told about.
 
 The whole file is a single JSON document written through
 ``write_json_atomic``; reads tolerate a missing or corrupt file as empty,
-matching the cache semantics of the rest of the store.
+matching the cache semantics of the rest of the store. Mutators are stricter:
+a corrupt ``items.json`` is an error value, never an overwrite of whatever
+was there.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ import json
 from collections.abc import Callable
 import re
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -113,6 +116,13 @@ def _from_record(raw: Any) -> Item | None:
     )
 
 
+def _decode_items(raw: Any) -> tuple[Item, ...]:
+    records = raw.get("items") if isinstance(raw, dict) else raw if isinstance(raw, list) else ()
+    if not isinstance(records, list):
+        return ()
+    return tuple(item for item in (_from_record(r) for r in records) if item is not None)
+
+
 def load_items(foreman_root: Path) -> tuple[Item, ...]:
     """Read every item, oldest-first; a missing/corrupt file reads as empty."""
     try:
@@ -121,12 +131,53 @@ def load_items(foreman_root: Path) -> tuple[Item, ...]:
         return ()
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return ()
-    records = raw.get("items") if isinstance(raw, dict) else raw if isinstance(raw, list) else ()
-    if not isinstance(records, list):
-        return ()
-    return tuple(item for item in (_from_record(r) for r in records) if item is not None)
+    return _decode_items(raw)
+
+
+def _load_items_strict(foreman_root: Path) -> Result[tuple[Item, ...]]:
+    """``items.json`` decode for mutators: absent reads empty, corrupt is an error.
+
+    ``load_items`` tolerates corruption because readers may treat the store as
+    a cache; a mutator may not — writing ``{"items": [...]}`` over a file it
+    could not read would silently destroy whatever was there.
+    """
+    try:
+        path = items_path(foreman_root)
+    except ValueError as exc:
+        return Result(error=str(exc))
+    if not path.exists():
+        return Result(value=())
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return Result(error=f"items.json: unreadable or corrupt: {exc}")
+    return Result(value=_decode_items(raw))
+
+
+def _parse_utc(value: str) -> datetime | None:
+    """Parse an aware ISO-8601 timestamp, normalized to UTC; ``None`` if invalid.
+
+    Naive timestamps are rejected — without an offset a wall-clock string is
+    ambiguous, and comparing it against ``Z``-normalized deadlines silently
+    shifts the deadline by the host timezone.
+    """
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.tzinfo.utcoffset(parsed) is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
+def _format_utc(moment: datetime) -> str:
+    """The ``Z``-suffix shape ``utc_now`` writes — the canonical stored form."""
+    return moment.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _save_items(path: Path, items: tuple[Item, ...]) -> Result[None]:
@@ -147,14 +198,25 @@ def _next_item_id(items: tuple[Item, ...]) -> str:
 
 
 def open_items(items: tuple[Item, ...], *, now: str | None = None) -> tuple[Item, ...]:
-    """Items still awaiting the operator: ``open``, or ``snoozed`` past ``until``."""
-    moment = now if now is not None else utc_now()
-    return tuple(
-        item
-        for item in items
-        if item.status == STATUS_OPEN
-        or (item.status == STATUS_SNOOZED and (item.snoozed_until or "") <= moment)
-    )
+    """Items still awaiting the operator: ``open``, or ``snoozed`` past ``until``.
+
+    Deadlines are compared as parsed datetimes, not strings — a lexicographic
+    compare of unvalidated strings orders ``+02:00`` forms wrong. A stored
+    ``snoozed_until`` that fails to parse is treated as expired (the item
+    resurfaces: fail-visible rather than silently hidden).
+    """
+    moment = _parse_utc(now if now is not None else utc_now())
+    open_list: list[Item] = []
+    for item in items:
+        if item.status == STATUS_OPEN:
+            open_list.append(item)
+            continue
+        if item.status != STATUS_SNOOZED:
+            continue
+        until = _parse_utc(item.snoozed_until) if item.snoozed_until else None
+        if until is None or (moment is not None and until <= moment):
+            open_list.append(item)
+    return tuple(open_list)
 
 
 def create_item(
@@ -197,7 +259,10 @@ def create_item(
         path = items_path(foreman_root)
     except ValueError as exc:
         return Result(error=str(exc))
-    items = load_items(foreman_root)
+    loaded = _load_items_strict(foreman_root)
+    if not loaded.ok:
+        return Result(error=loaded.error)
+    items = loaded.value
     resolved_id = item_id or _next_item_id(items)
     if any(i.id == resolved_id for i in items):
         return Result(error=f"item.id {resolved_id!r}: already exists")
@@ -225,7 +290,10 @@ def _update(
         path = items_path(foreman_root)
     except ValueError as exc:
         return Result(error=str(exc))
-    items = load_items(foreman_root)
+    loaded = _load_items_strict(foreman_root)
+    if not loaded.ok:
+        return Result(error=loaded.error)
+    items = loaded.value
     index = next((i for i, item in enumerate(items) if item.id == item_id), None)
     if index is None:
         return Result(error=f"item {item_id!r}: not found (cannot {verb})")
@@ -246,8 +314,10 @@ def answer_item(
     answered_at: str | None = None,
 ) -> Result[Item]:
     """Record the operator's answer: an option index or the option's exact text."""
-    items = load_items(foreman_root)
-    target = next((i for i in items if i.id == item_id), None)
+    loaded = _load_items_strict(foreman_root)
+    if not loaded.ok:
+        return Result(error=loaded.error)
+    target = next((i for i in loaded.value if i.id == item_id), None)
     if target is None:
         return Result(error=f"item {item_id!r}: not found (cannot answer)")
     if target.status != STATUS_OPEN and target.status != STATUS_SNOOZED:
@@ -279,18 +349,31 @@ def answer_item(
 def snooze_item(
     foreman_root: Path, item_id: str, *, until: str, snoozed_at: str | None = None
 ) -> Result[Item]:
-    """Hide an item until an ISO-8601 ``until`` timestamp (local-time string ok)."""
-    if not until or not until.strip():
-        return Result(error="item.snoozed_until: a non-empty timestamp")
-    target = next((i for i in load_items(foreman_root) if i.id == item_id), None)
+    """Hide an item until an aware ISO-8601 ``until`` timestamp.
+
+    ``until`` must carry an offset (``Z`` or ``±HH:MM``); it is normalized to
+    UTC ``Z`` before storing so ``open_items`` compares instants, not strings.
+    Unparseable or naive input is an error value.
+    """
+    deadline = _parse_utc(until) if until and until.strip() else None
+    if deadline is None:
+        return Result(
+            error=f"item.snoozed_until {until!r}: an aware ISO-8601 timestamp "
+            "(e.g. 2026-11-26T09:00:00Z or ...+02:00)"
+        )
+    loaded = _load_items_strict(foreman_root)
+    if not loaded.ok:
+        return Result(error=loaded.error)
+    target = next((i for i in loaded.value if i.id == item_id), None)
     if target is None:
         return Result(error=f"item {item_id!r}: not found (cannot snooze)")
     if target.status in (STATUS_ANSWERED, STATUS_DISMISSED):
         return Result(error=f"item {item_id!r}: already {target.status}")
+    normalized = _format_utc(deadline)
     return _update(
         foreman_root,
         item_id,
-        lambda item: replace(item, status=STATUS_SNOOZED, snoozed_until=until),
+        lambda item: replace(item, status=STATUS_SNOOZED, snoozed_until=normalized),
         verb="snooze",
     )
 
@@ -299,7 +382,10 @@ def dismiss_item(
     foreman_root: Path, item_id: str, *, dismissed_at: str | None = None
 ) -> Result[Item]:
     """Close an item without an answer."""
-    target = next((i for i in load_items(foreman_root) if i.id == item_id), None)
+    loaded = _load_items_strict(foreman_root)
+    if not loaded.ok:
+        return Result(error=loaded.error)
+    target = next((i for i in loaded.value if i.id == item_id), None)
     if target is None:
         return Result(error=f"item {item_id!r}: not found (cannot dismiss)")
     if target.status in (STATUS_ANSWERED, STATUS_DISMISSED):

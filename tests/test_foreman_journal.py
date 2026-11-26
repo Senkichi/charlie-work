@@ -67,6 +67,56 @@ def test_torn_final_line_is_skipped(tmp_path: Path) -> None:
     assert appended.ok and appended.value.id == 2
 
 
+def test_append_after_torn_line_is_readable(tmp_path: Path) -> None:
+    """A torn final line cannot swallow the next append: the new record lands
+    on its own line (a leading ``\\n`` is written first) and reads back."""
+    fdir = _foreman(tmp_path)
+    journal = fdir / "journal.jsonl"
+    append_journal(fdir, "kept")
+    with journal.open("a", encoding="utf-8") as handle:
+        handle.write('{"id": 2, "ts": "x", "text": "torn')
+    appended = append_journal(fdir, "after-torn")
+    assert appended.ok, appended.error
+    entries = read_journal(fdir)
+    assert [e.text for e in entries] == ["kept", "after-torn"]
+    assert appended.value.id == 2
+
+
+def test_append_lock_busy_is_an_error_value(tmp_path: Path, monkeypatch) -> None:
+    """A held log lock makes the append a bounded error — never a hang."""
+    from charlie_work.file_lock import try_acquire_byte_range_lock
+    from charlie_work.foreman import journal as journal_mod
+
+    monkeypatch.setattr(journal_mod, "_LOCK_RETRIES", 2)
+    fdir = _foreman(tmp_path)
+    held = try_acquire_byte_range_lock(fdir / "journal.jsonl.lock")
+    assert held is not None
+    blocked = append_journal(fdir, "x")
+    assert not blocked.ok
+    assert "lock busy" in blocked.error
+    held.release()
+    assert append_journal(fdir, "x").ok
+
+
+def test_concurrent_appends_get_unique_ids(tmp_path: Path) -> None:
+    """``_next_id`` + ``_append`` run under the lock: no interleaved allocation."""
+    import threading
+
+    fdir = _foreman(tmp_path)
+    results = []
+    threads = [
+        threading.Thread(target=lambda i=i: results.append(append_inbox(fdir, f"m{i}")))
+        for i in range(8)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert all(r.ok for r in results)
+    ids = sorted(r.value.id for r in results)
+    assert ids == list(range(1, 9))
+
+
 def test_missing_files_read_empty(tmp_path: Path) -> None:
     fdir = _foreman(tmp_path)
     assert read_journal(fdir) == ()

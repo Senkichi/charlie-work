@@ -23,9 +23,15 @@ from .paths import instructions_path, shared_dir
 
 
 class _SharedTemplate(Template):
-    """``$placeholder`` syntax extended to hyphenated partial stems."""
+    """``$placeholder`` syntax extended to hyphenated partial stems.
 
-    idpattern = r"(?a:[_a-z][-._a-z0-9]*)"
+    An identifier must start with a letter/underscore, may contain hyphens,
+    and must end with a letter, digit, or underscore — so a sentence-final
+    ``$section_issue-style.`` keeps its period outside the placeholder and a
+    trailing ``-`` is never swallowed into the stem.
+    """
+
+    idpattern = r"(?a:[_a-z](?:[-_a-z0-9]*[_a-z0-9])?)"
 
 
 def _shared_partials(fleet_dir: Path) -> dict[str, str]:
@@ -43,7 +49,7 @@ def _shared_partials(fleet_dir: Path) -> dict[str, str]:
             continue
         try:
             partials[f"section_{path.stem}"] = path.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             continue
     return partials
 
@@ -64,14 +70,19 @@ def load_instructions(fleet_dir: Path, foreman_root: Path) -> Result[str]:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return Result(value="")
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         return Result(error=f"instructions.md: unreadable: {exc}")
-    try:
-        rendered = _SharedTemplate(text).substitute(_shared_partials(fleet_dir))
-    except KeyError as exc:
-        missing = exc.args[0]
-        stem = missing[len("section_") :] if str(missing).startswith("section_") else missing
+    template = _SharedTemplate(text)
+    partials = _shared_partials(fleet_dir)
+    # Only ``$section_<stem>`` identifiers are placeholders this renderer
+    # resolves (the ``prompts.py`` contract): any other ``$``-text — ``$HOME``,
+    # ``$5`` — is literal and passes through ``safe_substitute`` untouched.
+    missing = sorted(
+        key
+        for key in template.get_identifiers()
+        if key.startswith("section_") and key not in partials
+    )
+    if missing:
+        stem = missing[0][len("section_") :]
         return Result(error=f"instructions.md: shared partial {stem!r} not found")
-    except ValueError as exc:
-        return Result(error=f"instructions.md: {exc}")
-    return Result(value=rendered)
+    return Result(value=template.safe_substitute(partials))

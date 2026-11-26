@@ -59,7 +59,7 @@ _INSTRUCTIONS_TEMPLATE = """\
 # Instructions for {name}
 
 Standing instructions for this foreman's model call. Shared partials under
-`foremen/_shared/*.md` can be included here as `$section_<stem>`.
+`foremen/_shared/*.md` can be included here as `$$section_<stem>`.
 """
 
 
@@ -72,7 +72,7 @@ def registered_repo_keys(fleet_dir: Path) -> tuple[str, ...]:
     path = Path(fleet_dir) / layout.FLEET_REGISTRY_FILENAME
     try:
         data: Any = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return ()
     repos = data.get("repos") if isinstance(data, dict) else None
     if not isinstance(repos, dict):

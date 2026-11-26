@@ -112,6 +112,39 @@ def test_gang_list_degraded_displays_as_cricket(tmp_path: Path) -> None:
     assert "CRICKET" in result.message
 
 
+def test_gang_list_survives_non_utf8_charter(tmp_path: Path) -> None:
+    """A non-UTF-8 ``charter.yaml`` surfaces as a per-foreman error — it cannot
+    raise out of the list and hide the healthy foremen beside it."""
+    assert scaffold_foreman(tmp_path, "bad").ok
+    (tmp_path / "foremen" / "bad" / "charter.yaml").write_bytes("name: bad\n".encode("utf-16"))
+    (tmp_path / "foremen" / "bad" / "state.json").write_bytes(
+        '{"state": "active"}'.encode("utf-16")
+    )
+    assert scaffold_foreman(tmp_path, "good").ok
+    (tmp_path / "fleet.json").write_text(json.dumps({"version": 1, "repos": {"acme/w": {}}}))
+    (tmp_path / "foremen" / "good" / "charter.yaml").write_text(
+        'name: good\noutcome: do it\nrepos: ["acme/w"]\n'
+    )
+    result = run_gang_command(_args(tmp_path, "list"))
+    assert result.ok, result.message
+    entries = {e["name"]: e for e in result.data["foremen"]}
+    assert set(entries) == {"bad", "good"}
+    assert "charter_error" in entries["bad"]
+    assert entries["good"].get("issues") == "0/5"
+
+
+def test_main_dispatches_gang_list(tmp_path: Path, capsys) -> None:
+    """``charlie --fleet-dir <tmp> gang list`` reaches run_gang_command through
+    ``cli.main`` — deleting the GANG_COMMAND dispatch branch fails this test."""
+    from charlie_work import cli
+
+    assert scaffold_foreman(tmp_path, "g1").ok
+    rc = cli.main(["--fleet-dir", str(tmp_path), "gang", "list"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "g1" in out
+
+
 def test_gang_show(tmp_path: Path) -> None:
     assert scaffold_foreman(tmp_path, "g1").ok
     (tmp_path / "fleet.json").write_text(json.dumps({"version": 1, "repos": {"acme/w": {}}}))

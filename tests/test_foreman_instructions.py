@@ -61,6 +61,41 @@ def test_partial_from_another_foreman_is_not_shared(tmp_path: Path) -> None:
     assert not result.ok
 
 
+def test_freshly_scaffolded_instructions_render(tmp_path: Path) -> None:
+    """The built-in scaffold must render — its ``$section_<stem>`` is ``$$``-escaped."""
+    from charlie_work.foreman.store import scaffold_foreman
+
+    created = scaffold_foreman(tmp_path, "g1")
+    assert created.ok, created.error
+    result = load_instructions(tmp_path, created.value)
+    assert result.ok, result.error
+    assert "$section_<stem>" in result.value
+
+
+def test_sentence_final_placeholder_keeps_its_period(tmp_path: Path) -> None:
+    fdir = _setup(tmp_path)
+    shared = paths.shared_dir(tmp_path)
+    shared.mkdir(parents=True)
+    (shared / "issue-style.md").write_text("BODY\n", encoding="utf-8")
+    (fdir / "instructions.md").write_text(
+        "Follow the style in $section_issue-style.\n", encoding="utf-8"
+    )
+    result = load_instructions(tmp_path, fdir)
+    assert result.ok, result.error
+    assert result.value == "Follow the style in BODY\n.\n"
+
+
+def test_literal_dollar_text_passes_through(tmp_path: Path) -> None:
+    """Ordinary ``$``-text (``$HOME``, ``$5``) is literal — only ``$section_*`` resolves."""
+    fdir = _setup(tmp_path)
+    (fdir / "instructions.md").write_text(
+        "home is $HOME, budget is $5, keep $HOME.\n", encoding="utf-8"
+    )
+    result = load_instructions(tmp_path, fdir)
+    assert result.ok, result.error
+    assert result.value == "home is $HOME, budget is $5, keep $HOME.\n"
+
+
 def test_symlinked_partial_resolving_outside_is_skipped(tmp_path: Path) -> None:
     fdir = _setup(tmp_path)
     shared = paths.shared_dir(tmp_path)

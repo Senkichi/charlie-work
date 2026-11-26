@@ -141,11 +141,13 @@ def load_charter(foreman_root: Path, *, registered_repos: Collection[str]) -> Re
     if not path.is_file():
         return Result(error=f"charter.yaml not found at {path}")
     try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return Result(error=f"charter.yaml: unreadable: {exc}")
+    try:
+        raw = yaml.safe_load(text)
     except yaml.YAMLError as exc:
         return Result(error=f"charter.yaml: invalid YAML: {exc}")
-    except OSError as exc:
-        return Result(error=f"charter.yaml: unreadable: {exc}")
     if raw is None:
         return Result(error="charter.yaml: empty file")
     try:

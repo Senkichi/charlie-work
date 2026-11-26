@@ -186,6 +186,43 @@ def test_charter_symlink_escape_is_an_error_value(tmp_path: Path) -> None:
     assert "escapes" in result.error
 
 
+_BASE = 'name: g1\noutcome: Migrate the transport layer\nrepos: ["acme/widgets"]\n'
+
+
+@pytest.mark.parametrize(
+    "doc,expected",
+    [
+        # Every bounds field rejects a non-positive value.
+        (_BASE + "bounds:\n  max_open_issues: 0\n", "charter.bounds.max_open_issues"),
+        (_BASE + "bounds:\n  max_issues_per_turn: 0\n", "charter.bounds.max_issues_per_turn"),
+        (
+            _BASE + "bounds:\n  min_turn_interval_minutes: -1\n",
+            "charter.bounds.min_turn_interval_minutes",
+        ),
+        (_BASE + "bounds:\n  max_quiet_hours: 0\n", "charter.bounds.max_quiet_hours"),
+        (_BASE + "bounds:\n  max_turns_per_day: 0\n", "charter.bounds.max_turns_per_day"),
+        (_BASE + "bounds:\n  max_unanswered_days: 0\n", "charter.bounds.max_unanswered_days"),
+        # Field types: standing, repos, done_when.check, bounds, cadence.
+        (_BASE + 'standing: "yes"\n', "charter.standing"),
+        ("name: g1\noutcome: x\nrepos: acme/widgets\n", "charter.repos"),
+        (_BASE + 'done_when:\n  check: "uv run pytest"\n', "charter.done_when.check"),
+        (_BASE + "bounds: 5\n", "charter.bounds"),
+        (_BASE + 'cadence: "09:00"\n', "charter.cadence"),
+        # Empty outcome; missing or non-string name.
+        ('name: g1\noutcome: ""\nrepos: ["acme/widgets"]\n', "charter.outcome"),
+        ('outcome: x\nrepos: ["acme/widgets"]\n', "charter.name"),
+        ('name: 5\noutcome: x\nrepos: ["acme/widgets"]\n', "charter.name"),
+    ],
+)
+def test_charter_field_rejection_matrix(tmp_path: Path, doc: str, expected: str) -> None:
+    """Every charter field's rejection path names the field — acceptance criterion."""
+    fdir = _foreman(tmp_path)
+    _write(fdir, doc)
+    result = load_charter(fdir, registered_repos=REPOS)
+    assert not result.ok
+    assert expected in result.error
+
+
 def test_done_when_null_is_preserved(tmp_path: Path) -> None:
     """``done_when: null`` and an omitted section land the same way (P2)."""
     fdir = _foreman(tmp_path)

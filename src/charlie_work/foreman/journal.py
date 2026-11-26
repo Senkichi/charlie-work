@@ -17,12 +17,14 @@ The atomic-rewrite invariant covers whole-document JSON state files
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from ..file_lock import try_acquire_byte_range_lock
 from . import Result
 from .paths import inbox_path, journal_path, signals_path
 
@@ -62,19 +64,62 @@ class SignalEntry:
 
 
 def _append(path: Path, record: dict[str, Any]) -> Result[None]:
+    line = json.dumps(record, sort_keys=True).encode("utf-8") + b"\n"
     try:
-        with path.open("a", encoding="utf-8", newline="\n") as handle:
-            handle.write(json.dumps(record, sort_keys=True) + "\n")
+        # ``a+b``: reads may seek, writes always land at EOF. A torn final line
+        # (no trailing newline) gets a leading ``\n`` first — otherwise the new
+        # record would glue onto the torn bytes and the pair would decode as
+        # one invalid line, silently swallowing the new entry.
+        with path.open("a+b") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            if size:
+                handle.seek(size - 1)
+                if handle.read(1) != b"\n":
+                    handle.write(b"\n")
+            handle.write(line)
     except OSError as exc:
         return Result(error=f"{path.name}: unwritable: {exc}")
     return Result()
+
+
+_LOCK_RETRIES = 50
+_LOCK_RETRY_DELAY_SECONDS = 0.02
+
+
+def _append_entry(path: Path, record: dict[str, Any]) -> Result[int]:
+    """Allocate ``record["id"]`` and append it under the per-file lock.
+
+    ``_next_id`` + ``_append`` as one critical section: two concurrent
+    appenders (the foreman and, for inbox/signals, external writers) cannot
+    interleave the read-modify-write and mint a duplicate id. The lock is a
+    byte-range lock on ``<name>.lock`` beside the log — a bounded retry so a
+    wedged writer surfaces as an error value rather than hanging a Turn.
+    """
+    lock_path = path.with_name(path.name + ".lock")
+    lock = None
+    for _ in range(_LOCK_RETRIES):
+        lock = try_acquire_byte_range_lock(lock_path)
+        if lock is not None:
+            break
+        time.sleep(_LOCK_RETRY_DELAY_SECONDS)
+    if lock is None:
+        return Result(error=f"{path.name}: append lock busy after {_LOCK_RETRIES} retries")
+    try:
+        record["id"] = _next_id(path)
+        written = _append(path, record)
+        if not written.ok:
+            return Result(error=written.error)
+        return Result(value=record["id"])
+    finally:
+        lock.release()
 
 
 def _iter_entries(path: Path) -> Iterator[dict[str, Any]]:
     """Yield decoded entries, skipping blank lines and a torn final write."""
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return
     for line in text.splitlines():
         line = line.strip()
@@ -105,14 +150,14 @@ def append_journal(
         path = journal_path(foreman_root)
     except ValueError as exc:
         return Result(error=str(exc))
-    entry = JournalEntry(id=_next_id(path), ts=ts or utc_now(), text=text, turn_id=turn_id)
-    record: dict[str, Any] = {"id": entry.id, "ts": entry.ts, "text": entry.text}
+    stamp = ts or utc_now()
+    record: dict[str, Any] = {"ts": stamp, "text": text}
     if turn_id is not None:
         record["turn_id"] = turn_id
-    written = _append(path, record)
+    written = _append_entry(path, record)
     if not written.ok:
         return Result(error=written.error)
-    return Result(value=entry)
+    return Result(value=JournalEntry(id=written.value, ts=stamp, text=text, turn_id=turn_id))
 
 
 def read_journal(foreman_root: Path, *, limit: int | None = None) -> tuple[JournalEntry, ...]:
@@ -141,11 +186,11 @@ def append_inbox(foreman_root: Path, text: str, *, ts: str | None = None) -> Res
         path = inbox_path(foreman_root)
     except ValueError as exc:
         return Result(error=str(exc))
-    entry = InboxMessage(id=_next_id(path), ts=ts or utc_now(), text=text)
-    written = _append(path, {"id": entry.id, "ts": entry.ts, "text": entry.text})
+    stamp = ts or utc_now()
+    written = _append_entry(path, {"ts": stamp, "text": text})
     if not written.ok:
         return Result(error=written.error)
-    return Result(value=entry)
+    return Result(value=InboxMessage(id=written.value, ts=stamp, text=text))
 
 
 def read_inbox(foreman_root: Path, *, after_id: int = 0) -> tuple[InboxMessage, ...]:
@@ -173,13 +218,12 @@ def append_signal(
         path = signals_path(foreman_root)
     except ValueError as exc:
         return Result(error=str(exc))
-    entry = SignalEntry(id=_next_id(path), ts=ts or utc_now(), source=source, data=data or {})
-    written = _append(
-        path, {"id": entry.id, "ts": entry.ts, "source": entry.source, "data": entry.data}
-    )
+    stamp = ts or utc_now()
+    payload = data or {}
+    written = _append_entry(path, {"ts": stamp, "source": source, "data": payload})
     if not written.ok:
         return Result(error=written.error)
-    return Result(value=entry)
+    return Result(value=SignalEntry(id=written.value, ts=stamp, source=source, data=payload))
 
 
 def read_signals(foreman_root: Path, *, after_id: int = 0) -> tuple[SignalEntry, ...]:
