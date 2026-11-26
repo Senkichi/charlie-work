@@ -37,6 +37,16 @@ def test_write_list_read_delete_round_trip(tmp_path: Path) -> None:
     assert not read_memory(fdir, "decomp").ok
 
 
+def test_non_utf8_memory_read_is_an_error_value(tmp_path: Path) -> None:
+    """A non-UTF-8 memory file is an error value, not a UnicodeDecodeError raise."""
+    fdir = _foreman(tmp_path)
+    (fdir / "memory").mkdir()
+    (fdir / "memory" / "binary.md").write_bytes("note\n".encode("utf-16"))
+    result = read_memory(fdir, "binary")
+    assert not result.ok
+    assert "unreadable" in result.error
+
+
 def test_size_bound_refused(tmp_path: Path) -> None:
     fdir = _foreman(tmp_path)
     big = "x" * (MAX_MEMORY_BYTES + 1)
