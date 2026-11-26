@@ -265,9 +265,12 @@ def test_kill_process_tree_records_kill_when_taskkill_returncode_unexpected() ->
 def test_kill_process_tree_own_group_guard_posix(monkeypatch: pytest.MonkeyPatch) -> None:
     """kill_process_tree refuses a non-ancestor target in the caller's own process group.
 
-    Issue #3075 coverage dedupe: the report scored this leaf "equal" to the
-    kept bash-launcher test only because both skipped on the Windows fleet
-    host -- empty coverage, not shared assertions. What this asserts that the
+    Issue #3075 coverage dedupe: the report scored the pre-rewrite leaf
+    "equal" to the kept bash-launcher test because both skipped on the
+    Windows fleet host -- each recorded the identical collection/setup
+    footprint every skipped test records (conftest.py, _os_name_guard.py,
+    _process_guard.py -- verified against the newest cached map). Equal
+    recorded coverage is not equal assertions. What this asserts that the
     kept test does not: the POSIX ``pgid == os.getpgid(0)`` refusal itself.
     The pre-#1842 body called ``kill_process_tree(os.getpid())``, but the
     caller-ancestor exemption fires before the POSIX branch for a self target

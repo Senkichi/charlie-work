@@ -84,8 +84,11 @@ def test_vendored_base_equals_live_swole_checkout() -> None:
 
 
 # Issue #3075 coverage dedupe: the report scored this "equal" to the kept
-# bash-launcher test only because both skip in the nightly env (no
-# CHARLIE_WORK_SWOLE_ROOT on CI) -- empty coverage, not shared assertions.
+# bash-launcher test because both skip in the nightly env (no
+# CHARLIE_WORK_SWOLE_ROOT on CI) -- each records the identical
+# collection/setup footprint every skipped test records (conftest.py,
+# _os_name_guard.py, _process_guard.py -- verified against the newest
+# cached map), and equal recorded coverage is not equal assertions.
 # What this asserts that the kept test does not: the vendored ``status``
 # group is byte-equal to a LIVE swole checkout's and ``swole_drift`` reports
 # in_sync -- upstream drift detection that only runs where an operator-side
@@ -212,7 +215,7 @@ PR467_TOKENS = Path(
 )
 
 
-# Issue #3075 coverage dedupe: same degenerate "equal" verdict as the
+# Issue #3075 coverage dedupe: same skip-footprint "equal" verdict as the
 # live-swole leaf above -- this one only runs where the PR-#467 worktree
 # checkout exists. What this asserts that the kept test does not: the
 # vendored ``status`` AND ``base`` groups equal the PR-#467 branch's tokens

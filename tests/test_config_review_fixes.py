@@ -130,11 +130,6 @@ def test_layered_null_keeps_both_layers(tmp_path: Path) -> None:
         # the layered load SUCCEEDS and no construction error is raised anymore
         # (that behavior is pinned by
         # test_scalar_null_in_global_host_wide_section_takes_the_default below).
-        # Issue #3075 coverage dedupe flagged the max_running_heavy leaf "equal"
-        # to an unrelated bash-launcher test -- degenerate: a leaf skipped
-        # everywhere covers nothing, so its coverage equals every other skipped
-        # test's. It stays for the #1538 leaf pin; its live assertion is the
-        # default-taking test below.
         pytest.param(
             "runner_allocation:\n  enabled: true\n  threads_per_slot:\n",
             marks=pytest.mark.skip(
@@ -149,6 +144,15 @@ def test_layered_null_keeps_both_layers(tmp_path: Path) -> None:
                 "leaf id kept for the collect-only gate (#1538)"
             ),
         ),
+        # Issue #3075 coverage dedupe flagged this leaf "equal" to an unrelated
+        # bash-launcher test: in the nightly env both skip, so each records the
+        # identical collection/setup footprint every skipped test records
+        # (conftest.py, _os_name_guard.py, _process_guard.py -- verified against
+        # the newest cached map). Equal recorded coverage is not equal
+        # assertions: this leaf asserts nothing (unconditional skip) and exists
+        # only because the collect-only gate pins its id (#1538);
+        # test_scalar_null_in_global_host_wide_section_takes_the_default below
+        # pins threads_per_slot only.
         pytest.param(
             "runner_allocation:\n  enabled: true\n  max_running_heavy:\n",
             marks=pytest.mark.skip(
