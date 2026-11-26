@@ -498,8 +498,15 @@ def count_fleet_live_reviews(
         )
         if not reviews_dir.exists():
             continue
+        # Lock-free census read (issue #3141): this walk runs under the
+        # fleet launch lock, so it must not queue on another repo's state
+        # lock -- a long hold there used to freeze every other lane's
+        # launch gate silently for the whole hold.
         total_live_count += count_live_sessions(
-            reviews_dir, layout.state_file_path(state_dir), REVIEW_LANE
+            reviews_dir,
+            layout.state_file_path(state_dir),
+            REVIEW_LANE,
+            lock_free_state_read=True,
         )
 
     return total_live_count, skipped_repos

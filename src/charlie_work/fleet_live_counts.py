@@ -60,8 +60,15 @@ def count_fleet_live_sessions_with_adapter_kinds(
             skipped_repos.append(name_with_owner)
             continue
 
+        # Lock-free census read (issue #3141): this walk runs under the
+        # fleet launch lock, so it must not queue on another repo's state
+        # lock -- a long hold there (e.g. a slow reconcile) used to freeze
+        # every other lane's launch gate silently for the whole hold.
         repo_total, repo_kinds = count_live_sessions_with_adapter_kinds(
-            sessions_dir, layout.state_file_path(state_dir), WORKER_LANE
+            sessions_dir,
+            layout.state_file_path(state_dir),
+            WORKER_LANE,
+            lock_free_state_read=True,
         )
         total_live_count += repo_total
         for kind, count in repo_kinds.items():

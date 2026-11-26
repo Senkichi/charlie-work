@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from . import host as _host
+from . import state as _state
 from .state import load_state_locked
 
 
@@ -89,7 +90,11 @@ def _ghost_pid_alive(entry: dict[str, Any], kind: LiveSessionKind) -> bool:
 
 
 def count_live_sessions_with_adapter_kinds(
-    directory: Path, state_file: Path | None, kind: LiveSessionKind
+    directory: Path,
+    state_file: Path | None,
+    kind: LiveSessionKind,
+    *,
+    lock_free_state_read: bool = False,
 ) -> tuple[int, dict[str, int]]:
     """One ``iter_workers`` pass returning the corroborated total AND the per-kind counts.
 
@@ -113,6 +118,15 @@ def count_live_sessions_with_adapter_kinds(
     worker/reviewer invisible to concurrency accounting and the next pass
     can launch past the configured cap (issue #343). A ghost has no sidecar
     and therefore no known adapter, so it never enters the per-kind counts.
+
+    ``lock_free_state_read``: the corroboration pass reads ``state_file``
+    through the lock-free ``load_state`` instead of ``load_state_locked``.
+    State writes are atomic replaces, so a lock-free read is the last
+    committed snapshot -- which is all a fleet-wide census needs, and the
+    census must not queue on another repo's state lock: a slow holder
+    there used to freeze every other lane's launch gate for the whole hold
+    (issue #3141). The default keeps the locked read for callers whose
+    count gates a mutation of that same state.
     """
     from .worker import iter_workers
 
@@ -126,7 +140,15 @@ def count_live_sessions_with_adapter_kinds(
             counts[w.adapter_kind] = counts.get(w.adapter_kind, 0) + 1
 
     if state_file is not None:
-        state = load_state_locked(state_file)
+        # ``_state.load_state`` deliberately bypasses the module's
+        # locked-read enforcement (the AST lint only allows attribute-form
+        # ``load_state`` calls): the flag above is the caller's explicit
+        # opt-in to the lock-free census read.
+        state = (
+            _state.load_state(state_file)
+            if lock_free_state_read
+            else load_state_locked(state_file)
+        )
         for number_str, entry in state.get(kind.state_map, {}).items():
             if not isinstance(entry, dict):
                 continue
@@ -151,10 +173,19 @@ def count_live_sessions_with_adapter_kinds(
     return live_count, counts
 
 
-def count_live_sessions(directory: Path, state_file: Path | None, kind: LiveSessionKind) -> int:
+def count_live_sessions(
+    directory: Path,
+    state_file: Path | None,
+    kind: LiveSessionKind,
+    *,
+    lock_free_state_read: bool = False,
+) -> int:
     """Count live sessions under ``directory``, corroborated against ``state_file``.
 
     Thin wrapper over :func:`count_live_sessions_with_adapter_kinds` (issue
     #2764): the total half of its single sidecar pass, unchanged in behavior.
+    ``lock_free_state_read`` is forwarded verbatim (issue #3141).
     """
-    return count_live_sessions_with_adapter_kinds(directory, state_file, kind)[0]
+    return count_live_sessions_with_adapter_kinds(
+        directory, state_file, kind, lock_free_state_read=lock_free_state_read
+    )[0]
