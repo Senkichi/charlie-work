@@ -52,7 +52,15 @@ from charlie_work.local_issue_files import issue_number_from_name
 from charlie_work.local_issues import LocalFileGitHub
 from charlie_work.local_lane import local_pr_dict
 
-from _verdict_parity_driver import MISSING, Diff, Scenario, _diffs, _fresh_repo, run_both
+from _verdict_parity_driver import (
+    MISSING,
+    Diff,
+    Scenario,
+    _diffs,
+    _fresh_repo,
+    _repo_template,
+    run_both,
+)
 from _verdict_parity_table import DECLARED_DIFFERENCES, SCENARIOS
 
 _CACHE: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
@@ -281,6 +289,25 @@ def test_fresh_repo_materializes_without_git_spawns() -> None:
     with mock.patch.object(subprocess, "Popen", wraps=subprocess.Popen) as popen:
         _fresh_repo()
     assert popen.call_count == 0, "the copy phase spawned instead of copying the template"
+
+
+def test_fresh_repo_hands_each_caller_its_own_tree() -> None:
+    """Issue #3150 pin: the isolation half of the template-copy contract. The Local
+    path writes into ``repo.root`` (issue files, ``.var`` state, ``ci-fleet.toml``),
+    so ``_fresh_repo`` must hand every caller its own tree and keep the
+    per-environment template pristine -- handing out the template itself would let
+    one caller's writes leak into every later copy. Holds under
+    ``CI_FLEET_TEST_REUSE=off`` too, so unlike the spawn pin this is not skipped."""
+    first = _fresh_repo()
+    second = _fresh_repo()
+    template = _repo_template()
+    assert first.root != template.root, "_fresh_repo returned the template itself"
+    assert second.root != template.root, "_fresh_repo returned the template itself"
+    assert first.root != second.root, "two calls share one tree"
+    sentinel = first.root / "written-into-first-copy-only"
+    sentinel.write_text("x", encoding="utf-8")
+    assert not (second.root / sentinel.name).exists(), "a write into one copy reached another"
+    assert not (template.root / sentinel.name).exists(), "a write into a copy reached the template"
 
 
 @pytest.mark.parametrize("path", ["issue.status", "labels.added", "events.order"])
