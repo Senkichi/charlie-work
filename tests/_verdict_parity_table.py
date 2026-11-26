@@ -458,18 +458,8 @@ def _rescue_when(diff: Diff) -> bool:
     return _RESCUE_PINNED[diff.path] == (diff.remote, diff.local)
 
 
-def _repeats_summary(diff: Diff) -> bool:
-    """Local body == PR body + exactly the one repeated Required changes section."""
-    if not isinstance(diff.remote, str):
-        return False
-    scenario = next(sc for sc in SCENARIOS if sc.name == diff.scenario)
-    if scenario.required_changes:
-        return False
-    return diff.local == f"{diff.remote}\n\n### Required changes\n- {scenario.summary.strip()}"
-
-
 DECLARED_DIFFERENCES: tuple[DeclaredDifference, ...] = (
-    # --- the issue's eight rows: difference and reason exactly as its table gives them ---
+    # --- the issue's table rows (seven remain): difference and reason as its table gives them, except the two rows whose reason differs by design (issues #3105, #3106) ---
     DeclaredDifference(
         "No Rescue tier on the Local path",
         "stated in a comment in `record_local_review`; at the cap a local record escalates directly",
@@ -516,20 +506,27 @@ DECLARED_DIFFERENCES: tuple[DeclaredDifference, ...] = (
         _remote_missing,
     ),
     DeclaredDifference(
-        "Local verdict comment repeats the summary",
-        "drift, tracked separately",
-        ("verdict_comment",),
-        _repeats_summary,
-    ),
-    DeclaredDifference(
         "`reviewed_body_sha256` not recorded locally",
-        "drift, tracked separately",
+        (
+            "the Local path has no PR body to hash (its packet `pr.json` and `local_pr_dict` "
+            "carry no `body`; `LocalFileGitHub.pr_view` returns `{}` and `pr_list` returns "
+            '`[]`), and every comparison of the stored hash requires `"body" in pr`, so a '
+            "recorded hash could never be compared. `_body_rework_escape_warning` does "
+            "execute for a Local path record in the mechanical de-escalation sweep, but with "
+            "`pr == {}` it fails closed; `_route_to_rework` only copies the stored value"
+        ),
         ("decision_file.reviewed_body_sha256", "pr_record.reviewed_body_sha256"),
         _local_missing,
     ),
     DeclaredDifference(
         "Local lifecycle transitions omit the record number",
-        "drift, tracked separately",
+        (
+            "A Local path record's number is its local issue file's number, not a GitHub PR "
+            "number, and the dashboard links milestones to an item by (source, pr) alone. "
+            "`lifecycle_transition` rows are the exact Stage time source, so in an events.db "
+            "that also holds PR path history a same-numbered PR's drill-down would absorb the "
+            "Local issue's stages; the rows are already complete keyed by issue number."
+        ),
         ("events.lifecycle_transition#0.payload.pr_number",),
         lambda diff: diff.remote == 7 and diff.local in (MISSING, None),
     ),
