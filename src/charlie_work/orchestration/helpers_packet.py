@@ -8,11 +8,13 @@ the ``workflow_delegation`` installer re-attaches each ``def`` onto the class.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 
 import charlie_work.workflow as _wf
 from charlie_work.attachment_contracts import hook_entry as attachment_hook_entry
 from charlie_work.attachment_contracts.model import AdvisoryRecord
 from charlie_work.command_result import CommandResult
+from charlie_work.iso_timestamp import parse_iso_timestamp
 from charlie_work.workflow_delegation import as_staticmethod
 
 
@@ -111,6 +113,29 @@ def _read_packet_body(self, pr_number: int) -> str | None:
         return None
     value = data.get("body")
     return value if isinstance(value, str) else None
+
+
+def _read_packet_built_at(self, pr_number: int) -> datetime | None:
+    """Return the ``packet_built_at`` stamped into the existing review
+    packet's ``pr.json`` for ``pr_number`` (issue #3182), or ``None`` if no
+    packet exists, it cannot be read, or it predates the field.
+
+    A ``None`` read is a legacy packet: it cannot prove it postdates the
+    verdict-voiding unescalation the currency check compares it against,
+    so the caller treats it as built before. That is the fail-safe
+    direction -- worst case is one rebuild, after which the stamp exists.
+    """
+    pr_json_path = self.paths.prs / f"pr-{pr_number}" / "pr.json"
+    if not pr_json_path.exists():
+        return None
+    try:
+        with pr_json_path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return parse_iso_timestamp(data.get("packet_built_at"))
 
 
 def _read_packet_turn_cap_multiplier(self, pr_number: int) -> int:

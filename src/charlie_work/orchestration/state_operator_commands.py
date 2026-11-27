@@ -27,7 +27,10 @@ from charlie_work.state import (
     PASSIVE_OPEN_STATUS,
     SINK_STATUSES,
 )
-from charlie_work.unescalate_reset_fields import stamp_unescalate_cleared_markers
+from charlie_work.unescalate_reset_fields import (
+    UNESCALATE_VERDICT_VOIDED_AT_KEY,
+    stamp_unescalate_cleared_markers,
+)
 from charlie_work.worktree import (
     OPERATOR_MARKER_KIND,
     OPERATOR_MARKER_SESSION_ID,
@@ -300,7 +303,13 @@ def unescalate(
       "escalated" too -- that verdict is voided back to a "pending" stub
       (issue #1765 finding 1) the same way ``review()``'s own stale-head
       void does: archive it first, then overwrite with a head-stamped
-      pending placeholder. Without this, ``review_queue()`` treats the
+      pending placeholder. The void also stamps
+      ``unescalate_verdict_voided_at`` on the PR record (issue #3182) so
+      the same-head packet skip treats a packet built before this
+      unescalation as not current whenever the live body drifted from the
+      packet body -- the operator decision the voided verdict was waiting
+      on reaches the fresh review instead of the stale packet's copy.
+      Without this, ``review_queue()`` treats the
       still-valid verdict as "nothing to do" and skips the PR forever, so
       resetting the status to passive-open would report changed=True while
       leaving the PR permanently unreachable -- the alerting label is gone
@@ -769,6 +778,16 @@ def unescalate(
                     archive_round=False,
                 )
                 verdict_voided = True
+                # Issue #3182: record WHEN the void happened on the PR
+                # record so the same-head packet skip treats a packet built
+                # before this unescalation as not current whenever the live
+                # body drifted from the packet body -- an operator decision
+                # written into the PR body (the resolution the voided
+                # verdict was waiting on) must reach the fresh review, not
+                # the stale packet's copy.
+                pr_record = state["prs"].get(str(pr_number))
+                if isinstance(pr_record, dict):
+                    pr_record[UNESCALATE_VERDICT_VOIDED_AT_KEY] = _wf.utc_now()
         if issue_number is not None:
             fresh_issue = state["issues"].get(str(issue_number), {})
             if isinstance(fresh_issue, dict):

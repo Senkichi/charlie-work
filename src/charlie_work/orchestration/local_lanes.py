@@ -606,6 +606,10 @@ def _local_build_packet(
         "review_turn_cap_max_touched_lines": _wf._max_touched_file_line_count(
             diff, self.repo_root
         ),
+        # Issue #3182: same stamp the remote ``review()`` packet carries --
+        # the same-head packet skip compares it against the PR record's
+        # verdict-voiding unescalation time.
+        "packet_built_at": _wf.utc_now(),
     }
     self._write_json(pr_json_path, pr_json)
     self._write_json(checks_path, [])
