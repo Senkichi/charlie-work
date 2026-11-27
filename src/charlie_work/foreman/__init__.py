@@ -32,6 +32,7 @@ from typing import Generic, TypeVar
 __all__ = [
     "FOREMAN_STATES",
     "Result",
+    "display_action_outcome",
     "display_state",
 ]
 
@@ -67,3 +68,14 @@ _DEGRADED_DISPLAY = "CRICKET"
 def display_state(state: str) -> str:
     """Map a foreman state to its CLI display spelling."""
     return _DEGRADED_DISPLAY if state == "degraded" else state
+
+
+#: Themed display spelling for a refused Apply outcome (design §8.3/§13:
+#: display text labels a refused action ``jabroni``; the event kind and the
+#: stored reason stay semantic).
+_REFUSED_ACTION_DISPLAY = "jabroni"
+
+
+def display_action_outcome(outcome: str) -> str:
+    """Map an Apply action outcome to its CLI display spelling."""
+    return _REFUSED_ACTION_DISPLAY if outcome == "refused" else outcome

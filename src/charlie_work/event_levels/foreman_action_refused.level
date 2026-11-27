@@ -1,0 +1,8 @@
+warning
+# Issue #3119: a foreman Apply step refused one action — charter miss,
+# bound reached, lint or guard refusal, failed effect. Warning, not
+# error: a refusal is the safety surface doing its designed job (the
+# action simply never took effect, and the reason is in the payload),
+# but it is also the only signal that a foreman's plan is not landing,
+# so it belongs in the warning stream the way
+# outbound_body_secret_refused does.
