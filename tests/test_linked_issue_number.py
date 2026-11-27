@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from charlie_work.issue_linking import linked_issue_number
+import pytest
+
+from charlie_work.issue_linking import (
+    iter_unnegated_closing_keyword_matches,
+    linked_issue_number,
+)
 
 
 def test_linked_issue_number_from_branch_body_or_title() -> None:
@@ -278,6 +283,34 @@ def test_linked_issue_number_negation_guard_table() -> None:
         )
         is None
     )
+
+
+@pytest.mark.parametrize(
+    "word",
+    ["prefix", "prefixes", "suffixed", "unresolved", "enclosed"],
+)
+def test_closing_keyword_match_requires_leading_word_boundary(word: str) -> None:
+    # Issue #3181: a word that merely *ends* in a closing keyword is not one.
+    # GitHub only auto-closes on a whole-word keyword, so "prefix #N" must not
+    # read as "fix #N" -- before the fix, every word below produced a match
+    # whose matched text was the keyword suffix plus the issue reference.
+    assert list(iter_unnegated_closing_keyword_matches(f"{word} #123")) == []
+
+
+@pytest.mark.parametrize("text", ["fix", "Fixes", "(closes", "-resolve"])
+def test_closing_keyword_match_still_binds_whole_keywords(text: str) -> None:
+    # The leading word boundary must not reject real keywords: any case,
+    # after punctuation (an opening parenthesis or a hyphen), and at the
+    # start of a line.
+    matches = list(iter_unnegated_closing_keyword_matches(f"{text} #123"))
+    assert len(matches) == 1
+    assert int(matches[0].group(1)) == 123
+
+
+def test_closing_keyword_match_binds_at_line_start() -> None:
+    matches = list(iter_unnegated_closing_keyword_matches("\nresolves #123"))
+    assert len(matches) == 1
+    assert int(matches[0].group(1)) == 123
 
 
 def test_linked_issue_number_negation_does_not_shadow_later_genuine_match() -> None:

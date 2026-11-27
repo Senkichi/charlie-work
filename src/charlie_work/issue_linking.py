@@ -45,8 +45,13 @@ if TYPE_CHECKING:  # annotation only: keeps this module free of any runtime conf
 # GitHub's own issue-closing keyword set, used here to decide whether a `#N`
 # reference in freeform text actually links the PR to issue N. Shared between
 # the matching regex below and `_CLOSING_KEYWORD_DEFANG_RE` so the two
-# patterns cannot drift apart.
-_CLOSING_KEYWORDS_ALT = r"(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)"
+# patterns cannot drift apart. The leading `\b` lives inside the alternation
+# (issue #3181): GitHub only auto-closes on a whole-word keyword, so without
+# it a word that merely ends in a keyword ("prefix #N" -> "fix #N",
+# "prefixes #N" -> "fixes #N") is a false positive. Keeping the boundary
+# here, not at each pattern's call site, is what makes every pattern built
+# from this constant inherit it in one place.
+_CLOSING_KEYWORDS_ALT = r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)"
 _CLOSING_KEYWORD_REF = re.compile(_CLOSING_KEYWORDS_ALT + r"\s+#(\d+)", flags=re.IGNORECASE)
 
 # The orchestrator's own branch convention (agent/issue-N-slug). A head ref is
