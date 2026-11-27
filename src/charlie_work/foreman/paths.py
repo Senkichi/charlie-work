@@ -46,6 +46,9 @@ MEMORY_DIRNAME = "memory"
 TURNS_DIRNAME = "turns"
 TREE_DIRNAME = "tree"
 
+ACTIONS_FILENAME = "actions.json"
+APPLIED_FILENAME = "applied.jsonl"
+
 #: A foreman name: lowercase alphanumeric, hyphens allowed after the first
 #: character. The pattern deliberately excludes ``_``, so ``_shared`` can
 #: never be mistaken for a foreman directory.
@@ -127,6 +130,16 @@ def turn_dir(foreman_root: Path, turn_id: str) -> Path:
     """Resolve ``turns/<turn_id>``, containment-checked."""
     root = _sub(foreman_root, TURNS_DIRNAME)
     return require_contained(root, root / turn_id, context="turn_dir")
+
+
+def actions_path(foreman_root: Path, turn_id: str) -> Path:
+    """Resolve ``turns/<turn_id>/actions.json`` — Decide's output, Apply's input."""
+    return _sub(turn_dir(foreman_root, turn_id), ACTIONS_FILENAME)
+
+
+def applied_path(foreman_root: Path, turn_id: str) -> Path:
+    """Resolve ``turns/<turn_id>/applied.jsonl`` — Apply's per-action record."""
+    return _sub(turn_dir(foreman_root, turn_id), APPLIED_FILENAME)
 
 
 def charter_path(foreman_root: Path) -> Path:
