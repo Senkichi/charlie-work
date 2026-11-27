@@ -3,9 +3,10 @@
 Design §10/§16. Covers ``foreman/limits.py`` (the three limits and their
 items/events/state transitions), the ``forced_arming`` gate in
 ``apply_checks._arm_or_raise``, the WILD CARD/CRICKET display spellings,
-the five heartbeat alarm evaluators in ``heartbeat_alarms_fleet``, the
-per-foreman doctor check, and the pass-level wiring (``foreman_pass_completed``
-fleet event, notify after a failed Turn). Shared world builders live in
+the five heartbeat alarm evaluators in ``heartbeat_alarms_fleet``, and the
+per-foreman doctor check. Pass-level wiring (``foreman_pass_completed``,
+notify after a failed Turn, the ``--dry-run`` gate) lives in the sibling
+``tests/test_foreman_limits_pass.py``. Shared world builders live in
 ``tests/_foreman_pass_fixtures.py``; apply-side helpers mirror
 ``tests/test_foreman_apply.py``.
 """
@@ -23,14 +24,13 @@ from _foreman_pass_fixtures import (
     _events,
     _finish,
     _patch_state,
-    _run,
-    _succeeding_decide,
     _world,
 )
 from _worktree_fixtures import (
     _wt_scratch as _register_wt_scratch,  # noqa: F401 -- registers the wt_scratch fixture
 )
 
+from charlie_work import api_budget
 from charlie_work import heartbeat_alarms_foreman as haff
 from charlie_work import instrumentation, layout
 from charlie_work import doctor
@@ -38,12 +38,10 @@ from charlie_work.foreman import display_state
 from charlie_work.foreman import items as f_items
 from charlie_work.foreman import limits as flimits
 from charlie_work.foreman import paths as f_paths
-from charlie_work.foreman import pass_run
 from charlie_work.foreman.apply import apply_turn
 from charlie_work.foreman.charter import Charter, CharterBounds
 from charlie_work.foreman.state import (
     ForemanState,
-    read_state_snapshot,
     save_state,
 )
 from charlie_work.foreman_config import ForemanBreakerConfig
@@ -475,6 +473,66 @@ def test_verdict_token_leg_fails_on_foreman_heavy_spend(
     assert state.forced_arming == "propose"
 
 
+def test_verdict_token_leg_counts_ledger_sessions(
+    tmp_path: Path, wt_scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The api-budget session ledger feeds the token leg too (issue #480)."""
+    world = _world(tmp_path, wt_scratch, monkeypatch)
+    _verdict_world(world, ["done"] * 20)
+    # Ledger sessions: 100 tokens against authored issue 20; 999 against an
+    # issue the foreman never authored — only the authored session counts.
+    ledger = {
+        "version": 1,
+        "days": {},
+        "lifetime_usd": 0.0,
+        "sessions": [
+            {
+                "issue": 20,
+                "session_id": "s1",
+                "provider": "api",
+                "model": "m",
+                "started_at": "",
+                "ended_at": "",
+                "input_tokens": 60,
+                "output_tokens": 40,
+                "cached_tokens": 0,
+                "usd": 0.0,
+                "duration_s": 0.0,
+                "outcome": "ok",
+            },
+            {
+                "issue": 99,
+                "session_id": "s2",
+                "provider": "api",
+                "model": "m",
+                "started_at": "",
+                "ended_at": "",
+                "input_tokens": 999,
+                "output_tokens": 0,
+                "cached_tokens": 0,
+                "usd": 0.0,
+                "duration_s": 0.0,
+                "outcome": "ok",
+            },
+        ],
+    }
+    api_budget.ledger_path(world.state_root).write_text(json.dumps(ledger), encoding="utf-8")
+    instrumentation.log_event(
+        f_paths.state_path(world.foreman_root),
+        "foreman_turn_completed",
+        {"input_tokens": 25, "output_tokens": 5},
+        repo=REPO_KEY,
+    )
+
+    state = _eval(world)
+
+    verdicts = _events(world, flimits.EVENT_VERDICT)
+    assert verdicts[0]["worker_reviewer_tokens"] == 100
+    assert verdicts[0]["turn_tokens"] == 30
+    assert verdicts[0]["token_ok"] is False
+    assert state.forced_arming == "propose"
+
+
 def test_verdict_retries_when_report_item_fails(
     tmp_path: Path, wt_scratch: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -678,102 +736,3 @@ def test_doctor_foremen_reports_decode_problems(tmp_path: Path) -> None:
     assert len(findings) == 1 and findings[0][1] is False
     detail = findings[0][2]
     assert "ghost/repo" in detail and "bogus" in detail and "failed to decode" in detail
-
-
-# ---------------------------------------------------------------------------
-# pass-level wiring
-# ---------------------------------------------------------------------------
-
-
-def test_run_pass_writes_fleet_pass_event(
-    tmp_path: Path, wt_scratch: Path, monkeypatch: pytest.MonkeyPatch, fake_host
-) -> None:
-    world = _world(tmp_path, wt_scratch, monkeypatch)
-
-    _run(world)
-
-    fleet_events = [
-        row["payload"]
-        for row in instrumentation.query_events(
-            layout.state_file_path(world.fleet_dir), kind=pass_run.EVENT_PASS_COMPLETED
-        )
-    ]
-    assert len(fleet_events) == 1
-    assert fleet_events[0]["foremen"] == 1
-
-
-def test_run_pass_limits_eval_before_turn(
-    tmp_path: Path, wt_scratch: Path, monkeypatch: pytest.MonkeyPatch, fake_host
-) -> None:
-    """The limits evaluation runs at pass start even for a quiet foreman."""
-    world = _world(tmp_path, wt_scratch, monkeypatch)
-    _succeeding_decide(fake_host)
-    _patch_state(world, issues=_authored(20, 21, 22))
-    _finish(
-        world,
-        (20, "human_needed"),
-        (21, "operator_queue"),
-        (22, "human_needed"),
-        (30, "done"),
-        (31, "done"),
-        (32, "done"),
-        (33, "done"),
-        (34, "human_needed"),
-    )
-
-    passed = _run(world)
-
-    # The seeded world has a wake reason (the lifecycle fingerprint moved),
-    # so the Turn lands — and the default breaker (sample=10) stays quiet on
-    # three finished issues: limits ran, no trip, the Turn proceeded.
-    assert passed.outcomes[0].outcome == "turn"
-    state = read_state_snapshot(world.foreman_root)
-    assert state.degraded_reasons == ()
-    assert state.turns_total == 4
-
-
-def test_run_pass_breaker_trip_gates_armed_turn(
-    tmp_path: Path, wt_scratch: Path, monkeypatch: pytest.MonkeyPatch, fake_host
-) -> None:
-    """A trip during the pass leaves the foreman degraded for that same pass."""
-    world = _world(tmp_path, wt_scratch, monkeypatch)
-    _succeeding_decide(fake_host)
-    # Ten finished escalated foreman issues + a done baseline: the default
-    # sample of 10 is full and the rate (1.0 > 1.5 * 0) trips in-pass.
-    authored = _authored(*range(20, 30))
-    _patch_state(world, issues=authored)
-    _finish(
-        world,
-        *[(n, "human_needed") for n in range(20, 30)],
-        (40, "done"),
-        (41, "done"),
-    )
-
-    passed = _run(world)
-
-    state = read_state_snapshot(world.foreman_root)
-    assert state.state == "degraded"
-    assert "breaker" in state.degraded_reasons
-    # Degraded gates arming, not planning — the Turn still ran.
-    assert passed.outcomes[0].outcome == "turn"
-    assert state.turns_total == 4
-
-
-def test_failed_turn_still_notifies_items(
-    tmp_path: Path, wt_scratch: Path, monkeypatch: pytest.MonkeyPatch, fake_host
-) -> None:
-    world = _world(tmp_path, wt_scratch, monkeypatch)
-    from charlie_work.host.fakes import FakeDecideLauncher
-    from charlie_work.subprocess_runner import RunResult
-
-    fake_host(
-        decide_launch=FakeDecideLauncher([RunResult(returncode=1, stdout="", stderr="boom")])
-    )
-    calls: list[Path] = []
-    monkeypatch.setattr(
-        pass_run, "notify_unnotified_items", lambda root, *a, **k: calls.append(root)
-    )
-
-    _run(world)
-
-    assert calls == [world.foreman_root]
