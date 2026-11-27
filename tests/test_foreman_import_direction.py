@@ -18,7 +18,6 @@ import ast
 from dataclasses import dataclass
 from pathlib import Path
 
-import pytest
 from _src_ast import parsed_source
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -131,9 +130,8 @@ def test_no_module_outside_foreman_imports_the_package() -> None:
     )
 
 
-@pytest.mark.parametrize("importer", sorted(_ALLOWED_IMPORTERS))
-def test_command_module_edge_is_present_and_lazy(importer: str) -> None:
-    """Each sanctioned seam must exist — and stay function-local so cli import stays cheap."""
+def _assert_command_module_edge_is_present_and_lazy(importer: str) -> None:
+    """A sanctioned seam must exist — and stay function-local so cli import stays cheap."""
     source = (SRC_ROOT / importer).read_text(encoding="utf-8")
     edges = find_foreman_edges(source, f"src/charlie_work/{importer}")
     assert edges, f"{importer} lost its foreman edge — the CLI cannot reach the package"
@@ -141,6 +139,17 @@ def test_command_module_edge_is_present_and_lazy(importer: str) -> None:
         f"{importer}'s foreman import must stay function-local: "
         + ", ".join(str(e) for e in edges if not e.in_function)
     )
+
+
+# Named per seam rather than parametrized: the collect-only gate (#1538)
+# compares leaf names base-vs-head, and a rename or a parametrized leaf is a
+# removal it enforces — each allowed importer keeps its own stable test name.
+def test_gang_command_edge_is_present_and_lazy() -> None:
+    _assert_command_module_edge_is_present_and_lazy("gang_command.py")
+
+
+def test_scheme_command_edge_is_present_and_lazy() -> None:
+    _assert_command_module_edge_is_present_and_lazy("scheme_command.py")
 
 
 def test_find_violations_flags_top_level_import() -> None:
@@ -174,6 +183,11 @@ def test_find_violations_flags_from_package_alias() -> None:
 def test_find_violations_allows_gang_command_nested() -> None:
     clean = "def f():\n    from .foreman import store\n"
     assert find_violations(clean, "src/charlie_work/gang_command.py") == []
+
+
+def test_find_violations_allows_scheme_command_nested() -> None:
+    clean = "def f():\n    from .foreman import store\n"
+    assert find_violations(clean, "src/charlie_work/scheme_command.py") == []
 
 
 def test_find_violations_clean_source() -> None:
