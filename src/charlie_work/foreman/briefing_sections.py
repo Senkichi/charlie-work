@@ -409,7 +409,9 @@ def _refused_section(foreman: Foreman) -> Section:
                 refused = [
                     record
                     for record in _iter_entries(applied)
-                    if record.get("status") == "refused" or record.get("applied") is False
+                    if record.get("status") == "refused"
+                    or record.get("applied") is False
+                    or record.get("outcome") == "refused"
                 ]
                 break
     if not refused:
@@ -448,7 +450,11 @@ def _issues_filed_last_turn(foreman: Foreman) -> int:
             1
             for record in _iter_entries(applied)
             if record.get("type") == "file_issue"
-            and (record.get("status") == "applied" or record.get("applied") is True)
+            and (
+                record.get("status") == "applied"
+                or record.get("applied") is True
+                or record.get("outcome") == "applied"
+            )
         )
     return 0
 

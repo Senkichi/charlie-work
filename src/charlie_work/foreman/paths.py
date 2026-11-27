@@ -23,6 +23,7 @@ Layout (design §4)::
         items.json        # typed decision/permission/report items
         turns/            # one directory per Turn
         tree/             # detached worktree of the registered repo
+        check/            # transient done_when.check worktree (created and removed per run)
 """
 
 from __future__ import annotations
@@ -45,6 +46,10 @@ SIGNALS_FILENAME = "signals.jsonl"
 MEMORY_DIRNAME = "memory"
 TURNS_DIRNAME = "turns"
 TREE_DIRNAME = "tree"
+CHECK_DIRNAME = "check"
+
+ACTIONS_FILENAME = "actions.json"
+APPLIED_FILENAME = "applied.jsonl"
 
 #: A foreman name: lowercase alphanumeric, hyphens allowed after the first
 #: character. The pattern deliberately excludes ``_``, so ``_shared`` can
@@ -134,6 +139,16 @@ def turn_dir(foreman_root: Path, turn_id: str) -> Path:
     return require_contained(root, root / turn_id, context="turn_dir")
 
 
+def actions_path(foreman_root: Path, turn_id: str) -> Path:
+    """Resolve ``turns/<turn_id>/actions.json`` — Decide's output, Apply's input."""
+    return _sub(turn_dir(foreman_root, turn_id), ACTIONS_FILENAME)
+
+
+def applied_path(foreman_root: Path, turn_id: str) -> Path:
+    """Resolve ``turns/<turn_id>/applied.jsonl`` — Apply's per-action record."""
+    return _sub(turn_dir(foreman_root, turn_id), APPLIED_FILENAME)
+
+
 def charter_path(foreman_root: Path) -> Path:
     return _sub(foreman_root, CHARTER_FILENAME)
 
@@ -164,3 +179,8 @@ def signals_path(foreman_root: Path) -> Path:
 
 def tree_path(foreman_root: Path) -> Path:
     return _sub(foreman_root, TREE_DIRNAME)
+
+
+def done_check_path(foreman_root: Path) -> Path:
+    """Resolve ``check/`` — the transient worktree ``done_when.check`` runs in."""
+    return _sub(foreman_root, CHECK_DIRNAME)

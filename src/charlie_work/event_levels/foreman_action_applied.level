@@ -1,0 +1,5 @@
+info
+# Issue #3119: a foreman Apply step performed one action's effect
+# (filed/amended/withdrew an issue, commented, raised an item, touched
+# memory). Routine per-action bookkeeping — the paired refusal kind
+# (foreman_action_refused) carries the warning level.
