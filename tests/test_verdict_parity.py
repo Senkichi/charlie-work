@@ -493,7 +493,7 @@ _OUTCOME_DRIVES = frozenset({"run_both", "_outcomes"})
 _SETUP_SIDE = frozenset({"parity_outcomes", "_outcomes"})
 
 
-def test_the_outcome_drive_stays_in_setup_and_consumers_take_the_fixture() -> None:
+def test_the_outcome_drive_stays_in_fixture_setup() -> None:
     """Ledger pin (issues #3187, #3188, #3189, #3194): ``run_both``/``_outcomes``
     may be called only from ``parity_outcomes`` -- which runs during setup --
     never from a test's ``call`` phase.
@@ -502,11 +502,12 @@ def test_the_outcome_drive_stays_in_setup_and_consumers_take_the_fixture() -> No
     test body the ledger files it as that test's regression --
     ``test_both_entry_points_agree_except_where_declared[rework_vacuous_summary]``
     and five sibling params each got one. The drive moved into the
-    ``parity_outcomes`` fixture; this scan pins both halves of that contract:
-    no test body calls the drive, and every outcome consumer -- parametrized
-    by ``scenario``/``scenario_name`` or listed in ``_SCENARIO_DRIVE`` --
-    declares the fixture, so the drive cannot come back through a lazy
-    re-plumb of the outcomes lookup.
+    ``parity_outcomes`` fixture; this scan pins all three halves of that
+    contract: no test body calls the drive, every outcome consumer --
+    parametrized by ``scenario``/``scenario_name`` or listed in
+    ``_SCENARIO_DRIVE`` -- declares the fixture, and ``parity_outcomes``
+    stays a ``pytest.fixture``, so the drive cannot come back through a
+    lazy re-plumb of the outcomes lookup.
     """
     tree = parsed(Path(__file__))
     funcs = {
