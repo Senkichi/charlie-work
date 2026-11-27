@@ -248,6 +248,17 @@ UNESCALATE_ISSUE_RESET_FIELDS = (
 UNESCALATE_CLEARED_REASON_KEY = "unescalate_cleared_reason"
 UNESCALATE_CLEARED_AT_KEY = "unescalate_cleared_at"
 
+# Issue #3182: the PR-record stamp ``unescalate()`` writes at the moment it
+# voids a still-valid verdict. ``packet_currency.packet_body_current_for_skip``
+# compares it against the packet's own ``packet_built_at``: a packet built
+# BEFORE this stamp reads as not current whenever the live body hash differs
+# from the packet body's, so an operator decision written into the PR body --
+# the resolution the voided verdict was waiting on -- reaches the fresh review
+# instead of the same-head skip re-serving the old body. Like the #1477 pair
+# it is written BY the void, not leftover bookkeeping, so it is deliberately
+# absent from UNESCALATE_PR_RESET_FIELDS.
+UNESCALATE_VERDICT_VOIDED_AT_KEY = "unescalate_verdict_voided_at"
+
 
 def stamp_unescalate_cleared_markers(
     updated: dict[str, Any], entry: Mapping[str, Any], *, now: str

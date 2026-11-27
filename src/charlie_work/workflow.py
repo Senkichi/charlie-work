@@ -3498,6 +3498,12 @@ class OrchestratorApp:
             _max_touched_lines, self.config.review_dispatch
         )
         pr_json["review_turn_cap_max_touched_lines"] = _max_touched_lines
+        # Issue #3182: stamp the build time so the same-head packet skip can
+        # tell "packet predates the verdict-voiding unescalation" from
+        # "packet already rebuilt after it". A body drift on a packet that
+        # postdates the void is an unrelated edit and rebuilds nothing;
+        # the same drift on a pre-void packet must reach the fresh review.
+        pr_json["packet_built_at"] = utc_now()
         self._write_json(pr_dir / "pr.json", pr_json)
         self._write_json(pr_dir / "checks.json", checks)
         diff_path = pr_dir / "diff.patch"
