@@ -1297,12 +1297,8 @@ def launch_claude_worker(
         # so they must be torn down via remove_review_checkout — passing them
         # to remove_worktree would look for the wrong registered worktree path.
         if review:
-            remove_review_checkout(
-                repo_root,
-                issue_number,
-                reviews_dir=sessions_dir,
-                **review_checkout_kwargs(sessions_dir, review_checkouts, legacy_review_checkouts),
-            )
+            ck = review_checkout_kwargs(sessions_dir, review_checkouts, legacy_review_checkouts)
+            remove_review_checkout(repo_root, issue_number, reviews_dir=sessions_dir, **ck)
         elif worktree.foreign_adopted:
             # Issue #1476: the checkout belongs to whoever created it — a
             # launch failure must never delete a borrowed worktree. The only

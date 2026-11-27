@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -352,8 +353,12 @@ def review_checkout_scan_roots(active: Path, legacy: Path | None) -> tuple[Path,
     Also used by ``stalled_review_reap._reap_orphaned_review_checkouts`` for
     bare-path callers; :meth:`ResolvedLayout.review_checkout_scan_roots`
     delegates to the same single implementation.
+
+    Nested roots still scan both: the ``pr-*`` match is a direct-children
+    scan, so neither root's nesting inside the other makes its own ``pr-<N>``
+    children visible from the parent's listing.
     """
-    if legacy is None or legacy.is_relative_to(active) or active.is_relative_to(legacy):
+    if legacy is None or legacy == active:
         return (active,)
     try:
         if not legacy.is_dir() or not any(
@@ -364,6 +369,30 @@ def review_checkout_scan_roots(active: Path, legacy: Path | None) -> tuple[Path,
         # Unlistable: skip it this pass rather than fail the whole scan.
         return (active,)
     return (active, legacy)
+
+
+def review_checkout_pr_numbers(scan_roots: Iterable[Path]) -> set[int]:
+    """PR numbers of ``pr-<N>`` dirs found directly under any of *scan_roots*.
+
+    The directory half of the orphaned-review-checkout sweep's candidate
+    collection (``stalled_review_reap._reap_orphaned_review_checkouts``),
+    deduplicated across roots -- the same ``pr-<N>`` checkout can transiently
+    exist under both the active and the legacy root while the move is in
+    flight. Roots that are not directories and entries whose ``pr-`` suffix
+    is not numeric are skipped, the same rules the pre-#3224 single-root
+    ``reviews_dir`` scan applied.
+    """
+    found: set[int] = set()
+    for root in scan_roots:
+        if not root.is_dir():
+            continue
+        for entry in root.iterdir():
+            if entry.is_dir() and entry.name.startswith("pr-"):
+                try:
+                    found.add(int(entry.name.split("-", 1)[1]))
+                except ValueError:
+                    continue
+    return found
 
 
 def _review_checkout_roots(

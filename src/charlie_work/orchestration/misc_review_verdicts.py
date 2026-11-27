@@ -605,6 +605,7 @@ def _run_review_reap_sweeps(self, resolved_now: datetime) -> dict[str, Any]:
         write_gate=self.write_gate,
         review_checkouts=review_checkouts,
         legacy_review_checkouts=legacy_review_checkouts,
+        checkout_scan_roots=self._layout.review_checkout_scan_roots(),
     )
     return {
         "verdict_result": verdict_result,

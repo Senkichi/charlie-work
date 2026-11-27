@@ -1,4 +1,4 @@
-2000
-# Issue #3224: the review_checkouts/legacy_review_checkouts threading grew the
-# live count to 1806, past the 1800 mark. Reviewed hand-raise to the next
-# MARK_QUANTUM multiple.
+1800
+# Issue #3224 rework: the threading shrank to a folded ``**kw`` call site
+# (live 1798) after the checkout family moved to review_checkouts.py;
+# mark returned to the prior level by refresh_file_size_ratchet.py.
