@@ -11,7 +11,6 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from .instrumentation import log_event
 from .iso_timestamp import parse_iso_timestamp
 from .no_op_rework_body import _request_changes_body_drifted
 from .rework_outcome import applied_body_outdates_packet
@@ -48,10 +47,11 @@ def _unescalate_stale_packet_body(app: Any, state: Any, pr_number: int, pr: dict
         return False
     if app._packet_body_current(pr_number, pr):
         return False
-    log_event(
-        app.paths.state_file,
-        "unescalate_packet_body_stale",
-        {
+    # WriteGate.log_event takes (kind, payload) -- state_path/repo auto-bind;
+    # the kind scanner derives the slot from the callee's signature (#2481).
+    app.write_gate.log_event(
+        kind="unescalate_packet_body_stale",
+        payload={
             "pr_number": pr_number,
             "issue_number": pr_record.get("issue_number"),
             UNESCALATE_VERDICT_VOIDED_AT_KEY: voided_at_raw,
@@ -59,7 +59,6 @@ def _unescalate_stale_packet_body(app: Any, state: Any, pr_number: int, pr: dict
             if packet_built_at is not None
             else None,
         },
-        repo=app.repo_root.name,
     )
     return True
 
