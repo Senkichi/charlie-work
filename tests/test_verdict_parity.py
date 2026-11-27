@@ -46,6 +46,7 @@ import pytest
 
 import _git_templates
 from _dashboard_rollup_fixtures import _register
+from _src_ast import parsed
 from charlie_work import instrumentation
 from charlie_work.dashboard import rollup
 from charlie_work.dashboard.drill.timeline import pr_drill
@@ -419,7 +420,7 @@ def test_the_outcome_drive_stays_in_fixture_setup() -> None:
     itself in ``_SCENARIO_DRIVE`` when it is not parametrized by ``scenario`` /
     ``scenario_name`` -- rather than calling ``_outcomes`` in its body.
     """
-    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    tree = parsed(Path(__file__))
     drive_names = frozenset({"run_both", "_outcomes"})
 
     def drive_calls(node: ast.AST) -> list[int]:
