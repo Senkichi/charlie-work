@@ -16,7 +16,7 @@ it without a second chain implementation.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Annotated
 
 from .config_validation import NonEmpty, NotNull, NullIsDefault, OneOf, Positive, Typed
@@ -29,6 +29,23 @@ FOREMAN_DEFAULT_MODEL = "claude-sonnet-5-5"
 
 #: Default tool allowlist for the foreman's read-only model call.
 FOREMAN_DEFAULT_TOOLS = "Read,Grep,Glob"
+
+
+@dataclass(frozen=True)
+class ForemanBreakerConfig:
+    """The escalation breaker's three knobs (design §10, issue #3123).
+
+    ``sample`` is how many of the foreman's newest finished issues the
+    escalation rate is computed over; ``baseline_sample`` is the same count
+    over the repo's newest finished issues no foreman owns; ``ratio`` is the
+    multiple of the baseline rate that trips the breaker. All three are
+    counts/multipliers, never date windows — a long fleet pause cannot
+    empty the baseline and switch the breaker off.
+    """
+
+    sample: Annotated[int, Typed, Positive] = 10
+    ratio: Annotated[float, Typed, Positive] = 1.5
+    baseline_sample: Annotated[int, Typed, Positive] = 50
 
 
 @dataclass(frozen=True)
@@ -60,4 +77,7 @@ class ForemanConfig:
     # adds to a Turn: with the default 40 max_model_turns a slow model could
     # otherwise outlast a pass_interval window.
     decide_timeout_seconds: Annotated[int, Typed, Positive] = 1800
+    breaker: Annotated[ForemanBreakerConfig, NullIsDefault] = field(
+        default_factory=ForemanBreakerConfig
+    )
     chain = property(chain_of)

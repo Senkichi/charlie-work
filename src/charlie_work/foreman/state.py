@@ -62,6 +62,28 @@ class ForemanState:
     #: "bookkeeping landed, marker write crashed" (skip the replay) (#3122).
     last_turn_id: str | None = None
     issues: dict[int, AuthoredIssue] = field(default_factory=dict)
+    #: Which structural limits currently hold ``degraded`` (issue #3123).
+    #: Subset of ``foreman.limits.DEGRADED_REASONS`` — empty means the
+    #: degraded flag (if any) predates limit tracking. The pass recomputes
+    #: each reason every pass; ``state == "degraded"`` iff this is non-empty.
+    degraded_reasons: tuple[str, ...] = ()
+    #: The decision item the breaker raised on its current/last trip — the
+    #: item whose operator answer is one of the two recovery paths (§10).
+    breaker_item_id: str | None = None
+    #: The finished-issue sample the operator last acknowledged by answering
+    #: the breaker item. While this foreman's current sample equals it, the
+    #: breaker stays quiet — the answer already covered that sample; a new
+    #: finished issue re-arms the check.
+    breaker_ack_sample: tuple[int, ...] = ()
+    #: The verdict's forced arming override (design §16): ``"propose"`` after
+    #: a failed verdict, ``None`` otherwise. Overrides the charter's
+    #: ``arming`` until the verdict's decision item is answered.
+    forced_arming: str | None = None
+    #: Whether the once-per-foreman §16 verdict has been computed and raised.
+    verdict_raised: bool = False
+    #: The "retire or retune" decision item a failed verdict raised — the
+    #: item whose answer clears ``forced_arming``.
+    verdict_item_id: str | None = None
     version: int = 1
 
 
@@ -84,7 +106,21 @@ def _to_payload(state: ForemanState) -> dict[str, Any]:
             str(number): {"body_hash": issue.body_hash}
             for number, issue in sorted(state.issues.items())
         },
+        "degraded_reasons": list(state.degraded_reasons),
+        "breaker_item_id": state.breaker_item_id,
+        "breaker_ack_sample": list(state.breaker_ack_sample),
+        "forced_arming": state.forced_arming,
+        "verdict_raised": state.verdict_raised,
+        "verdict_item_id": state.verdict_item_id,
     }
+
+
+def _str_tuple(raw: Any) -> tuple[str, ...]:
+    return tuple(v for v in raw if isinstance(v, str)) if isinstance(raw, list) else ()
+
+
+def _int_tuple(raw: Any) -> tuple[int, ...]:
+    return tuple(v for v in raw if isinstance(v, int)) if isinstance(raw, list) else ()
 
 
 def _issue_from(number: int, raw: Any) -> AuthoredIssue | None:
@@ -151,6 +187,18 @@ def _from_payload(raw: Any) -> ForemanState:
             raw.get("last_turn_id") if isinstance(raw.get("last_turn_id"), str) else None
         ),
         issues=issues,
+        degraded_reasons=_str_tuple(raw.get("degraded_reasons")),
+        breaker_item_id=(
+            raw.get("breaker_item_id") if isinstance(raw.get("breaker_item_id"), str) else None
+        ),
+        breaker_ack_sample=_int_tuple(raw.get("breaker_ack_sample")),
+        forced_arming=(
+            raw.get("forced_arming") if raw.get("forced_arming") in ("propose",) else None
+        ),
+        verdict_raised=raw.get("verdict_raised") is True,
+        verdict_item_id=(
+            raw.get("verdict_item_id") if isinstance(raw.get("verdict_item_id"), str) else None
+        ),
         version=raw.get("version") if isinstance(raw.get("version"), int) else 1,
     )
 

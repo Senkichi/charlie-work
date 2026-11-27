@@ -139,7 +139,7 @@ def _gang_list(
         entry: dict[str, Any] = {
             "name": name,
             "state": state.state,
-            "display_state": display_state(state.state),
+            "display_state": display_state(state.state, state.degraded_reasons),
             "open_items": open_count,
         }
         chartered = fcharter.load_charter(fdir, registered_repos=repos)
@@ -148,13 +148,13 @@ def _gang_list(
             entry["issues"] = f"{len(state.issues)}/{bounds.max_open_issues}"
             entry["turns_today"] = f"{state.turns_today}/{bounds.max_turns_per_day}"
             lines.append(
-                f"{name}: {display_state(state.state)}, issues {entry['issues']}, "
+                f"{name}: {display_state(state.state, state.degraded_reasons)}, issues {entry['issues']}, "
                 f"turns today {entry['turns_today']}, items {open_count} open"
             )
         else:
             entry["charter_error"] = chartered.error
             lines.append(
-                f"{name}: {display_state(state.state)}, items {open_count} open "
+                f"{name}: {display_state(state.state, state.degraded_reasons)}, items {open_count} open "
                 f"(charter invalid: {chartered.error})"
             )
         data.append(entry)
@@ -175,10 +175,10 @@ def _gang_show(
         "name": name,
         "dir": str(fdir),
         "state": _plain(state),
-        "display_state": display_state(state.state),
+        "display_state": display_state(state.state, state.degraded_reasons),
         "open_items": [_plain(item) for item in open_list],
     }
-    lines = [f"{name}: {display_state(state.state)}", f"  dir: {fdir}"]
+    lines = [f"{name}: {display_state(state.state, state.degraded_reasons)}", f"  dir: {fdir}"]
     if chartered.ok:
         charter = chartered.value
         data["charter"] = _plain(charter)

@@ -1,0 +1,4 @@
+info
+# Issue #3123: the unattended limit cleared — the stale decision item was
+# answered and the "unattended" degraded reason lifted. Routine recovery
+# bookkeeping.

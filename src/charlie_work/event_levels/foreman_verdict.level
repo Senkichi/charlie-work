@@ -1,0 +1,6 @@
+info
+# Issue #3123 (design §16): the foreman verdict computed at 20 finished
+# authored issues or 14 days — carries the Done-share and token-share
+# numbers plus pass/fail. Info: a miss already surfaces through the
+# retire-or-retune decision item and the forced propose arming, which are
+# the operator-visible records.

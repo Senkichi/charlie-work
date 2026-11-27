@@ -170,6 +170,10 @@ def _arm_or_raise(run: _Run, number: int, key: str, title: str) -> str:
     why_unarmed: str | None = None
     if run.signal_marked:
         why_unarmed = "turn is signal-marked"
+    elif state.forced_arming is not None:
+        # Issue #3123: a failed §16 verdict forces propose arming until the
+        # operator answers the retire/retune item — whatever the charter says.
+        why_unarmed = "verdict forced arming: propose"
     elif run.charter.arming != ARMING_AUTO:
         why_unarmed = f"arming: {run.charter.arming}"
     elif state.state == "degraded":
