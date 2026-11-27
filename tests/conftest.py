@@ -11,6 +11,11 @@ from unittest.mock import create_autospec
 
 import pytest
 
+# Registers the autouse ``_no_real_foreman_pass_child`` fixture — the body
+# lives in ``_host_fixtures`` (the ``_worktree_fixtures`` pattern) so this
+# conftest stays under the file-size cap (issue #3122 rework).
+from _host_fixtures import _no_real_foreman_pass_child  # noqa: F401
+
 # The autouse ``_default_healthy_preflight`` stub below patches these two
 # modules on every test. Imported here -- at conftest import (collection)
 # time -- rather than lazily at the stub's first patch: the two modules cost
@@ -731,27 +736,6 @@ def fake_host(monkeypatch: pytest.MonkeyPatch) -> Callable[..., Any]:
         return ports
 
     return _install
-
-
-@pytest.fixture(autouse=True)
-def _no_real_foreman_pass_child(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Never let a test spawn a real ``charlie scheme`` child (issue #3122).
-
-    The fleet supervise loop spawns the periodic foreman pass through
-    ``host.current().foreman_pass_launch`` — ``Popen(sys.executable -m
-    charlie_work … scheme)``, a real detached process. The REAL launcher's
-    ``launch`` is stubbed with a fake (the port object itself stays REAL —
-    ``fake_host(foreman_pass_launch=...)`` still replaces it wholesale for
-    scripted outcomes).
-    """
-    from charlie_work import host as host_pkg
-    from charlie_work.host.fakes import FakeForemanPassLauncher
-
-    monkeypatch.setattr(
-        host_pkg.REAL.foreman_pass_launch,
-        "launch",
-        FakeForemanPassLauncher().launch,
-    )
 
 
 @pytest.fixture(autouse=True)
