@@ -14,7 +14,7 @@ from typing import Any
 from _fakes_github_rerun import FakeGitHubWithRerunCapture
 from _review_fixtures import _required_checks_config
 from charlie_work.instrumentation import query_events
-from charlie_work.github import GitHubError
+from charlie_work.github import GitHubError, defang_closing_keywords
 from charlie_work.paths import runtime_paths
 from charlie_work.pr_body_closing_autofix import (
     MAX_AUTOFIX_ATTEMPTS_PER_HEAD,
@@ -200,6 +200,21 @@ def test_rewrite_keeps_declared_target_and_negated_references() -> None:
     out = rewrite_unexpected_body_references(body, intended=123)
 
     assert out == "Closes #123. Also fixes issue 60 and resolved issue 61, but does not close #62."
+
+
+def test_defang_and_rewrite_leave_word_merely_ending_in_keyword_unchanged() -> None:
+    """Issue #3181: `prefix #N` merely ends in a keyword -- nothing to rewrite.
+
+    Before the leading word boundary, both halves of the fix surface rewrote
+    `prefix #60`: ``defang_closing_keywords`` produced ``prefix issue 60``
+    (rewriting the ``fix #60`` suffix), and the autofix's per-match rewrite did
+    the same to a body that listed the lint's test-case words.
+    """
+    assert defang_closing_keywords("prefix #60") == "prefix #60"
+    assert defang_closing_keywords("prefixes #60") == "prefixes #60"
+
+    body = "Closes #123\n\nLint test cases: prefix #60 and prefixes #60."
+    assert rewrite_unexpected_body_references(body, intended=123) == body
 
 
 def _assert_held_and_retries(tmp_path: Path, fake: _GateFake, recover: Any) -> None:
