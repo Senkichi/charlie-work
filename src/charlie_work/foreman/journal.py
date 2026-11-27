@@ -34,6 +34,11 @@ from ..file_lock import (
 from . import Result
 from .paths import inbox_path, journal_path, signals_path
 
+#: The 16 KB cap on a signal's serialized ``data`` payload (design §12 / issue
+#: #3121): a signal is data for the next briefing, and the cap keeps one
+#: producer from bloating the append-only log or the Turn's briefing budget.
+SIGNAL_MAX_PAYLOAD_BYTES = 16 * 1024
+
 
 def utc_now() -> str:
     """The timestamp shape every log entry carries (ISO-8601, ``Z`` suffix)."""
@@ -259,13 +264,29 @@ def append_signal(
     *,
     ts: str | None = None,
 ) -> Result[SignalEntry]:
-    """Append one external signal to ``signals.jsonl``."""
+    """Append one external signal to ``signals.jsonl``.
+
+    The ``data`` payload is size-capped at ``SIGNAL_MAX_PAYLOAD_BYTES``
+    encoded — a larger signal is refused (error value, never appended) so one
+    producer cannot bloat the log or a Turn's briefing budget.
+    """
     try:
         path = signals_path(foreman_root)
     except ValueError as exc:
         return Result(error=str(exc))
     stamp = ts or utc_now()
     payload = data or {}
+    try:
+        encoded = json.dumps(payload).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        # Unserializable or circular payloads are error values like every
+        # other refusal — the append log's errors-as-values contract holds.
+        return Result(error=f"signal payload: not JSON-serializable: {exc}")
+    size = len(encoded)
+    if size > SIGNAL_MAX_PAYLOAD_BYTES:
+        return Result(
+            error=f"signal payload: at most {SIGNAL_MAX_PAYLOAD_BYTES} bytes encoded, got {size}"
+        )
     written = _append_entry(path, {"ts": stamp, "source": source, "data": payload})
     if not written.ok:
         return Result(error=written.error)

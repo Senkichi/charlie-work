@@ -123,6 +123,11 @@ def memory_file(foreman_root: Path, name: str) -> Path:
     return require_contained(root, root / f"{stem}.md", context="memory_file")
 
 
+def turns_root(foreman_root: Path) -> Path:
+    """Resolve the ``turns/`` directory itself, containment-checked."""
+    return _sub(foreman_root, TURNS_DIRNAME)
+
+
 def turn_dir(foreman_root: Path, turn_id: str) -> Path:
     """Resolve ``turns/<turn_id>``, containment-checked."""
     root = _sub(foreman_root, TURNS_DIRNAME)

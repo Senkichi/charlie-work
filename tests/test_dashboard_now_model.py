@@ -339,6 +339,7 @@ def test_needs_me_groups_order_and_group_field(fleet) -> None:
         ("Awaiting your verdict", 1, 7200.0),
         ("Human needed", 0, None),
         ("Operator queue", 1, 3600.0),
+        ("Foremen", 0, None),
     ]
 
 

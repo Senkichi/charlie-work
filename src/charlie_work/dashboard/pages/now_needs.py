@@ -1,4 +1,4 @@
-"""The Needs-you panel: the count, three group tiles, and one list at a time.
+"""The Needs-you panel: the count, four group tiles, and one list at a time.
 
 Rows arrive grouped and sorted by ``now_model`` (the single point of grouping); this module
 only draws the decisions (``NEEDS_ME_GROUPS`` minus Exceptions, which are the header health
@@ -37,6 +37,7 @@ GROUPS = (
     Group("Awaiting your verdict", "verdicts", "Verdicts", "a PR is parked until you decide"),
     Group("Human needed", "decisions", "Decisions", "an issue needs a human call"),
     Group("Operator queue", "requeue", "Requeue", "escalated, waiting to be requeued"),
+    Group("Foremen", "foremen", "Foremen", "a foreman item awaits your answer"),
 )
 ACTIVE_ROWS = 6  # rows the active group shows before "N more"
 THEN_ROWS = 4  # rows a background group shows (CSS hides the rest; clicking activates it)

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from charlie_work.foreman import paths
 from charlie_work.foreman.journal import (
+    SIGNAL_MAX_PAYLOAD_BYTES,
     append_inbox,
     append_journal,
     append_signal,
@@ -53,6 +54,32 @@ def test_signals_unread_since(tmp_path: Path) -> None:
     assert unread[0].source == "schedule"
     assert unread[0].id == 2
     assert read_signals(fdir)[0].data == {"ref": "main"}
+
+
+def test_signal_payload_cap_refuses_oversized_and_accepts_at_cap(
+    tmp_path: Path,
+) -> None:
+    """The 16 KB cap is on the serialized ``data`` payload (issue #3121): over
+    is a refusal that appends nothing, at is accepted."""
+    fdir = _foreman(tmp_path)
+    oversized = {"blob": "x" * SIGNAL_MAX_PAYLOAD_BYTES}
+    refused = append_signal(fdir, "ci", oversized)
+    assert not refused.ok
+    assert str(SIGNAL_MAX_PAYLOAD_BYTES) in refused.error
+    assert read_signals(fdir) == ()
+    # Largest payload still under the cap: encoded size exactly at the limit.
+    fit = "y" * (SIGNAL_MAX_PAYLOAD_BYTES - len('{"blob": ""}'))
+    accepted = append_signal(fdir, "ci", {"blob": fit})
+    assert accepted.ok, accepted.error
+    assert read_signals(fdir)[0].data["blob"] == fit
+
+
+def test_signal_unserializable_payload_is_an_error_value(tmp_path: Path) -> None:
+    """A payload ``json.dumps`` cannot encode refuses instead of raising."""
+    fdir = _foreman(tmp_path)
+    refused = append_signal(fdir, "ci", {"when": object()})
+    assert not refused.ok and "serializable" in refused.error
+    assert read_signals(fdir) == ()
 
 
 def test_torn_final_line_is_skipped(tmp_path: Path) -> None:
