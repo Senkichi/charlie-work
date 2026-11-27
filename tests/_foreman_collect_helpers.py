@@ -335,24 +335,26 @@ def _build_world(
     assert answered.ok, answered.error
 
     # Previous Turn's Apply record: one applied file_issue plus a refusal.
+    # Records carry the keys ``foreman.apply._append_record`` writes — the
+    # refused section reads this exact shape (``outcome``, not ``status``).
     turn_dir = world.foreman_root / "turns" / "t-0011"
     turn_dir.mkdir(parents=True, exist_ok=True)
     applied_records = [
-        {"key": "rest-labels", "type": "file_issue", "status": "applied"},
+        {"key": "rest-labels", "type": "file_issue", "outcome": "applied"},
         {
             "key": "rest-core",
             "type": "file_issue",
-            "status": "refused",
+            "outcome": "refused",
             "reason": "max_open_issues bound reached (5)",
         },
-        {"key": "mem-1", "type": "write_memory", "status": "applied"},
+        {"key": "mem-1", "type": "write_memory", "outcome": "applied"},
     ]
     if heavy:
         applied_records += [
             {
                 "key": f"overflow-{i}",
                 "type": "file_issue",
-                "status": "refused",
+                "outcome": "refused",
                 "reason": "refused " + "r" * 200,
             }
             for i in range(30)
