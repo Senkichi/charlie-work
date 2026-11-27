@@ -734,6 +734,27 @@ def fake_host(monkeypatch: pytest.MonkeyPatch) -> Callable[..., Any]:
 
 
 @pytest.fixture(autouse=True)
+def _no_real_foreman_pass_child(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never let a test spawn a real ``charlie scheme`` child (issue #3122).
+
+    The fleet supervise loop spawns the periodic foreman pass through
+    ``host.current().foreman_pass_launch`` — ``Popen(sys.executable -m
+    charlie_work … scheme)``, a real detached process. The REAL launcher's
+    ``launch`` is stubbed with a fake (the port object itself stays REAL —
+    ``fake_host(foreman_pass_launch=...)`` still replaces it wholesale for
+    scripted outcomes).
+    """
+    from charlie_work import host as host_pkg
+    from charlie_work.host.fakes import FakeForemanPassLauncher
+
+    monkeypatch.setattr(
+        host_pkg.REAL.foreman_pass_launch,
+        "launch",
+        FakeForemanPassLauncher().launch,
+    )
+
+
+@pytest.fixture(autouse=True)
 def _no_real_ci_fleet(monkeypatch: pytest.MonkeyPatch) -> None:
     """Never let a test wrap a suite in the venv's real ``ci-fleet`` executable.
 

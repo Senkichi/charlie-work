@@ -57,6 +57,10 @@ class ForemanState:
     consecutive_failures: int = 0
     last_turn_at: str | None = None
     last_scheduled_turn_at: str | None = None
+    #: The turn id whose bookkeeping landed in this state — a resume reads it
+    #: to tell "Apply ran but bookkeeping never landed" (replay it) from
+    #: "bookkeeping landed, marker write crashed" (skip the replay) (#3122).
+    last_turn_id: str | None = None
     issues: dict[int, AuthoredIssue] = field(default_factory=dict)
     version: int = 1
 
@@ -75,6 +79,7 @@ def _to_payload(state: ForemanState) -> dict[str, Any]:
         "consecutive_failures": state.consecutive_failures,
         "last_turn_at": state.last_turn_at,
         "last_scheduled_turn_at": state.last_scheduled_turn_at,
+        "last_turn_id": state.last_turn_id,
         "issues": {
             str(number): {"body_hash": issue.body_hash}
             for number, issue in sorted(state.issues.items())
@@ -141,6 +146,9 @@ def _from_payload(raw: Any) -> ForemanState:
             raw.get("last_scheduled_turn_at")
             if isinstance(raw.get("last_scheduled_turn_at"), str)
             else None
+        ),
+        last_turn_id=(
+            raw.get("last_turn_id") if isinstance(raw.get("last_turn_id"), str) else None
         ),
         issues=issues,
         version=raw.get("version") if isinstance(raw.get("version"), int) else 1,

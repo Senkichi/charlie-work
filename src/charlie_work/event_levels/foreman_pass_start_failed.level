@@ -1,0 +1,5 @@
+warning
+# Issue #3122: the fleet supervise loop failed to spawn its periodic
+# ``charlie scheme`` child process. Warning: the next interval retries, but
+# until one lands no foreman Turns run — the failure must be visible rather
+# than silently absent.

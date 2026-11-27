@@ -1,0 +1,6 @@
+warning
+# Issue #3122: a foreman pass wanted to run a Turn but a bound deferred it
+# (fleet pause, min_turn_interval_minutes, max_turns_per_day, stale status
+# snapshot, or a deferred Decide). Warning, not info: like dispatch_deferred
+# the deferral is handled and retried next pass, but it is also the only
+# signal that a foreman is awake and unable to run.

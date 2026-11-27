@@ -1,0 +1,5 @@
+warning
+# Issue #3122: a foreman Turn failed at Collect, Decide, Apply or the
+# bookkeeping step. Warning, not error: a single failure is retried by the
+# wake predicate next pass; the consecutive_failures counter it increments
+# is the record that trips the foreman to ``faulted`` at three.

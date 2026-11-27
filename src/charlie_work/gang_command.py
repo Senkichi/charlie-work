@@ -29,7 +29,6 @@ from .fleet_paths import fleet_dir
 
 GANG_COMMAND = "gang"
 
-_BRIEFING_FILENAME = "briefing.md"
 _LOCAL_TIME_RE = re.compile(r"([01]\d|2[0-3]):[0-5]\d")
 
 
@@ -471,7 +470,11 @@ def _gang_pepe_silvia(store: Any, fpaths: Any, fleet: Path, name: str) -> Comman
     except ValueError as exc:
         return _fail("pepe-silvia", str(exc))
     briefings = (
-        [path for path in turns.glob(f"*/{_BRIEFING_FILENAME}") if path.is_file()]
+        [
+            path
+            for path in turns.glob(f"*/{fpaths.BRIEFING_FILENAME}")
+            if path.is_file()
+        ]
         if turns.is_dir()
         else []
     )

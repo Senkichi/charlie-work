@@ -270,3 +270,50 @@ class FakeDecideLauncher:
                 tuple(argv), cwd=cwd, env=env, timeout_seconds=timeout_seconds, stdin=stdin
             )
         return outcome
+
+
+class FakeForemanPassChild:
+    """A fake spawned ``charlie scheme`` child (issue #3122).
+
+    ``poll()`` returns ``exit_code`` — ``None`` while the child is "alive", an
+    int once it has "exited". Nothing here ever runs a process.
+    """
+
+    def __init__(self, exit_code: int | None = None, pid: int = 4242) -> None:
+        self.exit_code = exit_code
+        self.pid = pid
+
+    def poll(self) -> int | None:
+        return self.exit_code
+
+
+class FakeForemanPassLauncher:
+    """Scripted ``charlie scheme`` spawns; never spawns a process (issue #3122).
+
+    ``outcomes`` is consumed one per ``launch`` call (the last repeats). Each
+    is a ``ForemanPassStart`` (returned as-is), a ``str`` (a failed start with
+    that error), an ``int`` or ``None`` (a child whose ``poll()`` returns
+    it), or a callable taking the port's ``(argv, *, cwd)`` signature. With
+    no outcomes every launch succeeds with a live child. ``calls`` logs
+    ``(argv, cwd)`` per call.
+    """
+
+    def __init__(self, outcomes: Sequence[Any] = ()) -> None:
+        self._outcomes = list(outcomes)
+        self.calls: list[tuple[Any, ...]] = []
+
+    def launch(self, argv: tuple[str, ...], *, cwd: Path) -> Any:
+        from .launch import ForemanPassStart
+
+        index = len(self.calls)
+        self.calls.append((tuple(argv), cwd))
+        if not self._outcomes:
+            return ForemanPassStart(child=FakeForemanPassChild())
+        outcome = self._outcomes[min(index, len(self._outcomes) - 1)]
+        if isinstance(outcome, str):
+            return ForemanPassStart(error=outcome)
+        if isinstance(outcome, ForemanPassStart):
+            return outcome
+        if callable(outcome):
+            return outcome(tuple(argv), cwd=cwd)
+        return ForemanPassStart(child=FakeForemanPassChild(exit_code=outcome))

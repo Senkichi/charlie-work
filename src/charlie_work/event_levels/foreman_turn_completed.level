@@ -1,0 +1,5 @@
+info
+# Issue #3122: a foreman Turn completed — Collect, Decide, Apply and the
+# journal/state bookkeeping all landed. Carries the Decide usage record
+# (tokens, cost, duration, harness+model) and the apply/refuse/skip counts —
+# routine per-Turn bookkeeping, the design §10 usage ledger.

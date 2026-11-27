@@ -72,6 +72,11 @@ from .dashboard_command import (
     run_dashboard_command,
 )
 from .gang_command import GANG_COMMAND, register_gang_subparsers, run_gang_command
+from .scheme_command import (
+    SCHEME_COMMAND,
+    register_scheme_subparsers,
+    run_scheme_command,
+)
 from .fleet_registry import _load_registry, _select_repos, touch_repo, count_fleet_runners
 from .fleet_status import (  # noqa: F401  (deliberate re-export)
     FLEET_STATUS_REPO_TIMEOUT_SECONDS,
@@ -210,6 +215,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     register_dashboard_subparsers(subparsers)
     register_gang_subparsers(subparsers)
+    register_scheme_subparsers(subparsers)
     subparsers.add_parser("bootstrap-labels")
     subparsers.add_parser("intake")
 
@@ -2681,6 +2687,8 @@ def main(argv: list[str] | None = None) -> int:
             result = run_dashboard_command(args)
         elif args.command == GANG_COMMAND:
             result = run_gang_command(args)
+        elif args.command == SCHEME_COMMAND:
+            result = run_scheme_command(args)
         elif args.command == "worktree-clean":
             result = run_worktree_clean_command(args)
         elif args.command == "migrate-state-dir":
