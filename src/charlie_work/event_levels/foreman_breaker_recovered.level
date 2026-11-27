@@ -1,0 +1,4 @@
+info
+# Issue #3123: the escalation breaker cleared — the trip cause resolved
+# (decision item answered or the rate fell back under the threshold) and
+# the "breaker" degraded reason lifted. Routine recovery bookkeeping.

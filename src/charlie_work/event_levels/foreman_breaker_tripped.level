@@ -1,0 +1,6 @@
+warning
+# Issue #3123: the escalation breaker tripped — the foreman's last-10
+# escalation rate exceeded the config multiplier of the repo's last-50
+# non-foreman rate, degrading the foreman (new issues stay unarmed).
+# Warning, not error: the breaker is the safety surface working, and the
+# raised decision item is the path back.

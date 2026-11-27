@@ -232,6 +232,14 @@ _Avoid_: Ticket, alert, escalation (that is a lifecycle event)
 The two kinds of issue a foreman owns, both marked by its ownership label. It filed an authored issue and may amend or withdraw it. The operator handed it a tracked issue by adding the label, and the foreman may only watch it and comment on it.
 _Avoid_: Adopted, child issue
 
+**Degraded**:
+A foreman state meaning "keeps planning and reporting, but its new issues stay unarmed". A structural limit sets it — the breaker or the unattended limit — and it clears when the cause clears. It is a foreman state, not a lifecycle state.
+_Avoid_: Broken, failed (that is faulted), paused (that is the operator's)
+
+**Breaker**:
+The escalation-rate tripwire: when a foreman's escalation rate over its newest finished issues exceeds the configured multiple of the repo's non-foreman baseline, the foreman goes degraded and a decision item asks the operator to confirm or correct course.
+_Avoid_: Circuit breaker (that is the transport's), probation
+
 ### State and instrumentation
 
 **Lifecycle state**:

@@ -134,6 +134,21 @@ def load_alarm_leaves() -> tuple[Any, Any]:
     return ha, haf
 
 
+def load_foreman_alarm_leaf() -> Any:
+    """``heartbeat_alarms_foreman``, ``None`` if unloadable (issue #3123).
+
+    The third sibling leaf holds the foreman alarm verdicts; it is loaded
+    the same way (installed package first, file-path fallback so a wrong
+    venv run still evaluates) so ``check_foremen`` degrades to the loud
+    ANOMALY rather than silently green.
+    """
+    try:
+        from charlie_work import heartbeat_alarms_foreman as haff
+    except ImportError:
+        haff = _load_leaf_by_path("_cw_heartbeat_alarms_foreman", "heartbeat_alarms_foreman.py")
+    return haff
+
+
 _ha, _ = load_alarm_leaves()
 
 

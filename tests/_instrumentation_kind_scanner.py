@@ -722,6 +722,18 @@ _ALLOWED_UNRESOLVED_KIND_SITES: tuple[_UnresolvedKindSite, ...] = (
             "salvage lane was extracted for the file-size ratchet."
         ),
     ),
+    _UnresolvedKindSite(
+        path="foreman/limits.py",
+        scope="_emit",
+        source="kind",
+        reason=(
+            "foreman.limits._emit forwards its own `kind` parameter to "
+            "log_event. Every _emit call site in limits.py passes one of "
+            "the module's EVENT_* literals, each registered under "
+            "event_levels/ (issue #3123; same pass-through shape as "
+            "append_event above)."
+        ),
+    ),
 )
 
 

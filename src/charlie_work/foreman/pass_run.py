@@ -33,55 +33,62 @@ from __future__ import annotations
 import json
 import shutil
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .. import layout
 from ..atomic_write import write_json_atomic, write_text_atomic
 from ..config_validation import ConfigError
 from ..file_lock import try_acquire_byte_range_lock
 from ..fleet_pause import fleet_pause_pending
+from ..foreman_config import ForemanConfig
 from ..github import GitHub
 from ..global_config import load_layered_config
 from ..instrumentation import log_event
-from ..iso_timestamp import parse_iso_timestamp
 from ..local_issues import github_client_for
 from ..notify_freshness import resolve_fleet_notify
 from . import Result
 from . import items as fitems
 from . import journal as fjournal
+from . import limits as flimits
 from . import paths as fpaths
 from . import state as fstate
 from . import store
 from .actions import TURN_OUTPUT_SCHEMA
 from .apply import apply_turn
 from .apply_context import OUTCOME_APPLIED, OUTCOME_REFUSED, OUTCOME_SKIPPED
-from .collect import Foreman, build_briefing, lifecycle_fingerprint, load_foreman
+from .collect import Foreman, build_briefing, load_foreman
 from .decide import DecideForeman, decide
-from .items import STATUS_ANSWERED
 from .journal import utc_now
 from .notify import notify_unnotified_items
+from .wake import (  # noqa: F401 -- deliberate re-export (moved under the file-size ratchet; the pass's public surface stays put)
+    DEFER_DECIDE,
+    DEFER_FLEET_PAUSED,
+    DEFER_MAX_TURNS,
+    DEFER_MIN_INTERVAL,
+    DEFER_STALE_SNAPSHOT,
+    EVENT_WAKE_DEFERRED,
+    WAKE_INBOX,
+    WAKE_ITEM_ANSWER,
+    WAKE_LIFECYCLE,
+    WAKE_QUIET,
+    WAKE_REPORT_DUE,
+    WAKE_RESUME,
+    WAKE_SIGNAL,
+    _deferral_reason,
+    _emit_deferred,
+    _today,
+    wake_reason,
+)
 
-EVENT_WAKE_DEFERRED = "foreman_wake_deferred"
 EVENT_TURN_COMPLETED = "foreman_turn_completed"
 EVENT_TURN_FAILED = "foreman_turn_failed"
-
-#: Wake-predicate reasons (design §7): what made this foreman want a Turn.
-WAKE_LIFECYCLE = "lifecycle_changed"
-WAKE_INBOX = "inbox"
-WAKE_ITEM_ANSWER = "item_answer"
-WAKE_SIGNAL = "signal"
-WAKE_REPORT_DUE = "report_due"
-WAKE_QUIET = "quiet_elapsed"
-#: Not a predicate — the resume marker when a pass finishes a crashed Turn.
-WAKE_RESUME = "resume"
-
-#: Deferral reasons carried on ``foreman_wake_deferred`` (design §7).
-DEFER_FLEET_PAUSED = "fleet_paused"
-DEFER_MIN_INTERVAL = "min_turn_interval_minutes"
-DEFER_MAX_TURNS = "max_turns_per_day"
-DEFER_STALE_SNAPSHOT = "stale_snapshot"
-DEFER_DECIDE = "decide_deferred"
+#: The fleet-level "a foreman pass ran" heartbeat signal (design §10's
+#: "foreman pass not seen for twice its interval" alarm); written to the
+#: fleet events.db by ``run_pass`` — a literal, not an alias, so the
+#: event-kind scanner resolves the emit site.
+EVENT_PASS_COMPLETED = "foreman_pass_completed"
 
 #: Three consecutive failed Turns move a foreman to ``faulted`` (design §10).
 FAULT_LIMIT = 3
@@ -113,96 +120,6 @@ class PassResult:
 def _stamp(now: datetime) -> str:
     """The ``journal.utc_now`` timestamp shape for ``now``."""
     return now.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def _today(now: datetime) -> str:
-    """The UTC date bucket ``turns_today`` counts in."""
-    return now.astimezone(UTC).strftime("%Y-%m-%d")
-
-
-# --- wake predicate (design §7) -----------------------------------------------
-
-
-def _new_item_answer(foreman: Foreman) -> bool:
-    """An item moved to ``answered`` after the last Turn completed."""
-    last = parse_iso_timestamp(foreman.state.last_turn_at)
-    for item in fitems.load_items(foreman.root):
-        if item.status != STATUS_ANSWERED or not item.answered_at:
-            continue
-        answered = parse_iso_timestamp(item.answered_at)
-        if answered is not None and (last is None or answered > last):
-            return True
-    return False
-
-
-def _report_due(foreman: Foreman, now: datetime) -> bool:
-    """The daily ``cadence.report_at`` (local HH:MM) passed since the last
-    scheduled Turn — one catch-up Turn however many days were missed."""
-    cadence = foreman.charter.cadence
-    report_at = cadence.report_at if cadence is not None else None
-    if not report_at:
-        return False
-    local_now = now.astimezone()
-    due = local_now.replace(
-        hour=int(report_at[:2]), minute=int(report_at[3:5]), second=0, microsecond=0
-    )
-    if due > local_now:
-        due -= timedelta(days=1)
-    last = parse_iso_timestamp(foreman.state.last_scheduled_turn_at)
-    return last is None or last < due
-
-
-def _quiet_due(foreman: Foreman, now: datetime) -> bool:
-    """``bounds.max_quiet_hours`` elapsed since the last Turn."""
-    last = parse_iso_timestamp(foreman.state.last_turn_at)
-    return last is None or (now - last) >= timedelta(hours=foreman.charter.bounds.max_quiet_hours)
-
-
-def wake_reason(foreman: Foreman, *, now: datetime) -> str | None:
-    """The first true wake condition for ``foreman``, or ``None``."""
-    state = foreman.state
-    if lifecycle_fingerprint(foreman) != state.lifecycle_fingerprint:
-        return WAKE_LIFECYCLE
-    if fjournal.read_inbox(foreman.root, after_id=state.inbox_cursor):
-        return WAKE_INBOX
-    if _new_item_answer(foreman):
-        return WAKE_ITEM_ANSWER
-    if fjournal.read_signals(foreman.root, after_id=state.signal_cursor):
-        return WAKE_SIGNAL
-    if _report_due(foreman, now):
-        return WAKE_REPORT_DUE
-    if _quiet_due(foreman, now):
-        return WAKE_QUIET
-    return None
-
-
-def _deferral_reason(foreman: Foreman, *, fleet_paused: bool, now: datetime) -> str | None:
-    """The bound that defers a wanted Turn, or ``None``."""
-    if fleet_paused:
-        return DEFER_FLEET_PAUSED
-    bounds = foreman.charter.bounds
-    last = parse_iso_timestamp(foreman.state.last_turn_at)
-    if last is not None and (now - last) < timedelta(minutes=bounds.min_turn_interval_minutes):
-        return DEFER_MIN_INTERVAL
-    if (
-        foreman.state.turns_today_date == _today(now)
-        and foreman.state.turns_today >= bounds.max_turns_per_day
-    ):
-        return DEFER_MAX_TURNS
-    return None
-
-
-def _emit_deferred(foreman: Foreman, *, reason: str, wake: str, detail: str | None) -> None:
-    payload: dict[str, Any] = {"foreman": foreman.name, "reason": reason, "wake": wake}
-    if detail is not None:
-        payload["detail"] = detail
-    # write-gate-exempt(issue=3122): no write_gate receiver on the pass — the event mirrors the deferral decision into the foreman's events.db.
-    log_event(  # event-consumer: audit-only — the pass outcome carries the same decision
-        fpaths.state_path(foreman.root),
-        EVENT_WAKE_DEFERRED,
-        payload,
-        repo=foreman.repo_key,
-    )
 
 
 # --- Turn directory management ------------------------------------------------
@@ -368,6 +285,10 @@ def _record_failure(
         },
         repo=foreman.repo_key,
     )
+    # Issue #3123: notify runs after EVERY Turn, not only successful ones — a
+    # faulted foreman's report item above is exactly the notification that
+    # must not wait for a Turn that will never come.
+    notify_unnotified_items(root, resolve_fleet_notify(foreman.config.notify, foreman.state_root))
     return detail
 
 
@@ -669,6 +590,7 @@ def _pass_one(
     dry_run: bool,
     no_decide: bool,
     now: datetime,
+    foreman_config: ForemanConfig,
 ) -> ForemanPassOutcome:
     """Wake-evaluate and (maybe) run one foreman's Turn this pass."""
     loaded = load_foreman(fleet_dir, name)
@@ -677,6 +599,19 @@ def _pass_one(
     foreman = loaded.value
     if foreman.state.state not in ("active", "degraded"):
         return ForemanPassOutcome(name, "skipped", reason=f"state:{foreman.state.state}")
+
+    # Structural limits first (design §10, issue #3123): breaker, unattended
+    # limit, and the once-per-foreman verdict are evaluated at the start of
+    # each pass so a transition applies to the Turn about to run. A
+    # just-degraded foreman still runs Turns — degraded gates arming, not
+    # planning — so the rest of the pass continues with the updated state.
+    # --dry-run skips the evaluation entirely: like the pass-completed event
+    # and Apply itself, a dry pass must not persist degraded state, raise
+    # items, or set forced_arming on a live foreman.
+    if not dry_run:
+        flimits.evaluate_limits(
+            foreman, fleet_dir=fleet_dir, breaker=foreman_config.breaker, now=now
+        )
 
     # A crash survivor is outstanding work the pass owes the foreman — it
     # wakes the foreman even when no predicate fires (design §8.3).
@@ -734,7 +669,9 @@ def run_pass(
     except (ConfigError, OSError) as exc:
         return Result(error=f"config failed to load: {exc}")
     foreman_config = getattr(config, "foreman", None)
-    if foreman_config is not None and not getattr(foreman_config, "enabled", True):
+    if foreman_config is None:
+        foreman_config = ForemanConfig()
+    if not getattr(foreman_config, "enabled", True):
         return Result(value=PassResult(disabled=True))
 
     if only is not None:
@@ -760,10 +697,28 @@ def run_pass(
                 dry_run=dry_run,
                 no_decide=no_decide,
                 now=now,
+                foreman_config=foreman_config,
             )
             for name in names
         )
-        return Result(value=PassResult(outcomes=outcomes))
+        result = PassResult(outcomes=outcomes)
+        if not dry_run:
+            # The fleet-level "a pass ran" signal the heartbeat's
+            # pass-freshness alarm reads (design §10, issue #3123); siblings
+            # of supervisor-heartbeat.json land in the fleet events.db.
+            # write-gate-exempt(issue=3123): fleet-level event, no write_gate receiver — mirrors the completed pass into the fleet events.db like foreman_pass_start_failed.
+            log_event(  # event-consumer: audit-only — the alarm recomputes from the event ts
+                layout.state_file_path(fleet_dir),
+                EVENT_PASS_COMPLETED,
+                {
+                    "foremen": len(outcomes),
+                    "outcomes": {
+                        o.outcome: sum(1 for x in outcomes if x.outcome == o.outcome)
+                        for o in outcomes
+                    },
+                },
+            )
+        return Result(value=result)
     finally:
         pass_lock.release()
 
@@ -774,6 +729,7 @@ __all__ = [
     "DEFER_MAX_TURNS",
     "DEFER_MIN_INTERVAL",
     "DEFER_STALE_SNAPSHOT",
+    "EVENT_PASS_COMPLETED",
     "EVENT_TURN_COMPLETED",
     "EVENT_TURN_FAILED",
     "EVENT_WAKE_DEFERRED",

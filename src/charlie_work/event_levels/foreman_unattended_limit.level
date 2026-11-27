@@ -1,0 +1,5 @@
+warning
+# Issue #3123: the unattended limit tripped — an open decision item passed
+# the charter's max_unanswered_days bound, degrading the foreman until it
+# is answered. Warning: the limit working as designed, and an operator
+# answer is required to clear it.

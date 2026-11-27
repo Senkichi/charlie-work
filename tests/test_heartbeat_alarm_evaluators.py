@@ -442,7 +442,14 @@ def test_supervisor_heartbeat_file_round_trip(tmp_path: Path) -> None:
 # --- leaf contract ---------------------------------------------------------------
 
 
-@pytest.mark.parametrize("name", ["heartbeat_alarms.py", "heartbeat_alarms_fleet.py"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "heartbeat_alarms.py",
+        "heartbeat_alarms_fleet.py",
+        "heartbeat_alarms_foreman.py",
+    ],
+)
 def test_modules_are_stdlib_only_leaves_without_clock_or_io(name: str) -> None:
     src = Path(__file__).parent.parent / "src" / "charlie_work" / name
     tree = parsed(src)

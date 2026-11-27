@@ -26,6 +26,7 @@ the shared atomic-write helpers like every other JSON state file.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Generic, TypeVar
 
@@ -60,14 +61,26 @@ class Result(Generic[T]):
 #: charter's ``done_when.check`` passed and the foreman wrapped up.
 FOREMAN_STATES = frozenset({"active", "paused", "degraded", "faulted", "done"})
 
-#: Themed display spelling for ``degraded`` (CONTEXT.md: the names are
-#: CLI/display vocabulary only).
+#: Themed display spellings for ``degraded`` (CONTEXT.md: the names are
+#: CLI/display vocabulary only). A breaker trip shows WILD CARD; every other
+#: degraded cause (e.g. the unattended limit) shows CRICKET.
 _DEGRADED_DISPLAY = "CRICKET"
+_BREAKER_DISPLAY = "WILD CARD"
+_BREAKER_REASON = "breaker"
 
 
-def display_state(state: str) -> str:
-    """Map a foreman state to its CLI display spelling."""
-    return _DEGRADED_DISPLAY if state == "degraded" else state
+def display_state(state: str, degraded_reasons: Iterable[str] = ()) -> str:
+    """Map a foreman state to its CLI display spelling.
+
+    ``degraded_reasons`` is ``state.degraded_reasons`` from state.json — a
+    breaker-tripped degraded foreman displays WILD CARD, any other degraded
+    cause displays CRICKET (design §9's vocabulary table).
+    """
+    if state != "degraded":
+        return state
+    if _BREAKER_REASON in degraded_reasons:
+        return _BREAKER_DISPLAY
+    return _DEGRADED_DISPLAY
 
 
 #: Themed display spelling for a refused Apply outcome (design §8.3/§13:

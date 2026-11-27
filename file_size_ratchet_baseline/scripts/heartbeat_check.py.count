@@ -1,8 +1,16 @@
-2600
-# Architecture-deepening plan, candidate 3 ("markdown structure"): +~100
-# lines for `_scan_markdown_structure`, the stdlib-only CommonMark
-# block-structure scanner duplicated from `charlie_work.markdown_fence.scan`
-# (this script cannot import charlie_work -- scripts/README.md:50-51). Not
-# extractable: a second script file would violate the same stdlib-only
-# import boundary this duplicate exists to respect. Raised to the next
-# MARK_QUANTUM multiple per the ratchet's hand-raise rule (2800 -> 3000).
+2800
+# Issue #3123: +~200 lines for `check_foremen` and its store-decoding
+# helpers (`_foreman_dirs`, `_foreman_global_config`, `_foreman_state`,
+# `_foreman_turn_bound`, `_foreman_turn_tokens`, `_foreman_newest_pass_ts`)
+# -- the foreman alarms must read the foreman store by file shape because
+# ADR-0010 forbids importing charlie_work.foreman here, and the verdicts
+# already live in the shared heartbeat_alarms_foreman leaf. Not extractable:
+# the script family is stdlib-only and a second check module would cross
+# the same import boundary. Raised to the next MARK_QUANTUM multiple per
+# the ratchet's hand-raise rule (2600 -> 2800).
+#
+# Prior raise (still applies): architecture-deepening candidate 3
+# ("markdown structure"), +~100 lines for `_scan_markdown_structure`, the
+# stdlib-only CommonMark block-structure scanner duplicated from
+# `charlie_work.markdown_fence.scan` (this script cannot import
+# charlie_work -- scripts/README.md:50-51).

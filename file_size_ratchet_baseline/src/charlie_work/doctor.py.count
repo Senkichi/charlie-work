@@ -1,1 +1,8 @@
-1800
+2000
+# Issue #3123: +~130 lines for `_check_foremen` and its decode-by-shape
+# constants -- the foreman-store doctor check (charter/state/items decode,
+# charter.repos registered). Not extractable into charlie_work.foreman:
+# ADR-0010 forbids importing it outside gang_command/scheme_command, so the
+# check decodes the store by file shape beside the other fleet-level checks.
+# Raised to the next MARK_QUANTUM multiple per the ratchet's hand-raise
+# rule (1800 -> 2000).

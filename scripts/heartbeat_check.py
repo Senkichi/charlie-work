@@ -24,6 +24,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import shutil
 import sqlite3
 import stat
@@ -165,6 +166,10 @@ get_merged_commit_messages = _stale_mentions.get_merged_commit_messages
 # heartbeat_event_alarms.load_alarm_leaves) so a wrong-venv run keeps real
 # verdicts; only if both fail do the checks report a loud ANOMALY.
 _ha, _haf = _event_alarms.load_alarm_leaves()
+# The foreman verdicts live in the third sibling leaf (issue #3123), loaded
+# through the same installed-package/file-path resolution so a wrong-venv
+# run degrades to a loud ANOMALY rather than silently green.
+_haff = _event_alarms.load_foreman_alarm_leaf()
 _ALARMS_UNAVAILABLE = (
     "cannot evaluate: heartbeat_alarms leaves not importable and not loadable from src/"
 )
@@ -292,6 +297,19 @@ SUPERVISOR_HEARTBEAT_DEFAULT_PASS_TIMEOUT_SECONDS = (
 # does not alarm forever.
 SUPERVISOR_WEDGE_LOOP_EVENT_KIND = "supervisor_wedge_loop"
 SUPERVISOR_WEDGE_LOOP_LOOKBACK_HOURS = _haf.SUPERVISOR_WEDGE_LOOP_LOOKBACK_HOURS if _haf else 24
+
+# Foreman alarms (issue #3123, design §10) — the verdicts live in
+# heartbeat_alarms_foreman; these mirror the on-disk names heartbeat needs to
+# read the foreman store without importing charlie_work.foreman (ADR-0010's
+# import direction: only gang_command/scheme_command may import it).
+FOREMEN_DIRNAME = "foremen"
+FOREMAN_NAME_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]*\Z")
+FOREMAN_STATE_FILENAME = "state.json"
+FOREMAN_CHARTER_FILENAME = "charter.yaml"
+FOREMAN_PASS_COMPLETED_KIND = "foreman_pass_completed"
+FOREMAN_TURN_COMPLETED_KIND = "foreman_turn_completed"
+FLEET_PAUSE_FILENAME = "fleet-pause.json"
+FOREMAN_PASS_INTERVAL_DEFAULT_MINUTES = 5
 
 # Issue #1859: notify_digest_check is the stdlib-only file-probe leaf;
 # notify_digest_heartbeat holds the events.db-read-plus-verdict logic (see
@@ -2414,6 +2432,188 @@ def check_wedge_kill_loop(report: Report) -> None:
     )
 
 
+def _foreman_dirs() -> list[Path]:
+    """Foreman directories under ``<fleet_dir>/foremen`` — no foreman import.
+
+    Mirrors ``foreman.paths.list_foreman_dirs``: name-regex'd directories
+    only (``_shared`` and strays are not foremen). ADR-0010 forbids importing
+    ``charlie_work.foreman`` here, so the store is decoded by shape alone.
+    """
+    root = fleet_dir() / FOREMEN_DIRNAME
+    try:
+        return sorted(
+            entry
+            for entry in root.iterdir()
+            if entry.is_dir() and FOREMAN_NAME_PATTERN.match(entry.name)
+        )
+    except OSError:
+        return []
+
+
+def _foreman_global_config() -> tuple[bool, float]:
+    """``(enabled, pass_interval_minutes)`` from the fleet global config's ``foreman:`` section."""
+    cfg, _err = load_orchestrator_config(fleet_dir() / FLEET_GLOBAL_CONFIG_FILENAME)
+    section = cfg.get("foreman") if isinstance(cfg, dict) else None
+    if not isinstance(section, dict):
+        return True, float(FOREMAN_PASS_INTERVAL_DEFAULT_MINUTES)
+    try:
+        interval = float(
+            section.get("pass_interval_minutes") or FOREMAN_PASS_INTERVAL_DEFAULT_MINUTES
+        )
+    except (TypeError, ValueError):
+        interval = float(FOREMAN_PASS_INTERVAL_DEFAULT_MINUTES)
+    enabled = section.get("enabled", True)
+    return bool(enabled), max(interval, 0.0) or float(FOREMAN_PASS_INTERVAL_DEFAULT_MINUTES)
+
+
+def _foreman_state(fdir: Path) -> dict[str, Any]:
+    """Parsed ``state.json`` (a cache — unreadable decodes as {})."""
+    try:
+        data = json.loads((fdir / FOREMAN_STATE_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _foreman_turn_bound(fdir: Path) -> int | None:
+    """``bounds.max_turns_per_day`` from charter.yaml; None when unreadable."""
+    try:
+        data = yaml.safe_load((fdir / FOREMAN_CHARTER_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return None
+    bounds = data.get("bounds") if isinstance(data, dict) else None
+    bound = bounds.get("max_turns_per_day") if isinstance(bounds, dict) else None
+    return bound if isinstance(bound, int) else None
+
+
+def _foreman_turn_tokens(fdir: Path) -> list[int] | None:
+    """input+output totals of ``foreman_turn_completed``, oldest first; None if unreadable."""
+    db_path = fdir / "events.db"
+    if not db_path.exists():
+        return []
+    try:
+        conn = sqlite3.connect(str(db_path))
+    except sqlite3.Error:
+        return None
+    try:
+        try:
+            table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
+            ).fetchone()
+            if table is None:
+                return []
+            rows = conn.execute(
+                "SELECT payload FROM events WHERE kind = ? ORDER BY id ASC",
+                (FOREMAN_TURN_COMPLETED_KIND,),
+            ).fetchall()
+        except sqlite3.Error:
+            return None
+    finally:
+        conn.close()
+    totals: list[int] = []
+    for (payload,) in rows:
+        try:
+            data = json.loads(payload) if isinstance(payload, str) else {}
+        except json.JSONDecodeError:
+            data = {}
+        tokens = 0
+        if isinstance(data, dict):
+            for key in ("input_tokens", "output_tokens"):
+                value = data.get(key)
+                if isinstance(value, (int, float)):
+                    tokens += int(value)
+        totals.append(tokens)
+    return totals
+
+
+def _foreman_newest_pass_ts() -> str | None:
+    """``MAX(ts)`` of ``foreman_pass_completed`` in the fleet events.db (None = none/unreadable)."""
+    db_path = fleet_dir() / "events.db"
+    if not db_path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(str(db_path))
+    except sqlite3.Error:
+        return None
+    try:
+        try:
+            table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
+            ).fetchone()
+            if table is None:
+                return None
+            row = conn.execute(
+                "SELECT MAX(ts) FROM events WHERE kind = ?",
+                (FOREMAN_PASS_COMPLETED_KIND,),
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+    finally:
+        conn.close()
+    return row[0] if row and isinstance(row[0], str) else None
+
+
+def check_foremen(report: Report, *, now: datetime | None = None) -> None:
+    """The foreman alarms (issue #3123, design §10).
+
+    Five verdicts, all in ``heartbeat_alarms_foreman`` so the dashboard and
+    notifications agree: Turn-token spike over the trailing median,
+    ``max_turns_per_day`` reached, breaker tripped, foreman faulted, and a
+    foreman pass not seen for twice its interval. The store is decoded by
+    file shape — importing ``charlie_work.foreman`` is forbidden here
+    (ADR-0010). The pass-freshness leg is skipped when the supervise loop
+    legitimately never spawns the pass: the layer disabled or the fleet
+    paused.
+    """
+    check = "foremen"
+    now = now or datetime.now(timezone.utc)
+    foremen = _foreman_dirs()
+    if not foremen:
+        report.ok(check, "no foremen under foremen/ — foreman checks skipped")
+        return
+    if _ha is None or _haff is None:
+        report.anom(check, _ALARMS_UNAVAILABLE)
+        return
+    enabled, interval = _foreman_global_config()
+    for fdir in foremen:
+        name = fdir.name
+        data = _foreman_state(fdir)
+        state = data.get("state") if isinstance(data.get("state"), str) else "unknown"
+        reasons = [r for r in (data.get("degraded_reasons") or []) if isinstance(r, str)]
+        turns_today = data.get("turns_today")
+        turns_today = turns_today if isinstance(turns_today, int) else 0
+        turns_today_date = data.get("turns_today_date")
+        turns_today_date = turns_today_date if isinstance(turns_today_date, str) else ""
+
+        tokens = _foreman_turn_tokens(fdir)
+        _ha.emit(report, _haff.eval_foreman_turn_tokens(name, tokens or []))
+        _ha.emit(
+            report,
+            _haff.eval_foreman_turns_per_day(
+                name, turns_today, turns_today_date, _foreman_turn_bound(fdir), now
+            ),
+        )
+        _ha.emit(report, _haff.eval_foreman_breaker(name, reasons))
+        _ha.emit(report, _haff.eval_foreman_state(name, state, reasons))
+
+    if not enabled:
+        report.ok(
+            "foreman-pass-freshness",
+            "foreman.enabled is false — the pass is off by config",
+        )
+        return
+    if (fleet_dir() / FLEET_PAUSE_FILENAME).exists():
+        report.ok(
+            "foreman-pass-freshness",
+            f"fleet paused ({FLEET_PAUSE_FILENAME} present) — the pass is held",
+        )
+        return
+    _ha.emit(
+        report,
+        _haff.eval_foreman_pass_freshness(_foreman_newest_pass_ts(), interval, now),
+    )
+
+
 def check_notify_digest_freshness(report: Report, *, now: datetime | None = None) -> None:
     """Issue #1859 consumer: flag an enabled file sink whose digest is dead.
 
@@ -2532,6 +2732,7 @@ def main() -> int:
     check_supervisor_venv_refusal(report, repos, baseline)
     check_supervisor_heartbeat(report)
     check_wedge_kill_loop(report)
+    check_foremen(report, now=now)
     check_notify_digest_freshness(report, now=now)
 
     save_state(new_state)

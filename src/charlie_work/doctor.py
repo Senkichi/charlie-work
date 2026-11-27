@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -1013,6 +1014,136 @@ def _check_fleet_supervisor(add: Any, fleet_dir_override: str | None = None) -> 
     )
 
 
+# Foreman-store decode-by-shape constants. ADR-0010 forbids importing
+# ``charlie_work.foreman`` outside gang_command/scheme_command, so doctor
+# validates the on-disk store directly — the same names the package writes.
+_FOREMAN_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]*\Z")
+_FOREMAN_STATES = frozenset({"active", "paused", "degraded", "faulted", "done"})
+_FOREMAN_ITEM_KINDS = frozenset({"decision", "permission", "report"})
+_FOREMAN_CHARTER_FILENAME = "charter.yaml"
+_FOREMAN_STATE_FILENAME = "state.json"
+_FOREMAN_ITEMS_FILENAME = "items.json"
+
+
+def _check_foremen(add: Any, fleet_dir_override: str | None = None) -> None:
+    """Foreman-store health: charter/state/items decode, repo registered (issue #3123).
+
+    One check per foreman under ``<fleet_dir>/foremen``: ``charter.yaml``
+    parses, names its directory, and points its single ``repos`` entry at a
+    fleet-registry key; ``state.json`` parses with a known ``state``;
+    ``items.json`` parses with a list of decodable item records. Decoded by
+    file shape — ADR-0010 forbids importing ``charlie_work.foreman`` here.
+    """
+    foremen_root = fleet_dir(override=fleet_dir_override) / layout.FOREMEN_DIRNAME
+    try:
+        foremen = sorted(
+            entry
+            for entry in foremen_root.iterdir()
+            if entry.is_dir() and _FOREMAN_NAME_RE.fullmatch(entry.name)
+        )
+    except OSError:
+        return
+    if not foremen:
+        return
+
+    registry = _load_registry(layout.fleet_registry_path(override=fleet_dir_override))
+    registered = set((registry.get("repos") or {}).keys())
+
+    for fdir in foremen:
+        problems: list[str] = []
+
+        charter_path = fdir / _FOREMAN_CHARTER_FILENAME
+        try:
+            charter = yaml.safe_load(charter_path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            problems.append(f"{_FOREMAN_CHARTER_FILENAME}: unreadable: {exc}")
+            charter = None
+        except yaml.YAMLError as exc:
+            problems.append(f"{_FOREMAN_CHARTER_FILENAME}: not yaml: {exc}")
+            charter = None
+        if charter is not None:
+            if not isinstance(charter, dict):
+                problems.append(f"{_FOREMAN_CHARTER_FILENAME}: top-level is not a mapping")
+            else:
+                charter_name = charter.get("name")
+                if charter_name != fdir.name:
+                    problems.append(
+                        f"{_FOREMAN_CHARTER_FILENAME}: name {charter_name!r} "
+                        f"does not match directory {fdir.name!r}"
+                    )
+                repos = charter.get("repos")
+                if not isinstance(repos, list) or len(repos) != 1 or not isinstance(repos[0], str):
+                    problems.append(
+                        f"{_FOREMAN_CHARTER_FILENAME}: repos must be exactly one "
+                        f"fleet registry key, got {repos!r}"
+                    )
+                elif repos[0] not in registered:
+                    problems.append(
+                        f"{_FOREMAN_CHARTER_FILENAME}: repos[0] {repos[0]!r} is not a "
+                        "registered repo in fleet.json"
+                    )
+
+        state_path = fdir / _FOREMAN_STATE_FILENAME
+        try:
+            fstate = json.loads(state_path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            problems.append(f"{_FOREMAN_STATE_FILENAME}: unreadable: {exc}")
+            fstate = None
+        except json.JSONDecodeError as exc:
+            problems.append(f"{_FOREMAN_STATE_FILENAME}: corrupt: {exc}")
+            fstate = None
+        if fstate is not None:
+            if not isinstance(fstate, dict):
+                problems.append(f"{_FOREMAN_STATE_FILENAME}: top-level is not a mapping")
+            elif fstate.get("state") not in _FOREMAN_STATES:
+                problems.append(
+                    f"{_FOREMAN_STATE_FILENAME}: state {fstate.get('state')!r} "
+                    f"not one of {sorted(_FOREMAN_STATES)}"
+                )
+
+        items_path = fdir / _FOREMAN_ITEMS_FILENAME
+        if items_path.exists():
+            try:
+                items_raw = json.loads(items_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                problems.append(f"{_FOREMAN_ITEMS_FILENAME}: unreadable or corrupt: {exc}")
+            else:
+                records = (
+                    items_raw.get("items")
+                    if isinstance(items_raw, dict)
+                    else items_raw
+                    if isinstance(items_raw, list)
+                    else None
+                )
+                if not isinstance(records, list):
+                    problems.append(f"{_FOREMAN_ITEMS_FILENAME}: 'items' is not a list")
+                else:
+                    bad = sum(
+                        1
+                        for r in records
+                        if not isinstance(r, dict)
+                        or not isinstance(r.get("id"), str)
+                        or r.get("kind") not in _FOREMAN_ITEM_KINDS
+                    )
+                    if bad:
+                        problems.append(
+                            f"{_FOREMAN_ITEMS_FILENAME}: {bad} record(s) failed to decode"
+                        )
+
+        if problems:
+            add(
+                f"foreman {fdir.name}",
+                False,
+                f"{fdir}: " + "; ".join(problems),
+            )
+        else:
+            add(
+                f"foreman {fdir.name}",
+                True,
+                "charter, state, and items decode; repo registered",
+            )
+
+
 def _validate_gh_field_lists(add: Any, gh: GitHubLike) -> None:
     """Validate gh --json field lists against the live gh CLI.
 
@@ -1763,6 +1894,11 @@ def run_doctor(
     # written by whichever supervisor ran the pass, and gating its consumer on
     # one repo's config would re-hide the signal this check exists to surface.
     _check_provenance_refusal_streak(add, fleet_dir_override=fleet_dir_override)
+
+    # -- foreman stores (issue #3123) -----------------------------------------
+    # Read-only: decodes each foreman's charter/state/items by file shape and
+    # checks the charter's single repos entry against the fleet registry.
+    _check_foremen(add, fleet_dir_override=fleet_dir_override)
 
     # -- recent lane-startup failures (#6-G) ---------------------------------
     # Read-only: queries this repo's own events.db for past

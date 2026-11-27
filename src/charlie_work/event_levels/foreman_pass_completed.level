@@ -1,0 +1,5 @@
+info
+# Issue #3123: the foreman pass (``charlie scheme``) completed a sweep over
+# every foreman. Info, like foreman_turn_completed: routine per-pass
+# bookkeeping — the fleet-level event the "pass not seen for 2x its
+# interval" heartbeat alarm recomputes from.
