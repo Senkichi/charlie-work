@@ -404,6 +404,11 @@ FLEET_LOCK_HOLDER_FILENAME = "fleet.lock.holder"
 FLEET_SUPERVISOR_LOCK_FILENAME = "fleet-supervisor.lock"
 FLEET_STOP_REQUEST_FILENAME = "fleet-stop-request.json"
 FLEET_PAUSE_FILENAME = "fleet-pause.json"
+#: ``<fleet_dir>/foremen`` — the foreman layer's root (ADR-0010). The fleet
+#: supervise loop needs the dirname to gate its ``charlie scheme`` spawn on
+#: "any foreman exists" without importing ``charlie_work.foreman`` (#3122);
+#: ``foreman/paths.py`` aliases this constant as its own source of truth.
+FOREMEN_DIRNAME = "foremen"
 DASHBOARD_DB_FILENAME = "dashboard.db"
 NOTIFY_HEALTH_STATE_FILENAME = "notify_health_state.json"
 CAPACITY_STARVATION_STATE_FILENAME = "capacity_starvation_state.json"

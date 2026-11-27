@@ -19,6 +19,7 @@ returns the ``RunResult`` value.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -80,6 +81,55 @@ class DecideLauncher(Protocol):
     ) -> RunResult:
         """Run one bounded ``claude -p`` Decide launch; return the ``RunResult``."""
         ...
+
+
+@dataclass(frozen=True)
+class ForemanPassStart:
+    """One ``charlie scheme`` spawn outcome (issue #3122).
+
+    ``child`` is the spawned process — the caller only ever ``poll()``s it,
+    never waits on it (the supervise loop must not block on a Decide). Either
+    ``child`` or ``error`` is set; ``error`` carries the failure as a value.
+    """
+
+    child: Any | None = None
+    error: str | None = None
+
+
+class ForemanPassLauncher(Protocol):
+    """Spawn ``charlie scheme`` as a detached child process — never waited on.
+
+    The fleet supervise loop's only edge onto the foreman layer (issue #3122,
+    ADR-0010): the loop owns the argv and this port owns the Popen, so the
+    loop never imports ``charlie_work.foreman`` and a slow Decide can never
+    delay a fleet pass — the port returns the moment the child exists.
+    """
+
+    def launch(self, argv: tuple[str, ...], *, cwd: Path) -> ForemanPassStart:
+        """Spawn the pass child; return its handle or an error value."""
+        ...
+
+
+class RealForemanPassLauncher:
+    """The production ``ForemanPassLauncher``: ``subprocess.Popen``, detached."""
+
+    def launch(self, argv: tuple[str, ...], *, cwd: Path) -> ForemanPassStart:
+        import subprocess
+
+        from ..subprocess_runner import no_console_window_kwargs
+
+        try:
+            child = subprocess.Popen(
+                list(argv),
+                cwd=str(cwd),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                **no_console_window_kwargs(),
+            )
+        except OSError as exc:
+            return ForemanPassStart(error=f"{type(exc).__name__}: {exc}")
+        return ForemanPassStart(child=child)
 
 
 def error_record(

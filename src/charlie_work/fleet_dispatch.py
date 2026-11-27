@@ -68,6 +68,15 @@ from .fleet_stop import (
     fleet_stop_pending,
     supervise_loop_interrupted_result,
 )
+
+# Re-exported so the issue #3122 ratchet extraction keeps the
+# ``fleet_dispatch.<name>`` facade intact for existing callers/tests; the
+# implementations live in the foreman_pass_spawn domain module.
+from .foreman_pass_spawn import (  # noqa: F401  (deliberate re-export)
+    _foreman_pass_cadence,
+    _foremen_present,
+    _maybe_start_foreman_pass,
+)
 from . import harness_auth_block, launchd_probe, layout
 from .github import GitHub, GitHubError
 from .global_config import (
@@ -3049,6 +3058,12 @@ def run_fleet_supervise(
         fleet_cfg = getattr(global_config, "fleet_supervisor", None)
         if fleet_cfg is None:
             fleet_cfg = FleetSupervisorConfig()
+        # Issue #3122 (ADR-0010): the foreman pass cadence config — a
+        # host-side config lookup, not a ``charlie_work.foreman`` edge
+        # (foreman_pass_spawn owns the read).
+        foreman_pass_enabled, foreman_pass_interval = _foreman_pass_cadence(
+            global_config, dry_run=dry_run
+        )
         # The supervisor's private self-bookkeeping root is resolved via the
         # dedicated helper, which binds the phantom-state-dir opt-out (#1754).
         state_root = supervisor_runtime_paths(global_config.runtime.state_dir).root
@@ -3115,6 +3130,12 @@ def run_fleet_supervise(
         drain_state = FleetStopState()
         full_pass_interval = cfg.full_pass_interval_seconds
         last_full_pass_at = start_time - full_pass_interval
+        # The periodic foreman pass child (issue #3122): spawned as
+        # ``charlie scheme`` argv, polled for liveness, never waited on.
+        # Anchored like ``last_full_pass_at`` so the first interval ticks
+        # immediately on supervisor start.
+        foreman_child: Any | None = None
+        last_foreman_pass_at = start_time - foreman_pass_interval
         snapshot = _take_fleet_snapshot(fleet_dir_override=fleet_dir_override)
 
         # Supervisor lifecycle instrumentation (issue #627): record started/exited
@@ -3295,6 +3316,18 @@ def run_fleet_supervise(
                 exit_reason = _exit_reason = FLEET_PAUSED_EXIT_REASON
                 _exit_code = EXIT_FLEET_PAUSED
                 break
+
+            # Issue #3122 (ADR-0010): the periodic foreman pass. Spawned by
+            # argv on every iteration, idle polls included — a slow Decide
+            # can never delay a fleet pass (see foreman_pass_spawn).
+            foreman_child, last_foreman_pass_at = _maybe_start_foreman_pass(
+                foreman_child,
+                last_foreman_pass_at,
+                now=now,
+                interval_seconds=foreman_pass_interval,
+                enabled=foreman_pass_enabled,
+                fleet_dir_override=fleet_dir_override,
+            )
 
             new_snapshot = _take_fleet_snapshot(fleet_dir_override=fleet_dir_override)
             fallback_due = (now - last_full_pass_at) >= full_pass_interval

@@ -12,7 +12,9 @@ from dataclasses import dataclass
 from .clock import Clock, RealClock
 from .launch import (
     DecideLauncher,
+    ForemanPassLauncher,
     RealDecideLauncher,
+    RealForemanPassLauncher,
     RealReviewLauncher,
     RealWorkerLauncher,
     ReviewLauncher,
@@ -30,6 +32,7 @@ class HostPorts:
     launch: ReviewLauncher
     worker_launch: WorkerLauncher
     decide_launch: DecideLauncher
+    foreman_pass_launch: ForemanPassLauncher
 
 
 REAL = HostPorts(
@@ -39,6 +42,7 @@ REAL = HostPorts(
     launch=RealReviewLauncher(),
     worker_launch=RealWorkerLauncher(),
     decide_launch=RealDecideLauncher(),
+    foreman_pass_launch=RealForemanPassLauncher(),
 )
 
 _ACTIVE: HostPorts = REAL

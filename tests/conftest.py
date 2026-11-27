@@ -11,6 +11,11 @@ from unittest.mock import create_autospec
 
 import pytest
 
+# Registers the autouse ``_no_real_foreman_pass_child`` fixture — the body
+# lives in ``_host_fixtures`` (the ``_worktree_fixtures`` pattern) so this
+# conftest stays under the file-size cap (issue #3122 rework).
+from _host_fixtures import _no_real_foreman_pass_child  # noqa: F401
+
 # The autouse ``_default_healthy_preflight`` stub below patches these two
 # modules on every test. Imported here -- at conftest import (collection)
 # time -- rather than lazily at the stub's first patch: the two modules cost

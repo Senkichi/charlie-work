@@ -1,4 +1,12 @@
-4000
+4200
+# Issue #3122: the foreman-pass spawn wiring (_foremen_present +
+# _maybe_start_foreman_pass + the cadence read) was extracted to
+# foreman_pass_spawn.py per the round-2 review; the loop-bound remainder
+# (re-export import, cadence call, child/anchor state, the per-iteration
+# call site) keeps the file at 4025 -- supervisor-loop wiring that cannot
+# move without restructuring the loop, same shape as #1716 below.
+# 4000 -> 4200 per the hand-raise rule.
+#
 # Issue #1716: merging main's #1836 in-pass-deadline work into the
 # stop/drain branch puts the merged fleet_dispatch.py at 3616 lines --
 # past the 3600 mark (main: 3549; this branch's drain wiring: +67).

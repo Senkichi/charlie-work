@@ -1,7 +1,8 @@
 """Import-direction guard: the hub never imports ``charlie_work.foreman``.
 
 ADR-0010: the foreman is a *client* of the hub — no hub-side module may
-import the package. The one sanctioned edge is ``charlie_work.gang_command``,
+import the package. The sanctioned edges are the two CLI command modules —
+``charlie_work.gang_command`` and ``charlie_work.scheme_command`` (#3122) —
 whose handlers import the package *inside functions* so that ``import
 charlie_work.cli`` never loads it.
 
@@ -23,9 +24,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC_ROOT = REPO_ROOT / "src" / "charlie_work"
 FOREMAN_PKG = SRC_ROOT / "foreman"
 
-#: The one module allowed to import ``charlie_work.foreman`` — and only
+#: The modules allowed to import ``charlie_work.foreman`` — and only
 #: inside a function body, so the package stays out of the CLI's import time.
-_ALLOWED_IMPORTER = "gang_command.py"
+#: ``gang_command`` owns the operator commands; ``scheme_command`` (#3122)
+#: owns the foreman pass. The supervise loop is deliberately NOT here: it
+#: spawns ``charlie scheme`` by argv and never imports the package.
+_ALLOWED_IMPORTERS = frozenset({"gang_command.py", "scheme_command.py"})
 
 
 @dataclass(frozen=True)
@@ -98,12 +102,12 @@ def find_foreman_edges(source: str, filename: str) -> list[Edge]:
 
 
 def find_violations(source: str, filename: str) -> list[Edge]:
-    """Edges that break the rule: everything except gang_command's lazy imports."""
+    """Edges that break the rule: everything except the CLI seams' lazy imports."""
     basename = Path(filename).name
     return [
         edge
         for edge in find_foreman_edges(source, filename)
-        if not (basename == _ALLOWED_IMPORTER and edge.in_function)
+        if not (basename in _ALLOWED_IMPORTERS and edge.in_function)
     ]
 
 
@@ -120,20 +124,32 @@ def _scan_src() -> list[Edge]:
 def test_no_module_outside_foreman_imports_the_package() -> None:
     violations = _scan_src()
     assert violations == [], (
-        "ADR-0010: only gang_command may import charlie_work.foreman, and only "
-        "inside a function:\n" + "\n".join(f"  {v}" for v in violations)
+        "ADR-0010: only the CLI command modules may import "
+        "charlie_work.foreman, and only inside a function:\n"
+        + "\n".join(f"  {v}" for v in violations)
     )
 
 
-def test_gang_command_edge_is_present_and_lazy() -> None:
-    """The seam must exist — and stay function-local so cli import stays cheap."""
-    source = (SRC_ROOT / _ALLOWED_IMPORTER).read_text(encoding="utf-8")
-    edges = find_foreman_edges(source, f"src/charlie_work/{_ALLOWED_IMPORTER}")
-    assert edges, "gang_command lost its foreman edge — the CLI cannot reach the store"
+def _assert_command_module_edge_is_present_and_lazy(importer: str) -> None:
+    """A sanctioned seam must exist — and stay function-local so cli import stays cheap."""
+    source = (SRC_ROOT / importer).read_text(encoding="utf-8")
+    edges = find_foreman_edges(source, f"src/charlie_work/{importer}")
+    assert edges, f"{importer} lost its foreman edge — the CLI cannot reach the package"
     assert all(e.in_function for e in edges), (
-        "gang_command's foreman import must stay function-local: "
+        f"{importer}'s foreman import must stay function-local: "
         + ", ".join(str(e) for e in edges if not e.in_function)
     )
+
+
+# Named per seam rather than parametrized: the collect-only gate (#1538)
+# compares leaf names base-vs-head, and a rename or a parametrized leaf is a
+# removal it enforces — each allowed importer keeps its own stable test name.
+def test_gang_command_edge_is_present_and_lazy() -> None:
+    _assert_command_module_edge_is_present_and_lazy("gang_command.py")
+
+
+def test_scheme_command_edge_is_present_and_lazy() -> None:
+    _assert_command_module_edge_is_present_and_lazy("scheme_command.py")
 
 
 def test_find_violations_flags_top_level_import() -> None:
@@ -167,6 +183,11 @@ def test_find_violations_flags_from_package_alias() -> None:
 def test_find_violations_allows_gang_command_nested() -> None:
     clean = "def f():\n    from .foreman import store\n"
     assert find_violations(clean, "src/charlie_work/gang_command.py") == []
+
+
+def test_find_violations_allows_scheme_command_nested() -> None:
+    clean = "def f():\n    from .foreman import store\n"
+    assert find_violations(clean, "src/charlie_work/scheme_command.py") == []
 
 
 def test_find_violations_clean_source() -> None:

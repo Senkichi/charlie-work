@@ -34,7 +34,11 @@ from pathlib import Path
 from .. import layout
 from ..safe_path import contains, require_contained
 
-FOREMEN_DIRNAME = "foremen"
+#: ``<fleet_dir>/foremen`` — owned by ``layout.py`` (the hub's fleet-dir
+#: surface needs it to gate the ``charlie scheme`` spawn without importing
+#: this package); aliased here so the package's own path helpers read the
+#: same source of truth.
+FOREMEN_DIRNAME = layout.FOREMEN_DIRNAME
 SHARED_DIRNAME = "_shared"
 
 CHARTER_FILENAME = "charter.yaml"
@@ -50,6 +54,24 @@ CHECK_DIRNAME = "check"
 
 ACTIONS_FILENAME = "actions.json"
 APPLIED_FILENAME = "applied.jsonl"
+BRIEFING_FILENAME = "briefing.md"
+#: The Turn's bookkeeping sidecar (cursors, fingerprint, decide usage) — the
+#: resume source when ``actions.json`` outlives its pass (issue #3122).
+TURN_META_FILENAME = "turn.json"
+#: Written only after a Turn's bookkeeping lands: journal line, cursor/fingerprint
+#: state update. A ``turn-*`` dir holding ``actions.json`` without it is a
+#: resume candidate.
+COMPLETE_FILENAME = "complete.json"
+#: Fleet-wide pass lock (``foremen/pass.lock``): at most one ``charlie scheme``
+#: pass — and so at most one Decide — at a time.
+PASS_LOCK_FILENAME = "pass.lock"
+#: Per-foreman Turn lock (``foremen/<name>/turn.lock``): one foreman's Turns
+#: never overlap, even across pass processes.
+TURN_LOCK_FILENAME = "turn.lock"
+#: Turn directory name prefixes — ``turn-`` for real Turns, ``dry-`` for
+#: ``--dry-run`` runs so a dry plan is never a resume candidate.
+TURN_DIR_PREFIX = "turn-"
+DRY_TURN_DIR_PREFIX = "dry-"
 
 #: A foreman name: lowercase alphanumeric, hyphens allowed after the first
 #: character. The pattern deliberately excludes ``_``, so ``_shared`` can
@@ -147,6 +169,31 @@ def actions_path(foreman_root: Path, turn_id: str) -> Path:
 def applied_path(foreman_root: Path, turn_id: str) -> Path:
     """Resolve ``turns/<turn_id>/applied.jsonl`` — Apply's per-action record."""
     return _sub(turn_dir(foreman_root, turn_id), APPLIED_FILENAME)
+
+
+def briefing_path(foreman_root: Path, turn_id: str) -> Path:
+    """Resolve ``turns/<turn_id>/briefing.md`` — Collect's document."""
+    return _sub(turn_dir(foreman_root, turn_id), BRIEFING_FILENAME)
+
+
+def turn_meta_path(foreman_root: Path, turn_id: str) -> Path:
+    """Resolve ``turns/<turn_id>/turn.json`` — the resume/bookkeeping sidecar."""
+    return _sub(turn_dir(foreman_root, turn_id), TURN_META_FILENAME)
+
+
+def complete_path(foreman_root: Path, turn_id: str) -> Path:
+    """Resolve ``turns/<turn_id>/complete.json`` — the Turn-finished marker."""
+    return _sub(turn_dir(foreman_root, turn_id), COMPLETE_FILENAME)
+
+
+def pass_lock_path(fleet_dir: Path) -> Path:
+    """Resolve ``foremen/pass.lock`` — the fleet-wide foreman-pass lock file."""
+    return foremen_root(fleet_dir) / PASS_LOCK_FILENAME
+
+
+def turn_lock_path(foreman_root: Path) -> Path:
+    """Resolve ``foremen/<name>/turn.lock`` — the per-foreman Turn lock file."""
+    return _sub(foreman_root, TURN_LOCK_FILENAME)
 
 
 def charter_path(foreman_root: Path) -> Path:

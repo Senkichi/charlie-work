@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import layout
-from ..config import LabelConfig
+from ..config import LabelConfig, OrchestratorConfig
 from ..config_validation import ConfigError
 from ..github import label_names
 from ..global_config import load_layered_config
@@ -75,6 +75,9 @@ class Foreman:
     state_file: Path  # <state_root>/state.json — events.db lives beside it
     labels: LabelConfig
     full_pass_interval_seconds: int
+    #: The repo's resolved layered config — Decide needs the foreman role
+    #: chain and timeout, Apply the issue-client settings (issue #3122).
+    config: OrchestratorConfig
 
 
 def _registry_entry(fleet_dir: Path, key: str) -> dict[str, Any] | None:
@@ -136,6 +139,7 @@ def load_foreman(fleet_dir: Path, name: str) -> Result[Foreman]:
             state_file=layout.state_file_path(state_root),
             labels=config.labels,
             full_pass_interval_seconds=config.supervisor.full_pass_interval_seconds,
+            config=config,
         )
     )
 

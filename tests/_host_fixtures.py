@@ -1,4 +1,13 @@
-"""Helpers for tests that script process liveness through the host probe."""
+"""Helpers for tests that script process liveness through the host probe.
+
+``_no_real_foreman_pass_child`` joined under the #3122 rework: the autouse
+port guard moved out of ``conftest.py`` when the file crossed the 800-line
+cap (file-size ratchet, issue #1442) — a host-port fake belongs with the
+host helpers, and this module's light import set keeps
+``charlie_work.foreman`` out of the conftest path (ADR-0010's seam
+notwithstanding, the lazy import inside the fixture body is what scopes the
+cost to the tests that install a launcher).
+"""
 
 from __future__ import annotations
 
@@ -34,3 +43,23 @@ def host_probe(
         yield probe
     finally:
         host_pkg._ACTIVE = prev
+
+
+@pytest.fixture(autouse=True)
+def _no_real_foreman_pass_child(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never let a test spawn a real ``charlie scheme`` child (issue #3122).
+
+    The fleet supervise loop spawns the periodic foreman pass through
+    ``host.current().foreman_pass_launch`` — ``Popen(sys.executable -m
+    charlie_work … scheme)``, a real detached process. The REAL launcher's
+    ``launch`` is stubbed with a fake (the port object itself stays REAL —
+    ``fake_host(foreman_pass_launch=...)`` still replaces it wholesale for
+    scripted outcomes).
+    """
+    from charlie_work.host.fakes import FakeForemanPassLauncher
+
+    monkeypatch.setattr(
+        host_pkg.REAL.foreman_pass_launch,
+        "launch",
+        FakeForemanPassLauncher().launch,
+    )
