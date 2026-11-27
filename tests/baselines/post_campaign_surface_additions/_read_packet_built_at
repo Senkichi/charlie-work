@@ -1,0 +1,10 @@
+issue #3182: reads the ``packet_built_at`` stamp the packet builders write
+into pr.json so ``packet_currency.packet_body_current_for_skip`` can tell a
+packet built before a verdict-voiding ``charlie unescalate`` (stale when the
+live body drifted from the packet body -- the operator's decision must reach
+the fresh review) from one rebuilt after it (drift is an unrelated edit and
+rebuilds nothing, per #2826). Net-new OrchestratorApp member added after the
+Track 2 Phase B surface baseline was pinned; declared here so the
+member-surface conservation check in tests/test_workflow_delegation_l00.py
+subtracts it before comparing moved delegates against the pre-campaign total
+(133).

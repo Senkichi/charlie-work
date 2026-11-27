@@ -1,0 +1,6 @@
+info
+# Issue #3182: the same-head packet skip declined a packet built before a
+# verdict-voiding ``charlie unescalate`` because the live PR body drifted
+# from the packet body -- the packet is being rebuilt so the operator's
+# decision reaches the reviewer. Expected signal on the unescalate path,
+# not a fault.
