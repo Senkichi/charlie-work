@@ -18,7 +18,7 @@ from charlie_work.dispatch_deferral import DEFAULT_STARVATION_THRESHOLD
 from charlie_work.github import GitHubError, GraphQLBudgetError
 from charlie_work.instrumentation import query_events
 from charlie_work.paths import runtime_paths
-from charlie_work.state import StateLockBusy
+from charlie_work.state import StateLockBusy, load_state, save_state, state_lock
 from charlie_work.command_result import CommandResult
 from charlie_work.workflow import OrchestratorApp
 
@@ -37,7 +37,18 @@ def _app(tmp_path: Path) -> OrchestratorApp:
         fleet=FleetConfig(global_max_concurrent_sessions=2, launch_lock_wait_seconds=0),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    return OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+    # Issue #3139: a rework pass with no candidate returns before the launch
+    # permit, so it can never defer on fleet_lock_held. Seed issue 123
+    # rework_requested (FakeGitHub's open PR 456 links it) so dispatch_rework
+    # reaches the permit -- the fresh lane is unaffected (it selects on GH
+    # labels, not state status).
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {"number": 123, "status": "rework_requested"}
+        state["prs"]["456"] = {"number": 456, "issue_number": 123}
+        save_state(paths.state_file, state)
+    return app
 
 
 def _events(app: OrchestratorApp, kind: str) -> list[dict[str, Any]]:

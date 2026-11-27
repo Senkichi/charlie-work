@@ -95,7 +95,7 @@ import os
 import random
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -113,8 +113,19 @@ from charlie_work.adapters import (
 )
 from charlie_work.atomic_write import write_json_atomic
 from charlie_work.fleet_lock_holder import fleet_lock_held_extra
-from charlie_work.fleet_pause import FLEET_PAUSED, launch_pause_fields
 from charlie_work.fleet_registry import try_acquire_fleet_lock
+from charlie_work.worker_launch_gates import (
+    CLAMPED_BY_HARNESS_MAX,  # noqa: F401  (deliberate re-export)
+    REASON_CONCURRENCY_CAP,  # noqa: F401  (deliberate re-export)
+    REASON_FLEET_LOCK_HELD,
+    REASON_FLEET_PAUSED,  # noqa: F401  (deliberate re-export)
+    REASON_LAUNCH_LOCK_INVALID,
+    REASON_PROVIDER_THROTTLED,
+    WorkerLaunchDeferral,
+    _apply_harness_caps,
+    _harness_free_slots,
+    lock_free_launch_gates,
+)
 from charlie_work.host.clock import Clock
 from charlie_work.host.launch import worker_error_results
 
@@ -136,16 +147,6 @@ logger = logging.getLogger(__name__)
 
 # Identity-checked proof that a lock handle / permit came from this module.
 _MINT = object()
-
-REASON_FLEET_LOCK_HELD = "fleet_lock_held"
-REASON_FLEET_PAUSED = FLEET_PAUSED
-REASON_PROVIDER_THROTTLED = role_selection.REASON_PROVIDER_THROTTLED
-REASON_CONCURRENCY_CAP = "concurrency_cap"
-REASON_LAUNCH_LOCK_INVALID = "launch_lock_invalid"
-
-# ``ConcurrencyGovernorResult.clamped_by`` when a per-harness ceiling (issue #2757)
-# is the term that bound ``dispatch_limit``.
-CLAMPED_BY_HARNESS_MAX = "harness_max"
 
 FleetLockAcquirer = Callable[[str | None], Any]
 
@@ -183,6 +184,9 @@ class FleetLaunchLock:
         "_clock",
         "_acquired_at",
         "_released_at",
+        "_permit_issued_at",
+        "_launch_started_at",
+        "_launch_done_at",
     )
 
     def __init__(
@@ -205,6 +209,9 @@ class FleetLaunchLock:
         self._clock = clock
         self._acquired_at: float | None = None
         self._released_at: float | None = None
+        self._permit_issued_at: float | None = None
+        self._launch_started_at: float | None = None
+        self._launch_done_at: float | None = None
 
     @property
     def valid(self) -> bool:
@@ -245,13 +252,70 @@ class FleetLaunchLock:
         self._write_holder()
         return time.monotonic() - start
 
-    def event_fields(self) -> dict[str, float]:
+    def note_permit_issued(self) -> None:
+        """Issue #3139: boundary between the ``governor`` and ``selection`` phases.
+
+        Recorded only when :func:`issue_worker_launch_permit` mints a
+        ``WorkerLaunchPermit`` -- a deferral never reaches selection, so its
+        ``governor`` phase spans the whole hold.
+        """
+        if self._clock is not None and self._acquired_at is not None:
+            self._permit_issued_at = self._clock.monotonic()
+
+    def note_launch_started(self) -> None:
+        """Issue #3139: boundary between the ``selection`` and ``launch`` phases.
+
+        First-write-wins: the rework lane launches a normal and a rescue
+        batch through two ``_launch_workers`` calls; ``selection`` ends at
+        the FIRST attempt.
+        """
+        if (
+            self._clock is not None
+            and self._acquired_at is not None
+            and self._launch_started_at is None
+        ):
+            self._launch_started_at = self._clock.monotonic()
+
+    def note_launch_done(self) -> None:
+        """Issue #3139: boundary between the ``launch`` and ``post_launch`` phases.
+
+        Last-write-wins: a second ``_launch_workers`` call (rework rescue
+        tier) extends ``launch`` to the end of the LAST attempt.
+        """
+        if self._clock is not None and self._acquired_at is not None:
+            self._launch_done_at = self._clock.monotonic()
+
+    def event_fields(self) -> dict[str, Any]:
         """Issue #3089: ``launch_lock_held_seconds`` (Host clock) for the aggregate
-        Event; empty when no lock was realized. Elapsed-so-far if not yet released."""
-        if self._acquired_at is None or self._clock is None:
+        Event; issue #3139: ``launch_lock_phase_seconds`` beside it -- one entry
+        per phase the lane reached while it held the lock (``governor``,
+        ``selection``, ``launch``, ``post_launch``), each running to the next
+        phase's boundary so the entries sum to the hold time. A cap-disabled
+        no-op handle reports nothing; a realizable handle that was never
+        realized reports an exact ``0`` hold and an empty phase map.
+        Elapsed-so-far if not yet released."""
+        if self._acquired_at is None:
+            if self._acquire is None:
+                return {}
+            return {"launch_lock_held_seconds": 0.0, "launch_lock_phase_seconds": {}}
+        if self._clock is None:
             return {}
         end = self._released_at if self._released_at is not None else self._clock.monotonic()
-        return {"launch_lock_held_seconds": end - self._acquired_at}
+        starts: list[tuple[str, float]] = [("governor", self._acquired_at)]
+        if self._permit_issued_at is not None:
+            starts.append(("selection", self._permit_issued_at))
+        if self._launch_started_at is not None:
+            starts.append(("launch", self._launch_started_at))
+        if self._launch_done_at is not None:
+            starts.append(("post_launch", self._launch_done_at))
+        phases = {
+            name: (starts[i + 1][1] if i + 1 < len(starts) else end) - start
+            for i, (name, start) in enumerate(starts)
+        }
+        return {
+            "launch_lock_held_seconds": end - self._acquired_at,
+            "launch_lock_phase_seconds": phases,
+        }
 
     def _write_holder(self) -> None:
         """Record who holds the lock so a starved waiter can report it (issue #2055)."""
@@ -301,40 +365,6 @@ class FleetLaunchLock:
 
     def __exit__(self, *_exc: object) -> None:
         self.release()
-
-
-@dataclass(frozen=True)
-class WorkerLaunchDeferral:
-    """The gate refused to issue a permit this pass. Nothing may launch.
-
-    ``governor`` is populated only when the governor ran before the
-    deferring gate -- i.e. the authoritative provider-throttle read (gate
-    4), whose payload reports the same governor fields the lanes always
-    reported. A pre-check (gate 0) throttle deferral has ``governor=None``:
-    it carries ``throttled_until`` and no governor report fields. ``ok`` is the
-    ``CommandResult.ok`` the lanes should surface: ``fleet_lock_held`` is an
-    ok-deferral (``True``) so ``dispatch_deferral`` records it and counts it
-    toward ``dispatch_starved`` -- that is the visibility the starvation
-    alarm is built on -- while ``provider_throttled`` and
-    ``launch_lock_invalid`` stay ``False`` (a policy backoff / a bug, each
-    surfaced as a not-ok result). ``extra`` carries reason-specific payload
-    fields (e.g. lock-wait / holder metadata for ``fleet_lock_held``).
-    """
-
-    reason: str
-    throttled_until: Any = None
-    governor: Any = None
-    ok: bool = False
-    extra: dict[str, Any] = field(default_factory=dict)
-
-    def report_fields(self) -> dict[str, Any]:
-        """Payload fields for this deferral (excludes ``deferred_reason``)."""
-        fields: dict[str, Any] = dict(self.extra)
-        if self.reason in (REASON_PROVIDER_THROTTLED, role_selection.REASON_HARNESS_AUTH_BLOCKED):
-            fields["throttled_until"] = self.throttled_until
-        if self.governor is not None and self.governor.any_term_enabled:
-            fields.update(self.governor.report_fields())
-        return fields
 
 
 @dataclass
@@ -461,47 +491,13 @@ def issue_worker_launch_permit(
     """
     _wf = _workflow()
 
-    # Issue #2766 pause gate: the flag is read fresh, lock-free, before anything
-    # else -- a fleet pass that began unpaused still stops launching once it is set.
-    if (paused := launch_pause_fields(app)) is not None:
-        return WorkerLaunchDeferral(REASON_FLEET_PAUSED, ok=True, extra=paused)
-
-    # Issue #2055 gate 0: lock-free provider-throttle/operator-hold
-    # pre-check -- a cheap unlocked ``state.json`` read via
-    # ``read_state_snapshot`` (issue #3141: the sanctioned non-mutating
-    # reader -- an unlocked ``load_state`` could quarantine a live file on a
-    # transient read failure). A throttled repo
-    # defers here without ever contending for the fleet lock (a throttled
-    # fleet previously still saturated it: the lock was taken before the
-    # throttle check and held across the whole scan). The authoritative
-    # throttle read still runs under the state lock after the governor
-    # below, so a throttle set after this check cannot slip through. The
-    # deferred payload from THAT path keeps its governor fields; a pre-check
-    # deferral carries none -- the governor has not run.
-    # Issue #2086: resolve the worker role chain against the fleet quota
-    # ledger first. Every entry restricted is the chained form of "provider
-    # throttled"; a per-repo window the ledger explains is covered below.
-    selection = role_selection.select_for_config(app.config.worker.chain, app.config)
-    if selection.exhausted:
-        return WorkerLaunchDeferral(
-            selection.exhausted_reason,
-            throttled_until=selection.report_fields().get("chain_retry_at"),
-            extra=selection.report_fields(),
-        )
-    # An unreadable state (None) reads as "not throttled" here -- the
-    # authoritative locked read below still runs before any launch.
-    pre_state = _wf.read_state_snapshot(app.paths.state_file) or {}
-    if _wf.is_throttled(pre_state) and not role_selection.window_covered(
-        pre_state.get("throttled_until"),
-        selection,
-        reason=pre_state.get("throttle_reason"),
-        adapter_kind=pre_state.get("throttle_adapter_kind"),
-        harness=pre_state.get("throttle_harness"),
-        model=pre_state.get("throttle_model"),
-    ):
-        return WorkerLaunchDeferral(
-            REASON_PROVIDER_THROTTLED, throttled_until=pre_state.get("throttled_until")
-        )
+    # Issue #3139: the lock-free gates are shared with the lanes'
+    # nothing-to-dispatch early return so an empty pass on a paused or
+    # throttled repo still reports the same deferral.
+    selection, preflight = lock_free_launch_gates(app)
+    if preflight is not None:
+        return preflight
+    assert selection is not None  # only the pause deferral skips selection
 
     owns_lock = launch_lock is None
     if launch_lock is None:
@@ -552,6 +548,9 @@ def issue_worker_launch_permit(
         return WorkerLaunchDeferral(
             REASON_PROVIDER_THROTTLED, throttled_until=throttled_until, governor=gov
         )
+    # Issue #3139: the governor phase ends here -- a deferral never reaches
+    # this mark, so its ``governor`` phase runs to release as the sole entry.
+    launch_lock.note_permit_issued()
     return WorkerLaunchPermit(
         requested=requested,
         max_launches=max(0, int(gov.dispatch_limit)),
@@ -562,54 +561,6 @@ def issue_worker_launch_permit(
         _token=_MINT,
         role_selection=selection,
     )
-
-
-def _harness_free_slots(app: OrchestratorApp, gov: Any) -> dict[str, int]:
-    """Free slots under each configured per-harness ceiling (empty when none is set)."""
-    free: dict[str, int] = {}
-    if not app.config.fleet.max_concurrent_sessions_by_harness:
-        return free
-    for harness in gov.harness_caps:
-        slots = gov.harness_available(harness)
-        if slots is not None:
-            free[harness] = slots
-    return free
-
-
-def _apply_harness_caps(
-    app: OrchestratorApp, selection: role_selection.RoleSelection, gov: Any
-) -> tuple[role_selection.RoleSelection, Any]:
-    """Bound the launch by the selected entry's harness ceiling (issue #2757).
-
-    ``fleet.max_concurrent_sessions_by_harness`` limits only the sessions that
-    draw on a given harness's quota, so it can only be enforced once the harness
-    is known -- i.e. after role-chain selection -- and, like the fleet cap, on a
-    live count taken under the fleet lock (the governor measured it). Unset map:
-    ``gov`` and ``selection`` come back untouched.
-
-    * Selected entry's harness has no ceiling, or has room: the launch is bounded
-      to the free slots (``clamped_by="harness_max"`` when that binds).
-    * Selected entry's harness is full: fall through to the next chain entry that
-      is neither quota-restricted nor on a full harness
-      (:func:`role_selection.reselect_within_harness_caps`), exactly as a quota
-      restriction routes past an entry, then bound by that entry's free slots.
-    * No such entry (a length-1 chain, or every entry restricted / full): the
-      launch is clamped to zero with ``clamped_by="harness_max"`` -- a deferral,
-      not a provider throttle, so no repo-wide throttle window is implied.
-    """
-    # Gated on config, the source of truth, not on ``gov``: the governor only
-    # populates the harness fields when the same map is set.
-    if not app.config.fleet.max_concurrent_sessions_by_harness or selection.entry is None:
-        return selection, gov
-    reselected = role_selection.reselect_within_harness_caps(selection, gov.harness_available)
-    if reselected.entry is None:
-        if gov.dispatch_limit > 0:
-            gov = replace(gov, dispatch_limit=0, clamped=True, clamped_by=CLAMPED_BY_HARNESS_MAX)
-        return selection, gov
-    free = gov.harness_available(reselected.entry.harness)
-    if free is not None and free < gov.dispatch_limit:
-        gov = replace(gov, dispatch_limit=free, clamped=True, clamped_by=CLAMPED_BY_HARNESS_MAX)
-    return reselected, gov
 
 
 def _refusal_reason(permit: object, count: int) -> str | None:
@@ -733,6 +684,9 @@ def _launch_workers(
             for request in requests
         ]
     permit._ledger.launched += len(requests)
+    # Issue #3139: the launch phase brackets the attempts themselves -- a
+    # refused batch never reaches this mark, so its time stays in selection.
+    permit._launch_lock.note_launch_started()
     _wf = _workflow()
     groups = _tier_groups(
         app, permit.role_selection, settings, requests, permit._ledger.harness_free
@@ -793,4 +747,5 @@ def _launch_workers(
             app._layout.session_manifest, requests, adapter=manifest_adapter_label(adapters)
         )
         write_session_results(app._layout.session_results, results)
+    permit._launch_lock.note_launch_done()
     return results

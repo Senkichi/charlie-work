@@ -139,6 +139,18 @@ def test_concurrency_governor_clamps_rework_dispatch(
     rework_prompt = pr_dir / "rework-prompt.md"
     rework_prompt.write_text("Fix the issues", encoding="utf-8")
 
+    # Issue #3139: a pass with no rework candidate returns before the
+    # governor runs, so the clamp report fields it asserts only exist when
+    # the lane has a candidate -- seed the rework_requested marker (FakeGitHub's
+    # open PR 456 links issue 123) so the lane reaches the governor.
+    from charlie_work.state import save_state
+
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {"number": 123, "status": "rework_requested"}
+        state["prs"]["456"] = {"number": 456, "issue_number": 123}
+        save_state(paths.state_file, state)
+
     result = app.dispatch_rework()
 
     # Should clamp to 0 since 2 sessions are alive and cap is 2

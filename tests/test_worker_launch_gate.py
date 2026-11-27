@@ -494,8 +494,11 @@ def test_throttle_deferral_releases_the_permit_owned_lock(
             state = {**state, "throttled_until": None}
         return state
 
+    # Issue #3139: the lock-free pre-check lives in worker_launch_gates and
+    # binds read_state_snapshot there -- patch that binding, not the
+    # workflow re-export (which was the call path before the extraction).
     monkeypatch.setattr(
-        "charlie_work.workflow.read_state_snapshot",
+        "charlie_work.worker_launch_gates.read_state_snapshot",
         _read_state_snapshot_hiding_throttle_once,
     )
 

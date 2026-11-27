@@ -54,8 +54,12 @@ import charlie_work.workflow as _wf
 from charlie_work.command_result import CommandResult
 from charlie_work import worker_fate
 import charlie_work.worker_launch_outcome as worker_launch_outcome
+from charlie_work.dispatch_empty_pass import (
+    _dispatch_deferral_result,
+    _dispatch_staleness_bookkeeping,
+    nothing_to_dispatch,
+)
 from charlie_work.worker_launch_gate import (
-    REASON_PROVIDER_THROTTLED,
     FleetLaunchLock,
     WorkerLaunchDeferral,
     _launch_workers,
@@ -66,7 +70,6 @@ from charlie_work.backlog_reachability import (
     classify_backlog_reachability,
     resolve_dispatch_mention_coverage,
 )
-from charlie_work.ci_findings import check_dispatch_staleness
 from charlie_work.citation_check import CitationVerdict
 from charlie_work.cross_repo_gate import (
     CrossRepoGateResult,
@@ -89,14 +92,10 @@ from charlie_work.github import label_names
 from charlie_work.github_capabilities.cross_repo_blockers import blocker_refs
 from charlie_work.labels import TransitionOutcome
 from charlie_work.state import (
-    arm_dispatch_stale_alert,
-    backfill_dispatch_baseline,
-    clear_dispatch_stale_alert,
     clear_escalation,
     clear_escalation_on_issue_prs,
     escalation_reason_class,
     operator_claimed_issues,
-    record_non_empty_dispatch,
 )
 
 
@@ -120,7 +119,29 @@ def _dispatch_impl(
     else:
         issues = ready_issues
     dispatch_limit = limit if limit is not None else self.config.dispatch.default_limit
+    open_ready_issue_count = sum(
+        1 for issue in issues if str(issue.get("state") or "OPEN").upper() == "OPEN"
+    )
     operator_claimed_ready: list[int] = []
+
+    def _resolve_merged_prs(
+        outcome: _wf._MergedPRListOutcome | None,
+    ) -> list[dict[str, Any]]:
+        # Both raising branches (the direct fallback below and the
+        # outcome.error re-raise) propagate GitHubError to dispatch()'s
+        # ``except GitHubError`` handler, which defers the pass. This is
+        # deliberate: proceeding with [] would re-dispatch issues a merged
+        # PR already covered (the silent-empty path #633 closed). The
+        # direct fallback is the COMMON case — it runs whenever there are
+        # open ready issues but no closed-ready issues this pass, because
+        # _finalize_externally_merged_issues skips the merged_pr_list()
+        # fetch entirely when closed_ready is empty (returning an outcome
+        # with called=False).
+        if outcome is None or not outcome.called:
+            return self.gh.merged_pr_list() if issues else []
+        if outcome.error is not None and issues:
+            raise outcome.error
+        return outcome.items if issues else []
 
     # Issue #1110 rework: classify_backlog_reachability now runs the same
     # per-issue blocker check the dispatch candidate filter runs (issue
@@ -160,9 +181,7 @@ def _dispatch_impl(
         self.gh,
         self.config,
         operator_claimed_issues(_wf.load_state_locked(self.paths.state_file)),
-        ready_open_count=sum(
-            1 for issue in issues if str(issue.get("state") or "OPEN").upper() == "OPEN"
-        ),
+        ready_open_count=open_ready_issue_count,
         mention_covered=mention_covered,
     )
 
@@ -187,6 +206,36 @@ def _dispatch_impl(
             write_gate=self.write_gate,
         )
 
+    # Issue #3139: when the lock-free scan leaves no open ready issue to
+    # consider, nothing this pass can launch -- return the lane's normal
+    # "nothing to dispatch" result without requesting the launch permit, so
+    # the pending lock handle is never realized and the event records
+    # ``launch_lock_held_seconds: 0``. A pass holding only CLOSED ready
+    # issues is not automatically empty: the merged-PR bookkeeping below
+    # (issue #427's externally-merged finalization, the #203 mention flag)
+    # is real under-the-lock work, so a closed issue bound to or mentioned
+    # by a merged PR still takes the permit. The dry-run path is
+    # unchanged -- it still realizes and releases the lock itself.
+    if not self.dry_run and not open_ready_issue_count:
+        resolved_merged_prs = _resolve_merged_prs(merged_prs)
+        merged_pr_bookkeeping_pending = False
+        if issues:
+            bound_probe, mention_probe, *_ = self._merged_pr_referenced_issue_numbers(
+                issues, resolved_merged_prs
+            )
+            merged_pr_bookkeeping_pending = bool(bound_probe or mention_probe)
+        if not merged_pr_bookkeeping_pending:
+            return nothing_to_dispatch(
+                self,
+                issues=issues,
+                dispatch_limit=dispatch_limit,
+                merged_prs=merged_prs,
+                resolved_merged_prs=resolved_merged_prs,
+                backlog_reachability=backlog_reachability,
+                stalled_entries=stalled_entries,
+                launch_lock=launch_lock,
+            )
+
     # Issue #2041/#2055: the shared worker-launch gate -- provider-throttle
     # pre-check (lock-free), the fleet lock realized HERE with a bounded wait
     # (never across the scans above), live_count computed under it, then the
@@ -210,23 +259,11 @@ def _dispatch_impl(
 
     if isinstance(permit, WorkerLaunchDeferral):
         # Return immediately with deferral reason
-        data = {
-            "selected_count": 0,
-            "attempted_count": 0,
-            "failed_count": 0,
-            "skipped_issue_numbers": [],
-            "label_errors": [],
-            "sessions": [],
-            "dispatch_results": [],
-            "merged_prs": merged_prs_for_tripwire,
-            "deferred_reason": permit.reason,
-            **permit.report_fields(),
-        }
-        if permit.reason == REASON_PROVIDER_THROTTLED:
-            message = f"dispatch deferred: provider throttled until {permit.throttled_until}"
-        else:
-            message = f"dispatch deferred: {permit.reason}"
-        return CommandResult(permit.ok, message, data)
+        return _dispatch_deferral_result(
+            permit,
+            merged_prs_for_tripwire=merged_prs_for_tripwire,
+            launch_lock=launch_lock,
+        )
     gov = permit.governor
     dispatch_limit = permit.max_launches
 
@@ -248,25 +285,6 @@ def _dispatch_impl(
             },
         )
     dispatch_limit = resume.cap_limit(dispatch_limit)
-
-    def _resolve_merged_prs(
-        outcome: _wf._MergedPRListOutcome | None,
-    ) -> list[dict[str, Any]]:
-        # Both raising branches (the direct fallback below and the
-        # outcome.error re-raise) propagate GitHubError to dispatch()'s
-        # ``except GitHubError`` handler, which defers the pass. This is
-        # deliberate: proceeding with [] would re-dispatch issues a merged
-        # PR already covered (the silent-empty path #633 closed). The
-        # direct fallback is the COMMON case — it runs whenever there are
-        # open ready issues but no closed-ready issues this pass, because
-        # _finalize_externally_merged_issues skips the merged_pr_list()
-        # fetch entirely when closed_ready is empty (returning an outcome
-        # with called=False).
-        if outcome is None or not outcome.called:
-            return self.gh.merged_pr_list() if issues else []
-        if outcome.error is not None and issues:
-            raise outcome.error
-        return outcome.items if issues else []
 
     # Dry-run: read-only planning — compute selection and would-be SessionRequests,
     # but skip all state writes, label transitions, and file mutations.
@@ -1586,61 +1604,15 @@ def _dispatch_impl(
             dispatch_limit,
             extra_failures=label_error_failures,
         )
-        # Issue #946: warn when a non-empty backlog has not produced a
-        # non-empty dispatch event for longer than the configured threshold.
-        # Issue #1769: a single frozen clock read for this whole cluster --
-        # the durable baseline marker, the staleness check, and the alert
-        # cadence marker all timestamp against the same instant, mirroring
-        # the #828/#838 single-frozen-clock-per-pass invariant.
-        dispatch_cadence_now = self.host.clock.now()
-        dispatch_cadence_now_iso = (
-            dispatch_cadence_now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-        )
-        if successful_issue_numbers:
-            # Durable baseline marker (issue #1769): persisted here,
-            # whenever a pass actually dispatches, instead of re-derived by
-            # scanning events.db -- a durable field cannot fall out of a
-            # rolling window the way a count-bounded lookback can.
-            state = record_non_empty_dispatch(
-                state, dispatch_cadence_now_iso, sorted(successful_issue_numbers)
-            )
-        # Issue #1769 review follow-up: a repo that was already mid-stall (or
-        # already existed) before the durable marker was introduced never
-        # takes the write path above on its own -- a stalled repo dispatches
-        # nothing by definition. One-time recovery from events.db history so
-        # that case does not report `no_baseline` forever. No-ops instantly
-        # once a baseline exists or a prior attempt already ran.
-        state = backfill_dispatch_baseline(state, self.paths.state_file)
-        dispatch_staleness = check_dispatch_staleness(
+        # Issue #3139: the cadence bookkeeping + staleness payload are shared
+        # with the never-realized-lock path so an empty pass cannot drift
+        # from the launch path's ``dispatch`` event.
+        state, dispatch_staleness_for_event = _dispatch_staleness_bookkeeping(
+            self,
             state,
-            self.config.dispatch,
-            backlog_reachability,
-            recent_issue_numbers=sorted(successful_issue_numbers),
-            now=dispatch_cadence_now,
+            successful_issue_numbers=successful_issue_numbers,
+            backlog_reachability=backlog_reachability,
         )
-        # `should_emit` is this method's own control-flow answer, not a fact
-        # worth persisting: it is `True` on every `dispatch_stale` row by
-        # construction (the event is only ever recorded when it's `True`),
-        # so embedding it in the payload/ring entry can never discriminate
-        # anything a reader doesn't already know (review finding #7).
-        dispatch_staleness_for_event = {
-            key: value for key, value in dispatch_staleness.items() if key != "should_emit"
-        }
-        if dispatch_staleness["stale"]:
-            # Issue #1769: edge-triggered + bounded low-rate reminder, not
-            # an unconditional re-fire every pass the condition holds (the
-            # design artifact's section 6 policy). `should_emit` already
-            # encodes both the stall-onset edge and the reminder cadence.
-            if dispatch_staleness["should_emit"]:
-                state = arm_dispatch_stale_alert(state, dispatch_cadence_now_iso)
-                state = self._record_event(state, "dispatch_stale", dispatch_staleness_for_event)
-        else:
-            # Reset the alert marker only on a genuine resolution -- an
-            # "unknown" reading (backlog_not_observed, no_baseline,
-            # threshold_disabled) must not be mistaken for one, or a
-            # transient blip resets the edge and the very next real
-            # observation re-fires immediately (review finding #4).
-            state = clear_dispatch_stale_alert(state, reason=dispatch_staleness["reason"])
         state = _wf.append_event(
             state,
             "dispatch",
