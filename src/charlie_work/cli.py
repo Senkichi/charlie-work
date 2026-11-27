@@ -38,6 +38,10 @@ from .experiment_report_command import (
     register_experiment_report_subparser,
     run_experiment_report_command,
 )
+from .issue_contract_lint_command import (
+    register_lint_issue_subparser,
+    run_lint_issue_command,
+)
 from .config import ConfigError, OrchestratorConfig, find_config_path
 from .doctor import DoctorCheck, run_doctor
 from .fleet_dispatch import (
@@ -613,6 +617,7 @@ def build_parser() -> argparse.ArgumentParser:
     register_junit_recorded_check_subparser(subparsers)
     register_experiment_report_subparser(subparsers)
     register_wait_pr_subparser(subparsers)
+    register_lint_issue_subparser(subparsers)
 
     migrate_parser = subparsers.add_parser(
         "migrate-state-dir",
@@ -2696,6 +2701,8 @@ def main(argv: list[str] | None = None) -> int:
             result = run_experiment_report_command(args)
         elif args.command == "wait-pr":
             result = run_wait_pr_command(args)
+        elif args.command == "lint-issue":
+            result = run_lint_issue_command(args)
         else:
             app = build_app(args)
             result = run_command(app, args)
@@ -2901,6 +2908,11 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"    {error}")
     elif args.command == "wait-pr" and not args.json_output:
         print(result.message)
+    elif args.command == "lint-issue" and not args.json_output:
+        # Issue #3115: the command's stdout contract is exactly one JSON
+        # document -- the {ok, ready_label, results} payload the caller
+        # consumes -- so the generic message+data rendering does not apply.
+        print(json.dumps(result.data, indent=2, sort_keys=True, default=str))
     else:
         print_result(result, json_output=args.json_output)
 
