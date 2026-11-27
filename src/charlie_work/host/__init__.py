@@ -10,7 +10,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .clock import Clock, RealClock
-from .launch import RealReviewLauncher, RealWorkerLauncher, ReviewLauncher, WorkerLauncher
+from .launch import (
+    DecideLauncher,
+    RealDecideLauncher,
+    RealReviewLauncher,
+    RealWorkerLauncher,
+    ReviewLauncher,
+    WorkerLauncher,
+)
 from .liveness import ProcessProbe, RealProcessProbe
 from .sessions import RealSessionCounter, SessionCounter
 
@@ -22,6 +29,7 @@ class HostPorts:
     sessions: SessionCounter
     launch: ReviewLauncher
     worker_launch: WorkerLauncher
+    decide_launch: DecideLauncher
 
 
 REAL = HostPorts(
@@ -30,6 +38,7 @@ REAL = HostPorts(
     sessions=RealSessionCounter(),
     launch=RealReviewLauncher(),
     worker_launch=RealWorkerLauncher(),
+    decide_launch=RealDecideLauncher(),
 )
 
 _ACTIVE: HostPorts = REAL
