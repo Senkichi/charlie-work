@@ -415,7 +415,9 @@ _SETUP_SIDE = frozenset({"parity_outcomes", "_outcomes"})
 
 
 def test_the_outcome_drive_stays_in_setup_and_consumers_take_the_fixture() -> None:
-    """Ledger pin (issue #3194): a consumer's ``call`` phase is assertion-only.
+    """Ledger pin (issues #3187, #3188, #3189, #3194): ``run_both``/``_outcomes``
+    may be called only from ``parity_outcomes`` -- which runs during setup --
+    never from a test's ``call`` phase.
 
     ``run_both`` costs ~0.5 s per scenario on a ``_CACHE`` miss; paid inside a
     test body the ledger files it as that test's regression --
