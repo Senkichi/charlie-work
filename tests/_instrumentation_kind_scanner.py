@@ -507,7 +507,8 @@ def _scan_event_kinds(root: Path) -> tuple[set[str], list[_UnresolvedKindSite]]:
     used: set[str] = set()
     unresolved: list[_UnresolvedKindSite] = []
     for path in source_files(root):
-        if not any(name in source_text(path) for name in _EMIT_NAMES):
+        text = source_text(path)
+        if not any(name in text for name in _EMIT_NAMES):
             continue
         try:
             tree = parsed(path)

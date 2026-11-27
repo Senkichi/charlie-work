@@ -53,17 +53,23 @@ class SourceCache:
         self._texts: dict[Path, str] = {}
         self._trees: dict[Path, tuple[ast.Module, str]] = {}
         self._files: dict[tuple[str, str], tuple[Path, ...]] = {}
+        self._keys: dict[Path, Path | None] = {}
 
     def _key(self, path: Path) -> Path | None:
         if not reuse_enabled():
             return None
         try:
+            return self._keys[path]
+        except KeyError:
+            pass
+        try:
             resolved = Path(path).resolve()
         except OSError:
-            return None
-        if any(resolved.is_relative_to(root) for root in self._roots):
-            return resolved
-        return None
+            resolved = None
+        if resolved is not None and not any(resolved.is_relative_to(root) for root in self._roots):
+            resolved = None
+        self._keys[path] = resolved
+        return resolved
 
     def source_text(self, path: Path) -> str:
         key = self._key(path)
