@@ -1502,3 +1502,79 @@ charlie-work has no daemon — detection is strictly invocation-cadence-bound. A
 - **Windows Task Scheduler**: See `examples/schedule/charlie-fleet-task.xml` for an XML template. Import with `schtasks /create /xml charlie-fleet-task.xml /tn "charlie-work fleet"` and adjust the `<Interval>` (e.g., `PT5M` for 5 minutes).
 
 The `notify` layer is disabled by default (`notify.enabled: false`). To enable it, add a `notify:` section to your `orchestrator.config.yaml` — see `examples/notify.config.yaml` for sink options (webhook, desktop, shell, file). The layer emits a digest once per pass if any issue's health state changed since the last pass, comparing against a dedicated per-issue `health` field in `state.json` (not the capped `events` log). Sink failures never fail the pass — errors are returned as values and logged.
+
+## Foremen
+
+A **foreman** is a chartered outcome manager above the fleet (ADR-0010,
+`docs/design/2026-11-25-foreman-layer-design.md`): you write an outcome once
+as a charter, and the foreman files and arms the issues that deliver it,
+watches them through the lifecycle, and raises items for you. The fleet
+supervise loop runs `charlie scheme` (one foreman pass) as a child process
+every `foreman.pass_interval_minutes` (default 5) — there is nothing to
+schedule and no long-lived model process. Foremen live under
+`<fleet_dir>/foremen/<name>/`.
+
+### Create
+
+```powershell
+charlie gang new the-gang-migrates-the-transport --from examples/foremen/migration
+```
+
+`new` copies `charter.yaml` and `instructions.md` from `--from` (or writes a
+minimal pair without it) and leaves the foreman **paused** — nothing runs
+until you say so. Before resuming, edit the charter: `name` must equal the
+directory name you scaffolded under, `repos` names exactly one fleet
+registry key, and `done_when.check` is the argv that proves the outcome —
+it runs in a fresh detached worktree at the default branch tip, and exit 0
+moves the foreman to `done` and raises a final report item. Guidance shared
+across foremen (issue style, planning rules) lives in
+`foremen/_shared/*.md` — `instructions.md` includes one by stem as
+`$section_<stem>`; copy `examples/foremen/_shared/` beside your foreman if
+you want the shipped set. `charlie gang list` and `charlie gang show <name>`
+inspect state, bounds usage, and open items.
+
+### Probation: three dry Turns while paused
+
+`--dry-run --only <name>` is the one pass mode a paused foreman answers: it
+runs Collect and Decide and prints what Apply would do, with zero effect.
+
+```powershell
+charlie scheme --dry-run --no-decide --only <name>   # briefing only; launches no model, costs nothing
+charlie scheme --dry-run --only <name>               # launches Decide; prints the Apply plan
+```
+
+Run it three times. Go live only when every `file_issue` action passed the
+lint and no action was refused on authority — `charlie gang pepe-silvia
+<name>` prints the briefing behind any dry Turn. A fleet-wide `--dry-run`
+(no `--only`) previews the pass exactly: paused foremen skip, the way a
+live pass skips them.
+
+### Live, and the operator's half
+
+```powershell
+charlie gang resume <name>                          # paused/faulted → active
+charlie gang interventions [<name>]                 # open items: question, options, the command that enacts each
+charlie gang intervene <name> <item> --choose 0     # answer an item (index or exact option text)
+charlie gang snooze <name> <item> --until <local time>   # hide it; charlie gang dismiss <name> <item> closes it
+charlie gang dayman [<name>]                        # the newest report item
+charlie gang pause <name>                           # stops Turns that have not happened yet
+charlie gang say <name> "prefer one PR per module"  # an instruction into its inbox
+charlie gang signal <name> --source ci --file evt.json     # external data in, never an instruction
+```
+
+An item never expires and never answers itself: a decision item unanswered
+for `bounds.max_unanswered_days` moves the foreman to `degraded` — it keeps
+planning but new issues stay unarmed — until you answer. Pausing, `faulted`
+and `done` stop Turns and nothing else; issues already armed are ordinary
+fleet issues and keep flowing.
+
+### Recover from `faulted`
+
+Three consecutive failed Turns (launch error, schema-invalid output, Apply
+exception) move a foreman to `faulted` and raise a report item carrying the
+resume command. Read the item with `charlie gang interventions <name>` and
+the `foreman_turn_failed` events in the foreman's `events.db` for the stage
+and error, fix the cause, then `charlie gang resume <name>` — it clears the
+failure count and makes the foreman active again. A `done` foreman is
+finished: `done_when.check` passed, the final report item shows under
+`charlie gang dayman`, and no further Turns run.

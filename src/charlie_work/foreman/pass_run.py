@@ -668,6 +668,7 @@ def _pass_one(
     fleet_paused: bool,
     dry_run: bool,
     no_decide: bool,
+    probe_paused: bool,
     now: datetime,
 ) -> ForemanPassOutcome:
     """Wake-evaluate and (maybe) run one foreman's Turn this pass."""
@@ -675,7 +676,13 @@ def _pass_one(
     if not loaded.ok:
         return ForemanPassOutcome(name, "failed", detail=loaded.error)
     foreman = loaded.value
-    if foreman.state.state not in ("active", "degraded"):
+    # ``--dry-run --only <name>`` is the probation preview (design §16): a
+    # paused foreman may dry-run a Turn (nothing applies) while live Turns
+    # stay stopped. ``done``/``faulted`` still skip, and a fleet-wide dry
+    # run skips paused foremen exactly the way the live pass does.
+    if foreman.state.state not in ("active", "degraded") and not (
+        probe_paused and foreman.state.state == "paused"
+    ):
         return ForemanPassOutcome(name, "skipped", reason=f"state:{foreman.state.state}")
 
     # A crash survivor is outstanding work the pass owes the foreman — it
@@ -759,6 +766,7 @@ def run_pass(
                 fleet_paused=paused,
                 dry_run=dry_run,
                 no_decide=no_decide,
+                probe_paused=dry_run and only is not None,
                 now=now,
             )
             for name in names

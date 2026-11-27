@@ -17,8 +17,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from _foreman_collect_helpers import NOW, REPO_KEY
-from _foreman_pass_fixtures import _run, _succeeding_decide, _world
+from _foreman_collect_helpers import FOREMAN_NAME, NOW, REPO_KEY
+from _foreman_pass_fixtures import _patch_state, _run, _succeeding_decide, _world
 from _worktree_fixtures import (
     _wt_scratch as _register_wt_scratch,  # noqa: F401 -- registers the wt_scratch fixture
 )
@@ -73,6 +73,52 @@ def test_dry_run_prints_plan_and_changes_nothing(
     assert state.last_turn_id is None
     gh = github_client_for(world.repo_root, world.foreman().config, github=GitHub, dry_run=False)
     assert gh.issue_list(state="open") == []
+
+
+def test_dry_run_only_probes_a_paused_foreman(
+    tmp_path: Path, wt_scratch: Path, monkeypatch: pytest.MonkeyPatch, fake_host
+) -> None:
+    """``--dry-run --only <name>`` previews a paused foreman's Turn — the
+    probation workflow of design §16. A live ``--only`` pass and a
+    fleet-wide ``--dry-run`` still skip it (issue #3124)."""
+    world = _world(tmp_path, wt_scratch, monkeypatch)
+    _patch_state(world, state="paused")
+    launcher = _succeeding_decide(
+        fake_host,
+        actions=[
+            {
+                "type": "file_issue",
+                "key": "k1",
+                "repo": REPO_KEY,
+                "title": "Would file",
+                "body": "body",
+            }
+        ],
+    )
+
+    passed = _run(world, dry_run=True, only=FOREMAN_NAME)
+
+    (outcome,) = passed.outcomes
+    assert outcome.outcome == "dry_run"
+    assert outcome.turn_id is not None
+    assert outcome.turn_id.startswith(f_paths.DRY_TURN_DIR_PREFIX)
+    plan = json.loads(outcome.detail or "{}")
+    # The preview shows what Apply would do when resumed — "applied"
+    # (would file), never all-skipped on the pause gate.
+    assert plan["plan"][0]["type"] == "file_issue"
+    assert plan["plan"][0]["outcome"] == "applied"
+    assert len(launcher.calls) == 1
+    # The preview changed nothing: still paused, bookkeeping untouched.
+    state = read_state_snapshot(world.foreman_root)
+    assert state.state == "paused"
+    assert state.turns_total == 3
+
+    # The same foreman under a live --only pass is a skip, and under a
+    # fleet-wide dry run it skips exactly the way the live pass does.
+    assert _run(world, only=FOREMAN_NAME).outcomes[0].outcome == "skipped"
+    assert _run(world, only=FOREMAN_NAME).outcomes[0].reason == "state:paused"
+    assert _run(world, dry_run=True).outcomes[0].outcome == "skipped"
+    assert len(launcher.calls) == 1  # no further Decide launches
 
 
 def test_dry_run_no_decide_stops_after_briefing(

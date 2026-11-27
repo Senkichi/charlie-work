@@ -15,6 +15,7 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
 from _worktree_fixtures import (
     _init_repo,
     _wt_scratch as _register_wt_scratch,  # noqa: F401 -- registers the wt_scratch fixture
@@ -137,6 +138,68 @@ def test_propose_done_done_when_timeout_is_refused(wt_scratch: Path, monkeypatch
     assert "timed out" in (outcome.reason or "")
     assert read_state_snapshot(froot).state == "active"
     assert not (froot / "check").exists()
+
+
+def test_propose_done_done_when_missing_binary_is_refused(wt_scratch: Path) -> None:
+    """An argv[0] that does not exist is a refusal value, not an exception —
+    and the check worktree is still removed (issue #3124)."""
+    froot, gh, charter = _setup_done(
+        wt_scratch,
+        check=("no-such-foreman-check-binary-3124", "--probe"),
+    )
+    _write_actions(froot, "t1", {"type": "propose_done", "evidence": "x"})
+    result = apply_turn(froot, "t1", charter=charter, gh=gh)
+    assert result.ok
+    (outcome,) = result.value.outcomes
+    assert outcome.outcome == OUTCOME_REFUSED
+    assert "could not start" in (outcome.reason or "")
+    assert read_state_snapshot(froot).state == "active"
+    assert not (froot / "check").exists()
+    assert load_items(froot) == ()
+
+
+@pytest.mark.parametrize("field", ["command", "check", "argv"])
+def test_propose_done_carrying_a_command_cannot_influence_what_runs(
+    wt_scratch: Path, field: str
+) -> None:
+    """The done-check argv comes only from the charter — never model output
+    (design §8.3, issue #3124). The ``propose_done`` schema admits no command
+    field at all, so a model-supplied one fails the whole Turn output and
+    nothing runs."""
+    model_marker = wt_scratch / "model-argv-ran.txt"
+    charter_marker = wt_scratch / "charter-argv-ran.txt"
+    froot, gh, charter = _setup_done(
+        wt_scratch,
+        check=(
+            sys.executable,
+            "-c",
+            "import sys; open(sys.argv[1], 'w').write('charter')",
+            str(charter_marker),
+        ),
+    )
+    action = {
+        "type": "propose_done",
+        "evidence": "x",
+        field: [
+            sys.executable,
+            "-c",
+            f"open({str(model_marker)!r}, 'w').write('model')",
+        ],
+    }
+    _write_actions(froot, "t1", action)
+    result = apply_turn(froot, "t1", charter=charter, gh=gh)
+    # The schema's additionalProperties:False on propose_done rejects the
+    # field; the Turn output fails as one error before any action applies.
+    assert not result.ok
+    assert "additional property" in (result.error or "")
+    assert field in (result.error or "")
+    # Neither argv ran: not the model's, and not the charter's either —
+    # a malformed Turn applies nothing.
+    assert not model_marker.exists()
+    assert not charter_marker.exists()
+    assert not (froot / "check").exists()
+    assert read_state_snapshot(froot).state == "active"
+    assert load_items(froot) == ()
 
 
 def test_propose_done_done_when_dry_run_never_runs_the_check(wt_scratch: Path) -> None:
