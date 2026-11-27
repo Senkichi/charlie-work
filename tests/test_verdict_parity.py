@@ -60,10 +60,22 @@ from _verdict_parity_driver import (
     _fresh_repo,
     _repo_template,
     run_both,
+    warm_repo_template,
 )
 from _verdict_parity_table import DECLARED_DIFFERENCES, SCENARIOS
 
 _CACHE: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _warm_repo_template() -> None:
+    """Charge the per-process repo template build to setup, not a test's call.
+
+    ``run_both`` takes ~0.5 s when it is a worker's first ``_fresh_repo`` caller
+    and ~0.2 s after; under ``--dist=load`` and shard splits any test can be
+    that caller, and the test ledger samples call time only (issue #3188).
+    """
+    warm_repo_template()
 
 
 def _outcomes(scenario: Scenario) -> tuple[dict[str, Any], dict[str, Any]]:
