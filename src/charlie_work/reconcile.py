@@ -84,6 +84,7 @@ from .worktree import (
     inspect_worktree_state,
     remove_review_checkout,
     resolve_base_branch_name,
+    review_checkout_kwargs,
 )
 
 logger = logging.getLogger(__name__)
@@ -2788,9 +2789,16 @@ def apply_fixes(
                 new_prs[pr_key] = new_pr_state
 
                 if repo_root is not None:
-                    reviews_dir = resolved_layout(config, repo_root).reviews_dir
+                    layout_view = resolved_layout(config, repo_root)
                     checkout_removed = remove_review_checkout(
-                        repo_root, item.pr_number, reviews_dir=reviews_dir
+                        repo_root,
+                        item.pr_number,
+                        reviews_dir=layout_view.reviews_dir,
+                        **review_checkout_kwargs(
+                            layout_view.reviews_dir,
+                            layout_view.review_checkouts,
+                            layout_view.legacy_review_checkouts,
+                        ),
                     )
                     checkout_action = (
                         f"remove review checkout for PR #{item.pr_number}: "
@@ -2873,9 +2881,16 @@ def apply_fixes(
                 if pr_key in new_prs:
                     new_prs[pr_key] = without_review_dispatch_claim(new_prs[pr_key])
                 if repo_root is not None:
-                    reviews_dir = resolved_layout(config, repo_root).reviews_dir
+                    layout_view = resolved_layout(config, repo_root)
                     checkout_removed = remove_review_checkout(
-                        repo_root, item.pr_number, reviews_dir=reviews_dir
+                        repo_root,
+                        item.pr_number,
+                        reviews_dir=layout_view.reviews_dir,
+                        **review_checkout_kwargs(
+                            layout_view.reviews_dir,
+                            layout_view.review_checkouts,
+                            layout_view.legacy_review_checkouts,
+                        ),
                     )
                     checkout_action = (
                         f"remove review checkout for PR #{item.pr_number}: "

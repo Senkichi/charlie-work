@@ -80,6 +80,7 @@ from .worktree import (
     remove_review_checkout,
     apply_rework_conflict_notice,
     remove_worktree,
+    review_checkout_kwargs,
     write_worktree_marker,
 )
 
@@ -982,6 +983,8 @@ def launch_claude_worker(
     rework: bool = False,
     review: bool = False,
     head_sha: str | None = None,
+    review_checkouts: Path | None = None,
+    legacy_review_checkouts: Path | None = None,
     recovery: dict[str, Any] | None = None,
     base_ref: str = "",
     tee_stream_json: bool = False,
@@ -1197,6 +1200,7 @@ def launch_claude_worker(
                 issue_number,
                 head_sha,
                 reviews_dir=sessions_dir,
+                **review_checkout_kwargs(sessions_dir, review_checkouts, legacy_review_checkouts),
             )
         else:
             worktree = create_worktree(
@@ -1293,7 +1297,12 @@ def launch_claude_worker(
         # so they must be torn down via remove_review_checkout — passing them
         # to remove_worktree would look for the wrong registered worktree path.
         if review:
-            remove_review_checkout(repo_root, issue_number, reviews_dir=sessions_dir)
+            remove_review_checkout(
+                repo_root,
+                issue_number,
+                reviews_dir=sessions_dir,
+                **review_checkout_kwargs(sessions_dir, review_checkouts, legacy_review_checkouts),
+            )
         elif worktree.foreign_adopted:
             # Issue #1476: the checkout belongs to whoever created it — a
             # launch failure must never delete a borrowed worktree. The only

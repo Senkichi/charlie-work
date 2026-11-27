@@ -122,6 +122,8 @@ def launch_api_worker(
     config: OrchestratorConfig | None = None,
     review: bool = False,
     head_sha: str = "",
+    review_checkouts: Path | None = None,
+    legacy_review_checkouts: Path | None = None,
     resolved_review_effort: str | None = None,
     max_turns_override: int | None = None,
 ) -> ClaudeWorkerRecord:
@@ -287,6 +289,8 @@ def launch_api_worker(
             base_ref=base_ref,
             review=review,
             head_sha=head_sha or None,
+            review_checkouts=review_checkouts,
+            legacy_review_checkouts=legacy_review_checkouts,
             resolved_review_effort=resolved_review_effort,
             max_turns_override=max_turns_override,
             # Force-enabled: the budget ledger depends on events.jsonl.

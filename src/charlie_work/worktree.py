@@ -4318,12 +4318,49 @@ def _commit_exists_locally(repo_root: Path, sha: str) -> bool:
     return result.ok
 
 
+def _review_checkout_path(checkouts_root: Path, pr_number: int) -> Path:
+    """The ``pr-<N>`` checkout path under a review-checkouts root.
+
+    The single place the keyed path is built -- every caller (create, remove,
+    the stalled-review orphan scan) resolves a root and lets this name the
+    checkout inside it.
+    """
+    return checkouts_root / f"pr-{pr_number}"
+
+
+def review_checkout_kwargs(
+    reviews_dir: Path,
+    review_checkouts: Path | None = None,
+    legacy_review_checkouts: Path | None = None,
+) -> dict[str, Path]:
+    """Kwargs forwarding the resolved checkout roots to the checkout helpers.
+
+    Includes a root only when it changes the outcome: ``review_checkouts``
+    only when it differs from ``reviews_dir`` (the value the parameter falls
+    back to), ``legacy_review_checkouts`` only when set and not the same root
+    as the active one. A caller holding :class:`ResolvedLayout` roots can pass
+    them unconditionally through this helper -- the call keeps its historical
+    ``reviews_dir=``-only shape whenever the roots coincide, which is also
+    what test doubles patched on the checkout-helper seams accept.
+    """
+    kwargs: dict[str, Path] = {}
+    if review_checkouts is not None and review_checkouts != reviews_dir:
+        kwargs["review_checkouts"] = review_checkouts
+    if legacy_review_checkouts is not None and legacy_review_checkouts != (
+        review_checkouts or reviews_dir
+    ):
+        kwargs["legacy_review_checkouts"] = legacy_review_checkouts
+    return kwargs
+
+
 def create_review_checkout(
     repo_root: Path,
     pr_number: int,
     head_sha: str,
     *,
     reviews_dir: Path,
+    review_checkouts: Path | None = None,
+    legacy_review_checkouts: Path | None = None,
 ) -> WorktreeInfo:
     """Create an isolated, detached-HEAD checkout of a PR's head SHA for a
     reviewer session.
@@ -4333,7 +4370,7 @@ def create_review_checkout(
     worktree path. Where ``create_worktree`` keys the checkout path by
     branch-slug under ``worktrees_dir`` and (in ``rework``/``review`` mode)
     attaches to the branch's live tip, this function keys the path by PR
-    number under a distinct ``reviews_dir`` and always checks out in detached
+    number under the review-checkouts root and always checks out in detached
     HEAD state at the exact ``head_sha``. That guarantees:
 
     - The reviewer's checkout can never alias a worker's worktree directory,
@@ -4343,9 +4380,19 @@ def create_review_checkout(
       real branch — the checkout is read-only in spirit even before the
       caller's ``--permission-mode`` is applied.
 
+    The checkout goes under ``review_checkouts`` when given (the resolved
+    ``ResolvedLayout.review_checkouts`` — the host I/O volume's
+    ``<worker_root>/<repo>/reviews`` when the manifest relocates checkouts),
+    else ``reviews_dir``. Only the ``pr-<N>`` checkout directory moves with
+    that root; sidecars, logs and every other session file stay in
+    ``reviews_dir``.
+
     Idempotent: if a checkout already exists at this PR's keyed path (e.g.
     from a previous review round at a different head_sha), it is torn down
-    and recreated fresh rather than reused or fast-forwarded in place.
+    and recreated fresh rather than reused or fast-forwarded in place. The
+    teardown covers the legacy root (``legacy_review_checkouts``) too, so a
+    pre-switch checkout left under ``reviews_dir`` cannot linger once the
+    checkout root moved onto the volume.
 
     Raises ``ValueError`` if ``head_sha`` is empty (caller error — never a
     transient condition). Raises ``RuntimeError`` if the fetch or worktree-add
@@ -4361,13 +4408,19 @@ def create_review_checkout(
     # an option without this guard.
     head_sha = require_valid_sha(head_sha, context="create_review_checkout head_sha")
 
-    target_dir = reviews_dir
+    target_dir = review_checkouts if review_checkouts is not None else reviews_dir
     target_dir.mkdir(parents=True, exist_ok=True)
-    checkout_path = target_dir / f"pr-{pr_number}"
+    checkout_path = _review_checkout_path(target_dir, pr_number)
 
     # Tear down any stale checkout at this path first (idempotent replace) —
-    # never reuse/fast-forward a review checkout in place.
-    remove_review_checkout(repo_root, pr_number, reviews_dir=target_dir)
+    # never reuse/fast-forward a review checkout in place. The legacy root is
+    # swept too so a pre-switch checkout cannot outlive the move.
+    remove_review_checkout(
+        repo_root,
+        pr_number,
+        reviews_dir=target_dir,
+        **review_checkout_kwargs(target_dir, legacy_review_checkouts=legacy_review_checkouts),
+    )
 
     # Only fetch if an origin remote exists (mirrors create_worktree's own
     # guard). Pure-local repos (test fixtures) have no origin to fetch from —
@@ -4409,22 +4462,42 @@ def create_review_checkout(
     return WorktreeInfo(path=checkout_path, branch=head_sha, venv_junction=None)
 
 
-def remove_review_checkout(repo_root: Path, pr_number: int, *, reviews_dir: Path) -> bool:
+def remove_review_checkout(
+    repo_root: Path,
+    pr_number: int,
+    *,
+    reviews_dir: Path,
+    review_checkouts: Path | None = None,
+    legacy_review_checkouts: Path | None = None,
+) -> bool:
     """Idempotent teardown of a PR's isolated review checkout.
+
+    Tears the ``pr-<N>`` checkout down under the active checkouts root
+    (``review_checkouts`` when given, else ``reviews_dir``) AND under
+    ``legacy_review_checkouts`` when that root is also set -- the second half
+    is the switchover guarantee: a checkout created before the root moved to
+    the host I/O volume is still found and removed.
 
     Returns True if the checkout was removed or was already absent; never
     raises. Safe to call speculatively (e.g. before creating a fresh checkout,
     or during a stale-claim/completed-verdict sweep that isn't sure whether a
     checkout exists for a given PR).
     """
-    checkout_path = reviews_dir / f"pr-{pr_number}"
+    active_root = review_checkouts if review_checkouts is not None else reviews_dir
+    candidates = [_review_checkout_path(active_root, pr_number)]
+    if legacy_review_checkouts is not None:
+        legacy_path = _review_checkout_path(legacy_review_checkouts, pr_number)
+        if legacy_path != candidates[0]:
+            candidates.append(legacy_path)
 
     existing_worktrees = list_worktrees(repo_root)
-    is_registered = any(Path(wt["worktree"]) == checkout_path for wt in existing_worktrees)
-    if not is_registered and not checkout_path.exists():
-        return True
-
-    return remove_worktree(repo_root, checkout_path, force=True, branch=None)
+    registered_paths = {Path(wt["worktree"]) for wt in existing_worktrees}
+    ok = True
+    for checkout_path in candidates:
+        if checkout_path not in registered_paths and not checkout_path.exists():
+            continue
+        ok = remove_worktree(repo_root, checkout_path, force=True, branch=None) and ok
+    return ok
 
 
 def inspect_worktree_state(

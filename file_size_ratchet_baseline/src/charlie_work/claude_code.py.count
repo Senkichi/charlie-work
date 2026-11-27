@@ -1,1 +1,4 @@
-1800
+2000
+# Issue #3224: the review_checkouts/legacy_review_checkouts threading grew the
+# live count to 1806, past the 1800 mark. Reviewed hand-raise to the next
+# MARK_QUANTUM multiple.

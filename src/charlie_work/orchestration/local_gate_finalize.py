@@ -30,7 +30,11 @@ from charlie_work.local_lane import (
 )
 from charlie_work.safe_path import contains
 from charlie_work.state import without_review_dispatch_claim
-from charlie_work.worktree import remove_review_checkout, remove_worktree
+from charlie_work.worktree import (
+    remove_review_checkout,
+    remove_worktree,
+    review_checkout_kwargs,
+)
 
 # Issue #2189: a green result whose base advance was *deferred* (a dirty base
 # checkout refused the fast-forward) keeps the tested pairing here. While the
@@ -153,7 +157,16 @@ def _local_gate_finalize_merge(
             force=True,
             branch=(branch if self.config.auto_merge.delete_branch else None),
         )
-    remove_review_checkout(self.repo_root, pr_number, reviews_dir=self._layout.reviews_dir)
+    remove_review_checkout(
+        self.repo_root,
+        pr_number,
+        reviews_dir=self._layout.reviews_dir,
+        **review_checkout_kwargs(
+            self._layout.reviews_dir,
+            self._layout.review_checkouts,
+            self._layout.legacy_review_checkouts,
+        ),
+    )
     with _wf.state_lock(self.paths.state_file):
         state = _wf.load_state(self.paths.state_file)
         pr_state = state["prs"].get(pr_key, {})

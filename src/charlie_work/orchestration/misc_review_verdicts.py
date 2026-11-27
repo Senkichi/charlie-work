@@ -45,6 +45,7 @@ from charlie_work.verdict_parsing import (
 )
 from charlie_work.state import without_review_dispatch_claim
 from charlie_work.worker import iter_workers
+from charlie_work.worktree import review_checkout_kwargs
 
 
 def _reap_review_verdicts(self, reviews_dir: Path) -> dict[str, Any]:
@@ -196,7 +197,16 @@ def _reap_review_verdicts(self, reviews_dir: Path) -> dict[str, Any]:
                 )
                 # write-gate-exempt(issue=2103): same raw state write shape as the other review-reap sites in this module; no write_gate param.
                 _wf.save_state(self.paths.state_file, state)
-            _wf.remove_review_checkout(self.repo_root, pr_number, reviews_dir=reviews_dir)
+            _wf.remove_review_checkout(
+                self.repo_root,
+                pr_number,
+                reviews_dir=reviews_dir,
+                **review_checkout_kwargs(
+                    reviews_dir,
+                    self._layout.review_checkouts,
+                    self._layout.legacy_review_checkouts,
+                ),
+            )
             w.reap_sidecar(reviews_dir)
             return True
         if verdict is None:
@@ -356,7 +366,14 @@ def _reap_review_verdicts(self, reviews_dir: Path) -> dict[str, Any]:
                     # checkout whose session was resumed since the claim (#2110).
                     if not _reviewer_alive(reviews_dir, pr_number):
                         _wf.remove_review_checkout(
-                            self.repo_root, pr_number, reviews_dir=reviews_dir
+                            self.repo_root,
+                            pr_number,
+                            reviews_dir=reviews_dir,
+                            **review_checkout_kwargs(
+                                reviews_dir,
+                                self._layout.review_checkouts,
+                                self._layout.legacy_review_checkouts,
+                            ),
                         )
                     return True
             return False
@@ -552,6 +569,11 @@ def _run_review_reap_sweeps(self, resolved_now: datetime) -> dict[str, Any]:
             "orphaned_checkouts": [],
         }
     reviews_dir = self._layout.reviews_dir
+    # The pr-<N> checkout root travels separately from reviews_dir: only the
+    # checkout dirs move to the host I/O volume; sidecars, logs and session
+    # records (the sweeps' ``reviews_dir`` reads) never do.
+    review_checkouts = self._layout.review_checkouts
+    legacy_review_checkouts = self._layout.legacy_review_checkouts
     verdict_result = self._reap_review_verdicts(reviews_dir)
     # See the docstring ordering note: stranded-verdict ingestion runs before
     # the stale-claim sweep so a just-recorded verdict is never mistaken for
@@ -564,9 +586,15 @@ def _run_review_reap_sweeps(self, resolved_now: datetime) -> dict[str, Any]:
         self.repo_root,
         write_gate=self.write_gate,
         now=resolved_now,
+        review_checkouts=review_checkouts,
+        legacy_review_checkouts=legacy_review_checkouts,
     )
     reaped_checkouts = _reap_completed_review_checkouts(
-        self.repo_root, reviews_dir, self.paths.state_file
+        self.repo_root,
+        reviews_dir,
+        self.paths.state_file,
+        review_checkouts=review_checkouts,
+        legacy_review_checkouts=legacy_review_checkouts,
     )
     orphaned_checkouts = _reap_orphaned_review_checkouts(
         self.gh,
@@ -575,6 +603,8 @@ def _run_review_reap_sweeps(self, resolved_now: datetime) -> dict[str, Any]:
         self.paths.state_file,
         self.config,
         write_gate=self.write_gate,
+        review_checkouts=review_checkouts,
+        legacy_review_checkouts=legacy_review_checkouts,
     )
     return {
         "verdict_result": verdict_result,

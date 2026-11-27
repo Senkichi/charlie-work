@@ -240,6 +240,16 @@ class ResolvedLayout:
     never diverge, regardless of which of the two independent overrides
     (``runtime.state_dir``, ``claude_code.worktrees_dir``) is in play.
 
+    ``review_checkouts`` is where ``worktree.create_review_checkout`` puts its
+    ``pr-<N>`` git worktrees -- the file-churn half of ``reviews_dir``. The
+    bookkeeping half (sidecars, logs, session records, terminal status) stays
+    in ``reviews_dir`` regardless: live-review accounting and verdict
+    collection read it unchanged. The checkout root follows the host I/O
+    volume (``<worker_root>/<repo name>/reviews``) under the same conditions
+    ``worktrees`` does, except that an explicit ``review_dispatch.reviews_dir``
+    pins checkouts to it as an operator override. It equals ``reviews_dir``
+    whenever the volume is not relocating checkouts.
+
     ``notify`` is a full, ready-to-pass ``NotifyConfig`` (not just a bare
     ``Path``) since :func:`charlie_work.notify.emit_digest` takes the config
     object directly; the source ``NotifyConfig`` is never mutated, only
@@ -251,10 +261,14 @@ class ResolvedLayout:
     session_results: Path
     reviews_dir: Path
     worktrees: Path
+    review_checkouts: Path
     notify: NotifyConfig
     #: The root worktrees lived under before the host I/O volume took over;
     #: ``None`` when the volume is not in use. Swept until it is empty.
     legacy_worktrees: Path | None = None
+    #: The root review checkouts lived under before the volume took them
+    #: (``reviews_dir``); ``None`` when they were never relocated.
+    legacy_review_checkouts: Path | None = None
     worker_io: WorkerIoStatus = NO_WORKER_IO
 
     def sweep_roots(self) -> tuple[Path, ...]:
@@ -272,6 +286,17 @@ class ResolvedLayout:
             # Unlistable: skip it this pass rather than fail the whole sweep.
             return (active,)
         return (active, legacy)
+
+    def review_checkout_scan_roots(self) -> tuple[Path, ...]:
+        """Roots the orphaned-review-checkout scan walks for ``pr-<N>`` dirs.
+
+        Mirrors :meth:`sweep_roots`, keyed on ``pr-*`` entries instead of any
+        entry: the bookkeeping root keeps non-checkout children (sidecars,
+        logs) forever, so "the legacy root is empty" is the wrong signal --
+        it is scanned while it still has ``pr-*`` dirs (checkouts created
+        before the switch).
+        """
+        return review_checkout_scan_roots(self.review_checkouts, self.legacy_review_checkouts)
 
     def host_io_scope_paths(self) -> tuple[Path, ...]:
         """The volume's worker root while it is in use, for host-load attribution.
@@ -317,6 +342,53 @@ def worktree_roots(config: OrchestratorConfig, repo_root: Path, state_root: Path
     return WorktreeRoots(host_io_worker.worktrees_root(status.io, repo_root), configured, status)
 
 
+def review_checkout_scan_roots(active: Path, legacy: Path | None) -> tuple[Path, ...]:
+    """Roots to scan for ``pr-<N>`` review-checkouts dirs.
+
+    The active root, plus the legacy one while it still has ``pr-*`` entries
+    (checkouts created before the switch) -- :meth:`ResolvedLayout.sweep_roots`
+    semantics keyed on ``pr-*`` dirs rather than any entry, since the
+    bookkeeping root keeps non-checkout children (sidecars, logs) forever.
+    Also used by ``stalled_review_reap._reap_orphaned_review_checkouts`` for
+    bare-path callers; :meth:`ResolvedLayout.review_checkout_scan_roots`
+    delegates to the same single implementation.
+    """
+    if legacy is None or legacy.is_relative_to(active) or active.is_relative_to(legacy):
+        return (active,)
+    try:
+        if not legacy.is_dir() or not any(
+            entry.is_dir() and entry.name.startswith("pr-") for entry in legacy.iterdir()
+        ):
+            return (active,)
+    except OSError:
+        # Unlistable: skip it this pass rather than fail the whole scan.
+        return (active,)
+    return (active, legacy)
+
+
+def _review_checkout_roots(
+    config: OrchestratorConfig,
+    reviews_dir: Path,
+    io: host_io_worker.WorkerIo | None,
+    repo_root: Path,
+) -> tuple[Path, Path | None]:
+    """The ``pr-<N>`` checkout root pair for :func:`resolved_layout`.
+
+    Precedence: an explicit ``review_dispatch.reviews_dir`` keeps checkouts
+    with the bookkeeping (operator override); otherwise the host I/O volume
+    relocates them to ``<worker_root>/<repo name>/reviews`` and ``reviews_dir``
+    becomes the legacy root; otherwise they stay in ``reviews_dir``. The kill
+    switch (``claude_code.host_io_worktrees: false``), an absent/invalid
+    manifest and any volume problem all arrive here as ``io=None`` -- the
+    same folded status :func:`worktree_roots` produces -- so checkouts fall
+    back to ``reviews_dir`` exactly as worker worktrees fall back to their
+    default root.
+    """
+    if config.review_dispatch.reviews_dir or io is None:
+        return reviews_dir, None
+    return host_io_worker.reviews_root(io, repo_root), reviews_dir
+
+
 def resolved_layout(config: OrchestratorConfig, repo_root: Path) -> ResolvedLayout:
     """Resolve every sentinel-style state-child config value for *config*.
 
@@ -346,6 +418,9 @@ def resolved_layout(config: OrchestratorConfig, repo_root: Path) -> ResolvedLayo
         default=layout.reviews_dir_default(root),
     )
     roots = worktree_roots(config, repo_root, root)
+    review_checkouts, legacy_review_checkouts = _review_checkout_roots(
+        config, reviews_dir, roots.io.io, repo_root
+    )
     notify_file_path = layout.resolve_state_child(
         config.notify.file_path,
         repo_root=repo_root,
@@ -357,8 +432,10 @@ def resolved_layout(config: OrchestratorConfig, repo_root: Path) -> ResolvedLayo
         session_results=session_results,
         reviews_dir=reviews_dir,
         worktrees=roots.active,
+        review_checkouts=review_checkouts,
         notify=dataclasses.replace(config.notify, file_path=str(notify_file_path)),
         legacy_worktrees=roots.legacy,
+        legacy_review_checkouts=legacy_review_checkouts,
         worker_io=roots.io,
     )
 

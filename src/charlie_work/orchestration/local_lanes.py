@@ -947,6 +947,8 @@ def _local_dispatch_reviewers(self, *, now: Any = None, launch_lock: Any = None)
                 head_sha=head_sha,
                 repo_root=self.repo_root,
                 reviews_dir=reviews_dir,
+                review_checkouts=self._layout.review_checkouts,
+                legacy_review_checkouts=self._layout.legacy_review_checkouts,
                 config=role_cfg,
                 worker_env=reviewer_adapter_settings.worker_env,
                 materialize_dirs=self.config.dispatch.materialize_dirs,

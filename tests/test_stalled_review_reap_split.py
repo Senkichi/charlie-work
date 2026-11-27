@@ -134,8 +134,11 @@ _MOVED_NAMES = (
 # Re-derived under issue #2279: the quota-backoff record now stamps the dead
 # reviewer's ``(harness, model)`` role entry (measured total 1489) plus the
 # same 30-line headroom.
+# Re-derived under issue #3224: the ``review_checkouts``/``legacy_review_checkouts``
+# threading plus the dual-root orphan scan (measured total 1572) plus the same
+# 30-line headroom.
 _CAP_BAND_MIN = 1308
-_CAP_BAND_MAX = 1519
+_CAP_BAND_MAX = 1602
 
 
 # ---------------------------------------------------------------------------
@@ -481,7 +484,7 @@ def test_member_content_defines_exactly_the_ten_moved_symbols() -> None:
 
 def test_module_total_line_count_is_within_the_recorded_cap_band() -> None:
     """BAND gate: the new module's total (docstring + imports + body) must
-    fall within [1308, 1519]. A6's Preflight step originally derived
+    fall within [1308, 1602]. A6's Preflight step originally derived
     [1308, 1338] live from ci_findings.py's own header/import-surface ratio
     (recorded in wf-a6-notes.md Step 10). W6 PR2 (issue #1264) widened the
     upper bound to 1391 -- the real post-conversion total this PR measured
@@ -492,8 +495,9 @@ def test_module_total_line_count_is_within_the_recorded_cap_band() -> None:
     (measured total 1394) plus the same 30-line headroom margin. Issue #1808
     re-derived it to 1483 (measured 1453 + the same margin), and issue #2279
     to 1519 (measured 1489 + the same margin) for the quota-backoff role-entry
-    stamp. This is NOT the repo's normal 800-line cap (explicitly waived for
-    this extraction by operator decision).
+    stamp. Issue #3224 re-derived it to 1602 (measured 1572 + the same margin)
+    for the review-checkouts root threading. This is NOT the repo's normal
+    800-line cap (explicitly waived for this extraction by operator decision).
     """
     total = len(_MODULE_PATH.read_text(encoding="utf-8").splitlines())
     assert _CAP_BAND_MIN <= total <= _CAP_BAND_MAX, (
