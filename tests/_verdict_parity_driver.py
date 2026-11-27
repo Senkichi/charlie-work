@@ -167,6 +167,26 @@ def _fresh_repo() -> _Repo:
     return replace(template, root=root)
 
 
+def warm_repo_template() -> None:
+    """Build ``_repo_template()`` during fixture setup, not a test's call phase.
+
+    ``_fresh_repo`` builds the ~12-subprocess template on the first call in each
+    pytest process (~0.5 s on the CI host). Under ``--dist=load`` and shard
+    splits any consumer can be a worker's first caller, and the test ledger
+    samples call time only (issue #3188). ``_isolate_git_env``'s GIT_CONFIG_*
+    trio is function-scoped, so it is applied here for the module-setup build to
+    land under the call-phase fingerprint -- the issue-#2565 rule
+    ``_git_templates`` documents. ``CI_FLEET_TEST_REUSE=off`` makes
+    ``_repo_template`` per-call, leaving nothing to warm.
+    """
+    if not _git_templates.reuse_enabled():
+        return
+    with pytest.MonkeyPatch.context() as patch:
+        for key, value in _git_templates.GIT_CONFIG_ENV.items():
+            patch.setenv(key, value)
+        _repo_template()
+
+
 def _config_data(scenario: Scenario) -> dict[str, Any]:
     data: dict[str, Any] = {"review": {"post_verdict_comment": scenario.post_verdict_comment}}
     if scenario.rescue_enabled:
