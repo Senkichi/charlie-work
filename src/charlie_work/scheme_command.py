@@ -26,6 +26,13 @@ SCHEME_COMMAND = "scheme"
 
 def register_scheme_subparsers(subparsers: Any) -> None:
     """Add the ``scheme`` parser to the top-level subparsers."""
+    # Deferred (the sibling *_command pattern): ``cli`` owns the global-aware
+    # ``--dry-run`` idiom — a plain store_true subcommand flag overwrites the
+    # top-level one argparse already parsed. A module-level edge would re-enter
+    # ``cli`` while it is still initialising: it imports this module to wire the
+    # subparser.
+    from .cli import _add_dry_run
+
     scheme = subparsers.add_parser(
         SCHEME_COMMAND, help="Run one foreman pass over the fleet's foremen (ADR-0010)"
     )
@@ -35,10 +42,8 @@ def register_scheme_subparsers(subparsers: Any) -> None:
         default=None,
         help="restrict the pass to one foreman",
     )
-    scheme.add_argument(
-        "--dry-run",
-        action="store_true",
-        dest="dry_run",
+    _add_dry_run(
+        scheme,
         help="run Collect and Decide and print what Apply would do — no effect",
     )
     scheme.add_argument(

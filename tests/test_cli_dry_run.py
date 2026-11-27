@@ -192,3 +192,13 @@ def test_global_dry_run_reaches_runners_allocate_in_either_position() -> None:
     assert parser.parse_args(["--dry-run", "runners", "allocate"]).dry_run is True
     assert parser.parse_args(["runners", "allocate", "--dry-run"]).dry_run is True
     assert parser.parse_args(["runners", "allocate"]).dry_run is False
+
+
+def test_global_dry_run_reaches_scheme_in_either_position() -> None:
+    """``scheme`` builds its parser in ``scheme_command``, outside ``cli.py`` —
+    the likeliest place for the clobbering idiom to creep back in."""
+    parser = cli.build_parser()
+
+    assert parser.parse_args(["--dry-run", "scheme"]).dry_run is True
+    assert parser.parse_args(["scheme", "--dry-run"]).dry_run is True
+    assert parser.parse_args(["scheme"]).dry_run is False

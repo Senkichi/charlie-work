@@ -148,7 +148,7 @@ from .command_result import CommandResult
 from .workflow import OrchestratorApp
 
 
-def _add_dry_run(parser: argparse.ArgumentParser) -> None:
+def _add_dry_run(parser: argparse.ArgumentParser, *, help: str | None = None) -> None:
     """Add a subcommand-level ``--dry-run`` that does not clobber the global one.
 
     ``--dry-run`` also exists on the top-level parser, so an operator may write it
@@ -165,7 +165,7 @@ def _add_dry_run(parser: argparse.ArgumentParser) -> None:
     keeps its ``False`` default, so ``args.dry_run`` always exists. Route every new
     subcommand-level flag through here rather than repeating the idiom.
     """
-    parser.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS, help=help)
 
 
 def _add_no_cache_arg(parser: argparse.ArgumentParser) -> None:
