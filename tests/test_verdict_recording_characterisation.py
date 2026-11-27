@@ -30,6 +30,7 @@ from _verdict_parity_driver import (
     _remote_app,
     _seed,
     _write_packet,
+    warm_repo_template,
 )
 import charlie_work.workflow as workflow
 from charlie_work.github import GitHubError
@@ -37,6 +38,17 @@ from charlie_work.labels import TransitionOutcome, TransitionResult
 from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.workflow import VERDICT_PROVENANCE_VALUES
 from charlie_work.workflow import OrchestratorApp
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _warm_repo_template() -> None:
+    """Charge the per-process repo template build to setup, not a test's call.
+
+    ``sides`` takes ~0.5 s when it is a worker's first ``_fresh_repo`` caller;
+    under ``--dist=load`` and shard splits any test can be that caller, and the
+    test ledger samples call time only (issue #3188).
+    """
+    warm_repo_template()
 
 
 @dataclass
