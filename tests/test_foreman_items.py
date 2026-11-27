@@ -108,7 +108,11 @@ def test_dismiss_and_missing_item(tmp_path: Path) -> None:
     assert open_items(load_items(fdir)) == ()
     assert not dismiss_item(fdir, "it-1").ok  # already closed
     assert not dismiss_item(fdir, "it-99").ok  # never existed
-    assert not snooze_item(fdir, "it-1", until="t").ok
+    # A *valid* ``until`` on a dismissed item must reach the status guard,
+    # not fail earlier at parse.
+    snoozed = snooze_item(fdir, "it-1", until="2026-11-26T09:00:00Z")
+    assert not snoozed.ok
+    assert "already dismissed" in snoozed.error
 
 
 def test_mark_notified(tmp_path: Path) -> None:
@@ -306,3 +310,92 @@ def test_unparseable_stored_snooze_resurfaces(tmp_path: Path) -> None:
     )
     items = load_items(fdir)
     assert len(open_items(items, now="2026-11-26T09:00:00Z")) == 1
+
+
+def test_snooze_extreme_offset_is_an_error_value(tmp_path: Path) -> None:
+    """An ``until`` whose UTC normalization overflows ``datetime.min``/``max``
+    is a parse failure — an error value out of ``snooze_item``, never an
+    ``OverflowError``, and the store is left byte-identical."""
+    fdir = _foreman(tmp_path)
+    create_item(fdir, kind="report", text="x")
+    path = fdir / "items.json"
+    before = path.read_bytes()
+    for until in ("0001-01-01T00:00:00+14:00", "9999-12-31T23:00:00-14:00"):
+        result = snooze_item(fdir, "it-1", until=until)
+        assert not result.ok
+        assert "snoozed_until" in result.error
+    assert path.read_bytes() == before
+
+
+def test_overflowing_stored_snooze_resurfaces(tmp_path: Path) -> None:
+    """A stored ``snoozed_until`` that parses but has no UTC representation
+    fails visible like an unparseable one — ``open_items`` does not raise and
+    the item resurfaces."""
+    fdir = _foreman(tmp_path)
+    create_item(fdir, kind="report", text="x")
+    path = fdir / "items.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "items": [
+                    {
+                        "id": "it-1",
+                        "kind": "report",
+                        "status": "snoozed",
+                        "text": "x",
+                        "snoozed_until": "0001-01-01T00:00:00+14:00",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    items = load_items(fdir)
+    assert len(open_items(items, now="2026-11-26T09:00:00Z")) == 1
+
+
+def test_snooze_on_answered_and_dismissed_is_an_error(tmp_path: Path) -> None:
+    """With a valid ``until`` the terminal-state guard is what rejects the
+    snooze — the error names the status the item already reached, and the
+    item is left untouched."""
+    fdir = _foreman(tmp_path)
+    create_item(fdir, kind="decision", question="q", options=["a", "b"])
+    create_item(fdir, kind="report", text="x")
+    assert answer_item(fdir, "it-1", choice=0).ok
+    assert dismiss_item(fdir, "it-2").ok
+    until = "2026-11-26T09:00:00Z"
+    answered = snooze_item(fdir, "it-1", until=until)
+    assert not answered.ok
+    assert "already answered" in answered.error
+    dismissed = snooze_item(fdir, "it-2", until=until)
+    assert not dismissed.ok
+    assert "already dismissed" in dismissed.error
+    items = {item.id: item for item in load_items(fdir)}
+    assert items["it-1"].status == "answered"
+    assert items["it-2"].status == "dismissed"
+    assert items["it-1"].snoozed_until is None
+    assert items["it-2"].snoozed_until is None
+
+
+def test_answer_snoozed_item_and_terminal_transition_clears_until(tmp_path: Path) -> None:
+    """A snoozed item is still answerable (snoozed is not terminal), and both
+    ``answer_item`` and ``dismiss_item`` clear ``snoozed_until`` — an answered
+    or dismissed item must not resurface on a stale deadline."""
+    fdir = _foreman(tmp_path)
+    create_item(fdir, kind="decision", question="q", options=["a", "b"])
+    create_item(fdir, kind="report", text="x")
+    until = "2026-11-26T09:00:00Z"
+    assert snooze_item(fdir, "it-1", until=until).ok
+    assert snooze_item(fdir, "it-2", until=until).ok
+    assert all(item.snoozed_until == until for item in load_items(fdir))
+    answered = answer_item(fdir, "it-1", choice=1)
+    assert answered.ok, answered.error
+    assert answered.value.status == "answered"
+    assert answered.value.snoozed_until is None
+    dismissed = dismiss_item(fdir, "it-2")
+    assert dismissed.ok, dismissed.error
+    assert dismissed.value.snoozed_until is None
+    items = {item.id: item for item in load_items(fdir)}
+    assert items["it-1"].snoozed_until is None
+    assert items["it-2"].snoozed_until is None

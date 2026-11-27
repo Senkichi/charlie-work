@@ -147,6 +147,37 @@ def test_gang_list_survives_non_utf8_charter(tmp_path: Path) -> None:
     assert entries["good"].get("issues") == "0/5"
 
 
+def test_gang_list_survives_overflowing_snoozed_until(tmp_path: Path) -> None:
+    """A stored ``snoozed_until`` that parses but overflows UTC normalization
+    cannot raise ``OverflowError`` out of ``open_items`` — the poisoned
+    foreman's item resurfaces and the healthy neighbour still lists."""
+    assert scaffold_foreman(tmp_path, "bad").ok
+    (tmp_path / "foremen" / "bad" / "items.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "items": [
+                    {
+                        "id": "it-1",
+                        "kind": "report",
+                        "status": "snoozed",
+                        "text": "x",
+                        "snoozed_until": "0001-01-01T00:00:00+14:00",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert scaffold_foreman(tmp_path, "good").ok
+    result = run_gang_command(_args(tmp_path, "list"))
+    assert result.ok, result.message
+    entries = {e["name"]: e for e in result.data["foremen"]}
+    assert set(entries) == {"bad", "good"}
+    assert entries["bad"]["open_items"] == 1
+    assert entries["good"]["open_items"] == 0
+
+
 def test_main_dispatches_gang_list(tmp_path: Path, capsys) -> None:
     """``charlie --fleet-dir <tmp> gang list`` reaches run_gang_command through
     ``cli.main`` — deleting the GANG_COMMAND dispatch branch fails this test."""

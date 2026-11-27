@@ -177,18 +177,20 @@ def _parse_utc(value: str) -> datetime | None:
 
     Naive timestamps are rejected — without an offset a wall-clock string is
     ambiguous, and comparing it against ``Z``-normalized deadlines silently
-    shifts the deadline by the host timezone.
+    shifts the deadline by the host timezone. ``OverflowError`` is a parse
+    failure too: ``astimezone`` raises it when an extreme-offset timestamp
+    near ``datetime.min``/``max`` has no UTC representation.
     """
     text = value.strip()
     if text.endswith(("Z", "z")):
         text = text[:-1] + "+00:00"
     try:
         parsed = datetime.fromisoformat(text)
-    except ValueError:
+        if parsed.tzinfo is None or parsed.tzinfo.utcoffset(parsed) is None:
+            return None
+        return parsed.astimezone(UTC)
+    except (ValueError, OverflowError):
         return None
-    if parsed.tzinfo is None or parsed.tzinfo.utcoffset(parsed) is None:
-        return None
-    return parsed.astimezone(UTC)
 
 
 def _format_utc(moment: datetime) -> str:
