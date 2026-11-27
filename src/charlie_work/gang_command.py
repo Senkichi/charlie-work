@@ -535,6 +535,8 @@ def _gang_set_state(
         # Resuming also clears ``faulted`` (which becomes active here) and the
         # consecutive-Turn-failure count that put it there (design §9).
         updates["consecutive_failures"] = 0
+    # The foreman-state store is not the orchestrator's gated mutator layer —
+    # write-gate-exempt(issue=3121): name-matched only, no write_gate receiver here.
     saved = fstate.save_state(fdir, fstate.with_updates(state, **updates))
     if not saved.ok:
         return _fail(verb, saved.error)
