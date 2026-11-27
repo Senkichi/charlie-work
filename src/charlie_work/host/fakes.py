@@ -7,6 +7,7 @@ invariant covers config and value objects; ``HostPorts`` itself is frozen).
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -222,4 +223,50 @@ class FakeWorkerLauncher:
         if callable(outcome):
             call: Callable[..., list[Any]] = outcome
             return call(repo_root, manifest_path, results_path, settings, requests)
+        return outcome
+
+
+class FakeDecideLauncher:
+    """Scripted foreman-Decide launches; never spawns a process (issue #3120).
+
+    ``outcomes`` is consumed one per ``launch`` call (the last repeats). Each
+    is a ``RunResult`` (returned as-is), a ``str`` (a failed ``RunResult``
+    with that stderr and returncode 1), or a callable taking the port's
+    ``(argv, *, cwd, env, timeout_seconds, stdin)`` signature. With no
+    outcomes every launch returns a canned successful ``claude`` result
+    envelope whose ``structured_output`` is an empty object. ``calls`` logs
+    ``(argv, cwd, env, timeout_seconds, stdin)`` per call.
+    """
+
+    def __init__(self, outcomes: Sequence[Any] = ()) -> None:
+        self._outcomes = list(outcomes)
+        self.calls: list[tuple[Any, ...]] = []
+
+    def launch(
+        self,
+        argv: tuple[str, ...],
+        *,
+        cwd: Path,
+        env: Mapping[str, str],
+        timeout_seconds: int,
+        stdin: str,
+    ) -> Any:
+        from ..subprocess_runner import RunResult
+
+        index = len(self.calls)
+        self.calls.append((tuple(argv), cwd, dict(env), timeout_seconds, stdin))
+        if not self._outcomes:
+            return RunResult(
+                returncode=0,
+                stdout=json.dumps({"is_error": False, "structured_output": {}}),
+                stderr="",
+            )
+        outcome = self._outcomes[min(index, len(self._outcomes) - 1)]
+        if isinstance(outcome, str):
+            return RunResult(returncode=1, stdout="", stderr=outcome)
+        if callable(outcome):
+            call: Callable[..., Any] = outcome
+            return call(
+                tuple(argv), cwd=cwd, env=env, timeout_seconds=timeout_seconds, stdin=stdin
+            )
         return outcome
