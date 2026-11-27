@@ -19,7 +19,9 @@ from pathlib import Path
 import pytest
 from _foreman_collect_helpers import NOW, REPO_KEY, _World
 from _foreman_pass_fixtures import (
+    _authored,
     _events,
+    _finish,
     _patch_state,
     _run,
     _succeeding_decide,
@@ -40,7 +42,6 @@ from charlie_work.foreman import pass_run
 from charlie_work.foreman.apply import apply_turn
 from charlie_work.foreman.charter import Charter, CharterBounds
 from charlie_work.foreman.state import (
-    AuthoredIssue,
     ForemanState,
     read_state_snapshot,
     save_state,
@@ -52,20 +53,6 @@ from charlie_work.local_issues import LocalFileGitHub
 _BREAKER = ForemanBreakerConfig(sample=3, baseline_sample=5, ratio=1.5)
 
 REPO = REPO_KEY
-
-
-def _authored(*numbers: int) -> dict[int, AuthoredIssue]:
-    return {n: AuthoredIssue(number=n, body_hash=f"h{n}") for n in numbers}
-
-
-def _finish(world: _World, *pairs: tuple[int, str]) -> None:
-    """Log ``lifecycle_transition`` events — each ``(issue_number, to_state)``."""
-    for i, (number, to_state) in enumerate(pairs):
-        world.log(
-            "lifecycle_transition",
-            {"issue_number": number, "to_state": to_state, "from_state": "in_progress"},
-            f"2026-11-24T{i:02d}:00:00Z",
-        )
 
 
 def _eval(world: _World, breaker: ForemanBreakerConfig = _BREAKER, now: datetime = NOW):
@@ -214,6 +201,68 @@ def test_breaker_answer_acknowledges_sample(
     _finish(world, (23, "human_needed"))
     _eval(world)
     assert len(_events(world, flimits.EVENT_BREAKER_TRIPPED)) == 2
+
+
+def test_breaker_reraises_item_when_trip_create_failed(
+    tmp_path: Path, wt_scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed create_item at trip time must not strand a degraded foreman.
+
+    The item is the only operator-facing path back, so the next pass
+    re-raises it while the breaker still holds — mirroring the verdict's
+    forced-arming re-raise.
+    """
+    world = _world(tmp_path, wt_scratch, monkeypatch)
+    real_create = f_items.create_item
+    monkeypatch.setattr(f_items, "create_item", lambda *a, **k: f_items.Result(error="disk full"))
+    state = _trip_breaker(world)
+    assert "breaker" in state.degraded_reasons
+    assert state.breaker_item_id is None
+
+    monkeypatch.setattr(f_items, "create_item", real_create)
+    state = _eval(world)
+
+    assert state.state == "degraded"
+    assert "breaker" in state.degraded_reasons
+    assert state.breaker_item_id is not None
+    item = _item(world, state.breaker_item_id)
+    assert item.kind == "decision" and item.status == "open"
+    assert "breaker" in (item.question or "")
+
+
+def test_baseline_excludes_foreman_labeled_snapshot_issues(
+    tmp_path: Path, wt_scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Tracked issues are owned too — the baseline must not count them.
+
+    The seeded snapshot carries 13 under ``foreman:g1`` (tracked — the
+    operator labeled it; it is in no register) and 15 under
+    ``foreman:other``. Finished, both still stay out of the "no foreman
+    owns" baseline the escalation rate is computed against.
+    """
+    world = _world(tmp_path, wt_scratch, monkeypatch)
+    _patch_state(world, issues=_authored(20, 21, 22))
+    _finish(
+        world,
+        (20, "human_needed"),
+        (21, "operator_queue"),
+        (22, "human_needed"),
+        (30, "done"),
+        (31, "done"),
+        (32, "done"),
+        (33, "done"),
+        (34, "done"),
+        (13, "human_needed"),
+        (15, "human_needed"),
+    )
+
+    state = _eval(world)
+
+    assert state.breaker_item_id is not None
+    tripped = _events(world, flimits.EVENT_BREAKER_TRIPPED)
+    assert len(tripped) == 1
+    assert tripped[0]["baseline"] == 5
+    assert tripped[0]["baseline_rate"] == 0.0
 
 
 def test_breaker_reason_is_independent_of_unattended(

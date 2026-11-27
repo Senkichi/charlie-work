@@ -27,6 +27,7 @@ from charlie_work.foreman import paths as f_paths
 from charlie_work.foreman import pass_run
 from charlie_work.foreman.collect import lifecycle_fingerprint
 from charlie_work.foreman.state import (
+    AuthoredIssue,
     ForemanState,
     read_state_snapshot,
     save_state,
@@ -65,6 +66,20 @@ def _world(tmp_path: Path, wt_scratch: Path, monkeypatch: pytest.MonkeyPatch, **
     )
     (world.repo_root / "docs" / "issues").mkdir(parents=True, exist_ok=True)
     return world
+
+
+def _authored(*numbers: int) -> dict[int, AuthoredIssue]:
+    return {n: AuthoredIssue(number=n, body_hash=f"h{n}") for n in numbers}
+
+
+def _finish(world: _World, *pairs: tuple[int, str]) -> None:
+    """Log ``lifecycle_transition`` events — each ``(issue_number, to_state)``."""
+    for i, (number, to_state) in enumerate(pairs):
+        world.log(
+            "lifecycle_transition",
+            {"issue_number": number, "to_state": to_state, "from_state": "in_progress"},
+            f"2026-11-24T{i:02d}:00:00Z",
+        )
 
 
 def _patch_state(world: _World, **changes: Any) -> ForemanState:

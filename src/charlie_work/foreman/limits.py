@@ -1,11 +1,11 @@
 """Structural limits: escalation breaker, unattended limit, verdict (issue #3123).
 
-Design §10/§16. Evaluated at the start of every pass for each foreman whose
-state is ``active`` or ``degraded`` — ``pass_run._pass_one`` calls
-:func:`evaluate_limits` before the wake predicate so a transition applies to
-the Turn about to run (a breaker-tripped foreman's new issues stay unarmed
-via the ``degraded`` state; a failed verdict's forced ``propose`` is read
-by ``apply_checks._arm_or_raise``).
+Design §10/§16. Evaluated at the start of every non-dry-run pass for each
+foreman whose state is ``active`` or ``degraded`` — ``pass_run._pass_one``
+calls :func:`evaluate_limits` before the wake predicate so a transition
+applies to the Turn about to run (a breaker-tripped foreman's new issues
+stay unarmed via the ``degraded`` state; a failed verdict's forced
+``propose`` is read by ``apply_checks._arm_or_raise``).
 
 The three limits share one bookkeeping shape:
 
@@ -34,8 +34,10 @@ from typing import TYPE_CHECKING, Any
 
 from .. import layout
 from ..api_budget import ledger_path, load_ledger
+from ..github import label_names
 from ..instrumentation import log_event, query_events
 from ..iso_timestamp import parse_iso_timestamp
+from . import collect
 from . import items as fitems
 from . import paths as fpaths
 from . import state as fstate
@@ -116,15 +118,54 @@ def _finished_issues(foreman: Foreman) -> list[FinishedIssue]:
     return finished
 
 
-def _all_foreman_owned(fleet_dir: Path) -> set[int]:
-    """Issue numbers every foreman's register records — the baseline's
-    "no foreman ownership label" exclusion set (design §10).
+def _snapshot_owned(foreman: Foreman) -> set[int]:
+    """Open issues in the repo's status snapshot carrying a ``foreman:`` label.
 
-    ``state.issues`` is the ownership-label cache: unioning it over all
-    foremen approximates "carries a ``foreman:`` label" without a GitHub
-    read, and errs toward excluding more issues from the baseline.
+    The same local source Collect reads — an owned issue here needs no
+    completed Turn to count, so it closes the register's pickup gap below.
+    Any ``foreman:`` name matches (``foreman:other`` included): the baseline
+    is "no foreman owns", not "this foreman does not own".
     """
+    prefix = foreman.labels.foreman_prefix
+    if not prefix:
+        return set()
+    _written, data = collect._read_snapshot(foreman.state_root)
+    if data is None:
+        return set()
+    issues = data.get("issues")
+    if not isinstance(issues, list):
+        return set()
     owned: set[int] = set()
+    for entry in issues:
+        if not isinstance(entry, dict):
+            continue
+        number = entry.get("number")
+        if isinstance(number, int) and any(name.startswith(prefix) for name in label_names(entry)):
+            owned.add(number)
+    return owned
+
+
+def _all_foreman_owned(foreman: Foreman, fleet_dir: Path) -> set[int]:
+    """Issue numbers the baseline's "no foreman owns" rule excludes (§10/§15).
+
+    Two local sources stand in for the GitHub label read the pass does not
+    make:
+
+    * every foreman's ``state.issues`` register — authored *and* tracked
+      issues recorded at the last completed Turn, plus entries the register
+      keeps after their label left the snapshot (a Turn's register write
+      unions prior entries forward, so it only grows);
+    * this repo's status snapshot — open issues carrying any ``foreman:``
+      label, covering a tracked issue between the operator adding the label
+      and its foreman's next completed Turn.
+
+    The approximation errs in *both* directions: a retained or foreign-repo
+    register entry can exclude an issue no foreman currently owns, and the
+    residual gap — an owned issue that finished and left the snapshot before
+    any Turn recorded it — still lands in the baseline. Both residuals age
+    out as the ``baseline_sample`` window slides past.
+    """
+    owned = _snapshot_owned(foreman)
     for _name, root in store.list_foremen(fleet_dir):
         owned.update(fstate.read_state_snapshot(root).issues)
     return owned
@@ -382,8 +423,9 @@ def evaluate_limits(
     state = fstate.read_state_snapshot(root)
     items = fitems.load_items(root)
     by_id = _item_by_id(items)
+    open_status = (fitems.STATUS_OPEN, fitems.STATUS_SNOOZED)
     finished = _finished_issues(foreman)
-    owned = _all_foreman_owned(fleet_dir)
+    owned = _all_foreman_owned(foreman, fleet_dir)
 
     foreman_finished = [f for f in finished if f.number in state.issues]
     sample = foreman_finished[: breaker.sample]
@@ -422,6 +464,23 @@ def evaluate_limits(
                     "baseline": len(baseline),
                 },
             )
+        else:
+            # Still tripped and unanswered: the course-check item is the only
+            # operator-facing path back, so a missing one is re-raised — a
+            # failed create_item at trip time or a wiped items.json must not
+            # leave a degraded foreman with nothing to answer (same shape as
+            # the forced-arming re-raise below).
+            recorded = by_id.get(state.breaker_item_id) if state.breaker_item_id else None
+            if recorded is None or recorded.status not in open_status:
+                item_id = _raise_breaker_item(
+                    foreman,
+                    by_id,
+                    state.breaker_item_id,
+                    _escalation_rate(sample),
+                    _escalation_rate(baseline),
+                )
+                if item_id is not None:
+                    changes["breaker_item_id"] = item_id
     elif over and sample_key != tuple(sorted(state.breaker_ack_sample)):
         reasons.add(DEGRADED_BREAKER)
         item_id = _raise_breaker_item(
@@ -503,7 +562,6 @@ def evaluate_limits(
             changes["verdict_item_id"] = None
         else:
             recorded = by_id.get(state.verdict_item_id) if state.verdict_item_id else None
-            open_status = (fitems.STATUS_OPEN, fitems.STATUS_SNOOZED)
             if recorded is None or recorded.status not in open_status:
                 retune = _raise_retune_item(foreman)
                 if retune is not None:

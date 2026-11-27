@@ -605,7 +605,13 @@ def _pass_one(
     # each pass so a transition applies to the Turn about to run. A
     # just-degraded foreman still runs Turns — degraded gates arming, not
     # planning — so the rest of the pass continues with the updated state.
-    flimits.evaluate_limits(foreman, fleet_dir=fleet_dir, breaker=foreman_config.breaker, now=now)
+    # --dry-run skips the evaluation entirely: like the pass-completed event
+    # and Apply itself, a dry pass must not persist degraded state, raise
+    # items, or set forced_arming on a live foreman.
+    if not dry_run:
+        flimits.evaluate_limits(
+            foreman, fleet_dir=fleet_dir, breaker=foreman_config.breaker, now=now
+        )
 
     # A crash survivor is outstanding work the pass owes the foreman — it
     # wakes the foreman even when no predicate fires (design §8.3).
