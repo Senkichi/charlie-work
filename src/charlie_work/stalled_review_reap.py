@@ -45,6 +45,7 @@ from typing import Any
 
 from . import layout
 from . import opencode_log
+from . import paths as _paths
 from .config import OrchestratorConfig
 from .github import GitHubLike
 from . import host as _host
@@ -73,7 +74,7 @@ from .role_quota_ledger import (
     role_key_for_view,
 )
 from .worker import _alive_review_worker_issue_numbers, iter_workers
-from .worktree import remove_review_checkout
+from .worktree import remove_review_checkout, review_checkout_kwargs
 from .write_gate import WriteGate, require_write_gate
 
 
@@ -85,6 +86,8 @@ def _remove_review_checkout_with_warning(
     write_gate: WriteGate,
     *,
     state_file: Path | None = None,
+    review_checkouts: Path | None = None,
+    legacy_review_checkouts: Path | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """Remove an isolated review checkout and emit a one-shot warning on failure.
 
@@ -103,7 +106,8 @@ def _remove_review_checkout_with_warning(
     passes it.
     """
     write_gate = require_write_gate(write_gate)
-    removed = remove_review_checkout(repo_root, pr_number, reviews_dir=reviews_dir)
+    kw = review_checkout_kwargs(reviews_dir, review_checkouts, legacy_review_checkouts)
+    removed = remove_review_checkout(repo_root, pr_number, reviews_dir=reviews_dir, **kw)
     pr_key = str(pr_number)
     prs = state.get("prs")
     if not isinstance(prs, dict):
@@ -353,6 +357,8 @@ def _detect_and_handle_stalled_reviews(
     write_gate: WriteGate,
     *,
     now: datetime | None = None,
+    review_checkouts: Path | None = None,
+    legacy_review_checkouts: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Detect reviewer processes that died without a verdict and free their claims.
 
@@ -394,6 +400,7 @@ def _detect_and_handle_stalled_reviews(
     """
     write_gate = require_write_gate(write_gate)
     resolved_now = now if now is not None else datetime.now(UTC)
+    kw = review_checkout_kwargs(reviews_dir, review_checkouts, legacy_review_checkouts)
     stalled: list[dict[str, Any]] = []
     sweep_events: list[tuple[str, dict[str, Any]]] = []
     state = load_state_locked(state_file)
@@ -682,7 +689,7 @@ def _detect_and_handle_stalled_reviews(
                         "reason": event_payload["reason"],
                     }
                 )
-                remove_review_checkout(repo_root, w.issue_number, reviews_dir=reviews_dir)
+                remove_review_checkout(repo_root, w.issue_number, reviews_dir=reviews_dir, **kw)
                 w.reap_sidecar(reviews_dir)
                 continue
             # Roll back (not fail) the claim: this is a global condition, not
@@ -722,7 +729,7 @@ def _detect_and_handle_stalled_reviews(
                     "reason": event_payload["reason"],
                 }
             )
-            remove_review_checkout(repo_root, w.issue_number, reviews_dir=reviews_dir)
+            remove_review_checkout(repo_root, w.issue_number, reviews_dir=reviews_dir, **kw)
             # Reap the sidecar like every other handled path in this sweep.
             # The rolled-back claim is deliberately non-terminal (so the PR
             # re-dispatches once the quota gate clears), which means neither
@@ -777,7 +784,7 @@ def _detect_and_handle_stalled_reviews(
                     "reason": event_payload["reason"],
                 }
             )
-            remove_review_checkout(repo_root, w.issue_number, reviews_dir=reviews_dir)
+            remove_review_checkout(repo_root, w.issue_number, reviews_dir=reviews_dir, **kw)
             w.reap_sidecar(reviews_dir)
             continue
 
@@ -858,7 +865,7 @@ def _detect_and_handle_stalled_reviews(
                         "reason": event_payload["reason"],
                     }
                 )
-                remove_review_checkout(repo_root, w.issue_number, reviews_dir=reviews_dir)
+                remove_review_checkout(repo_root, w.issue_number, reviews_dir=reviews_dir, **kw)
                 w.reap_sidecar(reviews_dir)
                 continue
             # Transient unreadable-log death (streak <= N): roll back the
@@ -896,7 +903,7 @@ def _detect_and_handle_stalled_reviews(
                     "reason": event_payload["reason"],
                 }
             )
-            remove_review_checkout(repo_root, w.issue_number, reviews_dir=reviews_dir)
+            remove_review_checkout(repo_root, w.issue_number, reviews_dir=reviews_dir, **kw)
             # Reap the sidecar: the rolled-back claim is non-terminal, so
             # neither terminal guard above will ever reap it -- without this
             # the same dead reviewer resurfaces every sweep (same rationale
@@ -935,6 +942,7 @@ def _detect_and_handle_stalled_reviews(
             w.issue_number,
             write_gate=write_gate,
             state_file=state_file,
+            **kw,
         )
         # The failed record above is now the source of truth for redispatch;
         # the dead session's sidecar must go with the checkout or it re-enters
@@ -986,6 +994,7 @@ def _detect_and_handle_stalled_reviews(
                         int(pr_key),
                         write_gate=write_gate,
                         state_file=state_file,
+                        **kw,
                     )
         elif status == "review_dispatch_dispatched":
             reviewer_pid = pr_state.get("reviewer_pid")
@@ -1037,6 +1046,7 @@ def _detect_and_handle_stalled_reviews(
                         int(pr_key),
                         write_gate=write_gate,
                         state_file=state_file,
+                        **kw,
                     )
         elif status is None and pr_state.get("status") == "reviewing":
             # Issue #487: a review packet was generated but was never claimed or
@@ -1197,6 +1207,7 @@ def _detect_and_handle_stalled_reviews(
                     int(pr_key),
                     write_gate=write_gate,
                     state_file=state_file,
+                    **kw,
                 )
 
     if changed:
@@ -1241,6 +1252,9 @@ def _reap_completed_review_checkouts(
     repo_root: Path,
     reviews_dir: Path,
     state_file: Path,
+    *,
+    review_checkouts: Path | None = None,
+    legacy_review_checkouts: Path | None = None,
 ) -> list[int]:
     """Remove isolated review checkouts for PRs whose reviewer already
     recorded a verdict, once the reviewer process itself has exited.
@@ -1267,11 +1281,12 @@ def _reap_completed_review_checkouts(
         return []
 
     alive_pr_numbers = _alive_review_worker_issue_numbers(reviews_dir)
+    kw = review_checkout_kwargs(reviews_dir, review_checkouts, legacy_review_checkouts)
     reaped: list[int] = []
     for pr_number in sorted(completed_prs):
         if pr_number in alive_pr_numbers:
             continue
-        if remove_review_checkout(repo_root, pr_number, reviews_dir=reviews_dir):
+        if remove_review_checkout(repo_root, pr_number, reviews_dir=reviews_dir, **kw):
             reaped.append(pr_number)
         # The verdict is recorded and the reviewer has exited: the sidecar has
         # served its purpose and must not linger as a phantom session.
@@ -1286,6 +1301,10 @@ def _reap_orphaned_review_checkouts(
     state_file: Path,
     config: OrchestratorConfig,
     write_gate: WriteGate,
+    *,
+    review_checkouts: Path | None = None,
+    legacy_review_checkouts: Path | None = None,
+    checkout_scan_roots: tuple[Path, ...] | None = None,
 ) -> list[int]:
     """Remove isolated review checkouts for PRs whose GitHub lifecycle has
     already reached ``MERGED`` or ``CLOSED`` and whose reviewer process has
@@ -1300,6 +1319,7 @@ def _reap_orphaned_review_checkouts(
     session is not interrupted.
     """
     write_gate = require_write_gate(write_gate)
+    kw = review_checkout_kwargs(reviews_dir, review_checkouts, legacy_review_checkouts)
     state = load_state_locked(state_file)
     # Capture the entry-pass snapshot so the save block below can merge-on-write
     # instead of restoring this stale snapshot wholesale (issue #594). The
@@ -1331,14 +1351,19 @@ def _reap_orphaned_review_checkouts(
             except ValueError:
                 continue
 
-    if reviews_dir.is_dir():
-        for entry in reviews_dir.iterdir():
-            if entry.is_dir() and entry.name.startswith("pr-"):
-                suffix = entry.name.split("-", 1)[1]
-                try:
-                    candidate_pr_numbers.add(int(suffix))
-                except ValueError:
-                    continue
+    # The ``pr-*`` dir scan covers both checkout roots: ``checkout_scan_roots``
+    # (``ResolvedLayout.review_checkout_scan_roots`` at the orchestrator layer)
+    # when given, else the same rule derived from the bare path pair, so a
+    # checkout created before the switch to the host I/O volume cannot be
+    # orphaned by the move.
+    candidate_pr_numbers.update(
+        _paths.review_checkout_pr_numbers(
+            checkout_scan_roots
+            or _paths.review_checkout_scan_roots(
+                review_checkouts or reviews_dir, legacy_review_checkouts
+            )
+        )
+    )
 
     if not candidate_pr_numbers:
         return []
@@ -1391,6 +1416,7 @@ def _reap_orphaned_review_checkouts(
             pr_number,
             write_gate=write_gate,
             state_file=state_file,
+            **kw,
         )
         # Reap the sidecar with the checkout: leaving it resurrects the dead
         # session as a phantom failed claim in the stalled sweep next pass,

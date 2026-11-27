@@ -11,7 +11,12 @@ import pytest
 from ci_fleet.host_io.manifest import VolumeInfo
 
 from charlie_work import cli, host_io_worker, layout
-from charlie_work.config import ClaudeCodeConfig, OrchestratorConfig, RuntimeConfig
+from charlie_work.config import (
+    ClaudeCodeConfig,
+    OrchestratorConfig,
+    ReviewDispatchConfig,
+    RuntimeConfig,
+)
 from charlie_work.env_sanitize import sanitize_env
 from charlie_work.fleet_dispatch import _repo_state_dirs
 from charlie_work.paths import resolved_layout, runtime_paths, worktree_roots
@@ -258,6 +263,73 @@ def test_worktree_clean_sweeps_both_roots(
     result = cli.run_worktree_clean_command(args)
     assert result.ok is True
     assert swept == [_volume_root(repo), legacy]
+
+
+# -- the review-checkouts root (issue #3224) ------------------------------------
+
+
+def _default_reviews_dir(repo: Path) -> Path:
+    return layout.reviews_dir_default(runtime_paths(repo, RuntimeConfig().state_dir).root)
+
+
+def test_the_volume_moves_review_checkouts_and_keeps_reviews_dir_as_legacy(
+    tmp_path: Path, mounted: None
+) -> None:
+    _write_manifest()
+    repo = _repo(tmp_path)
+    resolved = resolved_layout(OrchestratorConfig(), repo)
+    assert resolved.review_checkouts == Path("Y:\\fleet") / repo.name / layout.REVIEWS_DIRNAME
+    assert resolved.legacy_review_checkouts == _default_reviews_dir(repo)
+    # The bookkeeping root itself never moves: sidecars, logs and session
+    # records stay in reviews_dir.
+    assert resolved.reviews_dir == _default_reviews_dir(repo)
+
+
+def test_an_explicit_reviews_dir_pins_the_checkout_root(tmp_path: Path, mounted: None) -> None:
+    _write_manifest()
+    repo = _repo(tmp_path)
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(reviews_dir="alt-reviews"))
+    resolved = resolved_layout(config, repo)
+    assert resolved.reviews_dir == repo / "alt-reviews"
+    assert resolved.review_checkouts == repo / "alt-reviews"
+    assert resolved.legacy_review_checkouts is None
+
+
+def test_the_kill_switch_keeps_review_checkouts_on_reviews_dir(
+    tmp_path: Path, mounted: None
+) -> None:
+    _write_manifest()
+    repo = _repo(tmp_path)
+    config = OrchestratorConfig(claude_code=ClaudeCodeConfig(host_io_worktrees=False))
+    resolved = resolved_layout(config, repo)
+    assert resolved.review_checkouts == resolved.reviews_dir
+    assert resolved.legacy_review_checkouts is None
+
+
+def test_no_manifest_keeps_review_checkouts_on_reviews_dir(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    resolved = resolved_layout(OrchestratorConfig(), repo)
+    assert resolved.review_checkouts == resolved.reviews_dir
+    assert resolved.legacy_review_checkouts is None
+    assert resolved.review_checkout_scan_roots() == (resolved.reviews_dir,)
+
+
+def test_review_checkout_scan_roots_cover_the_legacy_root_only_while_it_has_pr_dirs(
+    tmp_path: Path, mounted: None
+) -> None:
+    _write_manifest()
+    repo = _repo(tmp_path)
+    resolved = resolved_layout(OrchestratorConfig(), repo)
+    legacy = resolved.legacy_review_checkouts
+    assert legacy is not None
+    assert resolved.review_checkout_scan_roots() == (resolved.review_checkouts,)
+    legacy.mkdir(parents=True)
+    # A sidecar-shaped entry is bookkeeping, not a checkout: the legacy root is
+    # scanned only while an actual pr-<N> dir survives there.
+    (legacy / "issue-1.claude.json").write_text("{}", encoding="utf-8")
+    assert resolved.review_checkout_scan_roots() == (resolved.review_checkouts,)
+    (legacy / "pr-1").mkdir()
+    assert resolved.review_checkout_scan_roots() == (resolved.review_checkouts, legacy)
 
 
 # -- merge_clean_results --------------------------------------------------------

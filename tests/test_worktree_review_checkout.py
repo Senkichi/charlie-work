@@ -196,3 +196,70 @@ def test_create_review_checkout_rejects_non_hex_head_sha(tmp_path: Path) -> None
 
     with pytest.raises(ValueError, match="create_review_checkout head_sha"):
         create_review_checkout(repo_root, 1, "not-a-sha!", reviews_dir=tmp_path / "reviews")
+
+
+def test_create_review_checkout_uses_the_relocated_root(tmp_path: Path) -> None:
+    """Issue #3224: ``review_checkouts`` (the host I/O volume root) hosts the
+    ``pr-<N>`` checkout while ``reviews_dir`` keeps only the bookkeeping.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    reviews_dir = tmp_path / "reviews"
+    checkouts = tmp_path / "volume" / "repo" / "reviews"
+    head_sha = _git(repo_root, "rev-parse", "HEAD").stdout.strip()
+
+    info = create_review_checkout(
+        repo_root, 3, head_sha, reviews_dir=reviews_dir, review_checkouts=checkouts
+    )
+
+    assert info.path == checkouts / "pr-3"
+    assert info.path.exists()
+    assert not (reviews_dir / "pr-3").exists()
+
+
+def test_remove_review_checkout_covers_the_legacy_root(tmp_path: Path) -> None:
+    """A checkout created before the root moved (under ``reviews_dir``) is
+    still found and removed once the active root relocated."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    reviews_dir = tmp_path / "reviews"
+    checkouts = tmp_path / "volume" / "repo" / "reviews"
+    head_sha = _git(repo_root, "rev-parse", "HEAD").stdout.strip()
+
+    legacy = create_review_checkout(repo_root, 4, head_sha, reviews_dir=reviews_dir)
+    assert legacy.path == reviews_dir / "pr-4"
+
+    removed = remove_review_checkout(
+        repo_root,
+        4,
+        reviews_dir=reviews_dir,
+        review_checkouts=checkouts,
+        legacy_review_checkouts=reviews_dir,
+    )
+    assert removed is True
+    assert not legacy.path.exists()
+
+
+def test_create_review_checkout_replaces_a_pre_switch_checkout(tmp_path: Path) -> None:
+    """Creating on the relocated root tears down the ``pr-<N>`` checkout left
+    under ``reviews_dir`` by a pre-switch dispatch -- the legacy root cannot
+    linger once the move happened."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    reviews_dir = tmp_path / "reviews"
+    checkouts = tmp_path / "volume" / "repo" / "reviews"
+    head_sha = _git(repo_root, "rev-parse", "HEAD").stdout.strip()
+
+    legacy = create_review_checkout(repo_root, 5, head_sha, reviews_dir=reviews_dir)
+    moved = create_review_checkout(
+        repo_root,
+        5,
+        head_sha,
+        reviews_dir=reviews_dir,
+        review_checkouts=checkouts,
+        legacy_review_checkouts=reviews_dir,
+    )
+
+    assert moved.path == checkouts / "pr-5"
+    assert moved.path.exists()
+    assert not legacy.path.exists()

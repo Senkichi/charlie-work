@@ -46,7 +46,7 @@ from .paths import runtime_paths
 from .post_mortem import real_activity_for_worker
 from .process_utils import kill_orphan_pid, kill_process_tree
 from .safe_path import contains
-from .safe_ref import require_valid_ref_name, require_valid_rev, require_valid_sha
+from .safe_ref import require_valid_ref_name, require_valid_rev
 from .subprocess_runner import RunResult, command_failure_message, run_captured
 from . import state as _state
 from .worktree_archive import (
@@ -90,6 +90,11 @@ from .foreign_worktree import (  # noqa: F401  (deliberate re-export)
     read_worktree_marker,
     remove_worktree_marker,
     write_worktree_marker,
+)
+from .review_checkouts import (  # noqa: F401  (deliberate re-export)
+    create_review_checkout,
+    remove_review_checkout,
+    review_checkout_kwargs,
 )
 
 logger = logging.getLogger(__name__)
@@ -4316,115 +4321,6 @@ def _commit_exists_locally(repo_root: Path, sha: str) -> bool:
         timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
     )
     return result.ok
-
-
-def create_review_checkout(
-    repo_root: Path,
-    pr_number: int,
-    head_sha: str,
-    *,
-    reviews_dir: Path,
-) -> WorktreeInfo:
-    """Create an isolated, detached-HEAD checkout of a PR's head SHA for a
-    reviewer session.
-
-    This is the reviewer-side sibling of ``create_worktree``, but deliberately
-    NOT built on top of it: a reviewer must never share a worker's branch or
-    worktree path. Where ``create_worktree`` keys the checkout path by
-    branch-slug under ``worktrees_dir`` and (in ``rework``/``review`` mode)
-    attaches to the branch's live tip, this function keys the path by PR
-    number under a distinct ``reviews_dir`` and always checks out in detached
-    HEAD state at the exact ``head_sha``. That guarantees:
-
-    - The reviewer's checkout can never alias a worker's worktree directory,
-      even for the same branch (different parent dir, different key scheme).
-    - The reviewer never has a branch checked out, so nothing it does (or a
-      bug in a permissive command template) can land a commit on the PR's
-      real branch — the checkout is read-only in spirit even before the
-      caller's ``--permission-mode`` is applied.
-
-    Idempotent: if a checkout already exists at this PR's keyed path (e.g.
-    from a previous review round at a different head_sha), it is torn down
-    and recreated fresh rather than reused or fast-forwarded in place.
-
-    Raises ``ValueError`` if ``head_sha`` is empty (caller error — never a
-    transient condition). Raises ``RuntimeError`` if the fetch or worktree-add
-    fails.
-    """
-    if not head_sha:
-        raise ValueError(
-            f"create_review_checkout requires a non-empty head_sha for PR #{pr_number}"
-        )
-    # Validate head_sha format before it reaches git argv (issue #659).
-    # head_sha is passed as a plain positional to ``git fetch origin`` and
-    # ``git worktree add --detach``, so a flag-like value would be parsed as
-    # an option without this guard.
-    head_sha = require_valid_sha(head_sha, context="create_review_checkout head_sha")
-
-    target_dir = reviews_dir
-    target_dir.mkdir(parents=True, exist_ok=True)
-    checkout_path = target_dir / f"pr-{pr_number}"
-
-    # Tear down any stale checkout at this path first (idempotent replace) —
-    # never reuse/fast-forward a review checkout in place.
-    remove_review_checkout(repo_root, pr_number, reviews_dir=target_dir)
-
-    # Only fetch if an origin remote exists (mirrors create_worktree's own
-    # guard). Pure-local repos (test fixtures) have no origin to fetch from —
-    # the caller-supplied head_sha must already be reachable locally there.
-    # Skip the network round-trip entirely when the commit is already local.
-    if _has_origin_remote(repo_root) and not _commit_exists_locally(repo_root, head_sha):
-        fetch_result = _run_remote_captured(
-            ["git", "fetch", "origin", head_sha],
-            cwd=repo_root,
-        )
-        if not fetch_result.ok:
-            # Raw-SHA fetches are refused by the server when the SHA is not
-            # currently advertised (e.g. read just before a push updated the
-            # branch). The PR head ref is always advertised — fall back to it
-            # so a transient race doesn't block the review checkout; the
-            # worktree add below still pins the exact caller-supplied head_sha.
-            _run_remote_captured(
-                ["git", "fetch", "origin", f"refs/pull/{pr_number}/head"],
-                cwd=repo_root,
-            )
-            if not _commit_exists_locally(repo_root, head_sha):
-                raise RuntimeError(
-                    f"[git fetch origin {head_sha}] Failed to fetch head_sha {head_sha!r} "
-                    f"for PR #{pr_number} review checkout: "
-                    f"{fetch_result.error or fetch_result.stderr}"
-                )
-
-    result = run_captured(
-        ["git", "worktree", "add", "--detach", str(checkout_path), head_sha],
-        cwd=repo_root,
-        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
-    )
-    if not result.ok:
-        raise RuntimeError(
-            f"git worktree add --detach failed for PR #{pr_number} review checkout at "
-            f"{head_sha!r}: {result.error or result.stderr}"
-        )
-
-    return WorktreeInfo(path=checkout_path, branch=head_sha, venv_junction=None)
-
-
-def remove_review_checkout(repo_root: Path, pr_number: int, *, reviews_dir: Path) -> bool:
-    """Idempotent teardown of a PR's isolated review checkout.
-
-    Returns True if the checkout was removed or was already absent; never
-    raises. Safe to call speculatively (e.g. before creating a fresh checkout,
-    or during a stale-claim/completed-verdict sweep that isn't sure whether a
-    checkout exists for a given PR).
-    """
-    checkout_path = reviews_dir / f"pr-{pr_number}"
-
-    existing_worktrees = list_worktrees(repo_root)
-    is_registered = any(Path(wt["worktree"]) == checkout_path for wt in existing_worktrees)
-    if not is_registered and not checkout_path.exists():
-        return True
-
-    return remove_worktree(repo_root, checkout_path, force=True, branch=None)
 
 
 def inspect_worktree_state(

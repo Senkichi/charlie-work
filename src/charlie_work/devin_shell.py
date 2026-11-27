@@ -70,6 +70,7 @@ from .worktree import (
     remove_review_checkout,
     remove_worktree,
     apply_rework_conflict_notice,
+    review_checkout_kwargs,
     write_worktree_marker,
 )
 
@@ -249,6 +250,8 @@ def launch_devin_session(
     config: OrchestratorConfig | None = None,
     review: bool = False,
     head_sha: str = "",
+    review_checkouts: Path | None = None,
+    legacy_review_checkouts: Path | None = None,
 ) -> SessionRecord:
     """Launch a headless Devin CLI session for one issue and return immediately.
 
@@ -341,6 +344,7 @@ def launch_devin_session(
                 issue_number,
                 head_sha,
                 reviews_dir=sessions_dir,
+                **review_checkout_kwargs(sessions_dir, review_checkouts, legacy_review_checkouts),
             )
         else:
             worktree = create_worktree(
@@ -414,7 +418,12 @@ def launch_devin_session(
 
     def _teardown_worktree() -> None:
         if review:
-            remove_review_checkout(repo_root, issue_number, reviews_dir=sessions_dir)
+            remove_review_checkout(
+                repo_root,
+                issue_number,
+                reviews_dir=sessions_dir,
+                **review_checkout_kwargs(sessions_dir, review_checkouts, legacy_review_checkouts),
+            )
         elif worktree.foreign_adopted:
             # Issue #1476: the checkout belongs to whoever created it — a
             # launch failure must never delete a borrowed worktree. No

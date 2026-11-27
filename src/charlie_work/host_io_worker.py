@@ -95,6 +95,11 @@ def worktrees_root(io: WorkerIo, repo_root: Path) -> Path:
     return layout.worktrees_dir(io.worker_root / repo_root.name)
 
 
+def reviews_root(io: WorkerIo, repo_root: Path) -> Path:
+    """``<worker_root>/<repo name>/reviews`` -- the ``pr-<N>`` checkouts root."""
+    return io.worker_root / repo_root.name / layout.REVIEWS_DIRNAME
+
+
 def worker_env(io: WorkerIo | None) -> dict[str, str]:
     """The env layer for worker launches; operator ``worker_env`` is merged over it."""
     return {} if io is None else {"UV_CACHE_DIR": str(io.uv_cache)}

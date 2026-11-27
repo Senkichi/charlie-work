@@ -1,1 +1,4 @@
 1800
+# Issue #3224 rework: the threading shrank to a folded ``**kw`` call site
+# (live 1798) after the checkout family moved to review_checkouts.py;
+# mark returned to the prior level by refresh_file_size_ratchet.py.

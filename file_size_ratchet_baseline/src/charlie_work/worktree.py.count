@@ -1,4 +1,8 @@
 5800
+# Issue #3224 rework: the review-checkout family (create/remove_review_checkout,
+# review_checkout_kwargs, _review_checkout_path) was extracted to
+# review_checkouts.py behind a facade re-export; live count fell to 5682.
+# Lowered back to the prior mark by refresh_file_size_ratchet.py.
 # Issue #2195 / PR #2197 rework: the foreign-worktree adoption kwargs wiring grew
 # the live count to 5803, past the 5800 mark. Reviewed hand-raise to the next
 # MARK_QUANTUM multiple.
