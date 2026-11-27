@@ -41,6 +41,34 @@ def test_source_text_is_read_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert cache.source_text(path) == "x = 1\n"  # cached: no second read
 
 
+def test_key_resolution_is_memoized_per_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3221: ``_key`` resolves a path's containment key once per cache.
+
+    ``Path.resolve`` is a filesystem call (``realpath``), so running it on
+    every ``source_text``/``parsed`` call dominated the whole-tree scanners'
+    cost -- thousands of resolutions per scan. Memoize the key per input
+    path: a handful of calls must not re-resolve. Bounded by two because a
+    path and its resolved spelling are distinct memo keys.
+    """
+    monkeypatch.delenv(REUSE_ENV, raising=False)
+    path = _module(tmp_path)
+    cache = SourceCache((path.parent,))
+    calls: list[Path] = []
+    real_resolve = Path.resolve
+
+    def counting_resolve(self: Path, *args: object, **kwargs: object) -> Path:
+        calls.append(self)
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", counting_resolve)
+    for _ in range(3):
+        cache.source_text(path)
+        cache.parsed(path)
+    assert len(calls) <= 2
+
+
 def test_kill_switch_parses_on_every_call(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = _module(tmp_path)
     cache = SourceCache((path.parent,))

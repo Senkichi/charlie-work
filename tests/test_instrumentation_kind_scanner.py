@@ -56,6 +56,36 @@ def test_emit_kind_text_prefilter_finds_every_emit_spelling(tmp_path: Path) -> N
     assert not unresolved
 
 
+def test_emit_kind_text_prefilter_reads_each_file_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#3221: the emit-name prefilter asks the cache for each file's text once.
+
+    ``any(name in source_text(path) ...)`` fetched the same text once per emit
+    name -- five ``_key`` resolutions and five lookups for the common no-emit
+    file. Pin the filter to one read per file.
+    """
+    import _instrumentation_kind_scanner as scanner
+
+    (tmp_path / "plain.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "emit.py").write_text(
+        "def emit(state):\n    log_event(state, 'k', {})\n", encoding="utf-8"
+    )
+    calls: list[Path] = []
+    real_source_text = scanner.source_text
+
+    def counting(path: Path) -> str:
+        calls.append(path)
+        return real_source_text(path)
+
+    monkeypatch.setattr(scanner, "source_text", counting)
+    used, unresolved = scanner._scan_event_kinds(tmp_path)
+
+    assert used == {"k"}
+    assert not unresolved
+    assert len(calls) == len(set(calls)) == 2
+
+
 def test_sweep_append_kind_scan_flags_unresolvable_element_not_silently_dropped(
     tmp_path: Path,
 ) -> None:
