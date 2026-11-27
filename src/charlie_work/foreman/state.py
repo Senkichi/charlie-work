@@ -39,13 +39,17 @@ class ForemanState:
     """The cached runtime picture of one foreman (design §7).
 
     ``event_cursor`` is how far the hub's event stream this foreman has
-    consumed; ``lifecycle_fingerprint`` detects a charter/registry change that
+    consumed; ``inbox_cursor`` and ``signal_cursor`` are the same unread-since
+    cursor for ``inbox.jsonl`` and ``signals.jsonl`` (issue #3118);
+    ``lifecycle_fingerprint`` detects a charter/registry change that
     should reset the turn cycle; ``issues`` mirrors the authored-issue label
     state with each issue's body hash so edits are detected.
     """
 
     state: str = DEFAULT_STATE
     event_cursor: int = 0
+    inbox_cursor: int = 0
+    signal_cursor: int = 0
     lifecycle_fingerprint: str = ""
     turns_total: int = 0
     turns_today: int = 0
@@ -62,6 +66,8 @@ def _to_payload(state: ForemanState) -> dict[str, Any]:
         "version": state.version,
         "state": state.state,
         "event_cursor": state.event_cursor,
+        "inbox_cursor": state.inbox_cursor,
+        "signal_cursor": state.signal_cursor,
         "lifecycle_fingerprint": state.lifecycle_fingerprint,
         "turns_total": state.turns_total,
         "turns_today": state.turns_today,
@@ -111,6 +117,10 @@ def _from_payload(raw: Any) -> ForemanState:
     return ForemanState(
         state=state_value if state_value in FOREMAN_STATES else DEFAULT_STATE,
         event_cursor=raw.get("event_cursor") if isinstance(raw.get("event_cursor"), int) else 0,
+        inbox_cursor=raw.get("inbox_cursor") if isinstance(raw.get("inbox_cursor"), int) else 0,
+        signal_cursor=(
+            raw.get("signal_cursor") if isinstance(raw.get("signal_cursor"), int) else 0
+        ),
         lifecycle_fingerprint=(
             raw.get("lifecycle_fingerprint")
             if isinstance(raw.get("lifecycle_fingerprint"), str)

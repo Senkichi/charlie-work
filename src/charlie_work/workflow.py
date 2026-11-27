@@ -2070,6 +2070,24 @@ class OrchestratorApp:
         if use_cache and (cached := status_snapshot.read_status_snapshot(self)) is not None:
             return cached
         issues = self.gh.issue_list(self.config.labels.ready)
+        # Issue #3118 (ADR-0010): the status snapshot is the foreman layer's
+        # only issue source, and a foreman-owned issue is not always Ready —
+        # a filed-but-unarmed issue carries only its ``foreman:<name>``
+        # ownership label. Include every open issue carrying a
+        # foreman-prefix label in the snapshot's ``issues`` list so a
+        # foreman's Collect step sees its full owned set. The prefix comes
+        # from LabelConfig; the foreman package is deliberately never
+        # imported here (the import-direction test enforces that boundary).
+        foreman_prefix = self.config.labels.foreman_prefix
+        foreman_owned: list[dict[str, Any]] = []
+        if foreman_prefix:
+            ready_numbers = {issue.get("number") for issue in issues}
+            foreman_owned = [
+                issue
+                for issue in self.gh.issue_list()
+                if issue.get("number") not in ready_numbers
+                and any(name.startswith(foreman_prefix) for name in label_names(issue))
+            ]
         prs = self.gh.pr_list()
         state = load_state_locked(self.paths.state_file)
         operator_claimed = operator_claimed_issues(state)
@@ -2085,7 +2103,7 @@ class OrchestratorApp:
         # before the serial per-issue lookups below run. See
         # _prefetch_blocker_data's docstring and issue #870: this is what
         # turns O(N) serial `gh` calls into one parallel batch.
-        self._prefetch_blocker_data(issues)
+        self._prefetch_blocker_data(issues + foreman_owned)
 
         # Check for blocked issues (dependency gate)
         truly_available, blocked_issues, _open_blockers_by_issue = self._filter_blocked_issues(
@@ -2170,7 +2188,7 @@ class OrchestratorApp:
             "open_linked_pr_count": len(linked_prs),
             "state_file": str(self.paths.state_file),
             "auto_merge_enabled": self.config.auto_merge.enabled,
-            "issues": [self._summarize_issue(issue) for issue in issues],
+            "issues": [self._summarize_issue(issue) for issue in issues + foreman_owned],
             "prs": linked_prs,
             "unlinked_prs": unlinked_prs,
             "unlinked_pr_count": len(unlinked_prs),
