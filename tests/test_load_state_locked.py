@@ -46,6 +46,25 @@ _LOCK_CONTEXT_NAMES = frozenset({"state_lock", "advisory_file_lock"})
 _TOKEN_GATE_SKIP = frozenset({tokenize.NL, tokenize.COMMENT, tokenize.NEWLINE})
 
 
+def _fstring_hides_load_state(literal: str) -> bool:
+    """True when a STRING token is an f-string whose text names ``load_state``.
+
+    Pre-PEP-701 (Python <3.12) an f-string tokenizes as ONE STRING token,
+    so ``f"{load_state(p)}"`` emits neither the NAME nor the ``(`` the pair
+    check below needs -- yet ``ast`` still parses the interpolation as a
+    real ``Call`` the visitor would flag. Any f-prefixed literal containing
+    the name therefore keeps the file: doubt lands on the AST stage, which
+    parses interpolations and decides (a text-only ``f"load_state failed"``
+    mention is simply an extra ``parsed()`` call, never a bypass). On 3.12+
+    f-strings split into FSTRING_* tokens and the ordinary pair check fires
+    inside them, so an f-prefixed STRING token can only appear on <3.12.
+    """
+    prefix_end = 0
+    while prefix_end < len(literal) and literal[prefix_end].isalpha():
+        prefix_end += 1
+    return "f" in literal[:prefix_end].lower() and "load_state" in literal
+
+
 def _has_load_state_call_tokens(text: str) -> bool:
     """True when ``text`` tokenizes a ``load_state`` NAME that is called.
 
@@ -57,8 +76,14 @@ def _has_load_state_call_tokens(text: str) -> bool:
     so a ``)``-run after the NAME still counts when a ``(`` follows.
     ``load_state`` inside strings/comments or inside a longer identifier
     (``load_state_locked``, ``reload_state``) produces no matching NAME
-    token and is correctly skipped. A tokenize failure returns True so the
-    file falls through to the authoritative AST stage.
+    token and is correctly skipped -- except inside an f-string on
+    Python <3.12, where the whole literal is one STRING token that can
+    hide an interpolated call; ``_fstring_hides_load_state`` keeps those
+    files so the pair check cannot wave an f-string-interpolated call
+    past the lint. A tokenize failure returns True so the file falls
+    through to the authoritative AST stage -- including an ERRORTOKEN,
+    the anomaly a <3.12 tokenizer emits (instead of raising TokenError)
+    for an unterminated string.
     """
     try:
         tokens = tokenize.generate_tokens(io.StringIO(text).readline)
@@ -66,11 +91,15 @@ def _has_load_state_call_tokens(text: str) -> bool:
         for token in tokens:
             if token.type in _TOKEN_GATE_SKIP:
                 continue
+            if token.type == tokenize.ERRORTOKEN:
+                return True
             if saw_name and token.type == tokenize.OP and token.string in "()":
                 if token.string == "(":
                     return True
                 # A ``)``-run: ``(load_state)(args)`` -- keep watching.
                 continue
+            if token.type == tokenize.STRING and _fstring_hides_load_state(token.string):
+                return True
             saw_name = token.type == tokenize.NAME and token.string == "load_state"
     except (tokenize.TokenError, IndentationError, SyntaxError):
         return True
@@ -373,16 +402,27 @@ def test_load_state_token_gate_fails_closed() -> None:
 
     The corpus scan skips files ``_has_load_state_call_tokens`` clears, so a
     blind spot in the gate is a lint bypass the AST stage never sees. Pin the
-    flagged call spellings (bare, attribute, paren-wrapped, line-continued)
-    as kept, and non-call mentions as cleared. A tokenize failure must keep
-    the file -- gate doubt always lands on the AST side.
+    flagged call spellings (bare, attribute, paren-wrapped, line-continued,
+    f-string-interpolated) as kept, and non-call mentions as cleared. A
+    tokenize failure must keep the file -- gate doubt always lands on the
+    AST side.
     """
     assert _has_load_state_call_tokens("load_state(path)\n")
     assert _has_load_state_call_tokens("_state.load_state(path)\n")
     assert _has_load_state_call_tokens("(load_state)(path)\n")
     assert _has_load_state_call_tokens("x = f(load_state\n(path))\n")
     assert _has_load_state_call_tokens("await load_state(path)\n")
-    assert _has_load_state_call_tokens("x = 'unclosed\n")  # TokenError -> keep
+    # TokenError on 3.12+, ERRORTOKEN on <3.12 -- either way, keep.
+    assert _has_load_state_call_tokens("x = 'unclosed\n")
+
+    # An interpolated call must keep on EVERY supported interpreter: on
+    # <3.12 the f-string is one STRING token kept by
+    # ``_fstring_hides_load_state``; on 3.12+ PEP 701 splits it into
+    # FSTRING_* tokens and the NAME+``(`` pair fires. Both spellings,
+    # both prefix cases.
+    assert _has_load_state_call_tokens('x = f"{load_state(p)}"\n')
+    assert _has_load_state_call_tokens('x = f"{_state.load_state(p)}"\n')
+    assert _has_load_state_call_tokens("x = F'{load_state(p)}'\n")
 
     assert not _has_load_state_call_tokens("from .state import load_state\n")
     assert not _has_load_state_call_tokens("load_state_locked(path)\n")
@@ -390,6 +430,10 @@ def test_load_state_token_gate_fails_closed() -> None:
     assert not _has_load_state_call_tokens("load_state\n")
     assert not _has_load_state_call_tokens("# load_state(path)\n")
     assert not _has_load_state_call_tokens('"""load_state(path)"""\n')
+    # A plain string carrying the same text is still cleared -- the
+    # f-string keep is prefix-scoped, not a blanket STRING keep.
+    assert not _has_load_state_call_tokens('x = "load_state(p)"\n')
+    assert not _has_load_state_call_tokens("x = b'load_state(p)'\n")
 
 
 def test_load_state_lint_fails_closed_on_attribute_spelling() -> None:
