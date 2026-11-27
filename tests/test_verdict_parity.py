@@ -80,8 +80,56 @@ def _ids(scenarios: tuple[Scenario, ...]) -> list[str]:
     return [scenario.name for scenario in scenarios]
 
 
-def _scenario(name: str) -> Scenario:
-    return next(scenario for scenario in SCENARIOS if scenario.name == name)
+_BY_NAME = {scenario.name: scenario for scenario in SCENARIOS}
+
+# The scenario names each non-parametrized consumer drives. ``parity_outcomes``
+# reads parametrized consumers (``scenario`` / ``scenario_name``) from the
+# callspec; a consumer that names its scenarios only in its body needs them
+# here or its ``parity_outcomes[...]`` lookup reports a KeyError.
+_SCENARIO_DRIVE: dict[str, tuple[str, ...]] = {
+    "test_every_path_a_declared_difference_names_is_exercised": tuple(_BY_NAME),
+    "test_patch_id_follows_the_pinned_head_not_the_packet": (
+        "no_packet_pins_live_head",
+        "stale_head_operator_pins_live",
+        "stale_head_operator_pins_packet",
+    ),
+    "test_the_rescue_exemption_is_limited_to_its_scenario": (
+        "rework_at_cap_new_head_rescue_enabled",
+        "approve",
+    ),
+    "test_local_path_has_no_body_to_hash_so_no_reviewed_body_sha256": ("approve",),
+    "test_local_lifecycle_transition_omits_the_record_number_so_no_pr_drill_collision": (
+        "approve",
+    ),
+}
+
+
+@pytest.fixture
+def parity_outcomes(
+    request: pytest.FixtureRequest,
+) -> dict[str, tuple[dict[str, Any], dict[str, Any]]]:
+    """``run_both`` outcomes keyed by scenario name, computed in fixture setup.
+
+    ``run_both`` drives both Verdict entry points over a real scratch git repo
+    (~0.5 s per scenario on a ``_CACHE`` miss): input acquisition, not the
+    assertion under test. Paid inside ``call``, the cost lands on whichever
+    test a worker's per-process ``_CACHE`` misses the scenario for -- xdist
+    placement, not this repo's code -- which the test ledger reads as a
+    per-test regression (issue #3187). Charging the drive to setup makes every
+    consumer's ``call`` phase assertion-only; the cost itself stays visible in
+    the ledger's slow-fixtures section.
+    """
+    callspec = getattr(request.node, "callspec", None)
+    params = getattr(callspec, "params", {})
+    names: list[str] = []
+    scenario = params.get("scenario")
+    if isinstance(scenario, Scenario):
+        names.append(scenario.name)
+    scenario_name = params.get("scenario_name")
+    if scenario_name in _BY_NAME:
+        names.append(scenario_name)
+    names += _SCENARIO_DRIVE.get(request.node.name.split("[")[0], ())
+    return {name: _outcomes(_BY_NAME[name]) for name in dict.fromkeys(names)}
 
 
 # The issue's list, at minimum. Names below map to SCENARIOS entries.
@@ -144,10 +192,13 @@ def test_scenario_table_covers_the_issue_list() -> None:
 
 
 @pytest.mark.parametrize("scenario", SCENARIOS, ids=_ids(SCENARIOS))
-def test_scenario_does_what_it_names_on_both_entry_points(scenario: Scenario) -> None:
+def test_scenario_does_what_it_names_on_both_entry_points(
+    scenario: Scenario,
+    parity_outcomes: dict[str, tuple[dict[str, Any], dict[str, Any]]],
+) -> None:
     """Both outcomes meet the scenario's expectations (and each side its own pins), so a
     scenario cannot pass by both paths failing for some other reason."""
-    remote, local = _outcomes(scenario)
+    remote, local = parity_outcomes[scenario.name]
     for side, outcome, pins in (
         ("record_review", remote, scenario.expect + scenario.expect_remote),
         ("record_local_review", local, scenario.expect + scenario.expect_local),
@@ -159,8 +210,11 @@ def test_scenario_does_what_it_names_on_both_entry_points(scenario: Scenario) ->
 
 
 @pytest.mark.parametrize("scenario", SCENARIOS, ids=_ids(SCENARIOS))
-def test_both_entry_points_agree_except_where_declared(scenario: Scenario) -> None:
-    remote, local = _outcomes(scenario)
+def test_both_entry_points_agree_except_where_declared(
+    scenario: Scenario,
+    parity_outcomes: dict[str, tuple[dict[str, Any], dict[str, Any]]],
+) -> None:
+    remote, local = parity_outcomes[scenario.name]
     undeclared = _undeclared(_diffs(scenario.name, remote, local))
     assert not undeclared, (
         "record_review and record_local_review disagree on something DECLARED_DIFFERENCES "
@@ -169,10 +223,14 @@ def test_both_entry_points_agree_except_where_declared(scenario: Scenario) -> No
     )
 
 
-def test_every_path_a_declared_difference_names_is_exercised() -> None:
+def test_every_path_a_declared_difference_names_is_exercised(
+    parity_outcomes: dict[str, tuple[dict[str, Any], dict[str, Any]]],
+) -> None:
     """A named path nothing exempts is stale (or too narrow to ever fire)."""
     all_diffs = [
-        diff for scenario in SCENARIOS for diff in _diffs(scenario.name, *_outcomes(scenario))
+        diff
+        for scenario in SCENARIOS
+        for diff in _diffs(scenario.name, *parity_outcomes[scenario.name])
     ]
     for row in DECLARED_DIFFERENCES:
         hit = {row.path_hit(diff.path) for diff in all_diffs if row.matches(diff)}
@@ -190,25 +248,27 @@ def test_declared_differences_start_with_the_issues_eight_rows_verbatim() -> Non
     )
 
 
-def test_local_path_has_no_body_to_hash_so_no_reviewed_body_sha256(tmp_path) -> None:
+def test_local_path_has_no_body_to_hash_so_no_reviewed_body_sha256(
+    tmp_path, parity_outcomes: dict[str, tuple[dict[str, Any], dict[str, Any]]]
+) -> None:
     """Pins the reason on the `reviewed_body_sha256` declared difference: if the Local path
     ever gains a PR body, this fails and the difference must be revisited (issue #3105)."""
     gh = LocalFileGitHub(repo_root=tmp_path, issues_dir=tmp_path)
     assert gh.pr_view(1) == {}
     assert gh.pr_list() == []
     assert "body" not in local_pr_dict({"number": 1, "branch": "b", "headRefOid": "0" * 40})
-    local = _outcomes(_scenario("approve"))[1]
+    local = parity_outcomes["approve"][1]
     assert local.get("decision_file.reviewed_body_sha256", MISSING) is MISSING
     assert local.get("pr_record.reviewed_body_sha256", MISSING) is MISSING
 
 
 def test_local_lifecycle_transition_omits_the_record_number_so_no_pr_drill_collision(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, parity_outcomes: dict[str, tuple[dict[str, Any], dict[str, Any]]]
 ) -> None:
     """Pins the reason on the "Local lifecycle transitions omit the record number" declared
     difference (issue #3106). If a fact stops being true the difference must be revisited."""
     # The Local path's Verdict transition carries no number through the real entry point.
-    local = _outcomes(_scenario("approve"))[1]
+    local = parity_outcomes["approve"][1]
     assert local["events.lifecycle_transition#0.payload.pr_number"] is None
     # (i) a Local path record's number is its local issue file's number.
     assert issue_number_from_name("7_some-issue.md") == 7
@@ -233,13 +293,15 @@ def test_local_lifecycle_transition_omits_the_record_number_so_no_pr_drill_colli
     assert {e.issue for e in drill.timeline} == {5, 9}
 
 
-def test_patch_id_follows_the_pinned_head_not_the_packet() -> None:
+def test_patch_id_follows_the_pinned_head_not_the_packet(
+    parity_outcomes: dict[str, tuple[dict[str, Any], dict[str, Any]]],
+) -> None:
     """With a stale packet, pinning the live head takes the live diff's patch-id and pinning
     the packet head takes the packet's: the patch-id source is discriminated."""
     key = "decision_file.reviewed_patch_id"
-    live = _outcomes(_scenario("no_packet_pins_live_head"))
-    pinned_live = _outcomes(_scenario("stale_head_operator_pins_live"))
-    pinned_packet = _outcomes(_scenario("stale_head_operator_pins_packet"))
+    live = parity_outcomes["no_packet_pins_live_head"]
+    pinned_live = parity_outcomes["stale_head_operator_pins_live"]
+    pinned_packet = parity_outcomes["stale_head_operator_pins_packet"]
     for side in (0, 1):
         assert live[side][key] and live[side][key] == pinned_live[side][key]
         assert pinned_packet[side][key] != live[side][key]
@@ -265,11 +327,14 @@ def test_patch_id_follows_the_pinned_head_not_the_packet() -> None:
     ],
 )
 def test_a_change_on_one_side_only_is_reported(
-    scenario_name: str, path: str, changed: Any
+    scenario_name: str,
+    path: str,
+    changed: Any,
+    parity_outcomes: dict[str, tuple[dict[str, Any], dict[str, Any]]],
 ) -> None:
     """The comparison can fail: perturb one field of the Local outcome and it shows
     up as an undeclared difference (the normalisation hides nothing it checks)."""
-    remote, local = _outcomes(_scenario(scenario_name))
+    remote, local = parity_outcomes[scenario_name]
     assert _undeclared(_diffs(scenario_name, remote, local)) == []
     assert local.get(path, MISSING) != changed
     perturbed = {**local, path: changed}
@@ -311,13 +376,15 @@ def test_fresh_repo_hands_each_caller_its_own_tree() -> None:
 
 
 @pytest.mark.parametrize("path", ["issue.status", "labels.added", "events.order"])
-def test_the_rescue_exemption_is_limited_to_its_scenario(path: str) -> None:
+def test_the_rescue_exemption_is_limited_to_its_scenario(
+    path: str, parity_outcomes: dict[str, tuple[dict[str, Any], dict[str, Any]]]
+) -> None:
     """Rescue-tier values are exempt in the rescue scenario only, and only as the
     exact values pinned there."""
     scenario = "rework_at_cap_new_head_rescue_enabled"
-    remote, local = _outcomes(_scenario(scenario))
+    remote, local = parity_outcomes[scenario]
     assert _undeclared(_diffs(scenario, remote, local)) == []
     perturbed = {**local, path: "different"}
     assert [d.path for d in _undeclared(_diffs(scenario, remote, perturbed))] == [path]
-    remote, local = _outcomes(_scenario("approve"))
+    remote, local = parity_outcomes["approve"]
     assert [d.path for d in _undeclared(_diffs("approve", remote, {**local, path: "x"}))] == [path]
