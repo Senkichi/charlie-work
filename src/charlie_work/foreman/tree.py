@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ..subprocess_runner import run_captured
+from ..subprocess_runner import RunResult, run_captured
 from ..worktree import (
     _has_origin_remote,
     _resolve_default_branch_ref,
@@ -24,9 +24,14 @@ from ..worktree import (
     list_worktrees,
 )
 from . import Result
-from .paths import tree_path
+from .paths import done_check_path, tree_path
 
 _TIMEOUT_SECONDS = 60
+
+#: Bound on the whole ``done_when.check`` run (design §8.3: "with a
+#: timeout"). Operator-authored argv like a pytest shard can take minutes;
+#: ten minutes is generous for a check meant to answer "is the outcome met".
+DONE_CHECK_TIMEOUT_SECONDS = 600
 
 
 def _registered(tree: Path, repo_root: Path) -> bool:
@@ -81,6 +86,18 @@ def _live_default_ref(repo_root: Path) -> Result[str]:
     return Result(value=ref)
 
 
+def _remove_worktree(repo_root: Path, worktree: Path) -> str | None:
+    """``git worktree remove --force``; the failure detail or None on success."""
+    removed = run_captured(
+        ["git", "worktree", "remove", "--force", str(worktree)],
+        cwd=repo_root,
+        timeout_seconds=_TIMEOUT_SECONDS,
+    )
+    if not removed.ok or worktree.exists():
+        return removed.error or removed.stderr.strip() or "directory still present"
+    return None
+
+
 def ensure_tree(foreman_root: Path, repo_root: Path) -> Result[Path]:
     """Create ``tree/`` as a detached worktree at the default branch tip.
 
@@ -100,13 +117,8 @@ def ensure_tree(foreman_root: Path, repo_root: Path) -> Result[Path]:
     if _registered(tree, repo_root):
         return Result(value=tree)
     if tree.exists():
-        removed = run_captured(
-            ["git", "worktree", "remove", "--force", str(tree)],
-            cwd=repo_root,
-            timeout_seconds=_TIMEOUT_SECONDS,
-        )
-        if not removed.ok or tree.exists():
-            detail = removed.error or removed.stderr.strip() or "directory still present"
+        detail = _remove_worktree(repo_root, tree)
+        if detail is not None:
             return Result(
                 error=f"tree: stale directory at {tree} not removable by "
                 f"git worktree remove: {detail}"
@@ -150,3 +162,65 @@ def sync_tree(foreman_root: Path, repo_root: Path) -> Result[Path]:
             f"{checkout.error or checkout.stderr.strip()}"
         )
     return Result(value=tree)
+
+
+def _output_tail(result: RunResult, *, lines: int = 8) -> str:
+    """The last ``lines`` of a check's combined output — the briefing's tail."""
+    text = "\n".join(part for part in (result.stdout.strip(), result.stderr.strip()) if part)
+    return "\n".join(text.splitlines()[-lines:])
+
+
+def run_done_check(
+    foreman_root: Path,
+    repo_root: Path,
+    argv: tuple[str, ...],
+    *,
+    timeout_seconds: int = DONE_CHECK_TIMEOUT_SECONDS,
+) -> Result[RunResult]:
+    """Run the charter's ``done_when.check`` argv in a fresh detached worktree.
+
+    Design §8.3: operator-authored argv, a timeout, and a worktree created
+    and removed around the run — never the operator's own checkout and never
+    ``tree/``, which belongs to Decide. The value is the check's
+    ``RunResult``: ``.ok`` means done, anything else carries the output tail
+    for the next briefing. Worktree setup/teardown failures are error
+    values; a check that ran but left an unremovable worktree is an error
+    carrying the ``RunResult`` as the value.
+    """
+    try:
+        worktree = done_check_path(foreman_root)
+    except ValueError as exc:
+        return Result(error=str(exc))
+    resolved = _live_default_ref(repo_root)
+    if not resolved.ok:
+        return Result(error=resolved.error)
+    ref = resolved.value
+    if worktree.exists():
+        detail = _remove_worktree(repo_root, worktree)
+        if detail is not None:
+            return Result(
+                error=f"done_when.check: stale worktree at {worktree} not "
+                f"removable by git worktree remove: {detail}"
+            )
+    added = run_captured(
+        ["git", "worktree", "add", "--detach", str(worktree), ref],
+        cwd=repo_root,
+        timeout_seconds=_TIMEOUT_SECONDS,
+    )
+    if not added.ok:
+        return Result(
+            error=f"done_when.check: git worktree add failed: "
+            f"{added.error or added.stderr.strip()}"
+        )
+    removal: str | None = None
+    try:
+        result = run_captured(list(argv), cwd=worktree, timeout_seconds=timeout_seconds)
+    finally:
+        removal = _remove_worktree(repo_root, worktree)
+    if removal is not None:
+        return Result(
+            value=result,
+            error=f"done_when.check ran (rc={result.returncode}) but its "
+            f"worktree could not be removed: {removal}",
+        )
+    return Result(value=result)
