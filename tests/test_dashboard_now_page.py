@@ -60,13 +60,23 @@ def test_count_is_decisions_only_and_exceptions_leave_the_panel() -> None:
 def test_groups_render_in_decision_order() -> None:
     page = _page()
     tiles = re.findall(r'class="tile" id="tile-(\w+)" data-g="\w+" aria-pressed="(\w+)"', page)
-    assert tiles == [("verdicts", "true"), ("decisions", "false"), ("requeue", "false")]
+    assert tiles == [
+        ("verdicts", "true"),
+        ("decisions", "false"),
+        ("requeue", "false"),
+        ("foremen", "false"),
+    ]
     assert re.findall(r'<section class="grp" data-g="(\w+)"', page) == [
         "verdicts",
         "decisions",
         "requeue",
     ]
-    assert re.findall(r'<span class="num">(\d+)</span><span class="lbl">', page) == ["1", "1", "1"]
+    assert re.findall(r'<span class="num">(\d+)</span><span class="lbl">', page) == [
+        "1",
+        "1",
+        "1",
+        "0",
+    ]
     assert 'data-g="verdicts" aria-label="Verdicts" data-on="1"' in page  # active at first paint
     assert 'id="needs-list" data-active="verdicts" data-default="verdicts"' in page
 

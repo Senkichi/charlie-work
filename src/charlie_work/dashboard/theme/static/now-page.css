@@ -96,7 +96,7 @@ body.now .healthpop {
 .hero { display: flex; align-items: baseline; gap: 0.35em; }
 .hero .num { font-size: var(--n-hero); line-height: 0.9; color: var(--lj-warn); }
 .hero h2 { font-size: var(--n-h); }
-.tiles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
 body.now .tile { border: 1px solid var(--lj-hair); border-radius: 12px; padding: 0.7em 0.8em; display: flex; flex-direction: column; gap: 0.15em; }
 .tile .num { font-size: var(--n-num); line-height: 1; }
 .tile .lbl { font-weight: 600; }

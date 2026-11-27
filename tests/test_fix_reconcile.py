@@ -648,6 +648,11 @@ def test_valid_issue_statuses_covers_every_assigned_status_literal() -> None:
         # to the REST workflow-run key of the same name: a field-name mapping,
         # not an assigned workflow status.
         "status",
+        # Issue #3121: a foreman *item* status (foremen/*/items.json's
+        # open/snoozed/answered/dismissed domain) -- the dashboard's read side
+        # (now_read_foremen) decodes an absent/unknown item status to it, and it
+        # never lands on issues[n]["status"].
+        "open",
     }
 
     unclassified = found - VALID_ISSUE_STATUSES - pr_or_event_only

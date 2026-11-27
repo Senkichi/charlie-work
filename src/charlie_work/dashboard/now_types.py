@@ -51,6 +51,25 @@ class RepoRead:
 
 
 @dataclass(frozen=True)
+class ForemanItemRead:
+    """One open ``decision``/``permission`` item from a foreman's ``items.json``.
+
+    Decoded by ``now_read_foremen`` straight from the item file (ADR-0008 —
+    the dashboard reads only the files, never imports the foreman package).
+    ``repo`` in a needs-me row is the foreman's name, so the row reads
+    ``<foreman>`` rather than pretending the item is a fleet issue.
+    """
+
+    foreman: str
+    item_id: str
+    kind: str  # decision | permission
+    text: str  # the question (report items never reach this type)
+    command: str | None
+    recommended: int | None  # validated option index, else None
+    created_at: datetime | None
+
+
+@dataclass(frozen=True)
 class SourcesRead:
     """Everything ``build_now_model`` needs, already read (the model does no I/O)."""
 
@@ -74,6 +93,8 @@ class SourcesRead:
     # p90 of seconds between completed loop passes over the last 24h (pooled across repos);
     # None when too few passes were observed. Drives the stale threshold (see now_cadence).
     snapshot_gap_p90_seconds: float | None = None
+    # Open ``decision``/``permission`` items across every foreman (issue #3121).
+    foreman_items: tuple[ForemanItemRead, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -89,7 +110,7 @@ class RepoFreshness:
 class NeedsMeItem:
     """One exception-zone row: where, how old, why, and what to type."""
 
-    kind: str  # operator_queue | human_needed | alarm | stale_source | paused | supervisor
+    kind: str  # operator_queue | human_needed | alarm | stale_source | paused | supervisor | foreman_item
     severity: str  # anomaly | action | warn
     repo: str
     age_seconds: float | None
@@ -106,7 +127,13 @@ class NeedsMeItem:
 
 
 # Needs-me groups in display order, by the decision the operator makes.
-NEEDS_ME_GROUPS = ("Exceptions", "Awaiting your verdict", "Human needed", "Operator queue")
+NEEDS_ME_GROUPS = (
+    "Exceptions",
+    "Awaiting your verdict",
+    "Human needed",
+    "Operator queue",
+    "Foremen",
+)
 
 
 @dataclass(frozen=True)

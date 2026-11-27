@@ -289,22 +289,13 @@ def _ps_single_quote(value: str) -> str:
     return value.replace("'", "''")
 
 
-def _desktop_sink(config: Any, digest: AttentionDigest) -> NotifyResult:
-    """OS-native toast notification.
-
-    Severity-gates to genuine attention transitions (STALLED / RUNAWAY / DEAD / ERROR).
-    Benign flow-control events (e.g. SKIPPED) are silently dropped so they do not
-    spam the operator; they are still written to file/webhook sinks by emit_digest.
+def _send_desktop_toast(title: str, message: str) -> NotifyResult:
+    """Deliver one OS-native toast; the shared plumbing for both payload shapes.
 
     Windows: PowerShell with WinRT Windows.UI.Notifications projection, falling back to msg.exe.
     POSIX: notify-send if present, else ok=False.
     Never raises; all failures return NotifyResult(ok=False, error=...).
     """
-    rendered = _desktop_message(digest)
-    if rendered is None:
-        return NotifyResult(ok=True, error="no desktop-severity transitions")
-    title, message = rendered
-
     if os.name == "nt":
         # Windows: try PowerShell toast first, fall back to msg.exe
         try:
@@ -367,6 +358,21 @@ $notifier.Show($toast)
             return NotifyResult(ok=False, error=f"notify-send not found or failed: {e}")
 
     return NotifyResult(ok=False, error="desktop notification failed")
+
+
+def _desktop_sink(config: Any, digest: AttentionDigest) -> NotifyResult:
+    """OS-native toast notification.
+
+    Severity-gates to genuine attention transitions (STALLED / RUNAWAY / DEAD / ERROR).
+    Benign flow-control events (e.g. SKIPPED) are silently dropped so they do not
+    spam the operator; they are still written to file/webhook sinks by emit_digest.
+    Never raises; all failures return NotifyResult(ok=False, error=...).
+    """
+    rendered = _desktop_message(digest)
+    if rendered is None:
+        return NotifyResult(ok=True, error="no desktop-severity transitions")
+    title, message = rendered
+    return _send_desktop_toast(title, message)
 
 
 def _shell_sink(config: Any, digest: AttentionDigest) -> NotifyResult:
@@ -484,5 +490,127 @@ def emit_digest(config: Any, digest: AttentionDigest) -> NotifyResult:
         return _shell_sink(config, digest)
     elif sink == "file":
         return _file_sink(config, digest)
+    else:
+        return NotifyResult(ok=False, error=f"unknown sink: {sink}")
+
+
+@dataclass(frozen=True)
+class NotifyMessage:
+    """The generic notification payload (issue #3121): title, body, optional command.
+
+    Beside ``AttentionDigest`` this is the second shape a sink must carry —
+    anything an operator needs to see that is not a worker-health transition
+    (a foreman's item, for example). ``command`` is the copy-paste remedy when
+    one exists.
+    """
+
+    title: str
+    body: str
+    command: str | None = None
+
+
+def _message_fields(message: NotifyMessage) -> dict[str, Any]:
+    return {"title": message.title, "body": message.body, "command": message.command}
+
+
+def _webhook_message_sink(config: Any, message: NotifyMessage) -> NotifyResult:
+    """POST the message as JSON to the webhook URL (same transport as the digest)."""
+    if not config.webhook_url:
+        return NotifyResult(ok=False, error="webhook_url is empty")
+
+    try:
+        payload = json.dumps(_message_fields(message)).encode("utf-8")
+        request = urllib.request.Request(
+            config.webhook_url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            if 200 <= response.status < 300:
+                return NotifyResult(ok=True)
+            else:
+                return NotifyResult(ok=False, error=f"webhook returned status {response.status}")
+    except urllib.error.URLError as e:
+        return NotifyResult(ok=False, error=f"webhook URL error: {e}")
+    except (OSError, TimeoutError) as e:
+        return NotifyResult(ok=False, error=f"webhook request failed: {e}")
+    except Exception as e:
+        return NotifyResult(ok=False, error=f"webhook unexpected error: {e}")
+
+
+def _desktop_message_sink(config: Any, message: NotifyMessage) -> NotifyResult:
+    """Toast the message; the optional command rides in the toast body."""
+    body = message.body
+    if message.command:
+        body = f"{body}\n{message.command}" if body else message.command
+    return _send_desktop_toast(f"charlie-work: {message.title}", body)
+
+
+def _shell_message_sink(config: Any, message: NotifyMessage) -> NotifyResult:
+    """Run the shell command with the message JSON appended as the final argument."""
+    if not config.shell_command:
+        return NotifyResult(ok=False, error="shell_command is empty")
+
+    try:
+        command = config.shell_command + (json.dumps(_message_fields(message)),)
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            **no_console_window_kwargs(),
+        )
+        if result.returncode == 0:
+            return NotifyResult(ok=True)
+        else:
+            return NotifyResult(
+                ok=False,
+                error=f"shell command exited with code {result.returncode}: {result.stderr[:200] if result.stderr else ''}",
+            )
+    except (subprocess.SubprocessError, TimeoutError, OSError) as e:
+        return NotifyResult(ok=False, error=f"shell command failed: {e}")
+    except Exception as e:
+        return NotifyResult(ok=False, error=f"shell unexpected error: {e}")
+
+
+def _file_message_sink(config: Any, message: NotifyMessage) -> NotifyResult:
+    """Append the message as one JSONL line to the file sink."""
+    if not config.file_path:
+        return NotifyResult(ok=False, error="file_path is empty")
+
+    try:
+        file_path = Path(config.file_path)
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        with file_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(_message_fields(message)) + "\n")
+        return NotifyResult(ok=True)
+    except (OSError, IOError) as e:
+        return NotifyResult(ok=False, error=f"file write failed: {e}")
+    except Exception as e:
+        return NotifyResult(ok=False, error=f"file unexpected error: {e}")
+
+
+def emit_message(config: Any, message: NotifyMessage) -> NotifyResult:
+    """Emit a generic message to the configured sink (issue #3121).
+
+    Same contract as ``emit_digest``: the configured sink is chosen by
+    ``config.sink``, a disabled notify layer is a quiet no-op, and every sink
+    failure comes back as a ``NotifyResult`` value — never raised.
+    """
+    if not config.enabled:
+        return NotifyResult(ok=True, error="notify disabled")
+
+    sink = config.sink.lower()
+
+    if sink == "webhook":
+        return _webhook_message_sink(config, message)
+    elif sink == "desktop":
+        return _desktop_message_sink(config, message)
+    elif sink == "shell":
+        return _shell_message_sink(config, message)
+    elif sink == "file":
+        return _file_message_sink(config, message)
     else:
         return NotifyResult(ok=False, error=f"unknown sink: {sink}")
