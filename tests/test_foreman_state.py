@@ -9,7 +9,7 @@ from charlie_work.foreman import paths
 from charlie_work.foreman.state import (
     AuthoredIssue,
     ForemanState,
-    load_state,
+    read_state_snapshot,
     save_state,
     with_updates,
 )
@@ -22,15 +22,22 @@ def _foreman(tmp_path: Path) -> Path:
 
 
 def test_missing_state_reads_as_paused_defaults(tmp_path: Path) -> None:
-    state = load_state(_foreman(tmp_path))
+    state = read_state_snapshot(_foreman(tmp_path))
     assert state == ForemanState()
     assert state.state == "paused"
 
 
 def test_corrupt_state_reads_as_defaults(tmp_path: Path) -> None:
     fdir = _foreman(tmp_path)
-    (fdir / "state.json").write_text("{not json", encoding="utf-8")
-    assert load_state(fdir) == ForemanState()
+    state_file = fdir / "state.json"
+    state_file.write_text("{not json", encoding="utf-8")
+    assert read_state_snapshot(fdir) == ForemanState()
+    # The read must never mutate: a corrupt cache is left byte-identical on
+    # disk — no quarantine rename, no rewrite — so a racing atomic replace can
+    # never be turned into the issue #310 hazard. This is the property that
+    # makes read_state_snapshot the sanctioned unlocked reader (issue #3141).
+    assert state_file.read_text(encoding="utf-8") == "{not json"
+    assert list(fdir.iterdir()) == [state_file]
 
 
 def test_state_round_trip(tmp_path: Path) -> None:
@@ -50,7 +57,7 @@ def test_state_round_trip(tmp_path: Path) -> None:
     )
     saved = save_state(fdir, original)
     assert saved.ok, saved.error
-    assert load_state(fdir) == original
+    assert read_state_snapshot(fdir) == original
 
 
 def test_unknown_state_value_falls_back_to_paused(tmp_path: Path) -> None:
@@ -58,7 +65,7 @@ def test_unknown_state_value_falls_back_to_paused(tmp_path: Path) -> None:
     (fdir / "state.json").write_text(
         json.dumps({"state": "transcended", "turns_total": 3}), encoding="utf-8"
     )
-    state = load_state(fdir)
+    state = read_state_snapshot(fdir)
     assert state.state == "paused"
     assert state.turns_total == 3  # salvageable fields still load
 
@@ -71,12 +78,12 @@ def test_save_rejects_unknown_state(tmp_path: Path) -> None:
 
 def test_with_updates_returns_new_value(tmp_path: Path) -> None:
     fdir = _foreman(tmp_path)
-    original = load_state(fdir)
+    original = read_state_snapshot(fdir)
     updated = with_updates(original, state="active", turns_total=1)
     assert original.state == "paused"  # never mutated in place
     assert updated.state == "active"
     save_state(fdir, updated)
-    assert load_state(fdir).state == "active"
+    assert read_state_snapshot(fdir).state == "active"
 
 
 def test_issues_round_trip_and_salvage(tmp_path: Path) -> None:
@@ -94,5 +101,5 @@ def test_issues_round_trip_and_salvage(tmp_path: Path) -> None:
         ),
         encoding="utf-8",
     )
-    state = load_state(fdir)
+    state = read_state_snapshot(fdir)
     assert state.issues == {3090: AuthoredIssue(number=3090, body_hash="h1")}

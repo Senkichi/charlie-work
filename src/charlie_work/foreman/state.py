@@ -137,11 +137,16 @@ def _from_payload(raw: Any) -> ForemanState:
     )
 
 
-def load_state(foreman_root: Path) -> ForemanState:
-    """Load ``state.json``, tolerating a missing or corrupt file.
+def read_state_snapshot(foreman_root: Path) -> ForemanState:
+    """Lock-free, non-mutating read of ``state.json`` — the foreman-layer
+    analogue of ``charlie_work.state.read_state_snapshot`` (issue #3141).
 
-    Returns the default paused state for anything unreadable — the cache can
-    always be rebuilt from GitHub labels and the append-only logs.
+    Safe unlocked: it never quarantines, renames, or writes anything, so a
+    racing atomic replace cannot be misread into mutating a healthy file.
+    The failure contract differs from the hub's reader by design: anything
+    unreadable returns the default paused state instead of ``None``, because
+    this file is a *cache* — it can always be rebuilt from GitHub labels and
+    the append-only logs.
     """
     try:
         path = state_path(foreman_root)

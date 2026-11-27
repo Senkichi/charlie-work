@@ -78,7 +78,7 @@ def _gang_list(
     lines: list[str] = []
     data: list[dict[str, Any]] = []
     for name, fdir in foremen:
-        state = fstate.load_state(fdir)
+        state = fstate.read_state_snapshot(fdir)
         open_count = len(fitems.open_items(fitems.load_items(fdir)))
         entry: dict[str, Any] = {
             "name": name,
@@ -112,7 +112,7 @@ def _gang_show(
     if not resolved.ok:
         return CommandResult(False, f"gang show: {resolved.error}", {})
     fdir = resolved.value
-    state = fstate.load_state(fdir)
+    state = fstate.read_state_snapshot(fdir)
     chartered = fcharter.load_charter(fdir, registered_repos=store.registered_repo_keys(fleet))
     open_list = fitems.open_items(fitems.load_items(fdir))
     data: dict[str, Any] = {
