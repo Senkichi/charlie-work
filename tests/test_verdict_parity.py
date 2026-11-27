@@ -35,8 +35,10 @@ too, so the list can neither hide a new drift nor go stale.
 
 from __future__ import annotations
 
+import ast
 import subprocess
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from unittest import mock
 
@@ -59,6 +61,7 @@ from _verdict_parity_driver import (
     _diffs,
     _fresh_repo,
     _repo_template,
+    _Repo,
     run_both,
     warm_repo_template,
 )
@@ -368,7 +371,7 @@ def test_fresh_repo_materializes_without_git_spawns() -> None:
     assert popen.call_count == 0, "the copy phase spawned instead of copying the template"
 
 
-def test_fresh_repo_hands_each_caller_its_own_tree() -> None:
+def test_fresh_repo_hands_each_caller_its_own_tree(repo_template: _Repo) -> None:
     """Issue #3150 pin: the isolation half of the template-copy contract. The Local
     path writes into ``repo.root`` (issue files, ``.var`` state, ``ci-fleet.toml``),
     so ``_fresh_repo`` must hand every caller its own tree and keep the
@@ -377,14 +380,92 @@ def test_fresh_repo_hands_each_caller_its_own_tree() -> None:
     ``CI_FLEET_TEST_REUSE=off`` too, so unlike the spawn pin this is not skipped."""
     first = _fresh_repo()
     second = _fresh_repo()
-    template = _repo_template()
-    assert first.root != template.root, "_fresh_repo returned the template itself"
-    assert second.root != template.root, "_fresh_repo returned the template itself"
+    assert first.root != repo_template.root, "_fresh_repo returned the template itself"
+    assert second.root != repo_template.root, "_fresh_repo returned the template itself"
     assert first.root != second.root, "two calls share one tree"
     sentinel = first.root / "written-into-first-copy-only"
     sentinel.write_text("x", encoding="utf-8")
     assert not (second.root / sentinel.name).exists(), "a write into one copy reached another"
-    assert not (template.root / sentinel.name).exists(), "a write into a copy reached the template"
+    assert not (repo_template.root / sentinel.name).exists(), (
+        "a write into a copy reached the template"
+    )
+
+
+@pytest.fixture
+def repo_template() -> _Repo:
+    """The process repo template, read during fixture setup.
+
+    Under ``CI_FLEET_TEST_REUSE=off`` ``_repo_template`` IS ``_make_repo`` -- a
+    fresh ~0.5 s build per call -- and a test-body read charges that to
+    ``call`` (the issue-#3190 mechanism the ledger measures). The fresh-repo
+    pins compare copies against the template, so they take it through this
+    fixture.
+    """
+    return _repo_template()
+
+
+# Fixture-side functions: the only places an expensive drive may run. Any other
+# function (or a module-level statement) that calls one re-charges the ~0.5 s
+# drive to that test's ``call`` phase, which the test ledger reads as a
+# per-test regression.
+_DRIVE_FIXTURE_SIDE = frozenset(
+    {"parity_outcomes", "_outcomes", "_warm_repo_template", "repo_template"}
+)
+
+
+def test_the_drives_stay_in_fixture_setup() -> None:
+    """Ledger pin (issues #3187, #3188, #3189, #3190): this module's expensive
+    drives may only run during fixture ``setup``, never in a test's ``call``
+    phase.
+
+    The two drive classes are the outcome drive -- ``run_both``/``_outcomes``,
+    ~0.5 s per scenario on a ``_CACHE`` miss -- and the repo-template build --
+    ``_repo_template``/``_make_repo``/``warm_repo_template``, ~0.5 s cold and
+    per-call under ``CI_FLEET_TEST_REUSE=off``. Four ledger filings on this
+    file (one per param of the parametrized parity tests) each traced to a
+    drive running inside a test body. ``_fresh_repo`` is deliberately not a
+    drive: post-warm it is the cheap ``copytree`` the fresh-repo pins
+    exercise in their bodies by design. A new consumer must take the
+    ``parity_outcomes`` or ``repo_template`` fixture -- naming itself in
+    ``_SCENARIO_DRIVE`` when it is not parametrized by ``scenario`` /
+    ``scenario_name`` -- rather than calling a drive in its body.
+    """
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    drive_names = frozenset(
+        {"run_both", "_outcomes", "_repo_template", "_make_repo", "warm_repo_template"}
+    )
+
+    def drive_calls(node: ast.AST) -> list[int]:
+        return [
+            sub.lineno
+            for sub in ast.walk(node)
+            if isinstance(sub, ast.Call)
+            and isinstance(sub.func, ast.Name)
+            and sub.func.id in drive_names
+        ]
+
+    callers = {
+        node.name: drive_calls(node)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    module_level = [
+        line
+        for node in tree.body
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        for line in drive_calls(node)
+    ]
+    offenders = {
+        name: lines for name, lines in callers.items() if lines and name not in _DRIVE_FIXTURE_SIDE
+    }
+    assert not offenders and not module_level, (
+        "a test-body drive re-opens the call-phase ledger regression -- take the "
+        "parity_outcomes or repo_template fixture instead: "
+        f"{offenders} module-level lines {module_level}"
+    )
+    # Positive control: the sanctioned call sites are still where the scan
+    # expects them, so a broken scan cannot pass vacuously.
+    assert {name for name, lines in callers.items() if lines} == set(_DRIVE_FIXTURE_SIDE)
 
 
 @pytest.mark.parametrize("path", ["issue.status", "labels.added", "events.order"])
