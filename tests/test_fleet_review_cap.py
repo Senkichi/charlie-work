@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -330,17 +331,36 @@ def test_knob_is_read_per_pass_without_restart(tmp_path: Path, launches: list[in
     assert uncapped.dispatch_reviews().data["launched_count"] == 3
 
 
-def test_lock_held_defers_with_event_and_launches_nothing(
-    tmp_path: Path, launches: list[int]
-) -> None:
+@pytest.fixture
+def _locked_review_app(tmp_path: Path) -> Iterator[OrchestratorApp]:
+    """Repo-``b`` app dispatching behind an already-held fleet lock.
+
+    Arrange work lives in setup because the ledger samples only the call
+    phase (issue #3213): app construction (``paths.ensure``'s mkdir chain +
+    ``check_prompt_template_drift``), the lock acquisition, and -- the
+    single largest cost -- the cold ``events.db`` open the deferred event's
+    ``log_event`` would otherwise pay inside the call (WAL + schema +
+    migrations per fresh state file; the ``query_events`` below pre-caches
+    the ``_get_db`` connection for this ``state_file``).
+    """
     fleet_dir = tmp_path / "fleet"
     app = _review_app(tmp_path, fleet_dir=fleet_dir, fleet_cap=5)
     held = try_acquire_fleet_lock(str(fleet_dir))
     assert held is not None
+    # Pre-open events.db for this state file; the deferred event's write in
+    # the call phase then hits the cached connection.
+    query_events(app.paths.state_file)
     try:
-        result = app.dispatch_reviews()
+        yield app
     finally:
         held.release()
+
+
+def test_lock_held_defers_with_event_and_launches_nothing(
+    _locked_review_app: OrchestratorApp, launches: list[int]
+) -> None:
+    app = _locked_review_app
+    result = app.dispatch_reviews()
 
     assert result.ok is True
     assert result.data["deferred_reason"] == "fleet_lock_held"
