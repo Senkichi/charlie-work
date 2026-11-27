@@ -20,10 +20,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Sequence
 
-from . import markdown_fence, markdown_guard
+from . import markdown_fence, markdown_guard, verdict_log_extraction
 from .claude_code import extract_event_text, iter_stream_json_events, parse_claude_events
 from .config import OrchestratorConfig
-from .throttle_signatures import match_throttle_tail
 
 # Sentinel value for the terminating-cause dict when no signal could be
 # captured at all (issue #1354). The ``cause`` key inside the dict is the
@@ -220,9 +219,7 @@ def _parse_review_verdict_from_log(log_path: Path) -> dict[str, Any] | None:
     except OSError:
         return None
 
-    from .verdict_log_extraction import extract_verdict_from_log_text
-
-    return extract_verdict_from_log_text(log_text)
+    return verdict_log_extraction.extract_verdict_from_log_text(log_text)
 
 
 def _session_mtime_cutoff(started_at: str | None) -> datetime | None:
@@ -429,9 +426,10 @@ REVIEW_MISS_DIED_MID_SESSION = "died_mid_session"
 # Default markers for _extract_review_session_summary's session-limit
 # reclassification (issue #651/#652). These are the NARROW
 # RuntimeConfig.session_limit_markers, NOT the broad throttle_error_markers:
-# reviewer launches force tee_stream_json=True (claude_code.py), making
-# log_path and events_path byte-identical, so any marker matched against the
-# log tail is also present in the parsed assistant text. The generic markers
+# a claude-code reviewer launches with tee_stream_json=True (claude_code.py),
+# making log_path and events_path byte-identical, so any marker matched
+# against the log tail is also present in the parsed assistant text. The
+# generic markers
 # in throttle_error_markers ("rate limit", "usage limit") legitimately appear
 # in this codebase's rate-limit/quota domain review commentary and would
 # false-positive on real review work. session_limit_markers contains only the
@@ -439,46 +437,6 @@ REVIEW_MISS_DIED_MID_SESSION = "died_mid_session"
 # match against reviewer text. Callers pass their config's list explicitly so
 # a new session-limit phrasing only needs a config change.
 _DEFAULT_REVIEW_SESSION_LIMIT_MARKERS = OrchestratorConfig().runtime.session_limit_markers
-
-# Tail length for the raw-log session-limit match in _extract_review_session_summary.
-# Mirrors the 2048-char tail used by the stalled-session sweep (the
-# ``log_text[-2048:]`` slice at the ``Path(w.log_path).read_text(...)`` call in
-# _handle_stalled_review_sessions): the CLI prints its session-limit notice at
-# the very end of the log, so the tail isolates the death message from the
-# multi-turn analysis prose earlier in the log.
-_REVIEW_THROTTLE_TAIL_CHARS = 2048
-
-
-def _log_tail_throttled(log_path: Path, markers: Sequence[str]) -> bool:
-    """Return True when the raw process log's tail contains a session-limit marker.
-
-    Reads the last ``_REVIEW_THROTTLE_TAIL_CHARS`` chars of ``log_path`` and
-    matches against ``markers`` via ``match_throttle_tail``. This is the same
-    raw-log-tail boundary the stalled-session sweep uses (the
-    ``log_text[-2048:]`` slice at the ``Path(w.log_path).read_text(...)`` call
-    in ``_handle_stalled_review_sessions``). Missing or unreadable logs do not
-    match.
-
-    Note (issue #652 review): because reviewer launches force
-    ``tee_stream_json=True``, ``log_path`` and ``events_path`` are
-    byte-identical — the raw log tail IS the events content, so matching
-    against the raw tail does NOT avoid matching the reviewer's own parsed
-    assistant text. The false-positive protection comes from the NARROW
-    ``session_limit_markers`` list (specific CLI death-message phrasing, not
-    generic domain terms), not from the raw-vs-parsed distinction. The
-    ``tool_call_count == 0`` guard in the caller is defense-in-depth.
-    """
-    try:
-        log_text = log_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return False
-    if not log_text:
-        return False
-    if len(log_text) > _REVIEW_THROTTLE_TAIL_CHARS:
-        tail = log_text[-_REVIEW_THROTTLE_TAIL_CHARS:]
-    else:
-        tail = log_text
-    return match_throttle_tail(tail, markers)[0]
 
 
 @dataclass(frozen=True)
@@ -632,9 +590,8 @@ def _extract_terminating_cause(
 
     The ``events_path`` is the structured ``.events.jsonl`` sidecar; the
     ``log_path`` is the raw process log (byte-identical to ``events_path``
-    when ``tee_stream_json=True``, which reviewer launches force). Both are
-    tried so the function works whether the caller has the events sidecar,
-    the raw log, or both.
+    for a tee'd claude-code launch). Both are tried so the function works
+    whether the caller has the events sidecar, the raw log, or both.
     """
     cause: dict[str, Any] = {}
 
@@ -718,6 +675,8 @@ def _extract_review_session_summary(
     max_turns: int,
     *,
     session_limit_markers: Sequence[str] | None = None,
+    throttle_error_markers: Sequence[str] | None = None,
+    quota_error_markers: Sequence[str] | None = None,
     exit_code: int | None = None,
 ) -> ReviewSessionOutcome | None:
     """Summarize and classify a reviewer session that produced no verdict.
@@ -768,7 +727,9 @@ def _extract_review_session_summary(
     ``RuntimeConfig.session_limit_markers`` so the marker list stays
     config-driven (single point of enforcement in
     ``throttle_signatures.match_throttle_tail``); callers pass their config's
-    list explicitly.
+    list explicitly. ``throttle_error_markers``/``quota_error_markers`` default
+    to the ``RuntimeConfig`` sets and feed only the ``provider_error_digest``
+    leg, where broad markers are safe (``_log_died_on_provider_error``).
 
     Returns ``None`` if the events file is missing and the log contains no
     recoverable text (nothing to summarize).
@@ -787,18 +748,28 @@ def _extract_review_session_summary(
             if text.strip():
                 assistant_texts.append(text.strip())
 
-    # Fallback: if no events.jsonl, try the log. When it is a stream-json
-    # tee, decode the events; otherwise keep the remaining prose lines with
-    # fenced code blocks stripped (those are verdict attempts, not analysis).
+    # Fallback: if no events.jsonl, try the log. recover_review_log_texts
+    # decodes stream-json tees AND opencode --format json logs (the cli_pins
+    # path never tees); the prose fallback strips fenced blocks. Call sites
+    # go through the module attribute (not a from-import) so the
+    # verdict_log_extraction monkeypatch seam stays live -- the modules are
+    # mutually dependent, and a top-level from-import here would bind the
+    # partially-initialized module's attributes (ImportError/AttributeError
+    # in one import order) instead of resolving them at call time.
+    oc_progress = None
     if not assistant_texts:
         try:
             log_text = log_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             log_text = ""
-        for event in iter_stream_json_events(log_text):
-            text = extract_event_text(event)
-            if text.strip():
-                assistant_texts.append(text.strip())
+        recovered, oc_progress = verdict_log_extraction.recover_review_log_texts(log_text)
+        assistant_texts.extend(recovered)
+        if not assistant_texts and oc_progress is not None:
+            # Recognized opencode JSONL with no assistant text or error event
+            # (killed mid-tool-call, for example): the raw-prose fallback
+            # must NOT run -- the log's non-event lines would be raw JSONL,
+            # dumped verbatim into the PR comment.
+            assistant_texts.append("(the session produced no assistant text before it ended)")
         if not assistant_texts:
             stripped = _strip_fenced_blocks(log_text)
             for line in stripped.splitlines():
@@ -809,8 +780,9 @@ def _extract_review_session_summary(
     if not assistant_texts:
         return None
 
-    turn_count = progress.turn_count if progress else 0
-    tool_call_count = progress.tool_call_count if progress else 0
+    metrics = progress or oc_progress
+    turn_count = metrics.turn_count if metrics else 0
+    tool_call_count = metrics.tool_call_count if metrics else 0
     tokens = progress.tokens if progress else None
     cost_usd = progress.cost_usd if progress else None
 
@@ -823,43 +795,56 @@ def _extract_review_session_summary(
     # A session with no turns and no tool calls never reached its first turn:
     # the process died at launch and whatever text we recovered is its error
     # output, not reviewer analysis.
+    throttle_markers = (
+        throttle_error_markers
+        if throttle_error_markers is not None
+        else verdict_log_extraction._default_review_throttle_error_markers()
+    )
+    quota_markers = (
+        quota_error_markers
+        if quota_error_markers is not None
+        else verdict_log_extraction._default_review_quota_error_markers()
+    )
+
     if turn_count == 0 and tool_call_count == 0:
         reason = REVIEW_MISS_LAUNCH_FAILED
+    elif (
+        tool_call_count == 0
+        and oc_progress is not None
+        and verdict_log_extraction._log_died_on_provider_error(
+            log_path, throttle_markers, quota_markers
+        )
+    ):
+        # An opencode reviewer with no tool calls that died on a provider
+        # throttle/quota error did no review work: environmental, not
+        # PR-level. Broad markers are safe because provider_error_digest
+        # strips every non-error record (#652's boundary). This branch sits
+        # BEFORE the turn-limit branch -- unlike the unchanged raw-tail guard
+        # below -- so a one-turn cap cannot relabel an output-less provider
+        # death as ``turn_limit_summary_posted`` and defeat #583's rollback
+        # guard. Its ``oc_progress`` gate is a type guard, redundant by
+        # construction: a non-empty digest implies a session_progress value.
+        reason = REVIEW_MISS_LAUNCH_FAILED
     elif max_turns > 0 and turn_count >= max_turns:
+        # Pre-existing precedence, deliberately NOT reordered with the digest
+        # branch above: a capped claude-code session keeps classifying here.
         reason = REVIEW_MISS_TURN_LIMIT
-    elif tool_call_count == 0 and _log_tail_throttled(log_path, markers):
-        # A session that made no tool calls but whose raw process log tail
-        # contains a provider session-limit notice (e.g. "hit your session
-        # limit") died on the notice, not after review work. The notice
-        # gets counted as one turn by parse_claude_events, so it fails the
-        # turn_count == 0 check above and would fall through to
-        # REVIEW_MISS_DIED_MID_SESSION -- the same bucket as a session that
-        # genuinely did substantial review work. That misclassification silently
-        # defeats the #583 throttle-rollback guard (did_substantial_work reads
-        # reason != REVIEW_MISS_LAUNCH_FAILED and is persisted as
-        # review_turn_limit_summary_posted), letting a global session-limit
-        # outage burn a PR's attempt budget with zero review work performed
+    elif tool_call_count == 0 and verdict_log_extraction._log_tail_throttled(log_path, markers):
+        # A session with no tool calls whose raw log tail carries a provider
+        # session-limit notice died on the notice, not after review work. The
+        # notice counts as one turn, so it fails the 0/0 check above and would
+        # otherwise land in died_mid_session -- silently defeating the #583
+        # rollback guard and burning the PR's budget during a global outage
         # (issue #651).
         #
-        # Two boundaries make this safe (issue #652 review):
-        # (1) Match only the NARROW session_limit_markers (specific CLI
-        #     death-message phrasing like "hit your session limit"), NOT the
-        #     broad throttle_error_markers. Reviewer launches force
-        #     tee_stream_json=True, so log_path and events_path are
-        #     byte-identical -- the raw log tail IS the events content, so
-        #     matching the raw tail does not avoid the reviewer's own parsed
-        #     assistant text. Generic markers ("rate limit", "usage limit")
-        #     legitimately appear in this codebase's rate-limit/quota review
-        #     commentary and would false-positive on real review work. The
-        #     specific session-limit phrasing is the CLI's own death message,
-        #     not a domain term, so it is safe to match against reviewer text.
-        # (2) Guard on ``tool_call_count == 0``: a session that made any tool
-        #     calls did real review actions and is a PR-level outcome
-        #     (died_mid_session) regardless of what its log tail says -- a
-        #     throttle on the final API call after real work is not a launch
-        #     failure. The turn-limit branch above already owns sessions that
-        #     exhausted their turn budget, so this only intercepts deaths that
-        #     occurred before any tool use.
+        # Safe because (issue #652): (1) only the NARROW session_limit_markers
+        # are matched -- a tee'd claude-code reviewer's log IS its events
+        # content, so generic phrasing ("rate limit") would false-positive on
+        # the reviewer's own commentary; the opencode leg is the separate,
+        # broad-marker-safe digest checked above. (2) ``tool_call_count == 0``
+        # means no review work happened. This branch keeps its original place
+        # AFTER the turn-limit branch; only the opencode digest branch above
+        # moved ahead of it.
         reason = REVIEW_MISS_LAUNCH_FAILED
     else:
         reason = REVIEW_MISS_DIED_MID_SESSION

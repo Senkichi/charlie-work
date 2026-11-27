@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from charlie_work.merge_path.gather import persisted_from
 import charlie_work.workflow as _wf
 
 
@@ -62,7 +63,7 @@ def _request_mergequeue_requeue_rework(
         extra_payload={
             "mergequeue_requeue_rework_requested_at": requested_at,
             "mergequeue_label": label,
-            "consecutive_mergequeue_requeues": pr_state.get("consecutive_mergequeue_requeues"),
+            "consecutive_mergequeue_requeues": persisted_from(pr_state).mergequeue_requeues,
         },
         extra_state=merged_extra_state,
     )

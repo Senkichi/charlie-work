@@ -24,8 +24,8 @@ from _verdict_parity_driver import (
     ISSUE,
     Scenario,
     _call_args,
+    _fresh_repo,
     _local_app,
-    _make_repo,
     _pin_worker_selection,
     _remote_app,
     _seed,
@@ -60,7 +60,7 @@ class Side:
 
 
 def sides(scenario: Scenario, *, mutate_state=None):
-    repo = _make_repo()
+    repo = _fresh_repo()
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(selection_wrapper, "ci_fleet_executable", lambda: Path("ci-fleet"))
         local_app = _local_app(scenario, repo)

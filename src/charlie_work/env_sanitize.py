@@ -287,6 +287,41 @@ def build_local_gate_env(
 WORKER_ENV_DEFAULTS: dict[str, str] = {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"}
 
 
+def _dedupe_env_case(child_env: dict[str, str]) -> dict[str, str]:
+    """Collapse case-variant env keys so the last-written value wins outright.
+
+    WINDOWS ONLY (see :func:`build_worker_env`): the spawned child's env block
+    resolves duplicate names case-insensitively by position -- the entry that
+    appears LAST wins. A Python dict can hold "OPENCODE_PERMISSION" and
+    "opencode_permission" side by side, so a merge that leaves a lowercase
+    twin after a pin silently hands the hostile value to the spawned child.
+    Keep the final layer's casing: iterate in merge order and delete an
+    earlier ``.upper()`` twin whenever a later variant arrives.
+    """
+    upper_to_key: dict[str, str] = {}
+    result: dict[str, str] = {}
+    for key, value in child_env.items():
+        upper = key.upper()
+        previous = upper_to_key.get(upper)
+        if previous is not None and previous != key:
+            del result[previous]
+        result[key] = value
+        upper_to_key[upper] = key
+    return result
+
+
+def _collapses_env_case() -> bool:
+    """True when the spawned child resolves env names case-insensitively.
+
+    A seam, not a policy: Windows' ``CreateProcessW`` env block resolves
+    duplicate names positionally; POSIX passes the pairs through verbatim, so
+    a case variant there is a DIFFERENT variable. Tests bind this directly
+    rather than patching ``os.name`` (which would reach every other consumer
+    of the ``os`` module for the duration of the test).
+    """
+    return os.name == "nt"
+
+
 def build_worker_env(
     sanitized_env: Mapping[str, str], env: Mapping[str, object] | None
 ) -> dict[str, str]:
@@ -294,12 +329,25 @@ def build_worker_env(
 
     Later layers win, so an operator ``worker_env`` value can still override a
     harness default.
+
+    On Windows the merged env is additionally deduplicated case-insensitively
+    (last-written value wins outright): the child's env block resolves
+    duplicate names by position, so a ``worker_env`` key that differs only in
+    case from a pin would otherwise shadow the pin. That collapse is NOT
+    applied on POSIX -- there a case variant is a DIFFERENT variable name
+    (``pythonpath`` is not ``PYTHONPATH``), and deleting the canonical
+    spelling would silently remove ``PATH``/``PYTHONPATH``/… from the child
+    while keeping a name nothing reads. POSIX therefore keeps both entries,
+    which is the pre-existing, harmless behaviour.
     """
-    return {
+    child_env = {
         **sanitized_env,
         **WORKER_ENV_DEFAULTS,
         **{str(k): str(v) for k, v in (env or {}).items()},
     }
+    if _collapses_env_case():
+        return _dedupe_env_case(child_env)
+    return child_env
 
 
 def _is_owned_venv(path: Path) -> bool:
@@ -359,7 +407,7 @@ def sanitize_env(
             (issue #2795) — see :func:`provider_api_key_env_vars`. The default
             of ``None`` fails open (strips nothing extra) for out-of-tree
             callers; every in-tree launch site must pass it explicitly — an
-            AST guard test (``tests/test_env_sanitize.py``) fails when a
+            AST guard test (``tests/test_env_sanitize_call_sites.py``) fails when a
             ``sanitize_env(`` call in ``src/`` omits ``config=``.
 
     Returns:

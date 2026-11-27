@@ -80,10 +80,15 @@ HARNESS_REGISTRY: dict[str, HarnessCapabilities] = {
         skill_dirs=(".devin/skills", ".claude/skills"),
     ),
     "api": HarnessCapabilities(worker=True, review=True, adapter_kind="api"),
-    # opencode CLI (``opencode run``), worker-only: opencode_worker.py.
+    # opencode CLI (``opencode run``): opencode_worker.py. Read-only review
+    # posture is enforced by the OPENCODE_CONFIG_CONTENT permission policy plus
+    # sanitize_review_command_template (opencode_worker), which strips the
+    # --agent/--server/session movers and PINS --standalone -- the env policy
+    # only governs a private server the launch starts itself. Paired guarantee,
+    # same role as _sanitize_review_command_template for claude-code reviewers.
     "opencode": HarnessCapabilities(
         worker=True,
-        review=False,
+        review=True,
         adapter_kind="opencode",
         skill_dirs=(".opencode/skills", ".claude/skills"),
         requires_model=True,

@@ -1487,17 +1487,18 @@ class RuntimeConfig:
     # limit" / "usage limit" appropriate for WORKER process log tails (workers
     # don't produce analysis prose) — this list contains only the CLI's own
     # specific session-limit death message phrasing. Reviewer sessions DO
-    # produce analysis prose, and reviewer launches force tee_stream_json=True
-    # (claude_code.py), making log_path and events_path byte-identical — so
-    # any marker matched against the log tail is also matched against the
-    # parsed assistant text. Generic markers would false-positive on
-    # legitimate review commentary about rate-limit/quota code (this
-    # codebase's domain), silently reclassifying real review work as launch
-    # failures and defeating the #583 rollback guard this reclassification
-    # exists to protect. The specific "hit your session limit" phrasing is the
-    # CLI's own death message, not a domain term, so it is safe to match
-    # against reviewer text. Extend via config when a new session-limit
-    # phrasing is observed.
+    # produce analysis prose, and a tee'd claude-code reviewer launch writes
+    # log_path and events_path byte-identically (claude_code.py; the opencode
+    # review path never tees and uses its own digest instead) — so any marker
+    # matched against that log tail is also matched against the parsed
+    # assistant text. Generic markers would false-positive on legitimate
+    # review commentary about rate-limit/quota code (this codebase's domain),
+    # silently reclassifying real review work as launch failures and
+    # defeating the #583 rollback guard this reclassification exists to
+    # protect. The specific "hit your session limit" phrasing is the CLI's own
+    # death message, not a domain term, so it is safe to match against
+    # reviewer text. Extend via config when a new session-limit phrasing is
+    # observed.
     session_limit_markers: Annotated[tuple[str, ...], Typed] = ("hit your session limit",)
     # Prose fallback markers for provider quota exhaustion (issue #1684).
     # The PRIMARY quota signal is the structured JSON trailer —

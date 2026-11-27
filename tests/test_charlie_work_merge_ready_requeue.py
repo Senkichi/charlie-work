@@ -102,6 +102,11 @@ def test_requeue_cap_stops_the_relabel_loop_and_routes_to_rework(tmp_path: Path)
     routed_events = _events(paths, "mergequeue_requeue_rework_requested")
     assert len(routed_events) == 1
     assert routed_events[0]["payload"]["issue_number"] == _ISSUE
+    # The router reads the persisted counter before stage-5 accounting
+    # writes the cap-tripping revert, so its payload carries the pre-pass
+    # count (2, the line-78 assertion) -- the capped event's `requeues`
+    # above carries the post-pass total (3).
+    assert routed_events[0]["payload"]["consecutive_mergequeue_requeues"] == 2
 
 
 def test_requeue_cap_is_durable_while_the_head_is_unchanged(tmp_path: Path) -> None:

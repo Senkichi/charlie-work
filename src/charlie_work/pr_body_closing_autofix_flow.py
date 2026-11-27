@@ -69,10 +69,14 @@ def autofix_body_closing_kw(
         return None
 
     head_sha = str(pr.get("headRefOid") or "")
-    state = _wf.load_state(app.paths.state_file)
+    # ``read_state_snapshot`` (issue #3141): the sanctioned non-mutating
+    # lock-free reader. An unreadable state (None) reads as "no attempts
+    # recorded" -- same as the empty-state fallback it replaces, minus the
+    # quarantine hazard ``load_state`` carried here.
+    state = _wf.read_state_snapshot(app.paths.state_file) or {}
     # The mechanical de-escalation sweep zeroes counters with ``0`` (see
     # REWORK_BUDGET_RESET_BY_ESCALATION_REASON); a non-dict means "no attempts".
-    raw_attempts = (state["prs"].get(str(pr_number)) or {}).get(_ATTEMPTS_KEY)
+    raw_attempts = ((state.get("prs") or {}).get(str(pr_number)) or {}).get(_ATTEMPTS_KEY)
     attempts_by_head = dict(raw_attempts) if isinstance(raw_attempts, dict) else {}
     attempts = int(attempts_by_head.get(head_sha, 0))
     if attempts >= MAX_AUTOFIX_ATTEMPTS_PER_HEAD:

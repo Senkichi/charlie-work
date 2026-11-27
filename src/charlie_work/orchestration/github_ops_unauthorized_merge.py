@@ -35,7 +35,9 @@ def _detect_unauthorized_merges(
 
     Findings are bounded to merges this control could actually have governed
     — see ``_apply_unauthorized_merge_baseline``, which every return path
-    goes through so the bound cannot be bypassed by a future caller.
+    goes through so the bound cannot be bypassed by a future caller. A merge
+    whose linked issue another host owns is outside that bound too
+    (``_drop_foreign_unauthorized_merge_findings``, issue #2910).
     """
     candidates: list[dict[str, Any]] = []
     prefix = self.config.dispatch.branch_prefix
@@ -190,6 +192,19 @@ def _detect_unauthorized_merges(
                     candidate["coverage_reason"] = coverage_result.reason
             candidates.append(candidate)
     reported = self._apply_unauthorized_merge_baseline(candidates)
+    # Issue #2910: a merge whose linked issue another host owns is that host's
+    # to audit. Its review decision lives in the other host's state directory,
+    # so here it can only ever read ``missing``, and raising it would fire on
+    # every normal merge on a shared repository. Applied to the bounded set,
+    # not to ``candidates``: the per-issue ``issue_view`` read the proof costs
+    # is then paid only when there is something to report rather than every
+    # pass, a PR baselined at arming stays baselined if host routing is later
+    # switched off, and a PR once proven foreign is remembered durably and
+    # never re-read. It drops only on positive proof of single foreign
+    # ownership, so an unlinked PR, a contested two-label issue, or a failed
+    # lookup still reports. It must run before the announce below, which is
+    # what writes the event and the durable state entry.
+    reported = self._drop_foreign_unauthorized_merge_findings(reported)
     # Announce on the bounded set, never on raw candidates: the arming pass
     # deliberately reports nothing, and an acked finding is deliberately
     # silent. Emitting before the bound would re-introduce exactly the noise

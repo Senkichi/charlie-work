@@ -102,6 +102,10 @@ def _seed_dead_primary(
         "command": [],
         "pid": DEAD_PID,
         "started_at": "2026-10-02T04:30:00Z",
+        # Real sidecars always stamp process_start_time; without it the stalled
+        # sweep's kill_process_tree skips the dead-pid identity check and pays
+        # the full child-enumeration + taskkill path (2x PowerShell + taskkill).
+        "process_start_time": 1784000000.0,
         "log_path": str(log_path),
         role_quota_ledger.SESSION_ROLE_KEY: role_quota_ledger.session_stamp(
             "worker", entry.harness, entry.model, chain_index
