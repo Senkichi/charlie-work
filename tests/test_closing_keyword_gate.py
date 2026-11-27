@@ -380,6 +380,63 @@ def test_cli_closing_keyword_check_passes_when_clean(monkeypatch, tmp_path) -> N
     assert result.data["findings"] == []
 
 
+def test_cli_closing_keyword_check_passes_on_word_merely_ending_in_keyword(
+    monkeypatch, tmp_path
+) -> None:
+    """Issue #3181: `prefix #N` in a PR body is not a closing reference.
+
+    GitHub only auto-closes on a whole-word keyword, so a word that merely
+    ends in one ("prefix" -> "fix") must not be flagged -- this is the exact
+    false positive that failed Lint on PR #3144, whose body only lists the
+    lint's test-case words followed by issue references.
+    """
+
+    class FakeGitHubPrefix(_FakeGitHubForCLI):
+        def pr_view(self, number: int, *, fields: str | None = None):
+            pr = super().pr_view(number, fields=fields)
+            pr["body"] = "Fixes #999999\n\nLint test cases: prefix #999997 and prefixes #999997."
+            return pr
+
+        def pr_commits(self, number: int):
+            return [_commit("c1", "fix: do the thing\n\nFixes #999999", ["recordedbase"])]
+
+    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit, **kw: tmp_path)
+    monkeypatch.setattr(cli_module, "load_layered_config", lambda *a, **k: OrchestratorConfig())
+    monkeypatch.setattr(cli_module, "GitHub", FakeGitHubPrefix)
+
+    result = cli_module.run_closing_keyword_check_command(_cli_args(999992))
+
+    assert result.ok is True, result.message
+    assert result.data["findings"] == []
+
+
+def test_cli_closing_keyword_check_still_fails_on_whole_keyword_other_issue(
+    monkeypatch, tmp_path
+) -> None:
+    """Companion control: a whole-word keyword for an issue other than the
+    declared target is still a finding after the word-boundary fix."""
+
+    class FakeGitHubWholeKeyword(_FakeGitHubForCLI):
+        def pr_view(self, number: int, *, fields: str | None = None):
+            pr = super().pr_view(number, fields=fields)
+            pr["body"] = "Fixes #999999\n\nfixes #999997"
+            return pr
+
+        def pr_commits(self, number: int):
+            return [_commit("c1", "fix: do the thing\n\nFixes #999999", ["recordedbase"])]
+
+    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit, **kw: tmp_path)
+    monkeypatch.setattr(cli_module, "load_layered_config", lambda *a, **k: OrchestratorConfig())
+    monkeypatch.setattr(cli_module, "GitHub", FakeGitHubWholeKeyword)
+
+    result = cli_module.run_closing_keyword_check_command(_cli_args(999992))
+
+    assert result.ok is False
+    assert result.data["findings"] == [
+        {"issue_number": 999997, "source": "pr body", "matched_text": "fixes #999997"}
+    ]
+
+
 def test_cli_closing_keyword_check_reports_fetch_failure(monkeypatch, tmp_path) -> None:
     class FakeGitHubNoCommits(_FakeGitHubForCLI):
         def pr_commits(self, number: int):
