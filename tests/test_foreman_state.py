@@ -76,6 +76,18 @@ def test_save_rejects_unknown_state(tmp_path: Path) -> None:
     assert "transcended" in result.error
 
 
+def test_save_to_missing_foreman_dir_is_an_error(tmp_path: Path) -> None:
+    """``write_json_atomic`` mkdirs the parent — saving to a removed or
+    never-created foreman must refuse first, not silently re-materialize a
+    charterless ``foremen/<name>/`` that ``gang list`` would then show."""
+    fdir = paths.foreman_dir(tmp_path, "ghost")
+    result = save_state(fdir, ForemanState(state="active"))
+    assert not result.ok
+    assert "parent directory" in result.error
+    assert not fdir.exists()
+    assert not (fdir / "state.json").exists()
+
+
 def test_with_updates_returns_new_value(tmp_path: Path) -> None:
     fdir = _foreman(tmp_path)
     original = read_state_snapshot(fdir)

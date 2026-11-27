@@ -169,6 +169,11 @@ def save_state(foreman_root: Path, state: ForemanState) -> Result[ForemanState]:
         path = state_path(foreman_root)
     except ValueError as exc:
         return Result(error=str(exc))
+    # ``write_json_atomic`` mkdirs the parent — a save to a removed foreman
+    # must refuse, not silently re-materialize a charterless
+    # ``foremen/<name>/`` that ``gang list`` would then show.
+    if not path.parent.is_dir():
+        return Result(error=f"{path.name}: parent directory {path.parent} does not exist")
     try:
         write_json_atomic(path, _to_payload(state))
     except OSError as exc:
