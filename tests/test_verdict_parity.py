@@ -484,23 +484,37 @@ def test_the_rescue_exemption_is_limited_to_its_scenario(
     assert [d.path for d in _undeclared(_diffs("approve", remote, {**local, path: "x"}))] == [path]
 
 
-_FIXTURE_SIDE = frozenset({"parity_outcomes", "_outcomes"})
+# The ~0.5 s-per-scenario outcome drive (``run_both``, via the ``_outcomes``
+# memo) may be called only from what pytest runs in ``setup``: the
+# ``parity_outcomes`` fixture. Any other function -- or a module-level
+# statement -- calling one charges the drive to a test's ``call`` phase,
+# which the test ledger reads as a per-test regression.
+_OUTCOME_DRIVES = frozenset({"run_both", "_outcomes"})
+_SETUP_SIDE = frozenset({"parity_outcomes", "_outcomes"})
 
 
 def test_the_outcome_drive_stays_in_fixture_setup() -> None:
-    """Ledger pin (issues #3187, #3188, #3189): ``run_both``/``_outcomes`` may be
-    called only from ``parity_outcomes`` -- which runs during setup -- never
-    from a test's ``call`` phase.
+    """Ledger pin (issues #3187, #3188, #3189, #3194): ``run_both``/``_outcomes``
+    may be called only from ``parity_outcomes`` -- which runs during setup --
+    never from a test's ``call`` phase.
 
-    ``run_both`` costs ~0.5 s per scenario on a ``_CACHE`` miss; inside a test
-    body the test ledger reads it as that test's ``call`` time and files a
-    per-test regression (three filings on this file before the drive moved to
-    setup). A new consumer must take the ``parity_outcomes`` fixture -- naming
-    itself in ``_SCENARIO_DRIVE`` when it is not parametrized by ``scenario`` /
-    ``scenario_name`` -- rather than calling ``_outcomes`` in its body.
+    ``run_both`` costs ~0.5 s per scenario on a ``_CACHE`` miss; paid inside a
+    test body the ledger files it as that test's regression --
+    ``test_both_entry_points_agree_except_where_declared[rework_vacuous_summary]``
+    and five sibling params each got one. The drive moved into the
+    ``parity_outcomes`` fixture; this scan pins all three halves of that
+    contract: no test body calls the drive, every outcome consumer --
+    parametrized by ``scenario``/``scenario_name`` or listed in
+    ``_SCENARIO_DRIVE`` -- declares the fixture, and ``parity_outcomes``
+    stays a ``pytest.fixture``, so the drive cannot come back through a
+    lazy re-plumb of the outcomes lookup.
     """
     tree = parsed(Path(__file__))
-    drive_names = frozenset({"run_both", "_outcomes"})
+    funcs = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
 
     def drive_calls(node: ast.AST) -> list[int]:
         return [
@@ -508,13 +522,13 @@ def test_the_outcome_drive_stays_in_fixture_setup() -> None:
             for sub in ast.walk(node)
             if isinstance(sub, ast.Call)
             and isinstance(sub.func, ast.Name)
-            and sub.func.id in drive_names
+            and sub.func.id in _OUTCOME_DRIVES
         ]
 
-    callers = {
-        node.name: drive_calls(node)
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    offenders = {
+        name: lines
+        for name, fn in funcs.items()
+        if (lines := drive_calls(fn)) and name not in _SETUP_SIDE
     }
     module_level = [
         line
@@ -522,9 +536,6 @@ def test_the_outcome_drive_stays_in_fixture_setup() -> None:
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
         for line in drive_calls(node)
     ]
-    offenders = {
-        name: lines for name, lines in callers.items() if lines and name not in _FIXTURE_SIDE
-    }
     assert not offenders and not module_level, (
         "a test-body outcome drive re-opens the call-phase ledger regression -- "
         "take the parity_outcomes fixture instead: "
@@ -532,4 +543,65 @@ def test_the_outcome_drive_stays_in_fixture_setup() -> None:
     )
     # Positive control: the sanctioned call sites are still where the scan
     # expects them, so a broken scan cannot pass vacuously.
-    assert {name for name, lines in callers.items() if lines} == set(_FIXTURE_SIDE)
+    assert {name for name, fn in funcs.items() if drive_calls(fn)} == set(_SETUP_SIDE)
+
+    def parametrizes(node: ast.FunctionDef | ast.AsyncFunctionDef, names: set[str]) -> bool:
+        for dec in node.decorator_list:
+            if not (
+                isinstance(dec, ast.Call)
+                and isinstance(dec.func, ast.Attribute)
+                and dec.func.attr == "parametrize"
+                and dec.args
+            ):
+                continue
+            first = dec.args[0]
+            params: list[str] = []
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                params = [part.strip() for part in first.value.split(",")]
+            elif isinstance(first, (ast.Tuple, ast.List)):
+                params = [
+                    elt.value
+                    for elt in first.elts
+                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+                ]
+            if names & set(params):
+                return True
+        return False
+
+    consumers = {
+        name: fn
+        for name, fn in funcs.items()
+        if name.startswith("test_")
+        and (name in _SCENARIO_DRIVE or parametrizes(fn, {"scenario", "scenario_name"}))
+    }
+    missing = sorted(
+        name
+        for name, fn in consumers.items()
+        if "parity_outcomes"
+        not in {arg.arg for arg in (*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs)}
+    )
+    assert not missing, (
+        "an outcome consumer that does not take parity_outcomes reaches the "
+        "outcomes another way -- the only other way is a call-phase drive: " + ", ".join(missing)
+    )
+    # Positive controls: every _SCENARIO_DRIVE key resolves to a real consumer
+    # and the parametrized parity tests are still found -- a rename cannot
+    # void the scan silently.
+    assert set(_SCENARIO_DRIVE) <= set(consumers)
+    assert {
+        "test_scenario_does_what_it_names_on_both_entry_points",
+        "test_both_entry_points_agree_except_where_declared",
+        "test_a_change_on_one_side_only_is_reported",
+    } <= set(consumers)
+
+    # Only a fixture runs in setup: ``parity_outcomes`` must stay one.
+    fixture_fn = funcs["parity_outcomes"]
+    assert any(
+        (isinstance(d, ast.Attribute) and d.attr == "fixture")
+        or (
+            isinstance(d, ast.Call)
+            and isinstance(d.func, ast.Attribute)
+            and d.func.attr == "fixture"
+        )
+        for d in fixture_fn.decorator_list
+    ), "parity_outcomes is no longer a pytest.fixture -- the drive moves back to call"
