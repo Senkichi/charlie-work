@@ -35,8 +35,10 @@ too, so the list can neither hide a new drift nor go stale.
 
 from __future__ import annotations
 
+import ast
 import subprocess
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from unittest import mock
 
@@ -44,6 +46,7 @@ import pytest
 
 import _git_templates
 from _dashboard_rollup_fixtures import _register
+from _src_ast import parsed
 from charlie_work import instrumentation
 from charlie_work.dashboard import rollup
 from charlie_work.dashboard.drill.timeline import pr_drill
@@ -400,3 +403,54 @@ def test_the_rescue_exemption_is_limited_to_its_scenario(
     assert [d.path for d in _undeclared(_diffs(scenario, remote, perturbed))] == [path]
     remote, local = parity_outcomes["approve"]
     assert [d.path for d in _undeclared(_diffs("approve", remote, {**local, path: "x"}))] == [path]
+
+
+_FIXTURE_SIDE = frozenset({"parity_outcomes", "_outcomes"})
+
+
+def test_the_outcome_drive_stays_in_fixture_setup() -> None:
+    """Ledger pin (issues #3187, #3188, #3189): ``run_both``/``_outcomes`` may be
+    called only from ``parity_outcomes`` -- which runs during setup -- never
+    from a test's ``call`` phase.
+
+    ``run_both`` costs ~0.5 s per scenario on a ``_CACHE`` miss; inside a test
+    body the test ledger reads it as that test's ``call`` time and files a
+    per-test regression (three filings on this file before the drive moved to
+    setup). A new consumer must take the ``parity_outcomes`` fixture -- naming
+    itself in ``_SCENARIO_DRIVE`` when it is not parametrized by ``scenario`` /
+    ``scenario_name`` -- rather than calling ``_outcomes`` in its body.
+    """
+    tree = parsed(Path(__file__))
+    drive_names = frozenset({"run_both", "_outcomes"})
+
+    def drive_calls(node: ast.AST) -> list[int]:
+        return [
+            sub.lineno
+            for sub in ast.walk(node)
+            if isinstance(sub, ast.Call)
+            and isinstance(sub.func, ast.Name)
+            and sub.func.id in drive_names
+        ]
+
+    callers = {
+        node.name: drive_calls(node)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    module_level = [
+        line
+        for node in tree.body
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        for line in drive_calls(node)
+    ]
+    offenders = {
+        name: lines for name, lines in callers.items() if lines and name not in _FIXTURE_SIDE
+    }
+    assert not offenders and not module_level, (
+        "a test-body outcome drive re-opens the call-phase ledger regression -- "
+        "take the parity_outcomes fixture instead: "
+        f"{offenders} module-level lines {module_level}"
+    )
+    # Positive control: the sanctioned call sites are still where the scan
+    # expects them, so a broken scan cannot pass vacuously.
+    assert {name for name, lines in callers.items() if lines} == set(_FIXTURE_SIDE)
