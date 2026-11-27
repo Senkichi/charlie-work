@@ -319,7 +319,13 @@ def _needs(issue: dict[str, Any]):
         snapshot=SimpleNamespace(data={"issues": [issue], "prs": []}),
         escalated_since=(),
     )
-    src = SimpleNamespace(labels=labels, repos=(repo,), pause=None, supervisor_heartbeat=None)
+    src = SimpleNamespace(
+        labels=labels,
+        repos=(repo,),
+        pause=None,
+        supervisor_heartbeat=None,
+        foreman_items=(),
+    )
     return now_needs_me.needs_me_items(src, (), (), NOW, 100.0, None)  # type: ignore[arg-type]
 
 

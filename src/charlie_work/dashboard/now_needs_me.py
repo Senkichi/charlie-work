@@ -125,6 +125,27 @@ def needs_me_items(
                             number=number,
                         )
                     )
+    for item in sources.foreman_items:
+        # The item's own ``command`` is the foreman's suggested remedy; without
+        # one the remedy is to answer the item, prefilled with the recommended
+        # option index when the foreman marked one.
+        command = item.command
+        if command is None:
+            choose = str(item.recommended) if item.recommended is not None else "<answer>"
+            command = join_command(
+                ["charlie", "gang", "intervene", item.foreman, item.item_id, "--choose", choose]
+            )
+        items.append(
+            NeedsMeItem(
+                "foreman_item",
+                "action",
+                item.foreman,
+                (now - item.created_at).total_seconds() if item.created_at else None,
+                f"{item.kind.title()} item {item.item_id}: {item.text}".rstrip(": "),
+                command,
+                False,
+            )
+        )
     for finding in findings:
         if finding.severity in ("anomaly", "warn"):
             items.append(
@@ -213,6 +234,8 @@ def _group(item: NeedsMeItem) -> str:
     if item.kind == "human_needed":
         # A PR parked for a verdict is a different decision than a bare issue.
         return "Awaiting your verdict" if item.secondary_command else "Human needed"
+    if item.kind == "foreman_item":
+        return "Foremen"
     return "Exceptions"
 
 

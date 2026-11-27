@@ -22,6 +22,7 @@ from .now_read_events import (
     runner_busy,
     runner_repos,
 )
+from .now_read_foremen import read_foreman_items
 from .now_read_state import read_repo_state
 from .now_types import RepoRead, SourcesRead
 
@@ -91,4 +92,5 @@ def collect_sources_read(
         done_24h=merged_24h(now, fleet_dir_override, threshold),
         collector_interval_seconds=collector_interval_seconds,
         snapshot_gap_p90_seconds=gap_p90,
+        foreman_items=read_foreman_items(fs.fleet_dir, now),
     )
