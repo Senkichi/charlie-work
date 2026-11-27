@@ -359,7 +359,10 @@ def apply_turn(
             continue
 
         state = read_state_snapshot(foreman_root)
-        if state.state == "paused":
+        # Pause stops effects, not previews: under ``--dry-run --only`` a
+        # paused foreman still walks every action so the plan it would
+        # apply when resumed is what the operator reviews.
+        if state.state == "paused" and not dry_run:
             stopped = True
             break
 

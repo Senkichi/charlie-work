@@ -123,6 +123,34 @@ predictable.
 | `charlie runners status` | current runner-pool state for this repo (online/busy/idle, queue depth, host headroom) |
 | `charlie runners allocate` | rebalance this host's running runner listeners across every repo by live queue demand (`--dry-run` to preview) |
 
+## Foremen
+
+A **foreman** is a chartered client of the hub that owns one outcome: it
+files and arms the issues that deliver it, watches them through the
+lifecycle, and raises items for the operator — the model proposes actions
+and deterministic code applies or refuses them (ADR-0010,
+`docs/design/2026-11-25-foreman-layer-design.md`). Foremen live under
+`<fleet_dir>/foremen/<name>/`; the fleet supervise loop runs
+`charlie scheme` (one foreman pass) every `foreman.pass_interval_minutes`.
+
+| Command | What it does |
+|---|---|
+| `charlie gang new <name> [--from DIR]` | scaffold a foreman (charter + instructions); starts paused |
+| `charlie gang list` / `charlie gang show <name>` | list foremen / show one foreman's charter, state, and open items |
+| `charlie gang say <name> "<text>"` | append an operator instruction to the foreman's inbox |
+| `charlie gang signal <name> --source <s> (--file <f> \| --text <t>)` | append an external event — data, never an instruction |
+| `charlie gang interventions [<name>]` | list open items with options and the command that enacts each |
+| `charlie gang intervene <name> <item> --choose <i>` | answer an item |
+| `charlie gang snooze <name> <item> --until <when>` / `charlie gang dismiss <name> <item>` | hide an item until a local time / close it unanswered |
+| `charlie gang pepe-silvia <name>` | print the newest Turn briefing |
+| `charlie gang dayman [<name>]` | print the newest report item |
+| `charlie gang pause <name>` / `charlie gang resume <name>` | stop Turns / go live (resume also clears `faulted`) |
+| `charlie scheme [--dry-run [--no-decide]] [--only <name>]` | run one foreman pass over the fleet's foremen |
+
+See [docs/RUNBOOK.md](docs/RUNBOOK.md#foremen) for the create → dry-run →
+live workflow, and `examples/foremen/migration/` for a bounded charter to
+start from.
+
 ## Dependencies
 
 The orchestrator supports dependency-aware dispatch through issue body markers

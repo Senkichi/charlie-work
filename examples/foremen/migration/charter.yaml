@@ -1,0 +1,30 @@
+# Example charter: a bounded foreman that owns one large migration and ships
+# it as small issues (design §6, §16). Only a human edits this file.
+#
+# `charlie gang new <name> --from examples/foremen/migration` copies this
+# file verbatim — before `charlie gang resume`, set `name` to the directory
+# name you scaffolded under, `repos` to the fleet registry key of the repo
+# being migrated, and `done_when.check` to the argv that proves the outcome.
+name: migration
+outcome: >-
+  Every call site of the old mechanism goes through the new one; the old
+  mechanism remains only as the documented fallback. The migration ships as
+  small, individually mergeable issues.
+repos: ["<owner>/<repo>"]   # placeholder: exactly one fleet registry key
+standing: false             # bounded — a standing foreman has no end state
+done_when:
+  # Operator-authored argv, never model output. Runs in a fresh detached
+  # worktree at the default branch tip with a timeout; exit 0 moves the
+  # foreman to done and raises a final report, anything else goes into the
+  # next briefing with the output tail.
+  check: ["uv", "run", "--extra", "dev", "pytest", "-q", "tests/test_migration_complete.py"]
+arming: auto                # auto | propose — propose gates every issue on the operator
+bounds:
+  max_open_issues: 5
+  max_issues_per_turn: 3
+  min_turn_interval_minutes: 30
+  max_quiet_hours: 24
+  max_turns_per_day: 12
+  max_unanswered_days: 7
+cadence:
+  report_at: "09:00"        # local HH:MM — one scheduled Turn per day
