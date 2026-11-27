@@ -121,11 +121,11 @@ def test_file_issue_files_arms_and_records(tmp_path: Path) -> None:
     assert "<!-- foreman:pepe turn:t1 key:a -->" in issue["body"]
 
     # The hash recorded in state.json is what amend later compares against.
-    recorded = read_state_snapshot(froot).issues[1]
-    assert recorded.body_hash
+    assert read_state_snapshot(froot).issues[1].body_hash
 
-    kinds = [(e["kind"], e["level"]) for e in _events(froot)]
-    assert (EVENT_ACTION_APPLIED, "info") in kinds
+    kinds = {(e["kind"], e["level"]) for e in _events(froot)}
+    # Arming goes through the label seam: the ready add emits lifecycle_transition.
+    assert (EVENT_ACTION_APPLIED, "info") in kinds and ("lifecycle_transition", "info") in kinds
 
 
 def test_blocked_by_key_resolves_to_a_real_number_and_lints_clean(
@@ -643,8 +643,8 @@ def test_pause_mid_turn_stops_remaining_actions(tmp_path: Path, monkeypatch) -> 
         calls["n"] += 1
         state = original(root)
         # First call is the main loop's before-action-0 check; every later
-        # read (including the inside-action helpers) reports paused, which
-        # matters only to the next loop check — helpers never gate on it.
+        # call on this binding reports paused and stops the next loop check.
+        # Inside-action helpers bind their own copy — never gated on it.
         return ForemanState(state="paused") if calls["n"] > 1 else state
 
     monkeypatch.setattr(apply_mod, "read_state_snapshot", paused_after_first_check)
