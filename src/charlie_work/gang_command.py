@@ -470,11 +470,7 @@ def _gang_pepe_silvia(store: Any, fpaths: Any, fleet: Path, name: str) -> Comman
     except ValueError as exc:
         return _fail("pepe-silvia", str(exc))
     briefings = (
-        [
-            path
-            for path in turns.glob(f"*/{fpaths.BRIEFING_FILENAME}")
-            if path.is_file()
-        ]
+        [path for path in turns.glob(f"*/{fpaths.BRIEFING_FILENAME}") if path.is_file()]
         if turns.is_dir()
         else []
     )
