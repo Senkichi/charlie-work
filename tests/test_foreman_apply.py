@@ -4,7 +4,7 @@ Covers the design §8.3 contract: per-action check order (authority, bounds,
 type-specific, effect, one event), blocker keys resolving to real numbers,
 idempotent create via the hidden marker, arming rules (auto / propose /
 degraded / signal-marked), crash-resume through ``applied.jsonl``, pause,
-and dry-run.
+and dry-run. ``done_when.check`` lives in ``test_foreman_apply_done.py``.
 """
 
 from __future__ import annotations

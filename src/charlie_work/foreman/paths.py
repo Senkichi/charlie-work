@@ -23,6 +23,7 @@ Layout (design §4)::
         items.json        # typed decision/permission/report items
         turns/            # one directory per Turn
         tree/             # detached worktree of the registered repo
+        check/            # transient done_when.check worktree (created and removed per run)
 """
 
 from __future__ import annotations
@@ -45,6 +46,7 @@ SIGNALS_FILENAME = "signals.jsonl"
 MEMORY_DIRNAME = "memory"
 TURNS_DIRNAME = "turns"
 TREE_DIRNAME = "tree"
+CHECK_DIRNAME = "check"
 
 ACTIONS_FILENAME = "actions.json"
 APPLIED_FILENAME = "applied.jsonl"
@@ -172,3 +174,8 @@ def signals_path(foreman_root: Path) -> Path:
 
 def tree_path(foreman_root: Path) -> Path:
     return _sub(foreman_root, TREE_DIRNAME)
+
+
+def done_check_path(foreman_root: Path) -> Path:
+    """Resolve ``check/`` — the transient worktree ``done_when.check`` runs in."""
+    return _sub(foreman_root, CHECK_DIRNAME)

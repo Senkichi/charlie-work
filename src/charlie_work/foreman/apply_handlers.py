@@ -9,6 +9,8 @@ verdict value, never an exception.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from ..github import label_names
 from ..github_body_scan import parse_blockers
 from ..issue_contract_lint import lint_issue_body
@@ -49,7 +51,8 @@ from .items import create_item
 from .memory import delete_memory as _delete_memory_file
 from .memory import write_memory as _write_memory_file
 from .paths import state_path
-from .state import read_state_snapshot
+from .state import read_state_snapshot, save_state, with_updates
+from .tree import _output_tail, DONE_CHECK_TIMEOUT_SECONDS, run_done_check
 
 
 def _file_issue(run: _Run, action: FileIssueAction, index: int) -> _Verdict:
@@ -338,9 +341,8 @@ def _delete_memory(run: _Run, action: DeleteMemoryAction) -> _Verdict:
     return _applied(f"deleted memory {action.path!r}")
 
 
-def _propose_done(run: _Run, action: ProposeDoneAction, index: int) -> _Verdict:
-    if run.charter.standing:
-        return _refused("charter is standing: a standing foreman never proposes done")
+def _propose_done_item(run: _Run, action: ProposeDoneAction, index: int) -> _Verdict:
+    """The no-``done_when`` fallback: done becomes a decision item (design §8.3)."""
     item_id = f"{run.turn_id}:propose-done:{index}"
     if run.dry_run:
         return _applied(f"would raise done-confirmation item {item_id}", item_id=item_id)
@@ -358,6 +360,66 @@ def _propose_done(run: _Run, action: ProposeDoneAction, index: int) -> _Verdict:
             return _applied(f"item {item_id} already exists (deduped)", item_id=item_id)
         return _refused(f"item store refused: {result.error}")
     return _applied(f"raised done-confirmation item {result.value.id}", item_id=result.value.id)
+
+
+def _propose_done(run: _Run, action: ProposeDoneAction, index: int) -> _Verdict:
+    if run.charter.standing:
+        return _refused("charter is standing: a standing foreman never proposes done")
+    done_when = run.charter.done_when
+    if done_when is None or not done_when.check:
+        return _propose_done_item(run, action, index)
+    argv = " ".join(done_when.check)
+    if run.dry_run:
+        return _applied(f"would run done_when.check ({argv})")
+    repo_root = run.repo_root
+    if repo_root is None:
+        return _refused("done_when.check: the issue client exposes no repo_root to worktree from")
+    checked = run_done_check(
+        run.foreman_root,
+        Path(repo_root),
+        done_when.check,
+        timeout_seconds=DONE_CHECK_TIMEOUT_SECONDS,
+    )
+    if not checked.ok:
+        return _refused(f"done_when.check could not run: {checked.error}")
+    result = checked.value
+    if not result.ok:
+        if result.timed_out:
+            status = f"timed out after {DONE_CHECK_TIMEOUT_SECONDS}s"
+        elif result.returncode is None:
+            status = f"could not start ({result.error})"
+        else:
+            status = f"exited {result.returncode}"
+        tail = _output_tail(result)
+        reason = f"done_when.check {status} ({argv})"
+        # The tail rides the refusal into the next briefing's refused section.
+        return _refused(f"{reason}: {tail}" if tail else reason)
+
+    # A pass moves the foreman to done and raises a final report — report
+    # first so a failed state write leaves an active foreman that can
+    # re-propose (the check re-runs; the report item id dedupes a replay).
+    report_id = f"{run.turn_id}:done-report:{index}"
+    report = create_item(
+        run.foreman_root,
+        kind="report",
+        text=(
+            f"Foreman {run.charter.name} is done: done_when.check passed in turn "
+            f"{run.turn_id}.\n\n{action.evidence}"
+        ),
+        item_id=report_id,
+    )
+    if not report.ok:
+        if not report.error or "already exists" not in report.error:
+            return _refused(f"final report refused: {report.error}")
+        report_note = f"final report item {report_id} already raised"
+    else:
+        report_note = f"final report item {report.value.id}"
+    state = read_state_snapshot(run.foreman_root)
+    # write-gate-exempt(issue=3119): name-matched only — foreman.state.save_state is the foreman's own store, not the orchestrator primitive; the engine has no write_gate receiver.
+    saved = save_state(run.foreman_root, with_updates(state, state="done"))
+    if not saved.ok:
+        return _refused(f"done_when.check passed but the done transition failed: {saved.error}")
+    return _applied(f"done_when.check passed — foreman done; {report_note}", item_id=report_id)
 
 
 def _process(run: _Run, action: Action, index: int) -> _Verdict:
