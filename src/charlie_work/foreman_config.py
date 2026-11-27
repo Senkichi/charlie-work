@@ -54,4 +54,10 @@ class ForemanConfig:
     tools: Annotated[str, Typed, NotNull, NonEmpty] = FOREMAN_DEFAULT_TOOLS
     max_model_turns: Annotated[int, Typed, Positive] = 40
     pass_interval_minutes: Annotated[int, Typed, Positive] = 5
+    # Wall-clock ceiling on one Decide model call (issue #3120) -- the
+    # ``run_captured`` timeout_seconds of the blocking launch. The launch is
+    # synchronous, so this is also the worst-case stall a single Decide step
+    # adds to a Turn: with the default 40 max_model_turns a slow model could
+    # otherwise outlast a pass_interval window.
+    decide_timeout_seconds: Annotated[int, Typed, Positive] = 1800
     chain = property(chain_of)

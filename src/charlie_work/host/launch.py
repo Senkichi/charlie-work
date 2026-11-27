@@ -1,4 +1,4 @@
-"""Host ports: worker and reviewer launch.
+"""Host ports: worker, reviewer, and foreman-Decide launch.
 
 Leaf module (stdlib only at top). ``RealReviewLauncher`` resolves
 ``review_launch._REVIEW_LAUNCHERS`` and ``RealWorkerLauncher`` resolves
@@ -8,15 +8,23 @@ intercepts -- the ``workflow.*`` delegate layer the Reals used to route
 through was deleted in issue #2235. Launch is non-blocking (the
 underlying launchers use ``Popen``) and failures come back as
 ``LaunchOutcome`` values -- these ports never raise.
+
+``DecideLauncher`` (issue #3120) is the one deliberate exception to the
+non-blocking rule: a foreman's Decide step is a single bounded
+``claude -p`` call the Turn driver waits on, so the port wraps
+``subprocess_runner.run_captured`` (timeout-bounded, tree-killing) and
+returns the ``RunResult`` value.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from ..adapters import AdapterSettings, SessionDispatchResult, SessionRequest
+    from ..subprocess_runner import RunResult
 
 
 class LaunchOutcome(Protocol):
@@ -49,6 +57,28 @@ class WorkerLauncher(Protocol):
         requests: list[SessionRequest],
     ) -> list[SessionDispatchResult]:
         """Launch one batch of worker requests -- one ``LaunchOutcome`` per request."""
+        ...
+
+
+class DecideLauncher(Protocol):
+    """The foreman Decide launch: blocking, read-only, one bounded model call.
+
+    The port carries the assembled argv verbatim -- the caller (``foreman.
+    decide``) owns the pinning contract; the port only runs it. ``env`` is a
+    complete sanitized environment (``env_sanitize.sanitize_env`` output),
+    ``stdin`` the briefing text.
+    """
+
+    def launch(
+        self,
+        argv: tuple[str, ...],
+        *,
+        cwd: Path,
+        env: Mapping[str, str],
+        timeout_seconds: int,
+        stdin: str,
+    ) -> RunResult:
+        """Run one bounded ``claude -p`` Decide launch; return the ``RunResult``."""
         ...
 
 
@@ -180,3 +210,26 @@ class RealWorkerLauncher:
             )
         except Exception as exc:  # errors from external processes come back as values
             return worker_error_results(repo_root, settings, requests, f"launch failed: {exc}")
+
+
+class RealDecideLauncher:
+    def launch(
+        self,
+        argv: tuple[str, ...],
+        *,
+        cwd: Path,
+        env: Mapping[str, str],
+        timeout_seconds: int,
+        stdin: str,
+    ) -> RunResult:
+        from ..subprocess_runner import run_captured
+
+        # ``run_captured`` never raises: timeouts, missing binaries, and
+        # non-zero exits all come back in the RunResult.
+        return run_captured(
+            list(argv),
+            cwd=cwd,
+            timeout_seconds=timeout_seconds,
+            stdin=stdin,
+            base_env=dict(env),
+        )
